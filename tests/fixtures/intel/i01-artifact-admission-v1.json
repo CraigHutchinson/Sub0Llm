@@ -1,0 +1,221 @@
+{
+  "schema": "sub0.intel.i01-artifact-admission.v1",
+  "recorded_utc": "2026-09-09",
+  "scope": "Phase-1 I01 artifact identity and replay admission; no backend correctness claim",
+  "admission_state": "blocked_missing_required_identities",
+  "evidence_revisions": {
+    "wp5a": "bb1fc707beb295e78786a13f0f69823c5b4cb0b9",
+    "wp5b": "e1bea23ac9a6fc0553595ad76753c20e1cdabf5a",
+    "wp5c": "2f57d148589ce6dd5eb85417174e032d2174cbed",
+    "corrected_wp4f": "296f2a12950476dc7627c0961d81eba562c04a08",
+    "wp5b_artifact_build_path_original": "40058197d7764ec293dca865d0a3b6d6ebe51b8d",
+    "wp5b_artifact_build_path_rebased": "9cd8f28a694b2fe6f18aad4d32c92ec422aa4f12"
+  },
+  "source_model": {
+    "family": "Qwen3.8-Flash-Next",
+    "gguf_repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    "gguf_revision": null,
+    "gguf_revision_requirement": "An immutable upstream revision must be recorded before prefix or full-model admission.",
+    "local_shards_observed": [
+      {"path_hint": "D:/ModelWeights/Qwen3.8-Flash-Next-GGUF/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf", "bytes": 10946624, "sha256": null},
+      {"path_hint": "D:/ModelWeights/Qwen3.8-Flash-Next-GGUF/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf", "bytes": 49990818368, "sha256": null},
+      {"path_hint": "D:/ModelWeights/Qwen3.8-Flash-Next-GGUF/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf", "bytes": 22544696352, "sha256": null}
+    ],
+    "identity_note": "Sizes were observed without hashing the giant external shards. All three SHA-256 values and the immutable upstream revision remain required unknowns.",
+    "retrieval_command_template": "huggingface-cli download unsloth/Qwen3.8-Flash-Next-GGUF --revision <PIN_REQUIRED> --include 'Qwen3.8-Flash-Next-UD-IQ1_S-*.gguf' --local-dir <SOURCE_GGUF_DIR>"
+  },
+  "tokenizer": {
+    "repository": "Qwen/Qwen3.8-Flash-Next",
+    "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "classification": "required_for_i17b_generation_optional_for_numeric_forward",
+    "assets": [
+      {"name": "vocab.json", "bytes": 6722759, "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"},
+      {"name": "merges.txt", "bytes": 3353259, "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"},
+      {"name": "tokenizer.json", "bytes": 12809320, "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"},
+      {"name": "tokenizer_config.json", "bytes": 17928, "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"},
+      {"name": "chat_template.jinja", "bytes": 8952, "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"},
+      {"name": "config.json", "bytes": 4745, "sha256": "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b"}
+    ],
+    "retrieval_command": "huggingface-cli download Qwen/Qwen3.8-Flash-Next vocab.json merges.txt tokenizer.json tokenizer_config.json chat_template.jinja config.json --revision de4b8e4d43b917e7706784d8bb445c9af86a3540 --local-dir <TOKENIZER_DIR>",
+    "model_trailer_tokenizer_fingerprint": "0x0000000000000000",
+    "trailer_interpretation": "Unknown identity; the S0L5 artifact itself does not bind the external tokenizer assets."
+  },
+  "generated_config": {
+    "source_path": "tests/qwen4_real_axes/sub0_config.hpp",
+    "bytes": 6604,
+    "sha256": "7a14ee912864c642b886e62fb28eb5584feaf6181a9d19390425db8e6f1ed4b2",
+    "axes": {
+      "d_model": 2560,
+      "n_layers_variants": [4, 48],
+      "n_heads": 24,
+      "n_kv_heads": 2,
+      "d_head": 256,
+      "d_ff": 640,
+      "seq_len": 128,
+      "vocab": 248320,
+      "loop_middle_layers": 0,
+      "loop_repeats": 1,
+      "depth_attention": false,
+      "gdn_layer_stride": 4,
+      "gdn_key_heads": 16,
+      "gdn_value_heads": 48,
+      "gdn_key_dim": 128,
+      "gdn_value_dim": 128,
+      "ngram_max_n": 0,
+      "ngram_tables_per_order": 1,
+      "ngram_table_size": 0,
+      "hc_count": 4,
+      "lowrank_dim": 320,
+      "num_experts": 512,
+      "experts_per_token": 10,
+      "qsa_idx_heads": 4,
+      "qsa_idx_kv_heads": 1,
+      "qsa_idx_head_dim": 128,
+      "qsa_index_budget": 2048,
+      "qsa_block_ratio": 4,
+      "rotary_dim": 64,
+      "rope_theta": 10000000.0,
+      "rope_scaling": "none",
+      "rope_scaling_factor": 1.0,
+      "use_ternary": false,
+      "use_gated_ffn": true,
+      "tie_embeddings": false,
+      "qk_norm": true,
+      "position_encoding": "rope"
+    },
+    "fingerprints": {
+      "arch_fingerprint": "0x000000014b189680",
+      "arch_fingerprint2": "0x0040100408000a04",
+      "model_arch_id_4_layers": "0x0ab07e1c5708a202",
+      "model_arch_id_48_layers": "0x55e43efd2649a656"
+    },
+    "parameter_layouts": {
+      "4_layers_quantized_experts": {"num_params": 95, "param_floats": 1581285280, "model_bytes": 6325141192},
+      "48_layers_quantized_experts": {"num_params": 1074, "param_floats": 4915107200, "model_bytes": 19660428872},
+      "corrected_first_four_layer_boundary": {"tensor_count": 90, "param_floats": 938773920}
+    }
+  },
+  "loader_formats": {
+    "model": {
+      "name": "S0L5",
+      "implementation": "include/sub0/model_file.hpp",
+      "header_bytes": 48,
+      "layout": "48-byte ModelHeader, float32 parameter payload in generated PARAM_LAYOUT order, uint64 tokenizer fingerprint, uint64 architecture fingerprint, uint64 architecture fingerprint2",
+      "compatibility": "Current loader requires the first two trailers. A missing final architecture-fingerprint2 trailer is treated as zero for legacy files."
+    },
+    "quantized_expert_sidecar": {
+      "name": "S0Q1",
+      "version": 1,
+      "implementation": "include/sub0/moe_quant.hpp",
+      "header_bytes": 56,
+      "descriptor_bytes": 32,
+      "path_rule": "<model-path>.moeq",
+      "layout": "header; n_layers*num_experts*3 tensor descriptors; native encoded GGUF payload bytes",
+      "pairing_guard": "model_param_floats in the sidecar header must match the S0L5 model",
+      "required_when": "MOE_QUANT_EXPERTS is enabled"
+    },
+    "logits": {"format": "raw little-endian float32", "shape": [6, 248320]},
+    "hidden_state": {"name": "S0HD", "implementation": "include/sub0/hidden_dump.hpp"}
+  },
+  "tracked_reference_fixtures": {
+    "classification": "required_for_component_replay",
+    "roots": ["tests/fixtures/qwen4_preview", "tests/fixtures/qwen_tokenizer"],
+    "checksum_inventory": "tests/fixtures/intel/qwen-reference-fixtures.sha256",
+    "coverage": [
+      {"operation": "tokenizer", "fixture": "tests/fixtures/qwen_tokenizer/manifest.json", "phase": "encode/decode/pretokenize/NFC", "dtype": "UTF-8 and integer token ids", "tolerance": "exact"},
+      {"operation": "gated_residual", "fixture": "tests/fixtures/qwen4_preview/gated_residual_layer0_small_manifest.json", "phase": "forward", "dtype": "float32", "tolerance": {"max_abs": 0.00005}},
+      {"operation": "gdn", "fixture": "tests/fixtures/qwen4_preview/gdn_layer0_small_manifest.json", "phase": "forward/backward/state", "dtype": "float32", "tolerance": {"forward_max_abs": 0.00005, "gradient_abs_floor": 0.0001, "gradient_max_relative": 0.05, "finite_difference_abs_floor": 0.002, "finite_difference_max_relative": 0.02, "state_noop": "exact"}},
+      {"operation": "moe", "fixture": "tests/fixtures/qwen4_preview/moe_layer0_small_manifest.json", "phase": "forward/mutant", "dtype": "float32", "tolerance": {"max_abs": 0.0000005}},
+      {"operation": "qsa", "fixture": "tests/fixtures/qwen4_preview/qsa_layer3_small_manifest.json", "phase": "forward/mutant/batch/decode", "dtype": "float32", "tolerance": {"max_abs": 0.00001, "mutant_separation_min": 0.0001, "batch_decode": "exact"}},
+      {"operation": "ngram_embedding_sample", "fixture": "tests/fixtures/qwen4_preview/ngram_embedding_manifest.json", "phase": "layout", "dtype": "float32", "tolerance": "exact"}
+    ],
+    "ple_limit": "The ngram fixture covers only 6 tokens, 16 heads, and 160 sampled rows. It is not a full PLE artifact."
+  },
+  "artifact_sets": {
+    "i11_dense_control": {
+      "purpose": "I11 supported dense control with the full dense chain and full vocabulary head",
+      "classification": "required_for_i11",
+      "admission": {"status": "missing", "reason": "No qualifying dense model/config artifact, immutable source identity, model checksum, expected logits/state, or measured RSS was recorded."},
+      "model": null,
+      "sidecar": {"required": false, "value": null},
+      "ple": {"required": false, "value": null},
+      "required_unknowns": ["architecture/config selection", "immutable source revision and checksum", "S0L5 model path and SHA-256", "prompt/token ids", "expected logits or state and tolerances", "measured RSS"],
+      "failure_command": "pwsh -NoProfile -Command '$m=Get-Content -Raw tests/fixtures/intel/i01-artifact-admission-v1.json|ConvertFrom-Json; $a=$m.artifact_sets.i11_dense_control; if($a.admission.status -ne \"admitted\"){Write-Error (\"I01 required fixture unavailable: \"+$a.purpose); exit 2}'"
+    },
+    "four_layer_prefix": {
+      "purpose": "Corrected four-layer Qwen3.8 prefix control",
+      "classification": "required_for_i12_to_i16_prefix_checks",
+      "admission": {"status": "blocked_identity", "reason": "Observed model and sidecar are external and giant; SHA-256 values and immutable source-GGUF identity were not recorded."},
+      "config_layers": 4,
+      "model": {"path_hint": "D:/ModelWeights/Sub0Llm-Qwen4-sub4/qwen4_sub4_q_wp4f.bin", "bytes": 6325141192, "sha256": null, "format": "S0L5"},
+      "sidecar": {"path_hint": "D:/ModelWeights/Sub0Llm-Qwen4-sub4/qwen4_sub4_q_wp4f.bin.moeq", "bytes": 3408068664, "sha256": null, "format": "S0Q1-v1", "required": true},
+      "ple": {"available": false, "required": false, "reason": "The prefix control deliberately compiled NGRAM_MAX_N=0."},
+      "expected": {
+        "forward_input_token_ids": [1543, 88123, 245000, 7, 99999, 156789],
+        "bos_injected": false,
+        "logits": {"path_hint": "D:/ModelWeights/Sub0Llm-Qwen4-sub4/logits_q_wp4f.bin", "bytes": 5959680, "sha256": "2f4fed40ee7f43434f638fdc44682e23cac65f26159d34524bdc2821bdd385a0", "shape": [6, 248320]},
+        "hidden_state_engine": {"path_hint": "D:/ModelWeights/Sub0Llm-Qwen4-sub4/wp4f_sub0llm_fixed.s0hd", "bytes": 10261285, "sha256": "078730e5ec60621ea9f7eb1372714705e8b22199b39d2beacde0c95e94eacf7d"},
+        "hidden_state_llamacpp": {"path_hint": "D:/ModelWeights/Sub0Llm-Qwen4-sub4/wp4f_llamacpp_canonical.s0hd", "bytes": 1290403, "sha256": "1dfc4f00543eaf643168f81c205fae39a98ebbd9e044dbe6a780a8ff13ebcb07"},
+        "forward_vs_forward_one_max_abs": 0.0,
+        "engine_vs_math_replay_worst": 0.000000022,
+        "corrected_layer0_float64_rel_l2": 0.00000259,
+        "corrected_layer0_float64_cosine": 1.0,
+        "llamacpp_difference": {"observed_rel_l2": 0.0221, "interpretation": "Activation-quantization policy differs; the historical 1e-4 llama.cpp gate is inapplicable to this pair."},
+        "generation": {"raw_prompt": "The capital of France is", "seed": 1234, "temperature": 0.8, "top_k": 40, "generated_token_ids": [43751, 99014, 115301, 126138, 31346, 56912, 47894, 3966, 149822, 163763, 51754, 46627], "semantic_quality_expected": false}
+      },
+      "rss": {"peak_gib": 8.58, "workload": "four-layer generation", "measurement_kind": "historical observed peak; environment-specific, not an acceptance tolerance"},
+      "rebuild_commands": [
+        "cmake --build <BUILD_DIR> --config Release --target sub0llm-transplant-q sub0llm-qwen4-forward sub0llm-qwen4-gen",
+        "<BUILD_DIR>/Release/sub0llm-transplant-q.exe --gguf <SOURCE_GGUF_DIR>/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf --out <ARTIFACT_DIR>/qwen4_sub4_q_wp4f.bin"
+      ],
+      "required_unknowns": ["source GGUF immutable revision", "all three source shard SHA-256 values", "model SHA-256", "sidecar SHA-256"],
+      "failure_command": "pwsh -NoProfile -Command '$m=Get-Content -Raw tests/fixtures/intel/i01-artifact-admission-v1.json|ConvertFrom-Json; $a=$m.artifact_sets.four_layer_prefix; if($a.admission.status -ne \"admitted\"){Write-Error (\"I01 required fixture unavailable: \"+$a.purpose); exit 2}'"
+    },
+    "i17b_full_artifact": {
+      "purpose": "I17b full 48-layer useful-generation artifact",
+      "classification": "required_for_i17b",
+      "admission": {"status": "blocked_identity_and_capability", "reason": "Model/sidecar hashes and source identity are unknown; PLE was excluded and no full PLE artifact/loader exists."},
+      "config_layers": 48,
+      "model": {"path_hint": "D:/ModelWeights/Sub0Llm-Qwen4-full48/qwen4_full48_q.bin", "bytes": 19660428872, "sha256": null, "format": "S0L5"},
+      "sidecar": {"path_hint": "D:/ModelWeights/Sub0Llm-Qwen4-full48/qwen4_full48_q.bin.moeq", "bytes": 39848247352, "sha256": null, "format": "S0Q1-v1", "required": true},
+      "ple": {
+        "available": false,
+        "required": true,
+        "source_tensors_observed": ["per_layer_token_embd.weight", "blk.1.ple_conv1d", "blk.1.ple_key", "blk.1.ple_norm_conv", "blk.1.ple_norm_key", "blk.1.ple_norm_query", "blk.1.ple_value"],
+        "unknowns": ["extracted artifact path", "loader format", "origin mapping", "SHA-256", "reconstruction command"]
+      },
+      "expected": {
+        "forward_input_token_ids": [1543, 88123, 245000, 7, 99999, 156789],
+        "logits_shape": [6, 248320],
+        "nonfinite_logits": 0,
+        "forward_vs_forward_one_max_abs": 0.0,
+        "engine_vs_math_replay_layers_0_to_2": {"hidden_max_abs": 0.0000000182, "delta_max_abs": 0.0000000216},
+        "double_readout_vs_engine_logits_max_abs": 0.0000256,
+        "generation": {"raw_prompt": "The capital of France is", "prompt_token_ids": [760, 6511, 314, 9338, 369], "generated_token_ids": [11751, 13, 2500, 1599, 5656, 599, 89798, 440], "decoded_text": " Paris. How many countries have capitals with"},
+        "eos_probe": {"prompt_token_ids": [248045, 846, 198, 44240, 15131, 13, 248046, 198, 248045, 74455, 198, 12675, 0], "argmax_token_id": 248046, "tokens_generated_before_stop": 0},
+        "cli_contract": {"prompt_mode": "raw verbatim; no chat template is applied", "context_limit": "prompt token count plus requested generation must be <= baked SEQ_LEN=128", "windows_non_ascii_status": "not admitted; historical CLI used code page 1252"}
+      },
+      "rss": {
+        "forward_peak_gib": 35.51,
+        "forward_after_load_gib": 18.32,
+        "forward_after_graph_reset_gib": 32.35,
+        "generation_peak_gib": 37.11,
+        "generation_after_load_gib": 18.36,
+        "generation_after_graph_reset_gib": 32.40,
+        "measurement_kind": "historical observed peaks; environment-specific, not acceptance tolerances"
+      },
+      "rebuild_commands": [
+        "cmake --build <BUILD_DIR> --config Release --target sub0llm-transplant-q48 sub0llm-qwen4-forward-q48 sub0llm-qwen4-gen-q48",
+        "<BUILD_DIR>/Release/sub0llm-transplant-q48.exe --gguf <SOURCE_GGUF_DIR>/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf --out <ARTIFACT_DIR>/qwen4_full48_q.bin"
+      ],
+      "required_unknowns": ["source GGUF immutable revision", "all three source shard SHA-256 values", "model SHA-256", "sidecar SHA-256", "full PLE artifact identity/format/loader/rebuild", "qualifying non-ASCII prompt transport"],
+      "failure_command": "pwsh -NoProfile -Command '$m=Get-Content -Raw tests/fixtures/intel/i01-artifact-admission-v1.json|ConvertFrom-Json; $a=$m.artifact_sets.i17b_full_artifact; if($a.admission.status -ne \"admitted\"){Write-Error (\"I01 required fixture unavailable: \"+$a.purpose); exit 2}'"
+    }
+  },
+  "global_admission_rule": "A required artifact set is usable only when admission.status is 'admitted', every required file has a non-null SHA-256, source revisions are immutable, and all required capabilities are present.",
+  "notes": [
+    "Superseded prefix files without the q_wp4f suffix are deliberately excluded.",
+    "The full artifact is a reduced-function numeric control because NGRAM_MAX_N=0; it does not qualify as the I17b useful-generation artifact.",
+    "sample_token at vocab 248320 historically used about 2.84 MiB of stack; qwen4-gen used a 32 MiB linker stack setting. Production admission must preserve or remove that requirement."
+  ]
+}
