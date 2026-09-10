@@ -168,7 +168,7 @@ remain Claude's work. This review draws no conclusion about which implementation
 | B18 | Done | State the engine's process/thread ownership contract | Validated by public-header review | S initially | Completed on user request, 2026-09-08 |
 | B19 | Done | Configure externally defined Qwen4 vocabularies without corpus learning | Confirmed; measured ~100 s avoidable learner cost | M | After WP5 tokenizer/configuration path is stable |
 | B20 | Done | Reduce MoE decode transpose cost and use available CPU parallelism | Merged `d2bbea4`, 1.61x + exposed decode is now disk-bound | L | Completed 2026-09-09; both parts independently reverified, bit-for-bit |
-| B21 | P1 | Find why `ParallelExperts`' 10 decode threads show 1-thread disk-queue depth in production | Confirmed by direct `\PhysicalDisk\Avg. Disk Queue Length` measurement, root cause open | M | Blocks trusting any further decode-throughput number as I/O-bound-and-therefore-fixed |
+| B21 | P1 | Find why `ParallelExperts`' 10 decode threads plateau near 6-way concurrency with 3-9x inflated per-expert cost | Confirmed via wall-clock thread instrumentation; core parking ruled out; root cause open | M | Blocks trusting any further decode-throughput number as I/O-bound-and-therefore-fixed |
 
 ## Findings and acceptance criteria
 
@@ -621,19 +621,64 @@ sustains 6.34 GB/s vs. the engine's measured 55–108 MB/s); the 48-region fork/
 (measured 1.2–1.3x, not 4–5x); page-cache pressure under a 25 GiB resident-ballast simulation of the
 engine's own real private footprint (measured 1.3x, not 4–5x).
 
-**Still open, not yet tested**: P-core/E-core thread-affinity placement of the real OpenMP team vs. the
+**Still open at first filing**: P-core/E-core thread-affinity placement of the real OpenMP team vs. the
 harness's `std::thread` pool on this 8P+16E part; whether per-region OpenMP wake-up cost differs
 materially once the team is reused across 48 short regions inside a much larger, much busier process
 already holding 25+ GiB resident (TLB/cache contention the isolated harness's smaller footprint would not
 reproduce); whether something upstream of the resolve call itself (the router's own work, or the two-phase
 compute-then-combine restructuring) serializes the ten resolves in practice despite no lock being visible.
 
-**Acceptance criteria**: instrument or re-measure to identify the actual serialization point (VTune's
-thread-concurrency histogram over the resolve region, not its hotspot list, is the next instrument named
-by this research); fix it; re-verify decode throughput moves toward the harness's own 10-thread projection
-(~1.0–1.3 s/token) while `--verify`/parity/the determinism fixture stay exactly unchanged (this is once
-again a pure scheduling question — the two-phase compute-then-sum structure means answer correctness
-cannot depend on which thread computes which expert or how quickly).
+#### Follow-up, 2026-09-10 — the ten threads ARE running, partially concurrently; the picture is more specific than "one thread's worth"
+
+Temporary wall-clock instrumentation was added to `ParallelExperts` (per-thread `start`/`end`
+`std::chrono::steady_clock` timestamps around each `body(k, ...)` call, gated to the first few calls of a
+run, reverted before commit — not merged) and a short real decode run was captured. Findings, all directly
+measured:
+
+1. **`omp_get_num_threads()` inside the region reports 10, every call** — the team really is 10 real OS
+   threads, confirming the earlier code-review conclusion that there is no silent team-size collapse
+   (e.g. from `OMP_DYNAMIC`/nested-parallelism defaults).
+2. **The very first `ParallelExperts` call of the whole process (layer 0 of the first token) runs fully
+   sequentially** — thread N's `body` call starts within ~1-6 ms of thread N-1's ending, with essentially
+   no overlap at all. This is consistent with `libomp`'s worker-thread-pool cold-start cost (spinning up 9
+   new OS threads for the first time) and affects only that single call — it is not the steady-state
+   pattern and does not by itself explain a per-token cost.
+3. **Every subsequent call (steady-state) shows real but PARTIAL concurrency: 6 of the 10 threads start
+   within a ~1-2 ms window of each other and run with genuinely overlapping wall-clock durations (30-99 ms
+   each); the remaining 4 threads start ~90-120 ms later, right around when the first group of 6 begins
+   finishing.** This is not "one thread's worth of work" (the original framing from the first measurement
+   pass) — it is real, repeatable, bounded parallelism, consistently capped near 6 rather than reaching 10,
+   across multiple layers and multiple independent runs.
+4. **Windows core parking was tested directly and ruled out as the (sole) explanation.** Duplicated and
+   activated the built-in "High performance" power scheme (this machine's active scheme was "Balanced";
+   `powercfg /q ... SUB_PROCESSOR` found no distinct core-parking-minimum sub-setting exposed by name on
+   this Windows build, so the scheme swap was the available test) and re-ran the same instrumented decode:
+   throughput was unchanged (5.36 s/token vs. 5.85 s/token, within normal run-to-run variance) and the
+   identical "first-call-serial, then 6-then-4" pattern reproduced exactly. Power scheme was restored to
+   Balanced afterward (the duplicated scheme was deleted) — no lasting change to the machine.
+5. **Per-expert duration during the "concurrent" 6-thread bursts (30-99 ms) is 3-9x higher than BOTH the
+   isolated single-thread baselines** recorded in the empirical research pass (cold ~11.4 ms, warm ~6.5 ms
+   per expert, single-threaded). This is the most load-bearing new number: it means the live engine's
+   per-expert cost is not simply "the same work, less parallelized" — something makes each resolve
+   materially more expensive when several run concurrently in the real engine than the isolated harness's
+   equivalent concurrent case (which scaled to 2.13 ms/expert at 10 threads). Candidates not yet
+   discriminated: real memory-bandwidth/cache contention from 6 threads' dequant+transpose work competing
+   against the process's own 25+ GiB resident working set (the isolated harness's smaller footprint would
+   not reproduce this); a real, narrower cap on concurrent hard-fault service somewhere in the Windows
+   fault path (KB156932's architectural claim, at whatever the modern equivalent pool size actually is,
+   not the archived "three threads" figure) that lets a handful of faults progress concurrently but not
+   ten; or NVMe queue/driver behavior specific to small (~85 KB, per the empirical doc's own finding)
+   per-fault reads issued this way, as distinct from the large sequential `ReadFile` reads the overlapped-
+   I/O probe used to reach 6-16 deep queues.
+
+**Acceptance criteria (updated)**: identify why concurrency plateaus near 6 rather than 10, and why
+per-expert cost under real concurrent load is 3-9x the isolated baseline rather than matching it; fix or
+design around it; re-verify decode throughput moves toward the harness's own 10-thread projection
+(~1.0–1.3 s/token) while `--verify`/parity/the determinism fixture stay exactly unchanged (this remains a
+pure scheduling question — the two-phase compute-then-sum structure means answer correctness cannot depend
+on which thread computes which expert or how quickly). VTune's thread-concurrency histogram over the
+resolve region (not its hotspot list) remains the next-named instrument, now aimed at explaining a
+plateau-at-6 rather than a collapse-to-1.
 
 Full research trail: session scratchpad `sub0mempage-research-empirical-concurrency.md` (not part of this
 repo) — every number above is reproducible from the commands logged in that file's appendix.
