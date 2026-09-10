@@ -169,6 +169,7 @@ remain Claude's work. This review draws no conclusion about which implementation
 | B19 | Done | Configure externally defined Qwen4 vocabularies without corpus learning | Confirmed; measured ~100 s avoidable learner cost | M | After WP5 tokenizer/configuration path is stable |
 | B20 | Done | Reduce MoE decode transpose cost and use available CPU parallelism | Merged `d2bbea4`, 1.61x + exposed decode is now disk-bound | L | Completed 2026-09-09; both parts independently reverified, bit-for-bit |
 | B21 | P1 | Find why decode's per-expert resolve concurrency plateaus at ~2-3x with inflated per-expert cost, independent of requested thread count | Confirmed via wall-clock instrumentation at both 10 and 6 requested threads; core parking + thread-count ruled out; root cause open | M | Blocks trusting any further decode-throughput number as I/O-bound-and-therefore-fixed; also affects `MOE_DECODE_THREADS` sizing |
+| B22 | P3 (backlog) | Migrate `moeq::Store`/`ExpertCache`'s hand-rolled residency+slot-pool bookkeeping onto Sub0MemPage once it has a real implementation | Sub0MemPage's spec (github.com/CraigHutchinson/Sub0MemPage) is explicitly designed against this exact code as its first real consumer | M | Blocked on Sub0MemPage reaching a working implementation (currently design-only); not urgent, but should not be forgotten once it lands |
 
 ## Findings and acceptance criteria
 
@@ -729,6 +730,57 @@ count itself is ruled out as the axis that matters.
 
 Full research trail: session scratchpad `sub0mempage-research-empirical-concurrency.md` (not part of this
 repo) — every number above is reproducible from the commands logged in that file's appendix.
+
+### B22 — Migrate `moeq::Store`/`ExpertCache` onto Sub0MemPage once it has a real implementation
+
+Filed 2026-09-10, alongside the Sub0MemPage repository's own ownership-model resolution
+(`docs/sub0llm-consumer-trace.md` in that repo). **Not urgent — this is a backlog placeholder, not a
+call to action.** Sub0MemPage (github.com/CraigHutchinson/Sub0MemPage) is currently design-only, with no
+working implementation; this item exists so the migration is not forgotten once one exists, per this
+project's own standing discipline of tracking known-future work rather than letting it evaporate between
+sessions.
+
+**Why this is a real migration candidate, not a speculative one**: Sub0MemPage's own design was built
+*against* this exact code as its first real consumer, not designed in the abstract and retrofitted after
+the fact. `include/sub0/moe_quant.hpp`'s `moeq::Store` (the ~37 GiB S0Q1 sidecar's read-only mapping) and
+`ExpertCache<Slots, SlotFloats>` (the dequantized-plane pool with round-robin slot reuse and
+`(layer,expert)`-keyed hit detection) are, respectively, exactly the "addressable byte-range source" and
+"caller-owned destination slot pool" Sub0MemPage's own `register_region`/`register_slots` contract was
+shaped to sit underneath. Sub0MemPage's own research explicitly names `ExpertCache`'s current round-robin
+policy as "the naive replacement a Sub0MemPage-backed policy would supersede," and its own
+`sub0llm-consumer-trace.md` traces the exact migration this item tracks: `ExpertCache::pool_` gets
+registered via `register_slots` **unchanged, no new allocation**; `ExpertCache::resolve()`'s conflated
+"which slot, is it a hit, fault the bytes in" logic splits into Sub0MemPage's own bookkeeping (the first
+two, generalized) plus a one-line change at `dequantize_expert()`'s call site (reading from the slot a
+lease names instead of `store.raw(desc)`); and B21's own motivating defect (this file, above) is exactly
+the class of problem a batched `prefetch` call ahead of `ParallelExperts`' parallel region would sidestep
+by construction, independent of whatever B21's own root cause turns out to be.
+
+**What this buys, concretely, once Sub0MemPage exists**: proactive prefetch of a layer's ~10 expert planes
+issued from one thread before the parallel resolve region begins (replacing today's ten independent,
+uncoordinated reactive faults); a real, enforced hard budget on the sidecar's resident share instead of
+leaving it to the OS's default page-cache behavior entirely unmanaged; `wont_need` to deprioritize a
+completed layer's slots for reuse, something `ExpertCache`'s own policy has no way to express today; and —
+if Sub0MemPage's own future GPU/heterogeneous-memory backend work proceeds (raised the same day this item
+was filed, not yet designed) — a shared residency vocabulary between this CPU-side MoE cache and any future
+CUDA/iGPU expert-residency work, rather than two independently-invented ad hoc pools.
+
+**What does NOT change, and is worth stating so this isn't mistaken for a bigger rewrite than it is**:
+`dequantize_expert()`'s own two-step decode (`gguf::to_f32` then `transplant::transpose_out_in`) is
+untouched — Sub0MemPage never interprets bytes. `ExpertCache`'s own allocation, sizing, and per-thread
+ownership are untouched. The `#pragma omp parallel`/`#pragma omp for schedule(static)` structure in
+`decode.cpp` is untouched. `op_moe`'s own separate 8-slot batched-path pool (a genuinely different
+residency policy, real cross-row hit rate, deliberately left alone by B20) is a separate, independent
+migration candidate if this item is ever acted on — not assumed to move at the same time.
+
+**Acceptance criteria, once Sub0MemPage has a real implementation to migrate to**: `register_slots` over
+`ExpertCache::pool_` with zero new allocation (verified, not assumed); `--verify`/parity/the WP5c
+determinism fixture all byte-for-bit unchanged (this is once again a pure scheduling/residency change, not
+an arithmetic one); a measured throughput comparison against the pre-migration baseline, honestly reported
+whether or not it resolves B21's own still-open root cause (it is not expected to, per B21's own closing
+note — a proactive design sidesteps depending on N reactive threads cooperating correctly, but B21's
+specific unexplained ~2-3x concurrency ceiling and cost inflation could plausibly persist under an
+explicit-fill backend too, and that would itself be a finding worth reporting, not a silent non-result).
 
 ## Suggested execution order
 
