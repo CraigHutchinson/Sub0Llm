@@ -168,7 +168,7 @@ remain Claude's work. This review draws no conclusion about which implementation
 | B18 | Done | State the engine's process/thread ownership contract | Validated by public-header review | S initially | Completed on user request, 2026-09-08 |
 | B19 | Done | Configure externally defined Qwen4 vocabularies without corpus learning | Confirmed; measured ~100 s avoidable learner cost | M | After WP5 tokenizer/configuration path is stable |
 | B20 | Done | Reduce MoE decode transpose cost and use available CPU parallelism | Merged `d2bbea4`, 1.61x + exposed decode is now disk-bound | L | Completed 2026-09-09; both parts independently reverified, bit-for-bit |
-| B21 | P1 | Find why `ParallelExperts`' 10 decode threads plateau near 6-way concurrency with 3-9x inflated per-expert cost | Confirmed via wall-clock thread instrumentation; core parking ruled out; root cause open | M | Blocks trusting any further decode-throughput number as I/O-bound-and-therefore-fixed |
+| B21 | P1 | Find why decode's per-expert resolve concurrency plateaus at ~2-3x with inflated per-expert cost, independent of requested thread count | Confirmed via wall-clock instrumentation at both 10 and 6 requested threads; core parking + thread-count ruled out; root cause open | M | Blocks trusting any further decode-throughput number as I/O-bound-and-therefore-fixed; also affects `MOE_DECODE_THREADS` sizing |
 
 ## Findings and acceptance criteria
 
@@ -671,14 +671,61 @@ measured:
    per-fault reads issued this way, as distinct from the large sequential `ReadFile` reads the overlapped-
    I/O probe used to reach 6-16 deep queues.
 
-**Acceptance criteria (updated)**: identify why concurrency plateaus near 6 rather than 10, and why
-per-expert cost under real concurrent load is 3-9x the isolated baseline rather than matching it; fix or
-design around it; re-verify decode throughput moves toward the harness's own 10-thread projection
-(~1.0–1.3 s/token) while `--verify`/parity/the determinism fixture stay exactly unchanged (this remains a
-pure scheduling question — the two-phase compute-then-sum structure means answer correctness cannot depend
-on which thread computes which expert or how quickly). VTune's thread-concurrency histogram over the
-resolve region (not its hotspot list) remains the next-named instrument, now aimed at explaining a
-plateau-at-6 rather than a collapse-to-1.
+**Acceptance criteria (superseded by the follow-up below — kept for history)**: identify why concurrency
+plateaus near 6 rather than 10, and why per-expert cost under real concurrent load is 3-9x the isolated
+baseline rather than matching it; fix or design around it; re-verify decode throughput moves toward the
+harness's own 10-thread projection (~1.0–1.3 s/token) while `--verify`/parity/the determinism fixture stay
+exactly unchanged (this remains a pure scheduling question — the two-phase compute-then-sum structure
+means answer correctness cannot depend on which thread computes which expert or how quickly). VTune's
+thread-concurrency histogram over the resolve region (not its hotspot list) remains the next-named
+instrument.
+
+#### Follow-up 2, 2026-09-10 — the plateau is NOT a function of requested thread count at all
+
+Direct test: `DEFAULT_THREADS` was overridden 24 → 6 in the (untracked, generated) build header, so
+`MOE_DECODE_THREADS = min(DEFAULT_THREADS, EXPERTS_PER_TOK)` dropped from 10 to 6 — i.e. the team was
+asked for *exactly* the concurrency level the previous measurement seemed to plateau at. Same wall-clock
+instrumentation, same decode run. Reverted cleanly afterward (`sub0_system.hpp` restored from a pre-edit
+backup, `decode.cpp` diff against `main` confirmed empty both before and after, executable rebuilt from
+clean source).
+
+**Result: asking for exactly 6 did not produce clean 6-way concurrency or remove the cost inflation.**
+Real overlap sub-plateaued further, to roughly 2-3 threads genuinely concurrent at a time (not all 6);
+per-expert duration stayed in the same inflated range as the 10-thread run (15-73 ms vs. the 10-thread
+run's 30-99 ms — same order of magnitude, not reduced toward the 6.5-11.4 ms isolated baseline). Overall
+throughput was essentially unchanged (5.24 s/token at 6 threads vs. 5.36-5.85 s/token at 10) — if anything
+marginally *better* with fewer threads requested, meaning the extra requested concurrency above ~3 buys
+nothing measurable in this environment.
+
+**This rules out "6 is a hard cap that gets fully saturated, and asking for 10 just wastes 4 threads
+uselessly waiting."** The effective concurrency ceiling and the per-expert cost inflation are **not**
+functions of `MOE_DECODE_THREADS` at all — the same ~2-3x ceiling and the same order-of-magnitude
+inflation appear whether 6 or 10 threads are requested. This points away from anything at the
+OpenMP/application-thread-count level and squarely at something in the resolve path itself that is
+constant regardless of caller-side parallelism: real memory-bandwidth/cache contention against the
+engine's own 25+ GiB resident working set (a genuine possibility the isolated harness's much smaller
+footprint cannot reproduce, and the one candidate from the original list that predicts exactly this
+"doesn't scale with requested threads" shape), or a real OS/device-level concurrent-fault-service ceiling
+that is a property of the file/device/access-pattern rather than of the caller's thread count.
+
+**Practical implication for the engine, separate from full root-causing**: if the effective ceiling really
+is ~2-3x regardless of request, `MOE_DECODE_THREADS`'s current value (10, one thread per selected expert)
+may be leaving no measurable throughput on the table relative to a much smaller, much cheaper team (each
+`MoeDecodeThread` costs ~25 MiB; a 3-4 thread team would cost a fraction of the current 250 MiB and free
+that headroom for the file cache B20 already showed governs the sidecar's own resident share) — but this
+should be confirmed with a longer, less noisy run before acting on it, not shipped from two 12-token
+samples.
+
+**Acceptance criteria (updated)**: root-cause the ~2-3x ceiling and the inflation as a property of the
+resolve path independent of thread count — the leading candidates are contention against the engine's own
+large resident working set (test: repeat the harness's own concurrent-pipe measurement WITH a matching
+resident-ballast simulation, as the empirical doc's §5b already did for a different question, but this
+time instrumented with the same per-call wall-clock timing used here) and a real modern-Windows
+concurrent-hard-fault-service limit (test: the same wall-clock instrumentation against `FILE_FLAG_OVERLAPPED`
+reads into an owned arena instead of mmap faults, at the real call site, not just the standalone probe).
+VTune's thread-concurrency histogram over the resolve region remains a candidate instrument but is no
+longer the only lead — the ballast-plus-timing test above is cheaper and more targeted now that thread
+count itself is ruled out as the axis that matters.
 
 Full research trail: session scratchpad `sub0mempage-research-empirical-concurrency.md` (not part of this
 repo) — every number above is reproducible from the commands logged in that file's appendix.
