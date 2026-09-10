@@ -8,6 +8,10 @@
 #   moe_expert_bench.cpp — one routed MoE expert's decode cost, split into disk / dequant / transpose /
 #                          FFN. Plain main(), not Catch2: its first arm measures a page's FIRST touch,
 #                          which a benchmark harness' warm-up destroys. See that file's own header.
+#   backbone_dequant_bench.cpp — B24: format-specific dequant cost + achieved DRAM bandwidth for the
+#                          BACKBONE's own real Q5_K/Q6_K/Q8_0 tensors at 100% (dense) access density,
+#                          vs the sidecar's ~2%-density case moe_expert_bench.cpp already measured.
+#                          Same plain-main() reasoning; see that file's own header.
 
 CPMAddPackage("gh:catchorg/Catch2@3.7.1")   # no-op if the tests already fetched it (CPM dedups)
 
@@ -26,6 +30,14 @@ add_executable(sub0_moe_expert_bench moe_expert_bench.cpp)
 target_include_directories(sub0_moe_expert_bench PRIVATE "${CMAKE_SOURCE_DIR}/include")
 if(SUB0_HAS_OPENMP_SIMD_FLAG)
   target_compile_options(sub0_moe_expert_bench PRIVATE -fopenmp-simd)
+endif()
+
+# gguf.hpp only -- same "engine-free, real dims from the real file" reasoning as sub0_moe_expert_bench,
+# aimed at the backbone instead of the sidecar.
+add_executable(sub0_backbone_dequant_bench backbone_dequant_bench.cpp)
+target_include_directories(sub0_backbone_dequant_bench PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(SUB0_HAS_OPENMP_SIMD_FLAG)
+  target_compile_options(sub0_backbone_dequant_bench PRIVATE -fopenmp-simd)
 endif()
 
 # Header-only numerical core; recognize its SIMD pragmas just as the CPU engine does.

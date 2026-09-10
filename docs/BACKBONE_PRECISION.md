@@ -171,7 +171,97 @@ promotes on read) that Phase 2's native-quant format would plug into as a second
 rather than being a second, parallel storage mechanism built from scratch. Phase 2 should be scoped in
 detail (a real WP-style design pass, format-by-format dequant cost measurement, a decision between 2a and
 2b above) only once Phase 1 has real, measured numbers to build on — named here as the next priority per
-the user's own directive, not designed in full in this pass.
+the user's own directive, not designed in full in this pass. **B24 (below, §2c) supplies that
+format-by-format measurement ahead of Phase 1 landing — it does not depend on Phase 1's engine work, only
+on `gguf.hpp`'s existing dequantizers, so the 2a-vs-2b decision itself did not have to wait.**
+
+---
+
+### 2c. B24 measurement — the 2a-vs-2b fork, resolved
+
+**Measured, not assumed, on the real Qwen3.8-Flash-Next UD-IQ1_S shards
+(`D:\ModelWeights\Qwen3.8-Flash-Next-GGUF\UD-IQ1_S`), via a new engine-free benchmark,
+`benchmarks/backbone_dequant_bench.cpp` (built as `sub0_backbone_dequant_bench`, following
+`moe_expert_bench.cpp`'s own plain-`main()` precedent exactly, for the same reason: a cold/warm arm
+distinction a Catch2 warm-up would destroy).** Branch `research/b24-native-quant-backbone`. Kept as a
+permanent repo benchmark, not a scratch tool — the crossover math below is exactly the kind of thing a
+future format addition (a different K-quant, a different source model) should be able to re-run against,
+the same way `moe_expert_bench.cpp` stayed as the sidecar's own standing instrument.
+
+**Method.** For each of the backbone's three real formats (`Q5_K`, `Q6_K`, `Q8_0`), picked the largest
+real non-expert, non-PLE body-projection tensor of that type anywhere in the actual downloaded shards
+(dims from the file's own tensor table, never guessed — `blk.3.attn_q.weight` [`Q5_K`, 31.46M elements],
+`blk.2.attn_qkv.weight` [`Q6_K`, 26.21M elements], `output_hc_down.weight` [`Q8_0`, 3.28M elements]).
+Measured two things directly, not estimated:
+
+1. **Dequant cost** — `gguf::to_f32` (the exact function the offline transplant already calls) run
+   warm, repeatedly, over each tensor's real decoded bytes.
+2. **Achieved DRAM bandwidth per byte-width** — a replica-array streaming touch (one byte per 64B cache
+   line, footprint forced past this host's 36 MiB L3, `docs/host-cpu-arrow-lake-hx.md`), at the
+   quantized byte-width AND at F32 (today's resident format) and BF16 (Phase 1's).
+
+**Result — decisive, not close, and the same direction for all three formats.** 2a (dequantize once,
+keep a resident F32/BF16 buffer, read that every token) beats 2b (keep the quantized bytes resident,
+dequantize every read) by roughly **5-30x**, not a coin-flip:
+
+| Format | Measured dequant `D` | Break-even `D*` (F32-resident) | Break-even `D*` (BF16-resident) | Margin |
+|---|---:|---:|---:|---:|
+| `Q8_0` | ~0.54-0.70 ns/elem | ~0.10 ns/elem | ~0.03 ns/elem | 2a wins by ~5-7x |
+| `Q5_K` | ~1.03-1.08 ns/elem | ~0.11 ns/elem | ~0.04 ns/elem | 2a wins by ~9-10x |
+| `Q6_K` | ~1.10-1.23 ns/elem | ~0.10 ns/elem | ~0.04 ns/elem | 2a wins by ~11-12x |
+
+(`D*`, the break-even dequant cost per element, is derived as shown in the benchmark's own header: 2b
+wins iff `D < D* = (R - Q) / BW`, where `R` is the resident format's bytes/element, `Q` the quantized
+format's bytes/element, and `BW` the quantized stream's own measured achieved bandwidth — repeated across
+two independent runs, `D`/`D*` both stable to within their reported range.) **§0's own `~46%` warning
+sign from WP6b's sparse-density case was right to flag — inline dequant IS the dominant cost here too —
+but at 100% density the DRAM-bandwidth side of the ledger shrinks (quantized formats only save ~3-6x
+bytes vs F32/BF16's ~2-4x, not the sidecar's ~12x blended ratio) while the dequant side stays roughly the
+same per-element cost, so the net verdict flips decisively toward 2a, not 2b.** This is the opposite of
+what §0's arithmetic implicitly hoped for (2b was "the shape that actually delivers the ~23-48 ms/token
+estimate") — that estimate does not survive contact with the real per-element dequant cost.
+
+**A second, independent correction this measurement surfaced**: §0's own bandwidth assumption (70 GB/s,
+"typical dual-channel DDR5 mobile") does not match this host. The SAME benchmark's achieved streaming
+bandwidth, measured directly rather than assumed, is **~28-33 GB/s** for F32/BF16-width reads on this
+machine (`docs/host-cpu-arrow-lake-hx.md`'s Arrow Lake-HX, dual-channel), roughly **2.2x lower** than §0's
+figure. Recomputing §0's own table with the measured number: F32 backbone stream ≈ **~630-910 ms/token**
+(not ~281 ms), BF16 ≈ **~300-350 ms/token** (not ~140 ms). This does not change the 2a-vs-2b verdict
+(both sides of the comparison use the same measured `BW`, so it cancels out of the crossover), but it
+does change how big Phase 1's own win looks in absolute terms, and should replace §0's assumed figure
+wherever this document or a related one cites it.
+
+**Recommendation**: build 2a, not 2b. Concretely, this means Phase 2 should NOT build a new inline
+per-token dequant path at all — the real leverage in "model-native quantized backbone" is entirely in
+what `sub0llm-transplant` writes to disk (a smaller on-disk checkpoint, faster loads), landing at the
+SAME resident representation Phase 1's `PARAM_DTYPE` seam already builds. Concretely: Phase 2 reduces to
+"teach `sub0llm-transplant` an additional output mode that keeps blocks in something more compact than
+BF16 if a further win is wanted there" — a decision about the RESIDENT format (BF16 vs. some other
+fixed-width small type), never about doing block-decode inline in the hot per-token path. This also
+collapses Phase 2's dependency on Phase 1 from "the format Phase 2 adds" to "there may be no separate
+Phase 2 engine change at all" — once Phase 1's `PARAM_DTYPE` seam exists, whether the transplant tool
+happens to read `Q5_K`/`Q6_K`/`Q8_0`/`F32`/`BF16` bytes on the way to writing a smaller resident format is
+already exactly what it does today for BF16 output; there is no genuinely new *engine* mechanism 2b would
+have required that 2a still needs.
+
+**Honesty check not run, and why it's unlikely to matter here**: `docs/sub0mempage-research-empirical-
+concurrency.md`'s §5b ballast-under-pressure discipline was not replicated in this pass (time-boxed) —
+the numbers above are isolated-process measurements, not measured under the ~25 GiB resident memory
+pressure the real engine runs under (`docs/QWEN4_MEMORY_MAP.md`). This is a real gap, flagged rather than
+glossed over, but the margin here (5-30x, not a percent-level difference) is wide enough that a plausible
+memory-pressure effect on EITHER side of the comparison (a slower achieved `BW`, a slower `D` from cache
+contention) would have to be an order of magnitude larger than anything B21's own ballast test found
+elsewhere in this codebase to flip the verdict. Re-running under ballast is still the right thing to do
+before this is treated as fully closed, particularly because Q8_0's margin (5-7x) is the narrowest of the
+three and the one worth re-checking first if this is revisited.
+
+**Format-dependence, checked precisely as asked, not glossed**: all three formats land in the same
+direction (2a wins), so this is NOT a case requiring a per-format split verdict — but the margins are not
+identical, and `Q8_0` (the format with the fewest bits/element among the three real backbone formats,
+1.0625 vs `Q5_K`'s 0.6875 and `Q6_K`'s 0.8203) has the narrowest margin, consistent with its dequant cost
+`D` also being the LOWEST of the three (simpler block structure, per `gguf.hpp`'s own block-spec
+comment) — the two effects partially offset rather than compound, which is why `Q8_0` isn't the clear
+loser its higher bytes/element might suggest at a glance.
 
 ---
 
@@ -181,8 +271,11 @@ the user's own directive, not designed in full in this pass.
   recommended (a) as the starting point, not committed.
 - The exact `PARAM_DTYPE` enum shape/naming, and whether it reuses `Dtype`/`GEMM_DTYPE`'s existing
   machinery or is a new, CPU-backend-specific concept.
-- Phase 2's 2a-vs-2b fork — named as the real question, not resolved; 2b is the one that delivers the
-  user's own stated goal (bandwidth, not just footprint) but is the harder, riskier build and needs its own
-  dense-access-pattern dequant-cost measurement before being committed to.
+- ~~Phase 2's 2a-vs-2b fork — named as the real question, not resolved~~ **RESOLVED by B24 (§2c):
+  measured on the real backbone tensors/formats, 2a wins decisively (5-30x margin) for all three real
+  formats (`Q5_K`/`Q6_K`/`Q8_0`) — dequantize once into a resident buffer, do NOT dequantize inline per
+  read. Phase 2 therefore reduces to a resident-format choice for `sub0llm-transplant`'s output, not a
+  new hot-path engine mechanism. Not run under B21-style memory-pressure ballast — flagged as the one
+  remaining honesty gap, judged unlikely to flip a margin this wide (§2c's own note).**
 - Whether the CUDA backend's own existing `ACT_DTYPE`/`GEMM_DTYPE` BF16 path should be touched at all —
   out of scope; this plan is CPU-backend-only, matching `QWEN4_MEMORY_MAP.md`'s own scope.
