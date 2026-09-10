@@ -90,14 +90,21 @@ inline float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 // TWO d_ff-wide accumulators (`g_scratch` for the gate projection, `pre_scratch` for the up projection,
 // combined into `pre_scratch` only once both are complete) where the old form needed one, since it can no
 // longer interleave the two projections' accumulation per output unit.
-inline void expert_ffn_row(const Dims& d, const float* x, const float* gate_w, const float* up_w,
-                            const float* down_w, float* out, float* pre_scratch, float* g_scratch) {
+// B24: the three weight-plane pointers are a template parameter (`WP`). This function has TWO kinds of
+// caller and they do not agree on the weight type: a ROUTED expert's planes come out of the sidecar's
+// dequantize pool and are always genuine `float*` (moe_quant.hpp produces f32), while the SHARED
+// expert's come straight out of `g_param_data`, whose element type is PARAM_DTYPE. Templating is what
+// lets both keep calling the one function -- which is the property docs/MOE.md already relies on for
+// WP4e's bit-identical gate. `const float*` deduces exactly as before in every F32 build.
+template <class WP>
+inline void expert_ffn_row(const Dims& d, const float* x, WP gate_w, WP up_w,
+                            WP down_w, float* out, float* pre_scratch, float* g_scratch) {
     for (int o = 0; o < d.d_ff; ++o) { pre_scratch[o] = 0.f; g_scratch[o] = 0.f; }
     for (int i = 0; i < d.hidden_size; ++i) {
         const float xi = x[i];
         if (xi == 0.f) continue;
-        const float* gr = gate_w + static_cast<std::size_t>(i) * d.d_ff;
-        const float* ur = up_w   + static_cast<std::size_t>(i) * d.d_ff;
+        const auto gr = gate_w + static_cast<std::size_t>(i) * d.d_ff;
+        const auto ur = up_w   + static_cast<std::size_t>(i) * d.d_ff;
         for (int o = 0; o < d.d_ff; ++o) { g_scratch[o] += xi * gr[o]; pre_scratch[o] += xi * ur[o]; }
     }
     for (int o = 0; o < d.d_ff; ++o) pre_scratch[o] = detail::silu(g_scratch[o]) * pre_scratch[o];
@@ -106,7 +113,7 @@ inline void expert_ffn_row(const Dims& d, const float* x, const float* gate_w, c
     for (int o = 0; o < d.d_ff; ++o) {
         const float po = pre_scratch[o];
         if (po == 0.f) continue;
-        const float* dr = down_w + static_cast<std::size_t>(o) * d.hidden_size;
+        const auto dr = down_w + static_cast<std::size_t>(o) * d.hidden_size;
         for (int j = 0; j < d.hidden_size; ++j) out[j] += po * dr[j];
     }
 }
@@ -117,7 +124,8 @@ inline void expert_ffn_row(const Dims& d, const float* x, const float* gate_w, c
 // num_experts]. `probs_scratch`: >= num_experts floats, destroyed (used as working storage for the
 // selection scan below, S4b -- this row's own softmax values are not needed again after this call).
 // `out_weight`/`out_idx`: caller buffers of length >= experts_per_tok (TOPK_MAX-capped internally).
-inline void router_topk_row(const Dims& d, const float* x, const float* router_w, float* probs_scratch,
+template <class WP>
+inline void router_topk_row(const Dims& d, const float* x, WP router_w, float* probs_scratch,
                              float* out_weight, int* out_idx, bool norm_topk_prob) {
     // INPUT-major/contiguous (this project's own linear_row convention, matching router_w's own
     // [hidden_size, num_experts] row-major layout): outer over the contraction dim (hidden_size), inner
@@ -130,7 +138,7 @@ inline void router_topk_row(const Dims& d, const float* x, const float* router_w
     for (int i = 0; i < d.hidden_size; ++i) {
         const float xi = x[i];
         if (xi == 0.f) continue;
-        const float* wr = router_w + static_cast<std::size_t>(i) * d.num_experts;
+        const auto wr = router_w + static_cast<std::size_t>(i) * d.num_experts;
         for (int e = 0; e < d.num_experts; ++e) probs_scratch[e] += xi * wr[e];
     }
     float mx = probs_scratch[0];
@@ -164,7 +172,13 @@ inline void router_topk_row(const Dims& d, const float* x, const float* router_w
 // One routed expert's three weight planes. `gate`/`up` are [hidden_size, d_ff] and `down` is
 // [d_ff, hidden_size], this project's own [in,out] convention -- exactly the three pointers
 // expert_ffn_row already takes.
-struct ExpertWeights { const float* gate; const float* up; const float* down; };
+// B24: parameterised on the plane pointer type so an f32-resident caller (whose planes come from
+// `g_param_data`, i.e. PARAM_DTYPE) and the sidecar resolver (whose planes are always dequantized f32)
+// can each name the one that is true for them. `ExpertWeights` keeps its original name and meaning --
+// the sidecar's f32 planes -- because that is what every existing call site means by it.
+template <class WP>
+struct ExpertWeightsOf { WP gate; WP up; WP down; };
+using ExpertWeights = ExpertWeightsOf<const float*>;
 
 // The full block for one row (Qwen4ExpTextSparseMoeBlock.forward, docs/MOE.md S1): route, run only the
 // experts_per_tok SELECTED experts' SwiGLU FFNs, weighted-sum them, then add the ALWAYS-ON shared
@@ -214,11 +228,13 @@ struct SerialExperts {
     }
 };
 
-template <class Resolve, class RunExperts>
-inline void forward_row_via_run(const Dims& d, const float* x, const float* router_w, Resolve&& resolve,
+// B24: `WP` is the PARAMETER-ARENA pointer type (router + shared expert). The ROUTED experts' own type
+// is whatever `resolve` returns and is deliberately independent of it -- see ExpertWeights above.
+template <class WP, class Resolve, class RunExperts>
+inline void forward_row_via_run(const Dims& d, const float* x, WP router_w, Resolve&& resolve,
                                  RunExperts&& run_experts,
-                                 const float* shared_gate_w, const float* shared_up_w,
-                                 const float* shared_down_w, const float* shared_gate_proj_w,
+                                 WP shared_gate_w, WP shared_up_w,
+                                 WP shared_down_w, WP shared_gate_proj_w,
                                  float* out, float* scratch, bool norm_topk_prob = true) {
     float* probs      = scratch;                    // [num_experts]
     float* ffn_scratch = probs + d.num_experts;      // [d_ff]
@@ -258,10 +274,10 @@ inline void forward_row_via_run(const Dims& d, const float* x, const float* rout
 // experts run one after another on this thread, reusing the one scratch pair. Kept as its own name (and
 // its own unchanged signature) because that is what op_moe's batched T-row path, the f32-resident
 // wrappers below, and every test call -- none of which are the decode hot path B20 measured -- want.
-template <class Resolve>
-inline void forward_row_via(const Dims& d, const float* x, const float* router_w, Resolve&& resolve,
-                             const float* shared_gate_w, const float* shared_up_w,
-                             const float* shared_down_w, const float* shared_gate_proj_w,
+template <class WP, class Resolve>
+inline void forward_row_via(const Dims& d, const float* x, WP router_w, Resolve&& resolve,
+                             WP shared_gate_w, WP shared_up_w,
+                             WP shared_down_w, WP shared_gate_proj_w,
                              float* out, float* scratch, bool norm_topk_prob = true) {
     forward_row_via_run(d, x, router_w, resolve, SerialExperts{}, shared_gate_w, shared_up_w,
                         shared_down_w, shared_gate_proj_w, out, scratch, norm_topk_prob);
@@ -269,15 +285,16 @@ inline void forward_row_via(const Dims& d, const float* x, const float* router_w
 
 // The f32-resident form: `expert_gate_w`/`expert_up_w`/`expert_down_w` are arrays of `num_experts`
 // pointers, one per routed expert. A thin wrapper, deliberately -- see forward_row_via's comment.
-inline void forward_row(const Dims& d, const float* x, const float* router_w,
-                         const float* const* expert_gate_w, const float* const* expert_up_w,
-                         const float* const* expert_down_w,
-                         const float* shared_gate_w, const float* shared_up_w, const float* shared_down_w,
-                         const float* shared_gate_proj_w,
+template <class WP>
+inline void forward_row(const Dims& d, const float* x, WP router_w,
+                         const WP* expert_gate_w, const WP* expert_up_w,
+                         const WP* expert_down_w,
+                         WP shared_gate_w, WP shared_up_w, WP shared_down_w,
+                         WP shared_gate_proj_w,
                          float* out, float* scratch, bool norm_topk_prob = true) {
     forward_row_via(d, x, router_w,
                     [&](int e) {
-                        return ExpertWeights{expert_gate_w[e], expert_up_w[e], expert_down_w[e]};
+                        return ExpertWeightsOf<WP>{expert_gate_w[e], expert_up_w[e], expert_down_w[e]};
                     },
                     shared_gate_w, shared_up_w, shared_down_w, shared_gate_proj_w, out, scratch,
                     norm_topk_prob);
@@ -285,11 +302,12 @@ inline void forward_row(const Dims& d, const float* x, const float* router_w,
 
 // Batched T-row wrapper. Rows are independent (this file's own header comment) so `scratch` is reused
 // across the loop, not sized per-row -- one scratch_floats(d)-sized buffer serves any T.
-inline void forward(const Dims& d, int T, const float* x, const float* router_w,
-                     const float* const* expert_gate_w, const float* const* expert_up_w,
-                     const float* const* expert_down_w,
-                     const float* shared_gate_w, const float* shared_up_w, const float* shared_down_w,
-                     const float* shared_gate_proj_w,
+template <class WP>
+inline void forward(const Dims& d, int T, const float* x, WP router_w,
+                     const WP* expert_gate_w, const WP* expert_up_w,
+                     const WP* expert_down_w,
+                     WP shared_gate_w, WP shared_up_w, WP shared_down_w,
+                     WP shared_gate_proj_w,
                      float* out, float* scratch, bool norm_topk_prob = true) {
     for (int t = 0; t < T; ++t) {
         forward_row(d, x + static_cast<std::size_t>(t) * d.hidden_size, router_w,
@@ -303,10 +321,10 @@ inline void forward(const Dims& d, int T, const float* x, const float* router_w,
 // default argument because the two have genuinely different call sites, and because `resolve` must be
 // reused across the T-row loop -- resolving per row is what makes the small pool pay for itself when
 // several rows of one batch pick the same expert.
-template <class Resolve>
-inline void forward_via(const Dims& d, int T, const float* x, const float* router_w, Resolve&& resolve,
-                         const float* shared_gate_w, const float* shared_up_w, const float* shared_down_w,
-                         const float* shared_gate_proj_w,
+template <class WP, class Resolve>
+inline void forward_via(const Dims& d, int T, const float* x, WP router_w, Resolve&& resolve,
+                         WP shared_gate_w, WP shared_up_w, WP shared_down_w,
+                         WP shared_gate_proj_w,
                          float* out, float* scratch, bool norm_topk_prob = true) {
     for (int t = 0; t < T; ++t) {
         forward_row_via(d, x + static_cast<std::size_t>(t) * d.hidden_size, router_w, resolve,

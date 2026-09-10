@@ -15,6 +15,7 @@
 #include "sub0/tokenizer.hpp"
 #include "sub0/layout.hpp"
 #include "sub0/model_file.hpp"
+#include "sub0/param_store.hpp"   // B24: PARAM_FILE_DTYPE / PARAM_ELEM_BYTES -- the blob's own dtype tag
 
 #include <algorithm>
 #include <array>
@@ -85,8 +86,14 @@ bool save_model(const char* path) {
     std::ofstream os(path, std::ios::binary);
     if (!os) return false;                        // e.g. transient lock/permission error
     Header h;
+    // B24 (docs/BACKBONE_PRECISION.md S1): the blob's element type follows this BUILD's own
+    // PARAM_DTYPE (param_store.hpp) -- F32 by default, BF16 when the configurator baked
+    // --prec-param 1. Written through param_store_ptr()/param_store_bytes() (core.hpp), the
+    // dtype-agnostic raw-storage seam, rather than params_ptr() (f32-only, refuses under BF16 --
+    // see its own comment in core.hpp).
+    h.param_dtype = static_cast<std::int32_t>(PARAM_FILE_DTYPE);
     os.write((const char*)&h, sizeof(h));
-    os.write((const char*)params_ptr(), (std::streamsize)(PARAM_FLOATS * sizeof(float)));
+    os.write((const char*)param_store_ptr(), (std::streamsize)param_store_bytes());
     // Trailing 8-byte tokenizer fingerprint: stamps WHICH vocab these weights were trained against so a
     // mismatched decoder is caught on load (0 when no tokenizer is loaded). Appended after the params so
     // a legacy reader that stops at PARAM_FLOATS is unaffected -- and a legacy file (no trailer) simply
@@ -141,7 +148,50 @@ bool load_model(const char* path) {
         std::println(stderr, "error: model was built with a different (constexpr) config");
         return false;
     }
-    is.read((char*)params_ptr(), (std::streamsize)(PARAM_FLOATS * sizeof(float)));
+    // B24 (docs/BACKBONE_PRECISION.md S1): which dtype the blob was actually written at. The tag
+    // (h.param_dtype) CANNOT be trusted alone for this -- it lives in bytes that were plain structure
+    // padding in every file written before B24, and padding was never guaranteed to be zero, so a
+    // pre-B24 f32 file's tag is whatever garbage sat on that writer's stack. The file's own TOTAL SIZE
+    // is the independent, authoritative signal (model_file.hpp's model_file_bytes(), the same formula
+    // the write side used): exactly one of the f32/bf16 candidate sizes can match a well-formed file
+    // at this h.param_floats, so compute both and see which one the bytes on disk actually are.
+    const std::streampos data_start = is.tellg();
+    is.seekg(0, std::ios::end);
+    const auto file_bytes = static_cast<std::uint64_t>(is.tellg());
+    is.seekg(data_start);
+    const std::uint64_t want_f32  = model_file_bytes(sizeof(Header), h.param_floats, 4);
+    const std::uint64_t want_bf16 = model_file_bytes(sizeof(Header), h.param_floats, 2);
+    ParamDtype file_dtype;
+    if (file_bytes == want_f32) file_dtype = ParamDtype::F32;
+    else if (file_bytes == want_bf16) file_dtype = ParamDtype::BF16;
+    else {
+        std::println(stderr,
+            "error: model file '{}' is {} bytes, which matches neither an f32 blob ({} bytes) nor a "
+            "bf16 one ({} bytes) for {} params -- truncated or corrupt", path, file_bytes, want_f32,
+            want_bf16, h.param_floats);
+        return false;
+    }
+    // Corroboration, not the decision: if the tag IS a recognised value (so not pre-B24 padding
+    // garbage) it must agree with what the size just established, or the file is genuinely corrupt
+    // rather than merely old.
+    if (param_dtype_bytes(h.param_dtype) != 0 &&
+        h.param_dtype != static_cast<std::int32_t>(file_dtype)) {
+        std::println(stderr,
+            "error: model file '{}''s dtype tag ({}) disagrees with its own size-derived dtype ({}) "
+            "-- corrupt file", path, param_dtype_name(h.param_dtype),
+            param_dtype_name(static_cast<std::int32_t>(file_dtype)));
+        return false;
+    }
+    if (file_dtype != PARAM_FILE_DTYPE) {
+        std::println(stderr,
+            "error: model file '{}' stores parameters as {} but this build was configured for {} "
+            "(tools/configurator.cpp --prec-param) -- there is no cross-dtype load path (promote/"
+            "demote happens only in sub0llm-transplant, offline); rebuild or re-transplant with a "
+            "matching --prec-param/--param-dtype", path, param_dtype_name(static_cast<std::int32_t>(file_dtype)),
+            param_dtype_name(static_cast<std::int32_t>(PARAM_FILE_DTYPE)));
+        return false;
+    }
+    is.read((char*)param_store_ptr(), (std::streamsize)param_store_bytes());
     if (!is) return false;
     sync_params_to_device();                     // push the loaded weights to the live (device) copy
     // Trailing tokenizer fingerprint (see save_model) -- REQUIRED. The "absent means unknown, no

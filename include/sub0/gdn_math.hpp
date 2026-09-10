@@ -145,11 +145,17 @@ inline void recurrence_step(int dk, int dv, float g_t, float beta_t,
 // knob (AGENTS.md S8: don't add surface area nothing has asked for yet). The causal conv's own
 // activation is separately, correctly SiLU (`config.hidden_act`) -- the two are genuinely different
 // activations in the real model, not the same choice reused twice.
+// B24: every one of the nine WEIGHT pointers is templated on `WP` (docs/BACKBONE_PRECISION.md S1,
+// include/sub0/param_store.hpp). `x`, `state`, `conv_hist`, `out` and `scratch` stay `float*` -- they
+// are activations and caller scratch, not parameters. In an F32 build `WP` is `const float*` and this
+// is the same function it was; nothing in the body changed but the four `const float* W...` row
+// pointers becoming `auto`.
+template <class WP>
 inline void forward(const Dims& d, int T,
                      const float* x,
-                     const float* w_qkv, const float* w_z, const float* w_b, const float* w_a,
-                     const float* conv_w, const float* dt_bias, const float* a_log, const float* norm_w,
-                     const float* w_out,
+                     WP w_qkv, WP w_z, WP w_b, WP w_a,
+                     WP conv_w, WP dt_bias, WP a_log, WP norm_w,
+                     WP w_out,
                      float* state, float* conv_hist,
                      float* out,
                      float* scratch) {
@@ -185,9 +191,9 @@ inline void forward(const Dims& d, int T,
         std::fill(zr, zr + value_dim, 0.f);
         for (int i = 0; i < hs; ++i) {
             const float xi = xt[i];
-            const float* Wq = w_qkv + static_cast<std::size_t>(i) * conv_dim;
+            const auto Wq = w_qkv + static_cast<std::size_t>(i) * conv_dim;
             for (int o = 0; o < conv_dim; ++o) qkvr[o] += xi * Wq[o];
-            const float* Wz = w_z + static_cast<std::size_t>(i) * value_dim;
+            const auto Wz = w_z + static_cast<std::size_t>(i) * value_dim;
             for (int o = 0; o < value_dim; ++o) zr[o] += xi * Wz[o];
         }
         for (int hh = 0; hh < Hv; ++hh) {
@@ -290,7 +296,7 @@ inline void forward(const Dims& d, int T,
         std::fill(ot, ot + hs, 0.f);
         for (int i = 0; i < value_dim; ++i) {
             const float gi = gated[i];
-            const float* Wo = w_out + static_cast<std::size_t>(i) * hs;
+            const auto Wo = w_out + static_cast<std::size_t>(i) * hs;
             for (int o = 0; o < hs; ++o) ot[o] += gi * Wo[o];
         }
     }

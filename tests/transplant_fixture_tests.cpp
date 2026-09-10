@@ -420,8 +420,14 @@ TEST_CASE("WP4c level 3: the GDN mapping replays layer 0's real fixture through 
         std::vector<float> unfolded(out.size(), 0.f);
         std::fill(state.begin(), state.end(), 0.f);
         std::fill(conv_hist.begin(), conv_hist.end(), 0.f);
+        // B24: gdn::forward's weight params are now templated on ONE `WP` (include/sub0/gdn_math.hpp),
+        // so every one of them must deduce the SAME type -- `w_qkv`/etc are `const Applied`, whose
+        // `.data.data()` is `const float*`, but `raw_a` is a plain (non-const) local `std::vector`,
+        // whose `.data()` is `float*`; mixing the two is a deduction failure ("conflicting types for
+        // WP"), not a BF16 issue. Cast to match every other argument's constness.
         sub0::gdn::forward(dims, T, input.data(), w_qkv.data.data(), w_z.data.data(), w_b.data.data(),
-                           w_a.data.data(), conv.data.data(), dt.data.data(), raw_a.data(),
+                           w_a.data.data(), conv.data.data(), dt.data.data(),
+                           static_cast<const float*>(raw_a.data()),
                            nrm.data.data(), w_out.data.data(), state.data(), conv_hist.data(),
                            unfolded.data(), scratch.data());
         double d = 0.0;
@@ -572,7 +578,11 @@ TEST_CASE("WP4c level 4: the QSA mapping replays layer 3's real fixture through 
         CHECK(stats_consistent(stats_of(idx.data), stats_of(swapped)));   // ...statistically identical
         std::vector<float> out2(static_cast<std::size_t>(T) * H, 0.f);
         std::vector<float> scratch(sub0::qsa::scratch_floats(dims, T), 0.f);
-        sub0::qsa::forward(dims, T, input.data(), swapped.data(), idx_qn.data.data(), idx_kn.data.data(),
+        // B24: same deduction-mismatch fix as the gdn::forward call above -- `swapped` is a plain local
+        // `std::vector` (`.data()` is `float*`), while every other WP-typed argument here is a `const
+        // Applied` (`.data.data()` is `const float*`).
+        sub0::qsa::forward(dims, T, input.data(), static_cast<const float*>(swapped.data()),
+                           idx_qn.data.data(), idx_kn.data.data(),
                            q.data.data(), gate.data.data(), k.data.data(), v.data.data(), qn.data.data(),
                            kn.data.data(), o.data.data(), cos.data(), sin.data(), sub0::qsa::RMS_EPS,
                            out2.data(), scratch.data());

@@ -12,6 +12,8 @@ void print_config() { cpu_detail::print_config(); }
 bool load_moe_quant_sidecar(const char* model_path) { return cpu_detail::load_moe_quant_sidecar(model_path); }
 std::size_t trainable_floats() { return cpu_detail::trainable_floats(); }
 float* params_ptr() { return cpu_detail::params_ptr(); }
+void* param_store_ptr() { return cpu_detail::param_store_ptr(); }
+std::size_t param_store_bytes() { return cpu_detail::param_store_bytes(); }
 float* grad_ptr() { return cpu_detail::grad_ptr(); }
 float* adam_m_ptr() { return cpu_detail::adam_m_ptr(); }
 float* adam_v_ptr() { return cpu_detail::adam_v_ptr(); }

@@ -101,14 +101,26 @@ namespace sub0 {
 // reason internal.hpp's per-thread Worker arrays are heap-allocated. ensure_shared_params() allocates
 // them once (zeroed) before any parameter node references them; unique_ptr<float[]> keeps [] and .get().
 // See internal.hpp's FORWARD_ONLY for why a build that cannot train allocates only the first of them.
-static std::unique_ptr<float[]> g_param_data;
+//
+// B24 (docs/BACKBONE_PRECISION.md S1): only the WEIGHTS took a dtype. `g_param_data`'s element type is
+// `param_t` -- `float` by default, `bf16` when the configurator baked `--prec-param 1`, halving 18.31
+// GiB to 9.16 at the real Qwen4 axes. The three TRAINING arenas below stay f32 unconditionally: they
+// hold gradients and AdamW moments, whose dynamic range is exactly what a reduced master-weight format
+// damages, and a bf16 build is inference-side by construction (the static_assert below).
+static_assert(PARAM_DTYPE == Dtype::F32 || FORWARD_ONLY,
+              "bf16 PARAMETER storage is an inference-side change (docs/BACKBONE_PRECISION.md S1): the "
+              "backward/optimizer path reads parameter leaves through Node::data, which a bf16 build "
+              "deliberately leaves empty, and training against bf16 master weights is a separate, "
+              "unvalidated question this phase does not answer. Configure --prec-param 1 only for a "
+              "forward-only build (Gated Residual / MoE / QSA on), or keep the F32 default.");
+static std::unique_ptr<param_t[]> g_param_data;
 static std::unique_ptr<float[]> g_param_grad;
 static std::unique_ptr<float[]> g_param_m;
 static std::unique_ptr<float[]> g_param_vel;
 static std::once_flag           g_shared_params_once;
 static void ensure_shared_params() {
     std::call_once(g_shared_params_once, [] {
-        g_param_data = std::make_unique<float[]>(PARAM_FLOATS);   // value-initialized -> zeroed
+        g_param_data = std::make_unique<param_t[]>(PARAM_FLOATS);   // value-initialized -> zeroed
         if constexpr (!FORWARD_ONLY) {
             g_param_grad = std::make_unique<float[]>(PARAM_FLOATS);
             g_param_m    = std::make_unique<float[]>(PARAM_FLOATS);
@@ -180,7 +192,15 @@ static Node* mk_param(int r, int c, bool decay) {
     Node& nd = W->param_nodes[W->pcount];
     nd = Node{};
     nd.op = Op::Leaf; nd.rows = r; nd.cols = c;
-    nd.data = std::span<float>(g_param_data.get() + off, n);    // shared weights
+    // B24: `pdata` is the read seam every kernel uses; `data` is the LEGACY f32 span, kept only while
+    // the arena really is f32. In a bf16 build there is no honest f32 span over two-byte elements, so it
+    // stays empty on purpose -- see Node::pdata's comment in core.hpp for why an empty span is the right
+    // failure mode here rather than a reinterpreted one.
+    nd.pdata = param_cptr(g_param_data.get() + off);            // shared weights
+    if constexpr (PARAM_DTYPE == Dtype::F32)
+        nd.data = std::span<float>(reinterpret_cast<float*>(g_param_data.get()) + off, n);
+    else
+        nd.data = std::span<float>{};
     // FORWARD_ONLY: no per-thread gradient accumulator exists, so a parameter leaf carries an EMPTY
     // grad span rather than a span into a buffer that was never allocated. Nothing in the forward path
     // reads a parameter's grad, and the backward path aborts before it could.
@@ -189,6 +209,24 @@ static Node* mk_param(int r, int c, bool decay) {
     W->views[W->pcount] = {off, n, decay};
     ++W->pcount;
     return &nd;
+}
+
+// B24: the WRITABLE view of a parameter leaf, for init_weights (and nothing else -- the forward path
+// is read-only through Node::pdata). `pdata` is deliberately const, so this is the one place that
+// un-consts it, next to the code that owns the arena, rather than at each initializer.
+//
+// OVERLOADED on `ParamCPtr`'s concrete underlying type, same reason as param_store.hpp's
+// param_cptr/param_get/param_set: `if constexpr` inside a plain (non-template, or bool-NTTP-"templated"
+// but not otherwise dependent) function does not defer checking its untaken branch, so both
+// `t->pdata.p` (valid only when `ParamCPtr == Bf16CPtr`) and `t->pdata` cast to `float*` (valid only
+// when `ParamCPtr == const float*`) were being type-checked unconditionally -- a hard error in an F32
+// build, caught building the sub4 correctness-gate pair. `t->pdata` itself picks the right overload by
+// ordinary overload resolution (ParamCPtr IS one concrete type or the other in any given build).
+static bf16*  param_write_ptr_of(Bf16CPtr p)      { return const_cast<bf16*>(p.p); }
+static float* param_write_ptr_of(const float* p)  { return const_cast<float*>(p); }
+static param_t* param_write_ptr(Node* t) { return param_write_ptr_of(t->pdata); }
+static std::size_t param_count(const Node* t) {
+    return static_cast<std::size_t>(t->rows) * static_cast<std::size_t>(t->cols);
 }
 
 static Node* mk_node(Op op, int r, int c) {
@@ -234,7 +272,8 @@ static Node* op_embed(Node* table, const int* ids, int T) {
     const int C = table->cols;
     Node* out = mk_node(Op::Embed, T, C);
     out->w = table; out->ids = ids;
-    Mat o = mat(out->data, T, C), tab = mat(table->data, table->rows, C);
+    Mat o = mat(out->data, T, C);
+    const ParamCPtr tab = table->pdata;                  // [table->rows, C], row-major
     const ScratchBindings*  binds = g_scratch_binds;    // null (the common case) => plain lookup, unchanged
     const SentinelBindings* sb    = g_sentinel_binds;
     const bool tok_table = (table == g_tok_emb_node);   // binding dispatches are TOKEN-table-only (above)
@@ -243,10 +282,10 @@ static Node* op_embed(Node* table, const int* ids, int T) {
         // binding. t==0 can't be a pair tail (a pair split across a window boundary degrades to the
         // plain rows -- benign: the reference simply isn't content-composed in that window).
         if (sb && tok_table && t > 0 && ids[t - 1] == sb->sigil && sb->bound(ids[t])) {
-            encode_slot(table->data.data(), C, sb->fragments(ids[t]), sb->encoding,
+            encode_slot(table->pdata, C, sb->fragments(ids[t]), sb->encoding,
                         out->data.data() + static_cast<std::size_t>(t) * C, sb->enc_w);
         } else if (binds && tok_table && is_scratch_slot(ids[t]) && binds->bound(ids[t])) {
-            encode_slot(table->data.data(), C, binds->fragments(ids[t]), binds->encoding,
+            encode_slot(table->pdata, C, binds->fragments(ids[t]), binds->encoding,
                         out->data.data() + static_cast<std::size_t>(t) * C, binds->enc_w);
         } else if (is_persistent_slot(ids[t], VOCAB)) {
             // UNCONDITIONAL for any id >= VOCAB -- never falls through to tab[ids[t],j] below, which
@@ -254,11 +293,12 @@ static Node* op_embed(Node* table, const int* ids, int T) {
             // (empty -> encode_slot's zero-row contract), so this is correct whether or not a real
             // persistent table is installed yet. See PersistentBindings' own comment, scratch_slots.hpp.
             const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
-            encode_slot(table->data.data(), C, persistent_fragments(g_persistent_binds, ids[t]), enc,
+            encode_slot(table->pdata, C, persistent_fragments(g_persistent_binds, ids[t]), enc,
                         out->data.data() + static_cast<std::size_t>(t) * C,
                         g_persistent_binds ? g_persistent_binds->enc_w : nullptr);
         } else {
-            for (int j = 0; j < C; ++j) o[t, j] = tab[ids[t], j];
+            const auto trow = tab + static_cast<std::size_t>(ids[t]) * C;
+            for (int j = 0; j < C; ++j) o[t, j] = trow[j];
         }
     }
     return out;
@@ -287,17 +327,33 @@ static void ternarize_into(std::span<const float> w, std::span<float> q) {
     }
 }
 
-static Node* op_linear(Node* x, Node* W, Node* bias, bool ternary) {
-    const int T = x->rows, in = x->cols, out = W->cols;
-    Node* y = mk_node(Op::Linear, T, out);
-    y->a = x; y->w = W; y->bias = bias; y->ternary = ternary;
-    const float* Wf = W->data.data();
+// B24: the ternary re-derivation, split out as a pair of OVERLOADS on Wf's concrete pointer type rather
+// than an `if constexpr (PARAM_DTYPE == Dtype::F32)` inline in op_linear -- op_linear is not a template,
+// so (param_store.hpp's own comment on param_cptr/param_get/param_set has the full reasoning) a branch
+// built from already-concrete types is checked whether or not it is taken: `Wf = sd.data()` (a
+// `float*`) does not assign into `Bf16CPtr` in a BF16 build. The ternary path is f32-only by
+// construction -- ternarize_into re-derives values from a full-precision copy on every call, which is a
+// TRAINING-time straight-through estimator, and USE_TERNARY implies a trainable build, which the
+// arena's own static_assert already restricts to F32 -- so the BF16 overload is simply a no-op.
+static void maybe_ternarize(const float*& Wf, Node* W, Node* y, bool ternary) {
     if (ternary && !g_packed_inference) {
         auto [sd, sg] = arena_alloc(W->data.size());
         ternarize_into(W->data, sd);
         y->scratch = sd;
         Wf = sd.data();
     }
+}
+static void maybe_ternarize(Bf16CPtr&, Node*, Node*, bool) {}
+
+static Node* op_linear(Node* x, Node* W, Node* bias, bool ternary) {
+    const int T = x->rows, in = x->cols, out = W->cols;
+    Node* y = mk_node(Op::Linear, T, out);
+    y->a = x; y->w = W; y->bias = bias; y->ternary = ternary;
+    // B24: the weight pointer is ParamCPtr (`const float*` under the F32 default, a widening proxy
+    // under BF16). See maybe_ternarize's own comment above for why the ternary re-derivation is a pair
+    // of overloads rather than an inline `if constexpr`.
+    ParamCPtr Wf = W->pdata;
+    maybe_ternarize(Wf, W, y, ternary);
     const float* X = x->data.data();
     for (int t = 0; t < T; ++t) {
         float* __restrict Yr        = y->data.data() + (size_t)t * out;
@@ -305,14 +361,14 @@ static Node* op_linear(Node* x, Node* W, Node* bias, bool ternary) {
         for (int p = 0; p < in; ++p) {
             const float xtp = Xr[p];
             if (xtp == 0.f) continue;                       // ternary weights make this sparse
-            const float* __restrict Wr = Wf + (size_t)p * out;
+            const auto Wr = Wf + (size_t)p * out;
             for (int o = 0; o < out; ++o) Yr[o] += xtp * Wr[o];  // contiguous axpy -> vectorizes
         }
     }
     if (bias) {
         Mat ym = mat(y->data, T, out);
         for (int t = 0; t < T; ++t)
-            for (int o = 0; o < out; ++o) ym[t, o] += bias->data[o];
+            for (int o = 0; o < out; ++o) ym[t, o] += bias->pdata[o];
     }
     return y;
 }
@@ -324,7 +380,7 @@ static Node* op_rmsnorm(Node* x, Node* gamma) {
     y->a = x; y->w = gamma;
     auto [rinv, rinv_g] = arena_alloc(T);
     y->scratch = rinv;
-    const float* __restrict G = gamma->data.data();
+    const ParamCPtr G = gamma->pdata;
     for (int t = 0; t < T; ++t) {
         const float* __restrict xr = x->data.data() + (size_t)t * C;
         float* __restrict yr       = y->data.data() + (size_t)t * C;
@@ -352,7 +408,7 @@ static Node* op_qknorm(Node* x, Node* gamma, int H) {
     y->a = x; y->w = gamma; y->heads = H;
     auto [rinv, rinv_g] = arena_alloc((size_t)T * H);
     y->scratch = rinv;
-    const float* __restrict G = gamma->data.data();
+    const ParamCPtr G = gamma->pdata;
     for (int t = 0; t < T; ++t) {
         const float* __restrict xr = x->data.data() + (size_t)t * C;
         float* __restrict yr       = y->data.data() + (size_t)t * C;
@@ -427,12 +483,12 @@ static Node* op_tied_head(Node* x, Node* table) {
     Node* y = mk_node(Op::TiedHead, T, V);
     y->a = x; y->w = table;
     const float* __restrict X  = x->data.data();
-    const float* __restrict Tb = table->data.data();
+    const ParamCPtr Tb = table->pdata;
     for (int t = 0; t < T; ++t) {
         const float* __restrict xt = X + static_cast<size_t>(t) * C;
         float* __restrict yr = y->data.data() + static_cast<size_t>(t) * V;
         for (int v = 0; v < V; ++v) {
-            const float* __restrict tv = Tb + static_cast<size_t>(v) * C;
+            const auto tv = Tb + static_cast<size_t>(v) * C;
             double s = 0.0;
             #pragma omp simd reduction(+ : s)
             for (int c = 0; c < C; ++c) s += static_cast<double>(xt[c]) * tv[c];
@@ -1179,10 +1235,10 @@ static Node* op_gdn(Node* a, Layer& L) {
     // independently from the verified gdn_math.hpp reference rather than copied from this call site,
     // disagreed with the CPU engine's real forward output at a real mixed-layer model and exposed it.
     gdn::forward(GDN_DIMS, T, a->data.data(),
-                 L.gdn_in_qkv->data.data(), L.gdn_in_z->data.data(),
-                 L.gdn_in_b->data.data(), L.gdn_in_a->data.data(),
-                 L.gdn_conv->data.data(), L.gdn_dt_bias->data.data(), L.gdn_a_log->data.data(),
-                 L.gdn_norm->data.data(), L.gdn_out_proj->data.data(),
+                 L.gdn_in_qkv->pdata, L.gdn_in_z->pdata,
+                 L.gdn_in_b->pdata, L.gdn_in_a->pdata,
+                 L.gdn_conv->pdata, L.gdn_dt_bias->pdata, L.gdn_a_log->pdata,
+                 L.gdn_norm->pdata, L.gdn_out_proj->pdata,
                  state.data(), convh.data(), out->data.data(), scratch.data());
     return out;
 }
@@ -1210,9 +1266,9 @@ static Node* op_gr_mix(Node* wide, Node* norm_w, Node* down_w, Node* up_w) {
     Node* out = mk_node(Op::GrMix, T, D_MODEL);
     out->a = wide; out->b = norm_w; out->w = down_w; out->bias = up_w;
     auto [normed, normed_g] = arena_alloc(gr::normed_scratch_floats(GR_DIMS, T));
-    gr::hc_norm(GR_DIMS, T, wide->data.data(), norm_w->data.data(), normed.data());
+    gr::hc_norm(GR_DIMS, T, wide->data.data(), norm_w->pdata, normed.data());
     auto [dscr, dscr_g] = arena_alloc(gr::mix_scratch_floats(GR_DIMS, T));
-    gr::mix(GR_DIMS, T, normed.data(), down_w->data.data(), up_w->data.data(), out->data.data(), dscr.data());
+    gr::mix(GR_DIMS, T, normed.data(), down_w->pdata, up_w->pdata, out->data.data(), dscr.data());
     return out;
 }
 
@@ -1221,8 +1277,8 @@ static Node* op_gr_gate(Node* wide, Node* norm_w, Node* block_inject_w) {
     Node* out = mk_node(Op::GrGate, T, HC_COUNT);
     out->a = wide; out->b = norm_w; out->w = block_inject_w;
     auto [normed, normed_g] = arena_alloc(gr::normed_scratch_floats(GR_DIMS, T));
-    gr::hc_norm(GR_DIMS, T, wide->data.data(), norm_w->data.data(), normed.data());
-    gr::gate(GR_DIMS, T, normed.data(), block_inject_w->data.data(), out->data.data());
+    gr::hc_norm(GR_DIMS, T, wide->data.data(), norm_w->pdata, normed.data());
+    gr::gate(GR_DIMS, T, normed.data(), block_inject_w->pdata, out->data.data());
     return out;
 }
 
@@ -1255,10 +1311,10 @@ static Node* op_moe(Node* x, Layer& L, int layer_index) {
     // The batched path stays SERIAL and stays on this Worker's own 8-slot pool: it is already inside
     // train_batch's parallel team when training, and its cache has a real cross-row hit rate that
     // decode's does not (see MOE_DECODE_SLOTS in internal.hpp). B20 part 2 changed decode, not this.
-    moe::forward_via(MOE_DIMS, T, x->data.data(), L.moe_router->data.data(),
+    moe::forward_via(MOE_DIMS, T, x->data.data(), L.moe_router->pdata,
                      [&](int e) { return moe_resolve(L, layer_index, e, W->moe_cache); },
-                     L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
-                     L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
+                     L.moe_shared_gate->pdata, L.moe_shared_up->pdata,
+                     L.moe_shared_down->pdata, L.moe_shared_gate_proj->pdata,
                      out->data.data(), scratch.data());
     return out;
 }
@@ -1279,10 +1335,10 @@ static Node* op_qsa(Node* a, Layer& L) {
     out->a = a;
     auto [scratch, scratch_g] = arena_alloc(qsa::scratch_floats(QSA_DIMS_BUF, T));
     qsa::forward(QSA_DIMS, T, a->data.data(),
-                 L.qsa_idx_qk->data.data(), L.qsa_idx_qnorm->data.data(), L.qsa_idx_knorm->data.data(),
-                 L.qsa_q->data.data(), L.qsa_gate->data.data(), L.qsa_k->data.data(),
-                 L.qsa_v->data.data(), L.qsa_qnorm->data.data(), L.qsa_knorm->data.data(),
-                 L.qsa_o->data.data(),
+                 L.qsa_idx_qk->pdata, L.qsa_idx_qnorm->pdata, L.qsa_idx_knorm->pdata,
+                 L.qsa_q->pdata, L.qsa_gate->pdata, L.qsa_k->pdata,
+                 L.qsa_v->pdata, L.qsa_qnorm->pdata, L.qsa_knorm->pdata,
+                 L.qsa_o->pdata,
                  g_qsa_rope.cos.data(), g_qsa_rope.sin.data(), qsa::RMS_EPS,
                  out->data.data(), scratch.data());
     return out;
@@ -1427,7 +1483,10 @@ void Model::build_layout() {
             v.op = Op::Leaf; v.rows = NGRAM_EMB_DIM; v.cols = D_MODEL;
             const std::size_t off = static_cast<std::size_t>(e) * NGRAM_EMB_DIM * D_MODEL;
             const std::size_t n   = static_cast<std::size_t>(NGRAM_EMB_DIM) * D_MODEL;
-            v.data = ngram_proj->data.subspan(off, n);   // ALIASES ngram_proj -- not a separate param
+            // ALIASES ngram_proj -- not a separate param. B24: the read seam is `pdata`; the f32 span
+            // exists only while the arena is f32 (see mk_param).
+            v.pdata = ngram_proj->pdata + off;
+            if constexpr (PARAM_DTYPE == Dtype::F32) v.data = ngram_proj->data.subspan(off, n);
             // FORWARD_ONLY leaves every parameter leaf's grad span EMPTY (mk_param), so there is
             // nothing to slice a row-block out of -- the alias stays empty too.
             v.grad = ngram_proj->grad.empty() ? std::span<float>{} : ngram_proj->grad.subspan(off, n);
@@ -1437,11 +1496,20 @@ void Model::build_layout() {
 
 void Model::init_weights() {
     std::mt19937 rng(1234);
+    // B24: written through param_set (param_store.hpp) rather than into `t->data`, because a bf16
+    // parameter leaf has no f32 span. Under the F32 default param_set is a plain store, so the values
+    // and the RNG draw order are identical to what they always were.
     auto randn = [&](Node* t, float std) {
         std::normal_distribution<float> nd(0.f, std);
-        for (auto& x : t->data) x = nd(rng);
+        param_t* w = param_write_ptr(t);
+        const std::size_t n = param_count(t);
+        for (std::size_t i = 0; i < n; ++i) param_set(w, i, nd(rng));
     };
-    auto ones = [](Node* t) { std::fill(t->data.begin(), t->data.end(), 1.f); };
+    auto ones = [](Node* t) {
+        param_t* w = param_write_ptr(t);
+        const std::size_t n = param_count(t);
+        for (std::size_t i = 0; i < n; ++i) param_set(w, i, 1.f);
+    };
     randn(tok_emb, 0.02f);
     if constexpr (HAS_POS_EMB) randn(pos_emb, 0.02f);   // absent entirely under RoPE
     std::uniform_real_distribution<float> gdn_a_init(0.01f, 16.f);   // real model's own A_log init range, S1a
@@ -1478,7 +1546,11 @@ void Model::init_weights() {
             randn(L.gdn_in_b, 0.02f);   randn(L.gdn_in_a, 0.02f);
             randn(L.gdn_conv, 0.02f);
             ones(L.gdn_dt_bias);
-            for (auto& x : L.gdn_a_log->data) x = std::log(gdn_a_init(rng));
+            {
+                param_t* w = param_write_ptr(L.gdn_a_log);
+                const std::size_t n = param_count(L.gdn_a_log);
+                for (std::size_t i = 0; i < n; ++i) param_set(w, i, std::log(gdn_a_init(rng)));
+            }
             ones(L.gdn_norm);
             randn(L.gdn_out_proj, 0.02f);
         }
@@ -1839,7 +1911,12 @@ void print_host_memplan() {
     // multiplier is 1, not 4 -- reporting 4 here would over-state the footprint by 3x PARAM_FLOATS,
     // which at the real Qwen4-preview axes is 130 GiB of memory that is never asked for.
     constexpr int    shared_copies = FORWARD_ONLY ? 1 : 4;                  // data (+ grad + m + vel)
-    constexpr double shared_mb = shared_copies * PARAM_FLOATS * sizeof(float) / kMiB;
+    // B24: PARAM_ELEM_BYTES, not a hardcoded sizeof(float) -- the "data" copy is param_t-sized (bf16
+    // halves it under PARAM_DTYPE==BF16), and safe to apply to all `shared_copies` copies uniformly
+    // because BF16 implies FORWARD_ONLY (shared_copies==1, only "data" exists) by the arena's own
+    // static_assert; whenever shared_copies==4 (a trainable build), PARAM_DTYPE is guaranteed F32 and
+    // PARAM_ELEM_BYTES == sizeof(float) anyway.
+    constexpr double shared_mb = shared_copies * PARAM_FLOATS * PARAM_ELEM_BYTES / kMiB;
     constexpr double worker_mb = sizeof(Worker) / kMiB;
     constexpr double wgrad_mb  = WORKER_GRAD_FLOATS * sizeof(float) / kMiB; // the per-worker gradient
     // act_data + act_grad, and NOT `2 * ACT_CAP`: the gradient arena is 1 float in a FORWARD_ONLY build
@@ -1876,7 +1953,8 @@ void print_config() {
     // Reporting the full count unconditionally would replace an under-report with an over-report.
     constexpr double kMB = 1e6;
     // x1, not x4, when this build cannot train -- see FORWARD_ONLY and print_host_memplan's own note.
-    constexpr double shared_mb = (FORWARD_ONLY ? 1 : 4) * PARAM_FLOATS * sizeof(float) / kMB;
+    // B24: PARAM_ELEM_BYTES, not sizeof(float) -- see print_host_memplan's identical fix, same reasoning.
+    constexpr double shared_mb = (FORWARD_ONLY ? 1 : 4) * PARAM_FLOATS * PARAM_ELEM_BYTES / kMB;
     constexpr double worker_mb = sizeof(Worker) / kMB;                     // grad + arenas + nodes + views
     constexpr int    workers   = COMPUTE_MODE == ComputeBackend::Gpu ? 1 : DEFAULT_THREADS;
     std::println("model: d={} L={} H={} ff={} seq={} vocab={}{} | params: {:.2f}M | "
@@ -1945,7 +2023,34 @@ bool load_moe_quant_sidecar(const char* model_path) {
     }
 }
 
-float*      params_ptr()       { ensure_shared_params(); return g_param_data.get(); }
+// B24: an f32 pointer into the parameter arena exists only while the arena IS f32. Under
+// PARAM_DTYPE==BF16 the elements are two bytes, so a `float*` over them would have the wrong stride and
+// every read would be a plausible-looking wrong number -- refuse at this seam instead (memory:
+// caps-bit-nothing-reads-is-not-a-guard, "put the refusal at the lowest callable seam"). Serialization
+// and anything else that only needs BYTES uses param_store_ptr() below.
+[[noreturn]] static void refuse_f32_params() {
+    std::println(stderr,
+                 "fatal: this build stores parameters as bf16 (--prec-param 1), so there is no f32 view "
+                 "of the parameter arena. A caller asking for params_ptr() wants either f32 master "
+                 "weights (a training path -- not supported in a bf16 build, see backend.cpp's own "
+                 "static_assert) or raw storage (use param_store_ptr()/param_store_bytes()).");
+    std::abort();
+}
+float*      params_ptr()       {
+    ensure_shared_params();
+    if constexpr (PARAM_DTYPE == Dtype::BF16) refuse_f32_params();
+    else return reinterpret_cast<float*>(g_param_data.get());
+}
+void*       param_store_ptr()  { ensure_shared_params(); return g_param_data.get(); }
+std::size_t param_store_bytes(){ return PARAM_FLOATS * sizeof(param_t); }
+// The optimizer's in-place f32 master-weight view. Unreachable in a bf16 build: the arena's own
+// static_assert makes bf16 imply FORWARD_ONLY, and every caller below sits behind AdamW::step's
+// [[noreturn]] FORWARD_ONLY refusal. Kept as a named function so that reasoning lives in one place
+// rather than at each `g_param_data[i]` the optimizer touches.
+static float* param_master_f32() {
+    if constexpr (PARAM_DTYPE == Dtype::BF16) refuse_f32_params();
+    else return reinterpret_cast<float*>(g_param_data.get());
+}
 // reduced grad the optimizer reads / the two AdamW moments -- all three absent under FORWARD_ONLY.
 float*      grad_ptr()         { ensure_shared_params(); if constexpr (FORWARD_ONLY) refuse_training_arena("the parameter-gradient arena"); else return g_param_grad.get(); }
 float*      adam_m_ptr()       { ensure_shared_params(); if constexpr (FORWARD_ONLY) refuse_training_arena("the AdamW first-moment arena"); else return g_param_m.get(); }
@@ -2120,8 +2225,9 @@ static void muon_step_one(std::size_t off, int rows, int cols, float lr, float b
     sub0::muon::newton_schulz5(upd, rows, cols, upd,
         std::span<float>(upd + MUON_MAX_MN, MUON_SCRATCH_FLOATS - MUON_MAX_MN), 5);
     const float scale = sub0::muon::scale_factor(rows, cols);
+    float* const master = cpu_detail::param_master_f32();
     for (std::size_t i = 0; i < n; ++i) {
-        float& p = g_param_data[off + i];
+        float& p = master[off + i];
         p -= lr * wd * p;             // decoupled weight decay, same convention as the AdamW path
         p -= lr * scale * upd[i];
     }
@@ -2163,6 +2269,7 @@ void AdamW::step() {
             continue;
         }
         const float wd = pd.decay ? wd_ : 0.f;   // hoist the invariant branch so the loop vectorizes
+        float* const master = cpu_detail::param_master_f32();
         #pragma omp simd
         for (size_t i = pd.off; i < pd.off + pd.n(); ++i) {
             float g = g_param_grad[i] * gs;
@@ -2170,8 +2277,8 @@ void AdamW::step() {
             g_param_vel[i] = b2_ * g_param_vel[i] + (1 - b2_) * g * g;
             float mhat = g_param_m[i] / bc1;
             float vhat = g_param_vel[i] / bc2;
-            g_param_data[i] -= lr_ * mhat / (std::sqrt(vhat) + eps_);
-            g_param_data[i] -= lr_ * wd * g_param_data[i];
+            master[i] -= lr_ * mhat / (std::sqrt(vhat) + eps_);
+            master[i] -= lr_ * wd * master[i];
         }
     }
 }

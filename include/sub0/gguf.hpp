@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "sub0/bf16.hpp"                // sub0::bf16_widen -- the one definition of the bf16 shift
 #include "sub0/gguf_quant_tables.hpp"   // the ggml IQ codebooks -- data only, see that file's header
 
 #include <cstdint>
@@ -376,12 +377,12 @@ inline bool dequantize_q8_0(std::span<const std::uint8_t> raw, std::uint64_t n_e
 // subnormal renormalization. (Getting these two confused -- reusing the f16 path for a bf16 tensor --
 // would decode plausible-magnitude garbage rather than failing, which is why they are separate
 // functions rather than one with a flag.)
-inline float bf16_to_f32(std::uint16_t h) {
-    const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof f);
-    return f;
-}
+//
+// B24: the shift itself now lives in include/sub0/bf16.hpp, because the engine's own parameter storage
+// and the offline transplant tool need the SAME conversion (and its round-to-nearest-even inverse), and
+// two definitions of a numeric format is the same mistake as two definitions of a struct layout. This
+// stays as the name every existing gguf-side call site already uses.
+inline float bf16_to_f32(std::uint16_t h) { return sub0::bf16_widen(h); }
 
 // --- K-quant and IQ-quant decoders ----------------------------------------------------------------
 //

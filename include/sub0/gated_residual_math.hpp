@@ -70,7 +70,15 @@ inline float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 // rather than exposed as a knob -- same precedent as gdn_math.hpp's own RMS_EPS/L2_EPS constants.
 //
 // `wide_in`: [T, wide], row-major. `norm_w`: [wide]. `out_normed`: [T, wide], written (not accumulated).
-inline void hc_norm(const Dims& d, int T, const float* wide_in, const float* norm_w, float* out_normed) {
+//
+// B24: `norm_w` is a WEIGHT, so its pointer type is a template parameter (`WP`) rather than
+// `const float*`. In an F32 build `WP` deduces to `const float*` and this is byte-for-byte the function
+// it always was; in a BF16-parameter build it deduces to `sub0::Bf16CPtr`, whose `operator[]` widens on
+// read, so the promote happens in a register inside the loop and the bytes crossing the memory bus are
+// the narrow ones. Nothing in the body changed except `const float* wg` becoming `auto wg` -- see
+// include/sub0/param_store.hpp for why an out-of-loop promoted buffer could not have done this.
+template <class WP>
+inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float* out_normed) {
     constexpr float EPS = 1e-6f;
     const int hs = d.hidden_size, hc = d.hc_count;
     for (int t = 0; t < T; ++t) {
@@ -83,7 +91,7 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, const float* nor
             for (int j = 0; j < hs; ++j) ms += xg[j] * xg[j];
             ms /= hs;
             const float rinv = 1.f / std::sqrt(ms + EPS);
-            const float* wg = norm_w + static_cast<std::size_t>(s) * hs;
+            const auto wg = norm_w + static_cast<std::size_t>(s) * hs;
             for (int j = 0; j < hs; ++j) yg[j] = xg[j] * rinv * (1.f + wg[j]);
         }
     }
@@ -96,7 +104,8 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, const float* nor
 // simplification, not an oversight; see that section for why the duplicated cost is bounded and cheap).
 // down_w: [wide, hc_lowrank], up_w: [hc_lowrank, wide], this project's own [in,out] convention.
 // out_mixed: [T, hidden_size]. scratch: >= T*hc_lowrank floats (the down-projection's pre-activation).
-inline void mix(const Dims& d, int T, const float* normed, const float* down_w, const float* up_w,
+template <class WP>
+inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
                  float* out_mixed, float* scratch) {
     const int hs = d.hidden_size, hc = d.hc_count, wide = d.wide(), lr = d.hc_lowrank;
     float* down_pre = scratch;                                    // [T, hc_lowrank]
@@ -107,7 +116,7 @@ inline void mix(const Dims& d, int T, const float* normed, const float* down_w, 
         for (int o = 0; o < lr; ++o) dr[o] = 0.f;
         for (int i = 0; i < wide; ++i) {
             const float xi = xr[i];
-            const float* Wr = down_w + static_cast<std::size_t>(i) * lr;
+            const auto Wr = down_w + static_cast<std::size_t>(i) * lr;
             for (int o = 0; o < lr; ++o) dr[o] += xi * Wr[o];
         }
         for (int o = 0; o < lr; ++o) dr[o] = detail::silu(dr[o] / static_cast<float>(hc));
@@ -129,7 +138,7 @@ inline void mix(const Dims& d, int T, const float* normed, const float* down_w, 
         for (int col = 0; col < wide; ++col) up_val[col] = 0.f;
         for (int i = 0; i < lr; ++i) {
             const float di = dr[i];
-            const float* Wr = up_w + static_cast<std::size_t>(i) * wide;
+            const auto Wr = up_w + static_cast<std::size_t>(i) * wide;
             for (int col = 0; col < wide; ++col) up_val[col] += di * Wr[col];
         }
         for (int j = 0; j < hs; ++j) out[j] = 0.f;
@@ -147,7 +156,8 @@ inline void mix(const Dims& d, int T, const float* normed, const float* down_w, 
 // The READ step's "injection_weights" half (docs/GATED_RESIDUAL.md S1a/S1b): inj = 2*sigmoid(
 // block_inject(normed)/hc_count), [T, hc_count]. block_inject_w: [wide, hc_count], this project's own
 // [in,out] convention. No scratch needed.
-inline void gate(const Dims& d, int T, const float* normed, const float* block_inject_w, float* out_inj) {
+template <class WP>
+inline void gate(const Dims& d, int T, const float* normed, WP block_inject_w, float* out_inj) {
     const int wide = d.wide(), hc = d.hc_count;
     const float inv_hc = 1.f / static_cast<float>(hc);
     for (int t = 0; t < T; ++t) {
@@ -156,7 +166,7 @@ inline void gate(const Dims& d, int T, const float* normed, const float* block_i
         for (int o = 0; o < hc; ++o) orow[o] = 0.f;
         for (int i = 0; i < wide; ++i) {
             const float xi = xr[i];
-            const float* Wr = block_inject_w + static_cast<std::size_t>(i) * hc;
+            const auto Wr = block_inject_w + static_cast<std::size_t>(i) * hc;
             for (int o = 0; o < hc; ++o) orow[o] += xi * Wr[o];
         }
         for (int o = 0; o < hc; ++o) orow[o] = 2.f * detail::sigmoid(orow[o] * inv_hc);

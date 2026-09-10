@@ -14,6 +14,8 @@ void print_config();
 bool load_moe_quant_sidecar(const char* model_path);
 std::size_t trainable_floats();
 float* params_ptr();
+void* param_store_ptr();
+std::size_t param_store_bytes();
 float* grad_ptr();
 float* adam_m_ptr();
 float* adam_v_ptr();
