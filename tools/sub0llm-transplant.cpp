@@ -34,6 +34,7 @@
 // layer 1, and the MTP and vision blocks, are NOT transplanted. They are reported by name in the
 // unmatched-source list rather than silently skipped.
 
+#include "sub0/bf16.hpp"
 #include "sub0/gguf.hpp"
 #include "sub0/layout.hpp"
 #include "sub0/model_file.hpp"
@@ -413,20 +414,35 @@ int main(int argc, char** argv) {
     CLI::App app{"sub0llm-transplant: a real Qwen4-preview GGUF -> this project's own S0L5 model file"};
     std::string gguf_dir, out_path, verify_path;
     bool dry_run = false;
+    int  param_dtype_opt = 0;   // B24 (docs/BACKBONE_PRECISION.md S1a-1): 0=f32 (default), 1=bf16
     app.add_option("--gguf", gguf_dir, "directory holding the model's .gguf shards")->required();
     app.add_option("--out", out_path, "destination .bin (omit with --dry-run or --verify)");
     app.add_flag("--dry-run", dry_run,
                  "run the full reconciliation and per-tensor statistics without writing the artifact");
+    // B24: the WRITE half of gguf.hpp's bf16_to_f32/sub0::bf16_widen pair. Every source format still
+    // dequantizes through the same gguf::to_f32 path it always did (this file's header comment) --
+    // only the FINAL write step changes, after every op/fold/level-2 check above has already run on
+    // the full-precision float. Round-to-nearest-even (bf16.hpp's f32_narrow), not truncation, so the
+    // conversion has zero mean error rather than a systematic shrink over 4.9e9 weights.
+    app.add_option("--param-dtype", param_dtype_opt,
+                   "Output element type for the parameter blob: 0=f32 (default), 1=bf16 (round-to-"
+                   "nearest-even). Must match the CONSUMING build's own --prec-param (tools/"
+                   "configurator.cpp) or load_model refuses the file.")
+       ->check(CLI::Range(0, 1));
     // Re-runs the ENTIRE pipeline against an existing artifact and compares every destination tensor
     // BIT-FOR-BIT with what the transplant computes. Not redundant with the write: it is the only
     // thing that checks the bytes that actually landed on disk -- header size, tensor placement,
-    // stream state, all of it -- rather than the bytes the tool believed it wrote.
+    // stream state, all of it -- rather than the bytes the tool believed it wrote. Under --param-dtype 1
+    // "bit-for-bit" means against the SAME bf16 rounding this run would itself produce (dst rounded
+    // through f32_narrow on both sides of the comparison), not against the pre-rounding float.
     app.add_option("--verify", verify_path, "compare an existing artifact against a fresh transplant");
     CLI11_PARSE(app, argc, argv);
     if (!dry_run && out_path.empty() && verify_path.empty()) {
         std::println(stderr, "error: one of --out, --dry-run or --verify is required");
         return 2;
     }
+    const ParamDtype out_dtype = (param_dtype_opt == 1) ? ParamDtype::BF16 : ParamDtype::F32;
+    const int elem_bytes = param_dtype_bytes(static_cast<std::int32_t>(out_dtype));
     if (!verify_path.empty()) dry_run = true;   // verifying never writes
 
     // --- index every shard's header ---------------------------------------------------------------
@@ -479,6 +495,7 @@ int main(int argc, char** argv) {
         vs.open(verify_path, std::ios::binary);
         if (!vs) { std::println(stderr, "error: cannot open {}", verify_path); return 2; }
         ModelHeader want, got;
+        want.param_dtype = static_cast<std::int32_t>(out_dtype);   // --param-dtype names what was verified
         vs.read(reinterpret_cast<char*>(&got), sizeof got);
         if (std::memcmp(&want, &got, sizeof want) != 0) {
             std::println(stderr, "error: {}'s header does not match this build's config", verify_path);
@@ -490,7 +507,8 @@ int main(int argc, char** argv) {
     if (!dry_run) {
         os.open(out_path, std::ios::binary | std::ios::trunc);
         if (!os) { std::println(stderr, "error: cannot create {}", out_path); return 2; }
-        const ModelHeader h;
+        ModelHeader h;
+        h.param_dtype = static_cast<std::int32_t>(out_dtype);
         os.write(reinterpret_cast<const char*>(&h), sizeof h);
         if (!os) { std::println(stderr, "error: header write failed"); return 4; }
     }
@@ -505,6 +523,7 @@ int main(int argc, char** argv) {
     Totals tot;
     std::vector<std::uint8_t> raw;
     std::vector<float> src, src_b, dst, perm;
+    std::vector<bf16> bf16_buf, vbf16;   // B24: --param-dtype 1's write/verify scratch (bf16.hpp)
     const auto t0 = std::chrono::steady_clock::now();
     int last_pct = -1;
 
@@ -622,14 +641,38 @@ int main(int argc, char** argv) {
         }
 
         if (!dry_run) {
-            os.write(reinterpret_cast<const char*>(dst.data()),
-                     static_cast<std::streamsize>(dst.size() * sizeof(float)));
+            if (out_dtype == ParamDtype::BF16) {
+                bf16_buf.resize(dst.size());
+                for (std::size_t k = 0; k < dst.size(); ++k) bf16_buf[k] = f32_narrow(dst[k]);
+                os.write(reinterpret_cast<const char*>(bf16_buf.data()),
+                         static_cast<std::streamsize>(bf16_buf.size() * sizeof(bf16)));
+            } else {
+                os.write(reinterpret_cast<const char*>(dst.data()),
+                         static_cast<std::streamsize>(dst.size() * sizeof(float)));
+            }
             if (!os) { std::println(stderr, "error: write failed at destination {}", i); return 4; }
         } else if (vs.is_open()) {
             vbuf.assign(n, 0.f);
-            vs.seekg(static_cast<std::streamoff>(sizeof(ModelHeader) + p.off * sizeof(float)));
-            vs.read(reinterpret_cast<char*>(vbuf.data()), static_cast<std::streamsize>(n * sizeof(float)));
-            if (static_cast<std::size_t>(vs.gcount()) != n * sizeof(float) || vbuf != dst) {
+            vs.seekg(static_cast<std::streamoff>(sizeof(ModelHeader) +
+                                                 p.off * static_cast<std::uint64_t>(elem_bytes)));
+            bool short_read = false, values_match = true;
+            if (out_dtype == ParamDtype::BF16) {
+                vbf16.assign(n, bf16{});
+                vs.read(reinterpret_cast<char*>(vbf16.data()), static_cast<std::streamsize>(n * sizeof(bf16)));
+                short_read = static_cast<std::size_t>(vs.gcount()) != n * sizeof(bf16);
+                if (!short_read)
+                    for (std::size_t k = 0; k < n; ++k) {
+                        vbuf[k] = to_f32(vbf16[k]);
+                        // Compare against the SAME rounding a fresh write of `dst` would produce, not
+                        // against the pre-rounding float -- see this flag's own --verify comment above.
+                        if (vbf16[k].bits != f32_narrow(dst[k]).bits) { values_match = false; break; }
+                    }
+            } else {
+                vs.read(reinterpret_cast<char*>(vbuf.data()), static_cast<std::streamsize>(n * sizeof(float)));
+                short_read = static_cast<std::size_t>(vs.gcount()) != n * sizeof(float);
+                values_match = short_read ? true : (vbuf == dst);
+            }
+            if (short_read || !values_match) {
                 ++verify_mismatches;
                 if (verify_mismatches <= 10)
                     std::println(stderr, "VERIFY FAIL at destination {} (kind {}, layer {}, expert {})",
@@ -754,8 +797,9 @@ int main(int argc, char** argv) {
     std::println("");
     std::println("--- level 1: reconciliation -----------------------------------------------");
     std::println("destinations filled      : {} of {}", tot.dest_tensors, NUM_PARAMS);
-    std::println("destination floats       : {} of {} ({} bytes)", tot.dest_floats, PARAM_FLOATS,
-                 tot.dest_floats * 4);
+    std::println("destination floats       : {} of {} ({} bytes at {})", tot.dest_floats, PARAM_FLOATS,
+                 tot.dest_floats * static_cast<std::uint64_t>(elem_bytes),
+                 param_dtype_name(static_cast<std::int32_t>(out_dtype)));
     std::println("synthesized (no source)  : {}", tot.synthesized);
     std::println("encoded source bytes read: {}", tot.src_bytes_read);
     std::println("unmatched in-scope source tensors: {}", unmatched.size());
@@ -772,8 +816,9 @@ int main(int argc, char** argv) {
         std::println("--- artifact verification ------------------------------------------------\n"
                      "bit-for-bit mismatches   : {} of {} destination tensors ({})",
                      verify_mismatches, NUM_PARAMS, verify_path);
-    if (!dry_run) std::println("wrote {} ({} bytes incl. header + trailers)", out_path,
-                               sizeof(ModelHeader) + PARAM_FLOATS * 4 + 24);
+    if (!dry_run) std::println("wrote {} ({} bytes incl. header + trailers, {} params)", out_path,
+                               model_file_bytes(sizeof(ModelHeader), PARAM_FLOATS, elem_bytes),
+                               param_dtype_name(static_cast<std::int32_t>(out_dtype)));
     if constexpr (USE_MOE_QUANT) {
         std::println("--- WP4e: quantized-resident routed experts ------------------------------");
         std::println("sidecar                  : {}", moeq_path);

@@ -386,7 +386,12 @@ inline std::span<const int> persistent_fragments(const PersistentBindings* pb, i
 //                 a learned width-2 convolution (TWO [C,C] projections packed into `enc_w` as [2,C,C] --
 //                 enc_w[0..C*C) and enc_w[C*C..2*C*C)) then max-pooled over window position. A single
 //                 fragment (no width-2 window exists) falls through as its own raw row.
-inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags, SlotEncoding enc, float* out,
+// B24: `tok_emb` is a PARAMETER tensor, so its pointer type is a template parameter -- the embedding
+// table is `param_t`-typed storage in a bf16-parameter build (docs/BACKBONE_PRECISION.md S1). `enc_w`
+// is deliberately NOT templated: the learned encoders it selects are training-side, and a bf16
+// parameter build is forward-only by construction. `const float*` deduces exactly as before.
+template <class WP>
+inline void encode_slot(WP tok_emb, int C, std::span<const int> frags, SlotEncoding enc, float* out,
                         const float* enc_w = nullptr) {
     for (int j = 0; j < C; ++j) out[j] = 0.f;
     if (frags.empty()) return;
@@ -404,7 +409,7 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
         }
         case SlotEncoding::CharEncoder: {
             for (int f : frags) {
-                const float* e = tok_emb + static_cast<std::size_t>(f) * C;
+                const auto e = tok_emb + static_cast<std::size_t>(f) * C;
                 for (int c = 0; c < C; ++c) {
                     const float* w = enc_w + static_cast<std::size_t>(c) * C;
                     float z = 0.f;
@@ -417,7 +422,7 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
         case SlotEncoding::Hash: {
             const int half = C / 2;
             for (std::size_t p = 0; p < frags.size(); ++p) {
-                const float* row = tok_emb + static_cast<std::size_t>(frags[p]) * C;
+                const auto row = tok_emb + static_cast<std::size_t>(frags[p]) * C;
                 for (int m = 0; m < half; ++m) {
                     const float ang = static_cast<float>(p) * std::pow(HASH_ROPE_THETA, -2.f * m / C);
                     const float cs = std::cos(ang), sn = std::sin(ang);
@@ -432,7 +437,7 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
         case SlotEncoding::ConvPool: {
             const int n = static_cast<int>(frags.size());
             if (n == 1) {   // no width-2 window -- pass the lone fragment through as-is
-                const float* row = tok_emb + static_cast<std::size_t>(frags[0]) * C;
+                const auto row = tok_emb + static_cast<std::size_t>(frags[0]) * C;
                 for (int c = 0; c < C; ++c) out[c] = row[c];
                 break;
             }
@@ -443,8 +448,8 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
                 const float* wr0 = w0 + static_cast<std::size_t>(c) * C;
                 const float* wr1 = w1 + static_cast<std::size_t>(c) * C;
                 for (int p = 0; p + 1 < n; ++p) {
-                    const float* e0 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p)]) * C;
-                    const float* e1 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p + 1)]) * C;
+                    const auto e0 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p)]) * C;
+                    const auto e1 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p + 1)]) * C;
                     float z = 0.f;
                     for (int k = 0; k < C; ++k) z += wr0[k] * e0[k] + wr1[k] * e1[k];
                     if (z > best) best = z;        // relu + max-pool over window positions, fused
@@ -456,7 +461,7 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
         case SlotEncoding::HRR: {
             const std::vector<float>& roles = hrr_role_table(C);
             for (std::size_t p = 0; p < frags.size(); ++p) {
-                const float* filler = tok_emb + static_cast<std::size_t>(frags[p]) * C;
+                const auto filler = tok_emb + static_cast<std::size_t>(frags[p]) * C;
                 const std::size_t pi = p < static_cast<std::size_t>(HRR_MAX_POS) ? p : static_cast<std::size_t>(HRR_MAX_POS - 1);
                 const float* role = roles.data() + pi * static_cast<std::size_t>(C);
                 // Circular convolution: out[n] += sum_k role[k] * filler[(n-k) mod C] -- bind(role_p, filler_p).
@@ -475,7 +480,7 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
         default: {
             const float inv = 1.f / static_cast<float>(frags.size());
             for (int f : frags) {
-                const float* row = tok_emb + static_cast<std::size_t>(f) * C;
+                const auto row = tok_emb + static_cast<std::size_t>(f) * C;
                 for (int j = 0; j < C; ++j) out[j] += row[j];
             }
             for (int j = 0; j < C; ++j) out[j] *= inv;
@@ -544,8 +549,8 @@ inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags
                 const float* wr1 = w1 + static_cast<std::size_t>(c) * C;
                 float best = 0.f; int best_p = -1;   // -1: no window beat the relu floor -> no gradient
                 for (int p = 0; p + 1 < n; ++p) {
-                    const float* e0 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p)]) * C;
-                    const float* e1 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p + 1)]) * C;
+                    const auto e0 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p)]) * C;
+                    const auto e1 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p + 1)]) * C;
                     float z = 0.f;
                     for (int k = 0; k < C; ++k) z += wr0[k] * e0[k] + wr1[k] * e1[k];
                     if (z > best) { best = z; best_p = p; }

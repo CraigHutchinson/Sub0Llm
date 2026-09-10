@@ -19,6 +19,9 @@
                             // constant (HAS_POS_EMB, D_KV) and got "no member named ... in namespace
                             // sub0" or an undeclared identifier. One include here, not N at the callers.
 
+#include "param_store.hpp"  // B24: param_t / ParamCPtr -- the parameter arena's element type and the
+                            // pointer a kernel reads it through. Needed HERE because Node carries one.
+
 #include <cstdint>
 #include <random>
 #include <span>
@@ -80,6 +83,19 @@ struct Node {
     // finding now that a backward exists. -1 on any non-GDN node.
     int gdn_link = -1;
     bool ternary = false;
+    // B24 (docs/BACKBONE_PRECISION.md S1): PARAMETER LEAVES ONLY -- the pointer through which a kernel
+    // reads this leaf's weights. Its type is `ParamCPtr` (param_store.hpp), which is `const float*` in
+    // an F32 build and a widening proxy in a BF16-parameter one, so the SAME kernel source reads either
+    // storage with no branch and no promoted copy.
+    //
+    // WHY THIS IS NOT JUST `data`. `data` is a `std::span<float>` over the ACTIVATION arena's element
+    // type, and a bf16 parameter arena has a different element type and a different stride -- there is
+    // no honest f32 span over it. In a bf16 build `mk_param` therefore leaves a parameter leaf's `data`
+    // (and its `grad`) EMPTY and `pdata` is the only way in, which turns any call site that was missed
+    // during the conversion into an immediate null read rather than a plausible-looking misread of bf16
+    // bytes as floats. In an F32 build `pdata == data.data()` and both remain valid, which is what keeps
+    // the default build byte-identical (AGENTS.md S4).
+    ParamCPtr pdata{};
 };
 
 // --- Model lifecycle --------------------------------------------------------
@@ -356,7 +372,16 @@ private:
 // expose them so the train stage can serialize the *complete* optimizer state and
 // resume a run exactly. All three buffers are trainable_floats() long.
 SUB0_API std::size_t trainable_floats();   // == PARAM_FLOATS
-SUB0_API float*      params_ptr();         // parameter values
+// Parameter values as f32. VALID ONLY IN A PARAM_DTYPE==F32 BUILD (the default): under BF16 the arena's
+// elements are two bytes and no f32 pointer over them exists, so this refuses at the lowest callable
+// seam (backend.cpp) rather than handing back a pointer whose stride is wrong. Serialization and any
+// other dtype-agnostic consumer goes through param_store_ptr()/param_store_bytes() below instead.
+SUB0_API float*      params_ptr();
+// B24: the parameter arena as raw storage -- `PARAM_FLOATS` elements of `sub0::param_t`, i.e.
+// `param_store_bytes()` bytes, whatever PARAM_DTYPE this build baked. This is what save_model/load_model
+// read and write, so the file format follows the build's own element type with no second code path.
+SUB0_API void*       param_store_ptr();
+SUB0_API std::size_t param_store_bytes();
 SUB0_API float*      grad_ptr();           // parameter gradients (filled by backward)
 SUB0_API float*      adam_m_ptr();         // Adam first-moment estimates
 SUB0_API float*      adam_v_ptr();         // Adam second-moment estimates

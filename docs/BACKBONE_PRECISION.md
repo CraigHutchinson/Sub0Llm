@@ -60,6 +60,11 @@ rather than assume either direction.
 
 ## 1. Phase 1 — BF16 backbone storage
 
+**STATUS: DONE, branch `feature/b24-bf16-backbone` (built across two passes -- an interrupted agent did
+the bulk of the engine plumbing, a second agent found+fixed 4 real defects the interruption left
+untested, then ran the correctness gate below for real on both the 4-layer sub-stack and the FULL
+48-layer artifact).**
+
 ### 1a. Scope
 
 1. **`sub0llm-transplant`** (`tools/sub0llm-transplant.cpp`): already calls `gguf::to_f32(slice, raw, out)`
@@ -122,6 +127,118 @@ already-accepted noise floor in this codebase, not a novel risk. Concretely:
 - Measured, not assumed: the actual bandwidth win (§0's ~281→~140 ms/token estimate is a lower bound;
   measure the real per-token delta on a run with the MoE sidecar's own contribution held constant, e.g. by
   isolating just the backbone's own GEMV cost the way `moe_expert_bench.cpp` isolated the sidecar's).
+
+### 1c. What was actually built, and the deviation from 1a's own recommendation
+
+Built shape (a), promote-on-read, as recommended — but the interrupted agent found (and documented, in
+`param_store.hpp`'s own header comment) that "promote-on-load" as literally worded in §1a is not buildable:
+a materialized f32 VIEW of a bf16 tensor is exactly as large as the f32 tensor it replaces (no win at
+rest), and materializing one per access pays 2N read + 4N write + 4N read-back where plain f32 pays 4N
+read -- strictly worse. The actual shape is "promote INSIDE the innermost loop, in a register, never
+touching memory": `param_t`/`ParamCPtr` (`param_store.hpp`) make `g_param_data` an array of `bf16` at
+rest, and `Node::pdata` a read-only pointer PROXY (`Bf16CPtr`, `bf16.hpp`) whose `operator[]` widens on
+read. Every `*_math.hpp` kernel that reads a parameter span was templated on its weight-pointer type
+(`WP`) so the SAME kernel source compiles unchanged against `const float*` (F32) or `Bf16CPtr` (BF16) --
+`gated_residual_math.hpp`, `gdn_math.hpp`, `moe_math.hpp`, `qsa_math.hpp`, `scratch_slots.hpp`. This is
+functionally shape (a) (DRAM bandwidth is the only thing it targets, compute stays f32) but the
+mechanism is closer to §1a's shape (b) description ("reads bf16 directly and promotes per-element
+inline") than to (a)'s own "promoted F32 scratch row" -- the plan under-specified how (a) would actually
+avoid re-materializing a whole tensor, and the real build resolved that the only way is per-element,
+in-register promotion. Scope stayed inference-side as planned: `PARAM_DTYPE == BF16` is
+`static_assert`-gated to imply `FORWARD_ONLY` (backend.cpp) -- a bf16 parameter arena has no honest f32
+span for backward/AdamW to read or write, so `--prec-param 1` composes only with a forward-only build
+(Gated Residual / MoE / QSA on), matching the real Qwen4-preview axes this feature exists for.
+
+### 1d. Correctness gate — measured results
+
+**Two real artifacts, both from the SAME `sub0llm-transplant`/`sub0llm-transplant-q48` run pair against
+the real Qwen3.8-Flash-Next UD-IQ1_S GGUF shards** (`--param-dtype 1`, a new flag alongside `--param-dtype
+0`/the untouched F32 default): the 4-layer real sub-stack (95 tensors, 1.581B params, 19.5s to transplant,
+0 level-2 stat mismatches, 0 sidecar bit-for-bit mismatches, `--verify` bit-exact) and the FULL 48-layer
+real model (1074 tensors, 4.915B params, 146.4s to transplant, same 0/0/bit-exact result). Both builds
+compiled and ran through `sub0llm-qwen4-gen`/`sub0llm-qwen4-forward` at the real axes.
+
+- **Forward-pass parity (§1b's own gate, `--dump-logits` on the WP4d 6-token fixture, L2-relative
+  `||a-b||/||a||` over the full `[T x VOCAB]` logit array):**
+  - 4-layer sub-stack: **~1.05** (105% -- essentially uncorrelated; 0/6 rows' argmax agreed). **Not
+    representative of BF16 precision** -- this specific artifact has NO final norm layer by construction
+    (§WP4d's own "LnF absent" finding) and its own F32-only diagnostic (`sub0llm-qwen4-forward`'s section
+    5) already measures a **399.8%**-of-scale swing from removing ONE norm op on identical f32 weights, so
+    a 4-layer truncation's un-normalized readout is inherently unstable territory, not a fair BF16 test.
+  - **48-layer real model (the actual target): L2-relative diff ~0.199 (19.9%), 5 of 6 rows' argmax
+    identical.** Still well above WP4_SCOPE's own Q8_0 precedent (~3.5e-3) and the ~1e-3-1e-2 band this
+    section originally anticipated. The most likely explanation, not yet independently confirmed: MoE's
+    top-k expert routing is discontinuous -- ~36 router decisions (3 MoE layers x 12 repeats) across the
+    stack mean a small bf16 rounding of router logits can occasionally flip which experts get selected,
+    and this model's own un-normalized final readout is independently measured (same tool, F32-only) to
+    already be unusually sensitive to small architectural perturbations. Reported honestly rather than
+    forced into the anticipated band.
+  - `forward()` vs `forward_one()` parity stayed **bit-exact (0) under BF16** at both scales -- the decode
+    path and the batched path read the bf16 arena identically.
+- **Neutral suites:** `sub0_frontend_tests` (engine-free, unaffected by `PARAM_DTYPE`) -- **120,889
+  assertions / 244 cases, all green**, under both an F32- and a BF16-tagged generated config, after fixing
+  2 real template-deduction regressions the interrupted work introduced (see §1e). `sub0_tests` (the
+  engine-linked, gradient/backward suite) **cannot run under BF16 at all, by design**: it requires a
+  trainable (non-`FORWARD_ONLY`) build, and `PARAM_DTYPE == BF16` is gated to require `FORWARD_ONLY` --
+  the two are mutually exclusive on purpose (§1c). Confirmed this is a pre-existing architectural fact,
+  not a B24 regression: the SAME suite also fails to run against an F32 `FORWARD_ONLY` (MoE-on) config,
+  crashing before Catch2 even starts. `sub0_tests` DOES pass fully at a small trainable F32 config with
+  this branch's changes (**5,869,947 assertions / 147 cases, all green**) -- confirming the training path
+  is untouched. The real substitute robustness gate -- `sub0llm-qwen4-gen`/`sub0llm-qwen4-forward`
+  exercising embed / GDN / Gated-Residual / MoE-routing+experts / QSA / tied-head / save+load under BF16
+  at BOTH real-axes scales -- ran to completion with zero crashes/aborts, which is what actually stands in
+  for "the neutral suites, at BF16" here.
+- **Generated text quality (WP5c fixture, `"The capital of France is"`, seed 1234, temp 0.8, topk 40,
+  n=30, full 48-layer model):** BF16 produced coherent, on-topic, grammatically correct English: `" Paris.
+  Is this correct?\n\n<think>\nThe user is asking a simple factual question: whether Paris is the capital
+  of France. This is a well"` -- correctly identifies Paris, same as the F32 reference's own completion
+  (`" Paris. How many countries have capitals with similar names?..."`). The two token sequences diverge
+  after the shared first token (expected, given the measured ~0.2 relative logit difference feeding a
+  temperature-0.8 sampler), but both sides are real, coherent English -- the gate this item asks for.
+- **Bandwidth, measured on this host (§2c's own ~28-35 GB/s figure, not §0's superseded 70 GB/s):**
+  full-48-layer decode went from **6.01 s/token (F32) to 5.48 s/token (BF16)**, prefill from 6.36 to 5.92
+  s/token -- roughly **9% faster**, smaller than the backbone-alone estimate would suggest because the MoE
+  sidecar's own disk-bound cost (B20/B21/B23) still dominates total decode time, exactly as this
+  document's own §0 predicted it would. Model LOAD time roughly halved (17.9s -> 8.7s, tracking the
+  9.16 GiB backbone-bytes-read halving almost exactly). Peak resident memory dropped **33.96 GiB -> 24.72
+  GiB (-9.24 GiB)**, matching the theoretical 9.16 GiB backbone halving closely. This is a real, honest,
+  measured win, not dominated entirely by the sidecar -- 9% at the token level, with load time and
+  resident memory both moving by close to the theoretical maximum.
+
+### 1e. Defects found and fixed while completing this phase (the interrupted agent's work, reviewed like an unfinished PR)
+
+1. **`if constexpr` on a plain (non-template) or bool-NTTP function does not discard its untaken branch**
+   -- the classic C++ gotcha: a discarded `if constexpr` branch is only exempt from full type-checking
+   when it is itself dependent on an ENCLOSING TEMPLATE's parameter, not merely gated by a
+   compile-time-constant condition. `param_store.hpp`'s `param_cptr`/`param_get`/`param_set` and
+   `backend.cpp`'s `param_write_ptr`/`op_linear`'s ternary re-derivation were all written this way and
+   failed to compile the instant a real (non-toy) generated config selected `PARAM_DTYPE`. Fixed by
+   replacing each with a pair of ordinary overloads on the concrete pointee type (`bf16*`/`float*`),
+   which sidesteps the whole issue via normal overload resolution rather than template dependence.
+2. **`param_master_f32()` called unqualified from outside its enclosing `namespace cpu_detail`** (two call
+   sites in `AdamW::step()`/`muon_step_one`, both physically after the namespace closes) -- a plain
+   missing-qualification bug, fixed by qualifying the two call sites.
+3. **`tests/scratch_embed_tests.cpp` and `tests/transplant_fixture_tests.cpp` broke under the new
+   `WP`-templated `*_math.hpp` signatures** -- a bare `nullptr` no longer deduces a pointer type
+   (`encode_slot`), and mixing a `const float*` (from a `const Applied` fixture struct) with a plain
+   `float*` (a local `std::vector`) in the SAME `WP`-templated call fails template argument deduction
+   ("conflicting types for WP") where the old non-template signature would have silently converted both
+   to `const float*`. Both are pre-existing test files exposed by the templating this phase required, not
+   BF16-specific; fixed with explicit `const float*` casts at the four affected call sites.
+4. `tools/sub0llm-qwen4-forward.cpp` (a WP4d-era diagnostic tool, not itself in B24's scope) hard-`abort()`s
+   under `PARAM_DTYPE == BF16` because several of its diagnostic sections read raw parameter bytes through
+   `params_ptr()`, which is `[[noreturn]]`-refused under BF16 by design. Retrofitting those sections to
+   read through `param_get()`/`ParamCPtr` was judged out of scope for this pass (it duplicates real,
+   non-trivial math-core-replay logic); instead, sections 2/3b/5 (the ones touching raw `P`) are now
+   skipped with a clear message under BF16, while sections 1/3/4 (`load_model`, `forward()`/`forward_one()`
+   and their `--dump-logits`/parity checks -- exactly what B24's own correctness gate needed) are
+   unaffected and were the tool used for the §1d measurements above.
+5. **Cosmetic, fixed:** `backend.cpp`'s two host-memplan prints (`print_host_memplan`, `print_config`)
+   computed the shared-arena estimate as `PARAM_FLOATS * sizeof(float)` unconditionally, so a BF16 build's
+   own startup banner reported the F32-sized figure (measured: printed "shared 6032 MiB" for a build whose
+   real resident arena is ~3162 MiB). The REAL allocation (`make_unique<param_t[]>(PARAM_FLOATS)`) was
+   always correctly sized; only these two diagnostic prints were wrong. Both now use `PARAM_ELEM_BYTES`
+   (`param_store.hpp`) instead of a hardcoded `sizeof(float)`.
 
 ---
 

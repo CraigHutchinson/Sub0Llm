@@ -169,15 +169,27 @@ int main(int argc, char** argv) {
                  static_cast<double>(PARAM_FLOATS) * 4.0 / (1024.0 * 1024.0 * 1024.0));
     report_memory("after load");
 
-    const float* P = params_ptr();
+    // B24 (docs/BACKBONE_PRECISION.md): this whole tool predates PARAM_DTYPE and its raw-pointer
+    // diagnostics (sections 2, 3b, 5 below) are built entirely on `params_ptr()`'s f32 view, which
+    // refuses (abort()) under a BF16 backbone -- see core.hpp's own comment on params_ptr(). Retrofitting
+    // those sections to read through param_get()/ParamCPtr the way the *_math.hpp kernels now do is real
+    // work this WP4d-era exploratory tool was not in B24's scope to receive; skipping them cleanly here
+    // (rather than letting params_ptr() abort mid-diagnostic) is the honest boundary for THIS pass. The
+    // parts that do not need P -- load_model, forward()/forward_one() and their --dump-logits/parity
+    // checks (sections 1, 3, 4) -- are exactly what B24's own correctness gate uses, and are unaffected.
+    const bool have_f32_params = (PARAM_DTYPE == Dtype::F32);
+    const float* P = have_f32_params ? params_ptr() : nullptr;
+    // Hoisted out of section 2's guarded block: section 5 also needs lmh/lmb (both nullptr, unused,
+    // under BF16 -- section 5 is guarded by the same have_f32_params check).
+    const ParamDesc* lmh = have_f32_params ? find_kind(PKind::LmHead) : nullptr;
+    const ParamDesc* lmb = have_f32_params ? find_kind(PKind::LmBias) : nullptr;
 
+    if (have_f32_params) {
     std::println("\n--- 2. the tail: no LnF slot, one synthesized destination ----------------");
     // LnF is GONE from the layout (the real model has no final norm -- the GR exit collapse's own
     // hc_norm is it), so the only synthesized destination left is LmBias. Asserted as an ABSENCE here,
     // not merely omitted, because "the slot quietly came back" is exactly what this check is for.
     const ParamDesc* lnf = find_kind(PKind::LnF);
-    const ParamDesc* lmh = find_kind(PKind::LmHead);
-    const ParamDesc* lmb = find_kind(PKind::LmBias);
     if (lnf) { std::println(stderr, "FAIL: PARAM_LAYOUT still carries an LnF tensor under GR"); return 3; }
     if (!lmh || !lmb) { std::println(stderr, "FAIL: LmHead/LmBias missing from PARAM_LAYOUT"); return 3; }
     {
@@ -196,6 +208,9 @@ int main(int argc, char** argv) {
                      e.mean, e.rms, e.min, e.max);
         std::println("LmHead  first 4096 floats: mean {:+.6f} rms {:.6f} [{:+.4f}, {:+.4f}]",
                      h.mean, h.rms, h.min, h.max);
+    }
+    } else {
+        std::println("\n--- 2. skipped: needs f32 params_ptr() (this build stores parameters as bf16) ---");
     }
 
     std::println("\n--- 3. Model::forward on the real weights -------------------------------");
@@ -258,6 +273,7 @@ int main(int argc, char** argv) {
                      std::distance(batched.begin() + static_cast<std::ptrdiff_t>(t) * VOCAB, am), s.nonfinite);
     }
 
+    if (have_f32_params)
     std::println("\n--- 3b. Model::forward vs an INDEPENDENT math-core replay ----------------");
     // The gate docs/WP4_SCOPE.md S6 asks for is "layer 0's output matches the existing real fixture
     // through the full engine path". That gate as written is not reachable, and the reason is worth
@@ -275,7 +291,9 @@ int main(int argc, char** argv) {
     // own per-execution residual-stream norms (loop_pass_stats). Layer 3 (QSA) is excluded only because
     // its op needs the backend's internal precomputed rope table; the check still covers embed, the GR
     // entry tile, 6 GR instances, 3 GDN mixers and 3 MoE blocks composed in the engine's own order.
-    {
+    //
+    // B24: needs raw params_ptr() (P) -- skipped under BF16, see the guard comment above section 2.
+    if (have_f32_params) {
         std::vector<float> eng_delta(LOOP_EXEC_COUNT, 0.f), eng_hnorm(LOOP_EXEC_COUNT, 0.f);
         loop_pass_stats(kTokens, T, eng_delta.data(), eng_hnorm.data());
 
@@ -407,6 +425,8 @@ int main(int argc, char** argv) {
         if (layout_ok)
             std::println("worst relative disagreement, engine path vs math-core replay: "
                          "||h_in|| {:.3g}, ||delta|| {:.3g}", worst_h, worst_d);
+    } else {
+        std::println("\n--- 3b. skipped: needs f32 params_ptr() (this build stores parameters as bf16) ---");
     }
 
     std::println("\n--- 4. forward vs forward_one parity at the real dims --------------------");
@@ -432,6 +452,8 @@ int main(int argc, char** argv) {
                  max_abs, worst_t, worst_v, max_rel);
     report_memory("after forward_one");
 
+    // B24: needs raw params_ptr() (P, lmh, lmb) -- skipped under BF16, see the guard comment above section 2.
+    if (have_f32_params) {
     std::println("\n--- 5. the readout is un-normed, and what the removed LnF was costing ----");
     // hidden_last is the GR EXIT-COLLAPSED representation at the final position -- and, since the LnF
     // removal, it is EXACTLY what lm_head reads (decode.cpp's forward_one no longer calls
@@ -482,6 +504,9 @@ int main(int argc, char** argv) {
                      "{:.6g}  ({:.1f}% of scale; argmax {} vs {})",
                      d5n, lrms, 100.0 * d5n / (lrms > 0 ? lrms : 1.0), arg(l5), arg(ln));
         std::println("    and the eps question that removal made moot: max|1e-5 - 1e-6| = {:.6g}", d56);
+    }
+    } else {
+        std::println("\n--- 5. skipped: needs f32 params_ptr() (this build stores parameters as bf16) ---");
     }
 
     std::println("\n--- peak resource use ---------------------------------------------------");

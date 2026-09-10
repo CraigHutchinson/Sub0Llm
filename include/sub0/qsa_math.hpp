@@ -131,7 +131,11 @@ inline constexpr std::size_t scratch_floats(const Dims& d, int T) {
 
 // Qwen4ExpTextRMSNorm (non-grouped): out = x * rsqrt(mean(x^2) + eps) * (1 + w). NOTE the (1 + w) gain
 // (this file's header comment). `out` may alias `x`.
-inline void rms_norm_row(const float* x, const float* w, int n, float eps, float* out) {
+// B24: `w` is a WEIGHT pointer, templated so a bf16-parameter build promotes inside the loop rather
+// than through a materialised f32 buffer (include/sub0/param_store.hpp). `const float*` deduces exactly
+// as before -- some callers legitimately pass an f32 scratch row rather than a parameter.
+template <class WP>
+inline void rms_norm_row(const float* x, WP w, int n, float eps, float* out) {
     float ms = 0.f;
     for (int i = 0; i < n; ++i) ms += x[i] * x[i];
     const float inv = 1.f / std::sqrt(ms / static_cast<float>(n) + eps);
@@ -164,12 +168,13 @@ inline void rope_apply_row(float* x, const float* cos, const float* sin, int rot
 
 // out[o] = sum_i x[i] * w[i*out_n + o]  -- this project's [rows=in, cols=out] convention, no bias
 // (attention_bias=false everywhere in the real config).
-inline void linear_row(const float* x, const float* w, int in_n, int out_n, float* out) {
+template <class WP>
+inline void linear_row(const float* x, WP w, int in_n, int out_n, float* out) {
     for (int o = 0; o < out_n; ++o) out[o] = 0.f;
     for (int i = 0; i < in_n; ++i) {
         const float xi = x[i];
         if (xi == 0.f) continue;
-        const float* wr = w + static_cast<std::size_t>(i) * out_n;
+        const auto wr = w + static_cast<std::size_t>(i) * out_n;
         for (int o = 0; o < out_n; ++o) out[o] += xi * wr[o];
     }
 }
@@ -181,8 +186,9 @@ inline void linear_row(const float* x, const float* w, int in_n, int out_n, floa
 // q_layernorm'd per head and rotated at this row's position; the KEY half is left COMPLETELY RAW
 // (k_layernorm and RoPE happen later, on the POOLED block key, at the block's own start position).
 // qk_proj_w: [hidden_size, idx_qk_out()]. q_ln_w: [idx_head_dim].
-inline void indexer_project_row(const Dims& d, const float* x, const float* qk_proj_w,
-                                 const float* q_ln_w, const float* cos_pos, const float* sin_pos,
+template <class WP>
+inline void indexer_project_row(const Dims& d, const float* x, WP qk_proj_w,
+                                 WP q_ln_w, const float* cos_pos, const float* sin_pos,
                                  float eps, float* out_q, float* out_raw_k) {
     // Project straight into out_q for the query part; the key part needs its own tail slot, so the
     // projection is done in two passes over the SAME weight columns rather than needing a joint buffer.
@@ -192,7 +198,7 @@ inline void indexer_project_row(const Dims& d, const float* x, const float* qk_p
     for (int i = 0; i < d.hidden_size; ++i) {
         const float xi = x[i];
         if (xi == 0.f) continue;
-        const float* wr = qk_proj_w + static_cast<std::size_t>(i) * out_n;
+        const auto wr = qk_proj_w + static_cast<std::size_t>(i) * out_n;
         for (int o = 0; o < d.idx_q_width(); ++o) out_q[o] += xi * wr[o];
         for (int o = 0; o < d.idx_kv_heads * d.idx_head_dim; ++o)
             out_raw_k[o] += xi * wr[d.idx_q_width() + o];
@@ -228,7 +234,8 @@ inline void indexer_project_row(const Dims& d, const float* x, const float* qk_p
 // the same value for every query that can see it, and recomputing it per query was pure repeated work.
 //
 // `out`: [idx_head_dim], this block's cache slot. Bumps stats::pool_block_key_calls.
-inline void pool_block_key(const Dims& d, const float* raw_keys, int block, const float* k_ln_w,
+template <class WP>
+inline void pool_block_key(const Dims& d, const float* raw_keys, int block, WP k_ln_w,
                            const float* cos, const float* sin, float eps, float* out) {
     ++stats::pool_block_key_calls;
     const int ratio = d.compress_ratio;
@@ -265,8 +272,9 @@ inline void pool_block_key(const Dims& d, const float* raw_keys, int block, cons
 // `*n_cached`; the buffer's contents need no clearing, since only its first `*n_cached` entries are
 // ever read. Never shrinks `*n_cached`: a shorter kv_len is a PREFIX of the same blocks, whose keys are
 // unchanged (that is what makes forward()'s row loop and forward_one()'s call sequence agree bitwise).
+template <class WP>
 inline int indexer_select_row(const Dims& d, const float* q, const float* raw_keys, int kv_len,
-                               const float* k_ln_w, const float* cos, const float* sin, float eps,
+                               WP k_ln_w, const float* cos, const float* sin, float eps,
                                float* block_keys, int* n_cached, float* out_mask, float* scratch) {
     for (int j = 0; j < kv_len; ++j) out_mask[j] = 0.f;
     const int ratio = d.compress_ratio;
@@ -315,9 +323,10 @@ inline int indexer_select_row(const Dims& d, const float* q, const float* raw_ke
 // arithmetic (a chunk of a bias-free Linear's output axis is a partition of its weight rows) -- see
 // docs/QSA.md S2b.4 for why, and for the per-head chunk order a future weight transplant must respect.
 // q_norm_w/k_norm_w: [head_dim], applied PER HEAD, BEFORE RoPE. v is neither normed nor rotated.
-inline void attn_project_row(const Dims& d, const float* x, const float* q_w, const float* gate_w,
-                              const float* k_w, const float* v_w, const float* q_norm_w,
-                              const float* k_norm_w, const float* cos_pos, const float* sin_pos,
+template <class WP>
+inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
+                              WP k_w, WP v_w, WP q_norm_w,
+                              WP k_norm_w, const float* cos_pos, const float* sin_pos,
                               float eps, float* out_q, float* out_gate, float* out_k, float* out_v) {
     linear_row(x, q_w,    d.hidden_size, d.q_width(),  out_q);
     linear_row(x, gate_w, d.hidden_size, d.q_width(),  out_gate);
@@ -341,8 +350,9 @@ inline void attn_project_row(const Dims& d, const float* x, const float* q_w, co
 // cannot happen here because indexer_select_row always keeps at least the query's own tail position.
 // k_cache/v_cache: [kv_len, kv_width()]. o_proj_w: [q_width(), hidden_size].
 // `scratch`: >= attn_scratch_floats(d, kv_len).
+template <class WP>
 inline void attn_row(const Dims& d, const float* q, const float* gate, const float* k_cache,
-                      const float* v_cache, int kv_len, const float* mask, const float* o_proj_w,
+                      const float* v_cache, int kv_len, const float* mask, WP o_proj_w,
                       float* out, float* scratch) {
     float* sc = scratch;                     // [kv_len]
     float* ao = scratch + kv_len;            // [q_width()]
@@ -383,10 +393,11 @@ inline void attn_row(const Dims& d, const float* q, const float* gate, const flo
 // helpers above, so the engine's batched Model::forward and its single-token Model::forward_one provably
 // run the SAME arithmetic (the forward-vs-forward_one parity test is what gates that -- docs/QSA.md S9).
 // `cos`/`sin`: [>= T, rotary_dim]. `out`: [T, hidden_size]. `scratch`: >= scratch_floats(d, T).
+template <class WP>
 inline void forward(const Dims& d, int T, const float* hidden,
-                     const float* idx_qk_proj_w, const float* idx_q_ln_w, const float* idx_k_ln_w,
-                     const float* q_w, const float* gate_w, const float* k_w, const float* v_w,
-                     const float* q_norm_w, const float* k_norm_w, const float* o_proj_w,
+                     WP idx_qk_proj_w, WP idx_q_ln_w, WP idx_k_ln_w,
+                     WP q_w, WP gate_w, WP k_w, WP v_w,
+                     WP q_norm_w, WP k_norm_w, WP o_proj_w,
                      const float* cos, const float* sin, float eps, float* out, float* scratch) {
     const std::size_t kvw = static_cast<std::size_t>(d.kv_width());
     float* k_cache  = scratch;

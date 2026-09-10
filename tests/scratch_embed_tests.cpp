@@ -359,7 +359,12 @@ TEST_CASE("scratch encoder: Scalar writes the bounded layout and has no gradient
     constexpr int C = 8;
     const auto f = frags_of("-6.02e23");
     float out[C];
-    sub0::encode_slot(nullptr, C, std::span<const int>(f), SlotEncoding::Scalar, out);   // tok_emb unused
+    // B24: encode_slot's tok_emb is now templated (include/sub0/scratch_slots.hpp) so a bare `nullptr`
+    // no longer deduces -- typed explicitly as `const float*` (this file's own type throughout) to keep
+    // the "Scalar never dereferences tok_emb" intent the literal null was making, rather than switching
+    // to a real buffer no encoding here actually reads.
+    sub0::encode_slot(static_cast<const float*>(nullptr), C, std::span<const int>(f),
+                      SlotEncoding::Scalar, out);   // tok_emb unused
     REQUIRE(out[0] == -1.f * SCALAR_AMP);                       // sign
     REQUIRE(out[1] == (23.f / SCALAR_EXP_SCALE) * SCALAR_AMP);  // exponent
     const int mant[SCALAR_MANT_DIGITS] = {6, 0, 2, 0};

@@ -198,25 +198,29 @@ struct ParallelExperts {
 };
 
 // y[out] = x[in] . W[in,out]  (+ bias); dense, same order as op_linear's non-ternary path.
+// B24: weights are read through Node::pdata (ParamCPtr), which is `const float*` under the F32 default
+// and a widening bf16 proxy otherwise -- so this loop's source is unchanged and its F32 codegen is too.
+// Note `__restrict` is dropped from the weight row: it is meaningless on a proxy, and the alias it was
+// promising about (weights never alias `y`) is still true by construction.
 static inline void linear_row(const float* __restrict x, const Node* W, const Node* bias,
                               float* __restrict y, int in, int out) {
     for (int o = 0; o < out; ++o) y[o] = 0.f;
-    const float* __restrict Wf = W->data.data();
+    const ParamCPtr Wf = W->pdata;
     for (int p = 0; p < in; ++p) {
         const float xp = x[p];
         if (xp == 0.f) continue;
-        const float* __restrict Wr = Wf + static_cast<size_t>(p) * out;
+        const auto Wr = Wf + static_cast<size_t>(p) * out;
         for (int o = 0; o < out; ++o) y[o] += xp * Wr[o];
     }
-    if (bias) for (int o = 0; o < out; ++o) y[o] += bias->data[o];
+    if (bias) for (int o = 0; o < out; ++o) y[o] += bias->pdata[o];
 }
 // Tied-embedding head, single-row (generation) form: y[v] = dot(x[:], table[v,:]), no bias -- see
 // op_tied_head's comment for why this is a dot-product pattern rather than linear_row's axpy one.
 static inline void tied_head_row(const float* __restrict x, const Node* table,
                                  float* __restrict y, int C, int V) {
-    const float* __restrict Tb = table->data.data();
+    const ParamCPtr Tb = table->pdata;
     for (int v = 0; v < V; ++v) {
-        const float* __restrict tv = Tb + static_cast<size_t>(v) * C;
+        const auto tv = Tb + static_cast<size_t>(v) * C;
         float s = 0.f;
         #pragma omp simd reduction(+ : s)
         for (int c = 0; c < C; ++c) s += x[c] * tv[c];
@@ -226,12 +230,12 @@ static inline void tied_head_row(const float* __restrict x, const Node* table,
 static inline void rmsnorm_row(const float* __restrict x, const Node* gamma, float* __restrict y, int C) {
     float ms = 0.f; for (int j = 0; j < C; ++j) ms += x[j] * x[j]; ms /= C;
     const float r = 1.f / std::sqrt(ms + 1e-5f);
-    const float* __restrict G = gamma->data.data();
+    const ParamCPtr G = gamma->pdata;
     for (int j = 0; j < C; ++j) y[j] = x[j] * r * G[j];
 }
 static inline void qknorm_row(float* __restrict x, const Node* gamma, int H, int C) {   // in place, mirrors rope_row
     const int d = C / H;
-    const float* __restrict G = gamma->data.data();
+    const ParamCPtr G = gamma->pdata;
     for (int h = 0; h < H; ++h) {
         const int off = h * d;
         float ms = 0.f; for (int j = 0; j < d; ++j) ms += x[off + j] * x[off + j]; ms /= d;
@@ -364,9 +368,9 @@ const float* Model::forward_one(int id, int pos) {
     auto gr_read_row = [&](const float* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w,
                             Node* ln, float* out_a) {
         if constexpr (USE_GATED_RESIDUAL) {
-            gr::hc_norm(GR_DIMS, 1, wide, norm_w->data.data(), gr_normed);
-            gr::mix(GR_DIMS, 1, gr_normed, down_w->data.data(), up_w->data.data(), gr_mixed, gr_mixscr);
-            gr::gate(GR_DIMS, 1, gr_normed, inject_w->data.data(), gr_inj);
+            gr::hc_norm(GR_DIMS, 1, wide, norm_w->pdata, gr_normed);
+            gr::mix(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed, gr_mixscr);
+            gr::gate(GR_DIMS, 1, gr_normed, inject_w->pdata, gr_inj);
             // WP4b blocker D: the mixer reads mixed_input DIRECTLY -- no Ln1/Ln2 exists under GR
             // (`ln` is nullptr), and gr::hc_norm above already applied the real model's own
             // pre-block norm at its own 1e-6 eps. Mirrors forward()'s gr_read exactly; the
@@ -389,10 +393,10 @@ const float* Model::forward_one(int id, int pos) {
     bool do_reinject = false;
 
     if (g_sentinel_binds && prev == g_sentinel_binds->sigil && g_sentinel_binds->bound(id)) {
-        encode_slot(tok_emb->data.data(), C, g_sentinel_binds->fragments(id), g_sentinel_binds->encoding,
+        encode_slot(tok_emb->pdata, C, g_sentinel_binds->fragments(id), g_sentinel_binds->encoding,
                     h, g_sentinel_binds->enc_w);
     } else if (g_scratch_binds && is_scratch_slot(id) && g_scratch_binds->bound(id)) {
-        encode_slot(tok_emb->data.data(), C, g_scratch_binds->fragments(id), g_scratch_binds->encoding, h,
+        encode_slot(tok_emb->pdata, C, g_scratch_binds->fragments(id), g_scratch_binds->encoding, h,
                     g_scratch_binds->enc_w);
         if (g_scratch_reinject_stride > 0) {   // save the layer-0 packed vector for periodic re-injection
             for (int j = 0; j < C; ++j) packed_copy[j] = h[j];
@@ -403,14 +407,14 @@ const float* Model::forward_one(int id, int pos) {
         // comment. Decode never runs backward, so this path only needs the forward compose (enc_w,
         // never enc_w_grad).
         const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
-        encode_slot(tok_emb->data.data(), C, persistent_fragments(g_persistent_binds, id), enc, h,
+        encode_slot(tok_emb->pdata, C, persistent_fragments(g_persistent_binds, id), enc, h,
                     g_persistent_binds ? g_persistent_binds->enc_w : nullptr);
     } else {
-        const float* emb = tok_emb->data.data() + static_cast<size_t>(id) * C;
+        const auto emb = tok_emb->pdata + static_cast<size_t>(id) * C;
         for (int j = 0; j < C; ++j) h[j] = emb[j];
     }
     if constexpr (POS_ENCODING == PosEncoding::Absolute) {
-        const float* pe = pos_emb->data.data() + static_cast<size_t>(pos) * C;
+        const auto pe = pos_emb->pdata + static_cast<size_t>(pos) * C;
         for (int j = 0; j < C; ++j) h[j] += pe[j];
     }
     // N-gram embeddings, decode path: mirrors forward()'s block exactly (same hashing, same
@@ -439,12 +443,12 @@ const float* Model::forward_one(int id, int pos) {
                 acc += static_cast<std::int64_t>(ptok) * NGRAM_VOCAB_MODS[static_cast<std::size_t>(e)][static_cast<std::size_t>(k - 2)];
             }
             const int tid = static_cast<int>(((acc % vocab_dim) + vocab_dim) % vocab_dim);
-            const float* row = ngram_tab[static_cast<std::size_t>(e)]->data.data()
+            const auto row = ngram_tab[static_cast<std::size_t>(e)]->pdata
                              + static_cast<std::size_t>(tid) * NGRAM_EMB_DIM;
-            const float* Wb = ngram_wblock[static_cast<std::size_t>(e)].data.data();
+            const ParamCPtr Wb = ngram_wblock[static_cast<std::size_t>(e)].pdata;
             for (int p = 0; p < NGRAM_EMB_DIM; ++p) {
                 const float xp = row[p];
-                const float* __restrict Wr = Wb + static_cast<std::size_t>(p) * C;
+                const auto Wr = Wb + static_cast<std::size_t>(p) * C;
                 for (int o = 0; o < C; ++o) h[o] += xp * Wr[o];
             }
         }
@@ -530,25 +534,25 @@ const float* Model::forward_one(int id, int pos) {
             // QsaRopeTables (internal.hpp); it was D_HEAD before --rotary-dim became an axis.
             const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * ROTARY_DIM;
             const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * ROTARY_DIM;
-            qsa::indexer_project_row(QSA_DIMS, a, L.qsa_idx_qk->data.data(),
-                                      L.qsa_idx_qnorm->data.data(), cos_pos, sin_pos, qsa::RMS_EPS,
+            qsa::indexer_project_row(QSA_DIMS, a, L.qsa_idx_qk->pdata,
+                                      L.qsa_idx_qnorm->pdata, cos_pos, sin_pos, qsa::RMS_EPS,
                                       qsa_idx_q,
                                       raw_k_base + static_cast<size_t>(pos) * QSA_INDEXER_HEAD_DIM);
-            qsa::attn_project_row(QSA_DIMS, a, L.qsa_q->data.data(), L.qsa_gate->data.data(),
-                                   L.qsa_k->data.data(), L.qsa_v->data.data(),
-                                   L.qsa_qnorm->data.data(), L.qsa_knorm->data.data(),
+            qsa::attn_project_row(QSA_DIMS, a, L.qsa_q->pdata, L.qsa_gate->pdata,
+                                   L.qsa_k->pdata, L.qsa_v->pdata,
+                                   L.qsa_qnorm->pdata, L.qsa_knorm->pdata,
                                    cos_pos, sin_pos, qsa::RMS_EPS,
                                    qn, qsa_gate_row, g_kv.krow(e, pos), g_kv.vrow(e, pos));
             // The pooled block keys persist across decode steps in this execution's own QsaCache
             // slot, exactly as the raw keys above already do -- the decode counterpart of the
             // batched path's in-scratch cache, filled by the SAME primitive (docs/QSA.md S11).
             qsa::indexer_select_row(QSA_DIMS, qsa_idx_q, raw_k_base, pos + 1,
-                                     L.qsa_idx_knorm->data.data(), g_qsa_rope.cos.data(),
+                                     L.qsa_idx_knorm->pdata, g_qsa_rope.cos.data(),
                                      g_qsa_rope.sin.data(), qsa::RMS_EPS,
                                      g_qsa_cache.block_base(e), g_qsa_cache.n_cached_of(e),
                                      qsa_mask, qsa_sel_scr);
             qsa::attn_row(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
-                           qsa_mask, L.qsa_o->data.data(), proj, qsa_att_scr);
+                           qsa_mask, L.qsa_o->pdata, proj, qsa_att_scr);
             gr_write_row(h, proj);                                           // residual (write step)
         };
         // Which of the two full-attention forms this build uses, decided ONCE at compile time. This
@@ -576,11 +580,11 @@ const float* Model::forward_one(int id, int pos) {
                 // decode path had the identical swap, independently) -- see that call site's comment.
                 float gdn_scratch[GDN_SCRATCH1];
                 gdn::forward(GDN_DIMS, 1, a,
-                             L.gdn_in_qkv->data.data(), L.gdn_in_z->data.data(),
-                             L.gdn_in_b->data.data(), L.gdn_in_a->data.data(),
-                             L.gdn_conv->data.data(), L.gdn_dt_bias->data.data(),
-                             L.gdn_a_log->data.data(), L.gdn_norm->data.data(),
-                             L.gdn_out_proj->data.data(),
+                             L.gdn_in_qkv->pdata, L.gdn_in_z->pdata,
+                             L.gdn_in_b->pdata, L.gdn_in_a->pdata,
+                             L.gdn_conv->pdata, L.gdn_dt_bias->pdata,
+                             L.gdn_a_log->pdata, L.gdn_norm->pdata,
+                             L.gdn_out_proj->pdata,
                              g_gdn_cache.state_of(e), g_gdn_cache.conv_of(e), proj, gdn_scratch);
                 gr_write_row(h, proj);                                       // residual (write step)
             }
@@ -601,14 +605,14 @@ const float* Model::forward_one(int id, int pos) {
             // omp_get_thread_num() rather than closing over one pool, because it is called from inside
             // the runner's own parallel region, once per thread.
             moe::forward_row_via_run(
-                MOE_DIMS, a, L.moe_router->data.data(),
+                MOE_DIMS, a, L.moe_router->pdata,
                 [&](int e) {
                     const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
                     return moe_resolve(L, l, e, g_moe_decode[static_cast<std::size_t>(t)]->cache);
                 },
                 ParallelExperts{},
-                L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
-                L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
+                L.moe_shared_gate->pdata, L.moe_shared_up->pdata,
+                L.moe_shared_down->pdata, L.moe_shared_gate_proj->pdata,
                 proj, moe_scratch);
         } else if constexpr (USE_GATED_FFN) {
             linear_row(a, L.Wg, nullptr, g1, C, D_FF);
@@ -648,8 +652,8 @@ const float* Model::forward_one(int id, int pos) {
     // own exit-collapse placement: use_combine=False, so just the mix half (no gate/combine) --
     // last_hidden captures the FULLY-COLLAPSED, D_MODEL-wide representation, same as the GR-off path.
     if constexpr (USE_GATED_RESIDUAL) {
-        gr::hc_norm(GR_DIMS, 1, h, gr_top_norm->data.data(), gr_normed);
-        gr::mix(GR_DIMS, 1, gr_normed, gr_top_down->data.data(), gr_top_up->data.data(), gr_mixed, gr_mixscr);
+        gr::hc_norm(GR_DIMS, 1, h, gr_top_norm->pdata, gr_normed);
+        gr::mix(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed, gr_mixscr);
         for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = gr_mixed[j];
         // No final norm under GR -- the exit collapse's own hc_norm is it, so mixed_input feeds the
         // head directly. Mirrors forward()'s own branch exactly (the forward-vs-forward_one parity
