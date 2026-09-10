@@ -1957,6 +1957,13 @@ gap for free.
   both arms because a `--vocab-exact` build emits no `tokenizer.tok` and `default_tokenizer()` is empty;
   pre-existing, unrelated, reported below.)
 
+**2026-09-10 follow-up**: this section's own byte-exact figures were carried forward, unchanged, into
+`docs/QWEN4_MEMORY_MAP.md` — a full need/timing/positioning inventory of every allocation in the gen
+tool's lifecycle (not just the large ones this section itemizes), covering the backbone, the Worker, the
+sidecar's own mapping semantics, decode's per-thread pools, the decode-persistent caches, and previously-
+uncatalogued small items (tokenizer tables, DLL images, thread stacks). Read that document for the full
+picture; this section remains the byte-exact source it was built from.
+
 ### WP6b — one expert, decomposed: `benchmarks/moe_expert_bench.cpp`. EXECUTED
 
 **Why a new binary rather than another whole-run measurement.** Every performance figure this document
