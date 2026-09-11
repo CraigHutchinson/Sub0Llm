@@ -415,3 +415,14 @@ session owner's own host state has changed) the already-documented A/B result ho
 toggle's own definition, not just buried in the backlog. `tools/configurator.cpp` is touched by all three --
 each keeps its own addition small/localized (near `--prec-param`) to minimize merge friction; the session
 owner resolves any 3-way conflict at merge time.
+
+---
+
+**2026-09-11 Claude Code — B37 in progress, isolated worktree `agent-af17639aa7eff561e`, branch
+`feature/b37-fp8-integration`.** Cherry-picked B33's code commit (`8410aa7`) onto current `main`
+(merge-base `4098c49` had zero divergence from `main` in the touched files, so it applied cleanly;
+only the three docs files needed conflict resolution, kept as `main`'s own already-landed narrative).
+Building+testing an isolated `out/build/d196check`-equivalent config (`data/gsm8k.txt --dmodel 196`,
+copied in locally since it's untracked) in this worktree now -- not touching the shared main checkout's
+own `out/build/d196check`. No file overlap with B36 (`moe_io.hpp`/`decode.cpp`) or B38
+(`simd_reduce.hpp`/`*_math.hpp`) beyond the shared, localized `configurator.cpp` `--prec-param` block.

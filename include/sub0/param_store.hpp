@@ -24,6 +24,19 @@
 // AdamW moments (those arenas are unchanged); what a bf16 build changes is the precision of the master
 // weight a step reads and writes back, which is a real and well-known training-quality regression and
 // is not what phase 1 is for. `--prec-param 1` is documented and defaulted accordingly.
+//
+// `--prec-param 2` (FP8/E4M3, B33/B37, docs/BACKBONE_PRECISION.md S2d) -- READ THIS BEFORE CHOOSING IT.
+// This is a REAL, HONEST NEGATIVE RESULT kept as a permanent, buildable, correctness-gated option, not
+// a recommendation. Measured on the real 48-layer Qwen4-preview artifact, independently reproduced
+// twice (S2d): a real ~4.63 GiB peak-memory win over BF16, traded for a ~40-60% decode THROUGHPUT
+// SLOWDOWN (most likely `Fp8CPtr::operator[]`'s multi-branch exponent-remap widen costing more
+// per-element CPU than the DRAM bytes it saves -- unlike bf16's branchless shift) AND a markedly worse
+// quality floor (logits vs F32 reference L2-relative ~0.43, vs BF16's own ~0.199). **BF16 (`--prec-param
+// 1`) remains the recommended reduced-precision choice; FP8 is not a faster or better default, it is a
+// smaller one, with a real and currently-unmitigated cost on both axes that matter more here.** Choose
+// it only if the ~4.63 GiB footprint reduction is worth those two costs for your own use case, or if you
+// are picking this format up specifically to pursue the named-but-unbuilt fix (a branchless/lookup-table
+// `fp8_widen`, `fp8.hpp`'s own comment) -- not by default and not without reading S2d first.
 
 #pragma once
 
