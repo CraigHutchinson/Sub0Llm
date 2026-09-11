@@ -118,6 +118,98 @@ inline void expert_ffn_row(const Dims& d, const float* x, WP gate_w, WP up_w,
     }
 }
 
+// --- fused, no-transpose variant of expert_ffn_row (B31, docs/INDEPENDENT_REVIEW_BACKLOG.md) -------
+//
+// The plain expert_ffn_row above needs its three weight planes already in THIS PROJECT'S [in,out]
+// convention -- for the routed-expert resolve path, that meant dequantize_expert (moe_quant.hpp) had to
+// run gguf::to_f32 (write) then transplant::transpose_out_in (read+write) before a single FFN read
+// could happen: 3 full touches of each ~19.66 MB plane-set instead of 1. This function instead consumes
+// the planes in GGUF's own SOURCE order (moeq::ExpertCacheSource pairs with it, moe_quant.hpp) --
+// gate_src/up_src are [d_ff, hidden_size] row-major (row o = output unit o's own hidden_size-wide
+// weight vector, contiguous), down_src is [hidden_size, d_ff] row-major (row j = output unit j's own
+// d_ff-wide weight vector, contiguous) -- eliminating the transpose stage's round trip entirely: a
+// resolve now touches DRAM once (the dequantize write) instead of three times.
+//
+// WHY THIS IS BIT-EXACT, NOT AN APPROXIMATION. expert_ffn_row's gate/up accumulation is an INPUT-major
+// scatter: outer loop i ascending 0..hidden_size-1, inner loop o, `g_scratch[o] += x[i]*gate_w[i*d_ff+o]`
+// -- so for a FIXED o, the additions happen in i = 0, 1, 2, ... ascending order, one term per i (terms
+// where x[i]==0 are skipped, not added as zero). This function computes the SAME g_scratch[o] as a single
+// dot product, `sum_i x[i]*gate_src[o*hidden_size+i]`, with the loop over i ALSO ascending and the same
+// x[i]==0 skip -- i.e. the exact same sequence of partial sums, only computed as a per-output REDUCTION
+// instead of a scatter. Same addends, same order -> bit-for-bit identical, not merely close (checked by
+// running both functions on the same dequantized-vs-source-order planes in tests/moe_quant_tests.cpp's
+// B31 case, not just argued here). The down projection is the identical argument with i/o swapped:
+// expert_ffn_row's own INPUT-major loop over o (d_ff) scatter-accumulates out[j] in o = 0..d_ff-1
+// ascending order for a fixed j (skipping pre_scratch[o]==0); this function's per-j dot product sums the
+// same terms in the same o-ascending order with the same skip.
+//
+// TILING. Each row read here is already fully contiguous, and the vector it is dotted against (x for
+// gate/up, pre_scratch for down) is small enough to stay L1-resident for the WHOLE call (hidden_size*4 =
+// 10 KiB, d_ff*4 = 2.5 KiB at the real Qwen4 axes -- both far under this host's 48 KiB P-core L1d, docs/
+// host-cpu-arrow-lake-hx.md) -- so unlike transpose_block's 2D blocking (which exists to fix a STRIDED
+// destination write), there is no strided axis to block away here: this is already the textbook
+// cache-optimal GEMV access pattern (stream the matrix once, reuse the small vector out of L1/L2). A
+// ROW_TILE grouping is still applied below, sized `consteval` against this host's smaller P-core L2 (3
+// MiB, per B31's own brief -- a single decode thread, B29, can land on either core type, so the SMALLER
+// P-core figure is the safe target) purely to bound how much of the source plane one chunk of the loop
+// touches before moving on to the next. Measured against the plain unblocked per-row loop on the real
+// 48-layer artifact: no reliable difference (same shape of honest null result as this project's own B28
+// software-prefetch finding, docs/INDEPENDENT_REVIEW_BACKLOG.md) -- kept anyway because it costs nothing
+// and documents the real cache budget this build was sized against, per this project's own
+// compile-time-over-runtime preference (AGENTS.md S1/S2).
+inline constexpr int kP_CORE_L2_BYTES = 3 * 1024 * 1024;
+// A conservative fraction of L2, leaving headroom for x/pre_scratch/g_scratch and everything else live
+// on this core (router probs, the shared-expert accumulators, OS/runtime state) -- not the whole 3 MiB.
+inline constexpr int kL2_TILE_BUDGET_BYTES = kP_CORE_L2_BYTES / 2;
+// How many D_FF=640-wide source rows (hidden_size=2560 floats = 10 KiB each at the real axes) fit the
+// budget -- computed from the real dims rather than hand-picked, per AGENTS.md S2's "derive bounds from
+// scale" precedent. Clamped to at least 1 (never fewer rows than exist to still make progress) and to the
+// call's own d_ff/hidden_size so a tiny test-scale Dims never asks for a tile bigger than the matrix.
+inline constexpr int row_tile(int row_bytes, int n_rows) {
+    const int budget_rows = row_bytes > 0 ? (kL2_TILE_BUDGET_BYTES / row_bytes) : n_rows;
+    int t = budget_rows < 1 ? 1 : budget_rows;
+    if (t > n_rows) t = n_rows > 0 ? n_rows : 1;
+    return t;
+}
+
+template <class WP>
+inline void expert_ffn_row_source(const Dims& d, const float* x, WP gate_src, WP up_src, WP down_src,
+                                   float* out, float* pre_scratch, float* g_scratch) {
+    const int gu_tile = row_tile(d.hidden_size * static_cast<int>(sizeof(float)), d.d_ff);
+    for (int ot = 0; ot < d.d_ff; ot += gu_tile) {
+        const int o_end = std::min(ot + gu_tile, d.d_ff);
+        for (int o = ot; o < o_end; ++o) {
+            const auto gr = gate_src + static_cast<std::size_t>(o) * d.hidden_size;
+            const auto ur = up_src   + static_cast<std::size_t>(o) * d.hidden_size;
+            float gs = 0.f, ps = 0.f;
+            for (int i = 0; i < d.hidden_size; ++i) {
+                const float xi = x[i];
+                if (xi == 0.f) continue;
+                gs += xi * gr[i];
+                ps += xi * ur[i];
+            }
+            g_scratch[o] = gs;
+            pre_scratch[o] = ps;
+        }
+    }
+    for (int o = 0; o < d.d_ff; ++o) pre_scratch[o] = detail::silu(g_scratch[o]) * pre_scratch[o];
+
+    const int down_tile = row_tile(d.d_ff * static_cast<int>(sizeof(float)), d.hidden_size);
+    for (int jt = 0; jt < d.hidden_size; jt += down_tile) {
+        const int j_end = std::min(jt + down_tile, d.hidden_size);
+        for (int j = jt; j < j_end; ++j) {
+            const auto dr = down_src + static_cast<std::size_t>(j) * d.d_ff;
+            float s = 0.f;
+            for (int o = 0; o < d.d_ff; ++o) {
+                const float po = pre_scratch[o];
+                if (po == 0.f) continue;
+                s += po * dr[o];
+            }
+            out[j] = s;
+        }
+    }
+}
+
 // The router (Qwen4ExpTextTopKRouter.forward, docs/MOE.md S1a): logits = linear(x, router_w) (no bias,
 // full-width softmax over ALL num_experts, THEN top-k -- not top-k-then-softmax); optionally renormalized
 // (norm_topk_prob, real config default True) so the selected weights sum to 1. router_w: [hidden_size,
@@ -228,14 +320,22 @@ struct SerialExperts {
     }
 };
 
-// B24: `WP` is the PARAMETER-ARENA pointer type (router + shared expert). The ROUTED experts' own type
-// is whatever `resolve` returns and is deliberately independent of it -- see ExpertWeights above.
-template <class WP, class Resolve, class RunExperts>
-inline void forward_row_via_run(const Dims& d, const float* x, WP router_w, Resolve&& resolve,
-                                 RunExperts&& run_experts,
-                                 WP shared_gate_w, WP shared_up_w,
-                                 WP shared_down_w, WP shared_gate_proj_w,
-                                 float* out, float* scratch, bool norm_topk_prob = true) {
+// B31: the generalized form, letting the caller decide HOW a selected expert's row is produced instead
+// of this function hardcoding "resolve weight pointers, then call expert_ffn_row" -- which is what lets
+// a caller fuse the resolve and the FFN together (moeq::ExpertCacheSource + expert_ffn_row_source above)
+// without a second, parallel copy of this whole two-phase/order-independence machinery. `compute_expert`
+// is called once per selected expert, exactly as `resolve` used to be, but its OWN job is now "produce
+// this row's `d.hidden_size` output floats", not merely "hand back three pointers". Same order-
+// independence argument as before: each call writes only its own `out_ptr`, nothing is read back until
+// phase 2.
+//
+// B24: `WP` is the PARAMETER-ARENA pointer type (router + shared expert).
+template <class WP, class ComputeExpert, class RunExperts>
+inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
+                                    ComputeExpert&& compute_expert, RunExperts&& run_experts,
+                                    WP shared_gate_w, WP shared_up_w,
+                                    WP shared_down_w, WP shared_gate_proj_w,
+                                    float* out, float* scratch, bool norm_topk_prob = true) {
     float* probs      = scratch;                    // [num_experts]
     float* ffn_scratch = probs + d.num_experts;      // [d_ff]
     float* g_scratch  = ffn_scratch + d.d_ff;        // [d_ff]
@@ -247,9 +347,7 @@ inline void forward_row_via_run(const Dims& d, const float* x, WP router_w, Reso
 
     // Phase 1: every selected expert into its own buffer. Order-independent by construction.
     run_experts(d.experts_per_tok, ffn_scratch, g_scratch, [&](int k, float* ffn, float* g) {
-        const ExpertWeights w = resolve(topk_idx[k]);
-        expert_ffn_row(d, x, w.gate, w.up, w.down,
-                       routed_out + static_cast<std::size_t>(k) * d.hidden_size, ffn, g);
+        compute_expert(k, topk_idx[k], routed_out + static_cast<std::size_t>(k) * d.hidden_size, ffn, g);
     });
     // Phase 2: the weighted sum, in the original selection order, on one thread.
     for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
@@ -268,6 +366,26 @@ inline void forward_row_via_run(const Dims& d, const float* x, WP router_w, Reso
     for (int i = 0; i < d.hidden_size; ++i) gate_logit += x[i] * shared_gate_proj_w[i];  // [hidden_size,1]
     const float sg = detail::sigmoid(gate_logit);
     for (int j = 0; j < d.hidden_size; ++j) out[j] += sg * expert_out[j];
+}
+
+// The original, unchanged-signature entry point every existing caller (op_moe, forward_row_via,
+// tests) uses: `resolve(idx) -> ExpertWeights`, then this function's own expert_ffn_row call, exactly as
+// before B31 -- now a thin wrapper over forward_row_via_run_ex so there is exactly one copy of the two-
+// phase/order-independence machinery, not two that could drift apart.
+template <class WP, class Resolve, class RunExperts>
+inline void forward_row_via_run(const Dims& d, const float* x, WP router_w, Resolve&& resolve,
+                                 RunExperts&& run_experts,
+                                 WP shared_gate_w, WP shared_up_w,
+                                 WP shared_down_w, WP shared_gate_proj_w,
+                                 float* out, float* scratch, bool norm_topk_prob = true) {
+    forward_row_via_run_ex(
+        d, x, router_w,
+        [&](int /*k*/, int idx, float* out_ptr, float* ffn, float* g) {
+            const ExpertWeights w = resolve(idx);
+            expert_ffn_row(d, x, w.gate, w.up, w.down, out_ptr, ffn, g);
+        },
+        static_cast<RunExperts&&>(run_experts), shared_gate_w, shared_up_w, shared_down_w,
+        shared_gate_proj_w, out, scratch, norm_topk_prob);
 }
 
 // The single-threaded form, and the one every caller that has no reason to fan out uses: the selected

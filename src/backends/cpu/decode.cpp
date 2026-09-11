@@ -154,7 +154,10 @@ thread_local QsaCache g_qsa_cache;   // only ever populated/consulted when USE_Q
 // in decode (see MOE_DECODE_SLOTS in internal.hpp for why). The batched path, which does have a real
 // hit rate, keeps that pool untouched.
 struct MoeDecodeThread {
-    MoeDecodeExpertCache cache{};
+    // B31: the fused, no-transpose pool (moeq::ExpertCacheSource) -- paired with
+    // moe::expert_ffn_row_source below, replacing the old dequant-then-transpose ExpertCache/
+    // expert_ffn_row pairing on this hot path only (op_moe's batched path is untouched).
+    MoeDecodeExpertCacheSource cache{};
     // expert_ffn_row's two d_ff-wide accumulators. Never zero-length (D_FF >= 1 always), so this stays
     // a valid array bound in a MoE-off build where nothing ever reads it.
     std::array<float, 2 * static_cast<std::size_t>(D_FF)> ffn{};
@@ -604,11 +607,31 @@ const float* Model::forward_one(int id, int pos) {
             // the ten contributions are summed in, are identical by construction. `resolve` reads
             // omp_get_thread_num() rather than closing over one pool, because it is called from inside
             // the runner's own parallel region, once per thread.
-            moe::forward_row_via_run(
+            // B31: fused resolve+FFN -- under MOE_QUANT_EXPERTS this dequantizes straight into
+            // SOURCE order (no transpose) and immediately runs expert_ffn_row_source over it, cutting
+            // the resolve's DRAM round trips from ~3 to 1 per plane-set (see moeq::ExpertCacheSource's
+            // and moe::expert_ffn_row_source's own comments for the full mechanism and the bit-exactness
+            // argument). The f32-resident (non-quantized) build keeps the original resolve+expert_ffn_row
+            // pairing unchanged -- there is no transpose to fuse away there at all.
+            moe::forward_row_via_run_ex(
                 MOE_DIMS, a, L.moe_router->pdata,
-                [&](int e) {
+                [&](int /*k*/, int e, float* out_ptr, float* ffn, float* g) {
                     const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
-                    return moe_resolve(L, l, e, g_moe_decode[static_cast<std::size_t>(t)]->cache);
+                    MoeDecodeThread& S = *g_moe_decode[static_cast<std::size_t>(t)];
+                    if constexpr (USE_MOE_QUANT) {
+                        const auto r = S.cache.resolve(g_moe_quant, l, e);
+                        if (r.gate == nullptr) {
+                            std::println(stderr,
+                                         "fatal: could not dequantize routed expert {} of layer {} from "
+                                         "the S0Q1 sidecar (unsupported GGML type or corrupt payload)",
+                                         e, l);
+                            std::abort();
+                        }
+                        moe::expert_ffn_row_source(MOE_DIMS, a, r.gate, r.up, r.down, out_ptr, ffn, g);
+                    } else {
+                        const moe::ExpertWeights w = moe_resolve(L, l, e, S.cache);
+                        moe::expert_ffn_row(MOE_DIMS, a, w.gate, w.up, w.down, out_ptr, ffn, g);
+                    }
                 },
                 ParallelExperts{},
                 L.moe_shared_gate->pdata, L.moe_shared_up->pdata,

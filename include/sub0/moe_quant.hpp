@@ -156,6 +156,23 @@ inline bool dequantize_expert(const Desc& d, std::span<const std::uint8_t> raw, 
     return true;
 }
 
+// Raw encoded bytes -> GGUF SOURCE-order f32 plane, i.e. WITHOUT the transpose step dequantize_expert
+// above applies (B31, docs/INDEPENDENT_REVIEW_BACKLOG.md). `dst` is a caller-owned std::vector sized
+// exactly `in_f*out_f` floats by the caller once (ExpertCacheSource::allocate below) -- gguf::to_f32's
+// own decoders all call resize()/assign() on their `out` vector, so handing them the PERSISTENT slot
+// plane directly (rather than a scratch buffer later copied or transposed elsewhere) means the dequant
+// write is the ONLY DRAM touch this step makes: no separate raw_scratch materialization, no transpose
+// read-back, no transpose write. Paired with moe::expert_ffn_row_source (moe_math.hpp), which reads
+// exactly this layout and is proven (see that function's own comment) to produce bit-identical output to
+// expert_ffn_row on dequantize_expert's transposed planes.
+inline bool dequantize_expert_source(const Desc& d, std::span<const std::uint8_t> raw,
+                                      std::vector<float>& dst) {
+    gguf::TensorInfo t;
+    t.type_raw = d.type_raw;
+    t.dims = {static_cast<std::uint64_t>(d.in_f) * d.out_f};
+    return gguf::to_f32(t, raw, dst);
+}
+
 // --- reader ------------------------------------------------------------------------------------------
 
 // Holds the sidecar's descriptor table and a read-only MAPPING of its encoded payload, in its native
@@ -323,6 +340,84 @@ private:
 
     std::unique_ptr<float[]>            pool_;
     std::vector<float>                  raw_scratch_;   // source-order f32, reused (AGENTS.md S1)
+    std::array<std::uint64_t, Slots>    key_{};
+    std::array<bool, Slots>             live_{};
+    int                                  next_ = 0;
+    std::uint64_t                        hits_ = 0, misses_ = 0;
+};
+
+// --- fused, no-transpose resolve pool (B31) -------------------------------------------------------
+//
+// ExpertCache above resolves an expert in THREE touches of DRAM per plane: gguf::to_f32 writes a
+// scratch buffer in GGUF source order, then transplant::transpose_out_in reads that scratch buffer AND
+// writes the slot's persistent (transposed) plane -- a real, measured cost (docs/
+// INDEPENDENT_REVIEW_BACKLOG.md B30's own byte accounting: ~3 full round trips over each expert's
+// ~19.66 MB plane-set before moe::expert_ffn_row's own read). This class instead dequantizes DIRECTLY
+// into each slot's OWN persistent plane, in GGUF's native SOURCE order, with no transpose at all --
+// dequantize_expert_source above hands gguf::to_f32 the slot's own std::vector as its `out` parameter,
+// so the dequant write IS the plane's only DRAM touch. Pairs with moe::expert_ffn_row_source
+// (moe_math.hpp), which consumes exactly this layout and is proven bit-identical to expert_ffn_row's
+// own output (see that function's own comment for the summation-order argument).
+//
+// Otherwise structurally identical to ExpertCache (same round-robin/key/live bookkeeping, same "only
+// one slot is a correctness requirement, the rest are a pure cache" reasoning) -- kept as a SEPARATE
+// class rather than a mode flag on ExpertCache so the batched path (op_moe, 8 real cross-row cache hits)
+// and every existing test/tool that depends on ExpertCache's current (transposed) contract stay
+// completely untouched (AGENTS.md S10 -- this is a new consumer of dequantize_expert_source, not a
+// changed contract on an existing one). Currently wired only to decode's own single-slot pool
+// (src/backends/cpu/decode.cpp's MoeDecodeThread) -- see that file for why decode's hit rate against
+// ANY pool bigger than one slot is provably zero.
+template <int Slots, std::size_t SlotFloats>
+class ExpertCacheSource {
+public:
+    static_assert(Slots >= 1, "at least one slot -- the resolve path has nowhere to put an expert otherwise");
+    static constexpr std::size_t kFloats = SlotFloats;
+
+    struct Resolved { const float* gate; const float* up; const float* down; };
+
+    // Each plane is its own std::vector, sized ONCE here and never resized again (dequantize_expert_source
+    // always writes exactly SlotFloats elements, so every later gguf::to_f32 call inside resolve() is a
+    // same-size resize -- no reallocation, no new DRAM traffic beyond the dequant write itself).
+    void allocate() {
+        if (plane_[0][0].size() != SlotFloats)
+            for (auto& slot : plane_) for (auto& p : slot) p.assign(SlotFloats, 0.f);
+    }
+
+    Resolved resolve(const Store& store, int layer, int expert) {
+        const std::uint64_t key = (static_cast<std::uint64_t>(layer) << 32)
+                                  | static_cast<std::uint32_t>(expert);
+        for (int s = 0; s < Slots; ++s)
+            if (live_[static_cast<std::size_t>(s)] && key_[static_cast<std::size_t>(s)] == key) {
+                ++hits_;
+                return at(s);
+            }
+        const int s = next_;
+        next_ = (next_ + 1) % Slots;
+        live_[static_cast<std::size_t>(s)] = false;
+        for (int w = 0; w < PerExpert; ++w) {
+            const Desc& d = store.desc(layer, expert, w);
+            if (!dequantize_expert_source(d, store.raw(d), plane_[static_cast<std::size_t>(s)][static_cast<std::size_t>(w)]))
+                return {nullptr, nullptr, nullptr};
+        }
+        key_[static_cast<std::size_t>(s)] = key;
+        live_[static_cast<std::size_t>(s)] = true;
+        ++misses_;
+        return at(s);
+    }
+
+    std::uint64_t hits() const { return hits_; }
+    std::uint64_t misses() const { return misses_; }
+    static constexpr std::uint64_t pool_bytes() {
+        return static_cast<std::uint64_t>(Slots) * PerExpert * SlotFloats * sizeof(float);
+    }
+
+private:
+    Resolved at(int s) {
+        auto& slot = plane_[static_cast<std::size_t>(s)];
+        return {slot[Gate].data(), slot[Up].data(), slot[Down].data()};
+    }
+
+    std::array<std::array<std::vector<float>, PerExpert>, Slots> plane_{};
     std::array<std::uint64_t, Slots>    key_{};
     std::array<bool, Slots>             live_{};
     int                                  next_ = 0;
