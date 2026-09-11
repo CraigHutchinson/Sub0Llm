@@ -453,3 +453,48 @@ TEST_CASE("moeq (WP5b): a Store outlives the scope its FileMap was opened in", "
     // too -- which is also the check that nothing leaked the HANDLE.
     REQUIRE(std::filesystem::remove(path));
 }
+
+TEST_CASE("moeq (B31): the fused no-transpose resolve produces the SAME output as dequant+transpose",
+          "[moequant]") {
+    // THE GATE for the whole B31 design. dequantize_expert_source + moe::expert_ffn_row_source is a
+    // from-scratch REORDERING of the same math dequantize_expert + moe::expert_ffn_row already compute
+    // (see moe_math.hpp's own comment on expert_ffn_row_source for the per-output summation-order
+    // argument this test exists to check, not merely restate): both paths must produce bit-identical
+    // FFN output over the SAME raw encoded bytes, for every one of the three plane roles, or the "one
+    // DRAM touch instead of three" design is measuring a coincidence rather than an identity.
+    const std::string path = temp_path("sub0_moeq_fused.bin");
+    const Built built = build_sidecar(2, path);
+    {
+    moeq::Store store;
+    std::string err;
+    REQUIRE(store.open(path, err));
+
+    moeq::ExpertCache<1, kPerExpert>       transposed;
+    moeq::ExpertCacheSource<1, kPerExpert> fused;
+    transposed.allocate();
+    fused.allocate();
+
+    // A row of input with no zeros anywhere, same reasoning as the WP5b case above: expert_ffn_row(_source)
+    // skips zero inputs, and an all-zero row would make a wrong plane invisible.
+    const moe::Dims dims{kIn, kOut, kExperts, 2};
+    std::vector<float> x(kIn);
+    for (int i = 0; i < kIn; ++i) x[static_cast<std::size_t>(i)] = 0.25f + 0.125f * static_cast<float>(i);
+    std::vector<float> out_t(kIn), out_f(kIn), pre(kOut), g(kOut);
+
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < kExperts; ++e) {
+            const auto rt = transposed.resolve(store, l, e);
+            const auto rf = fused.resolve(store, l, e);
+            REQUIRE(rt.gate != nullptr);
+            REQUIRE(rf.gate != nullptr);
+
+            moe::expert_ffn_row(dims, x.data(), rt.gate, rt.up, rt.down, out_t.data(), pre.data(), g.data());
+            moe::expert_ffn_row_source(dims, x.data(), rf.gate, rf.up, rf.down, out_f.data(), pre.data(), g.data());
+            REQUIRE(std::memcmp(out_t.data(), out_f.data(), out_t.size() * sizeof(float)) == 0);
+            bool any_nonzero = false;
+            for (float v : out_t) any_nonzero = any_nonzero || (v != 0.f);
+            REQUIRE(any_nonzero);
+        }
+    }
+    REQUIRE(std::filesystem::remove(path));
+}

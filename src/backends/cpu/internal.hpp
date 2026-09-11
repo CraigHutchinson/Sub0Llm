@@ -277,6 +277,11 @@ using MoeExpertCache = moeq::ExpertCache<MOE_RESOLVE_SLOTS, MOE_EXPERT_SLOT_FLOA
 // cost 150 MiB per thread to cache nothing.
 inline constexpr int MOE_DECODE_SLOTS = 1;
 using MoeDecodeExpertCache = moeq::ExpertCache<MOE_DECODE_SLOTS, MOE_EXPERT_SLOT_FLOATS>;
+// B31 (docs/INDEPENDENT_REVIEW_BACKLOG.md): decode's own fused, no-transpose pool -- see
+// moeq::ExpertCacheSource's own comment. Same slot count/width as MoeDecodeExpertCache; a different type
+// because it dequantizes directly into SOURCE order instead of this project's transposed convention, and
+// is consumed by moe::expert_ffn_row_source (moe_math.hpp) rather than moe::expert_ffn_row.
+using MoeDecodeExpertCacheSource = moeq::ExpertCacheSource<MOE_DECODE_SLOTS, MOE_EXPERT_SLOT_FLOATS>;
 // How wide decode fans out. B29 (docs/INDEPENDENT_REVIEW_BACKLOG.md): this USED to be
 // min(DEFAULT_THREADS, EXPERTS_PER_TOK) -- one thread per selected expert, on the assumption that more
 // concurrent resolves means more overlapped work. Directly measured, on the real 48-layer BF16 artifact,

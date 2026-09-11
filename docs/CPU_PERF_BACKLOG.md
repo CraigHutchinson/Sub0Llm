@@ -177,6 +177,30 @@ complexity (AGENTS.md §8). Likely explanation: at these plane sizes (320 KiB-90
 sequential read pattern `gguf::to_f32`'s decoders already walk is well served by the hardware prefetcher,
 so a software hint adds instruction overhead without buying anything the hardware wasn't already doing.
 
+### 2e. Resolve pipeline's redundant DRAM round-trips (dequant->transpose->FFN) — FUSED (B31)
+
+`docs/INDEPENDENT_REVIEW_BACKLOG.md` B31 has the full writeup; summarized here per this file's own
+cross-reference convention. The resolve pipeline (`moeq::ExpertCache::resolve` -> `gguf::to_f32` ->
+`transplant::transpose_out_in` -> `moe::expert_ffn_row`) touched each expert's ~19.66 MB plane-set up to
+3 times (dequant write, transpose read, transpose write) before the FFN's own read. Fixed by ELIMINATING
+the transpose stage for decode's hot path, not by tiling all three stages separately: `expert_ffn_row`'s
+existing per-output accumulation order turns out to be reproducible term-for-term as a direct dot product
+against the plane's UNTRANSPOSED GGUF source order (`moe::expert_ffn_row_source`, new), so
+`moeq::dequantize_expert_source` (new) writes the dequantized plane straight into the resolve pool's own
+persistent buffer with no transpose call and no separate scratch buffer at all. Bit-exact (proven in
+`expert_ffn_row_source`'s own comment; checked directly by a new `tests/moe_quant_tests.cpp` case, and by
+`forward`/`forward_one` parity staying exactly 0 on the real 48-layer artifact). Real measured
+before/after (`sub0llm-qwen4-forward --tokens 6`, thermal-confound-aware interleaved A/B, 4 runs each):
+**3.675 s/token before -> 3.385 s/token after, ~7.9% faster** — real and reproducible, but notably smaller
+than the ~40-50% a pure bandwidth-utilization estimate implied, most likely because MoE resolve is only
+part of decode's own per-token cost (backbone, attention, GDN, QSA, router and shared expert are
+unaffected) and because the remaining dequant+FFN-read traffic, not the now-eliminated transpose traffic,
+appears to dominate single-thread bandwidth demand. A `constexpr`, L2-cache-derived row tile
+(`row_tile()`) was also added for the new dot-product loops, per this task's own cache-aware brief, but
+measured to make no reliable difference over the plain unblocked loop — same shape of honest null result
+as 2d's own prefetch finding above, and for the same underlying reason: the access pattern here (stream a
+contiguous row once, reuse a small L1-resident vector) already has no strided axis to block away.
+
 ## 3. Methodology — how to reproduce or extend this profiling
 
 Two complementary techniques, use both, not either:

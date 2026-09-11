@@ -288,3 +288,31 @@ reducing pass count. Files: `include/sub0/moe_quant.hpp`, `include/sub0/gguf.hpp
 `param_store.hpp`/`bf16.hpp`/`fp8.hpp`/`model_file.hpp`/`configurator.cpp`/`sub0llm-transplant.cpp` --
 those are B33's. Gate: bit-exact numerical output (pure data-flow restructuring, no precision change),
 full suite green, real before/after decode throughput on the real 48-layer artifact.
+
+---
+
+**2026-09-11 Claude Code — B31 DONE, branch `feature/b31-cache-tiled-resolve`, NOT merged (session owner
+reverifies, same as every prior package).** Full writeup: `docs/INDEPENDENT_REVIEW_BACKLOG.md` B31 row,
+`docs/CPU_PERF_BACKLOG.md` §2e. Design decision made and documented inline: ELIMINATED the transpose stage
+for decode's hot path (not a 3-stage cache-tiled pipeline) — `expert_ffn_row`'s existing per-output
+accumulation order is reproducible term-for-term as a direct dot product against the plane's UNTRANSPOSED
+GGUF source order, so the transpose was never mathematically necessary for this consumer. New, additive
+surface only: `moeq::dequantize_expert_source`/`ExpertCacheSource` (moe_quant.hpp),
+`moe::expert_ffn_row_source`/`forward_row_via_run_ex` (moe_math.hpp, `forward_row_via_run` now a thin
+wrapper), `MoeDecodeExpertCacheSource` (internal.hpp), decode.cpp's `MoeDecodeThread`/forward_one MoE call
+site switched to the fused path under `USE_MOE_QUANT` only — op_moe's batched path and every existing
+test/tool keep the ORIGINAL `ExpertCache`/`dequantize_expert`/`expert_ffn_row` contract untouched (AGENTS.md
+S10). Bit-exact: proven in `expert_ffn_row_source`'s own comment, checked by a new `tests/moe_quant_tests.cpp`
+case (both paths, same encoded bytes, bit-for-bit output), and by `forward`/`forward_one` parity staying
+exactly 0 on the real 48-layer artifact with the fused path live. `sub0_frontend_tests` 120,923/245 (was
+120,889/244 — +1 case/+34 assertions, the new test only). Real measured on the real 48-layer BF16 artifact
+(`sub0llm-qwen4-forward --tokens 6`, thermal-confound-aware interleaved A/B against a sibling worktree at
+the pre-B31 commit, 4 runs each): **3.675 s/token before -> 3.385 s/token after, ~7.9% faster**, every
+AFTER run faster than every BEFORE run. Reported honestly as smaller than the ~40-50% a pure
+bandwidth-utilization estimate implied — MoE resolve is only part of decode's per-token cost, and the
+eliminated transpose traffic was evidently not the dominant single-thread bandwidth cost. A
+`constexpr`/L2-cache-derived row tile was added per the task's cache-aware brief but measured to make no
+reliable difference (same shape of honest null result as B28's own prefetch finding), kept anyway since it
+costs nothing and documents the real cache budget. Session goal ("actual token-generation near CPU
+theoretical performance") is NOT fully met by this package alone — real progress, gap narrows further but
+does not close; see B31's own backlog row for the full honest accounting.
