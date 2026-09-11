@@ -200,3 +200,14 @@ measurement. Do not touch `docs/ACTIVE_WORK_LOG.md`'s shared rows above.
 still open -- theoretical floor under B27's compute-bound model is ~837 ms/token; next lever is B21's own
 concurrency-ceiling finding, now suspected to be a compute-side bandwidth/cache-contention ceiling rather
 than disk-related.
+
+---
+
+**2026-09-11 Claude Code — B29 dispatched (active).** Following B28, re-measure `ParallelExperts`' real
+10-thread concurrency in the LIVE engine post-dequant-fix, and directly test B27's hypothesis that B21's
+own "~2-3x ceiling, independent of thread count" is a compute-side memory-bandwidth/cache-contention
+effect against the engine's 25+ GiB resident footprint (not disk-I/O concurrency, now ruled out by B27).
+Files: temporary instrumentation only in `src/backends/cpu/decode.cpp` (reverted before commit, per B21's
+and B27's own precedent), plus a possible new isolated harness variant with a large resident-ballast
+footprint if the existing one (B21's own harness, referenced in this file's B21 section) doesn't already
+cover the post-B28 numbers. Do not touch other agents' shared files without checking this log first.
