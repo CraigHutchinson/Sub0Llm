@@ -46,6 +46,10 @@
 #include <cstddef>
 #include <utility>
 
+#include "sub0/simd_reduce.hpp"  // B34/B38: sumsq_choice<UseSimd>() for this file's real contiguous
+                                  // self-dot hot loops in forward()/backward()
+                                  // (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
+
 namespace sub0::gdn {
 
 // Every dimension the recurrence needs, explicit rather than closed over a build's own constants --
@@ -150,7 +154,11 @@ inline void recurrence_step(int dk, int dv, float g_t, float beta_t,
 // are activations and caller scratch, not parameters. In an F32 build `WP` is `const float*` and this
 // is the same function it was; nothing in the body changed but the four `const float* W...` row
 // pointers becoming `auto`.
-template <class WP>
+// B34/B38: `UseSimd` (default false, today's exact scalar behavior) selects this function's own
+// reduction strategy for qss/kss/ms below -- explicit template argument at the call site
+// (src/backends/cpu/{backend,decode}.cpp), not a global read, matching this file's own "explicit Dims"
+// convention. src/backends/cuda/backend.cu's CPU-reference call takes the default (false), unaffected.
+template <bool UseSimd = false, class WP>
 inline void forward(const Dims& d, int T,
                      const float* x,
                      WP w_qkv, WP w_z, WP w_b, WP w_a,
@@ -255,8 +263,11 @@ inline void forward(const Dims& d, int T,
             float qn[256], kn[256];   // generous bound on head_k_dim (real model: 128)
             const float* qraw = row + q_off + hk * dk;
             const float* kraw = row + k_off + hk * dk;
-            float qss = 0.f, kss = 0.f;
-            for (int a = 0; a < dk; ++a) { qss += qraw[a] * qraw[a]; kss += kraw[a] * kraw[a]; }
+            // B34/B38: contiguous self-dot -- was a combined scalar reduction, see simd_reduce.hpp. Each
+            // accumulator has no data dependency on the other, so splitting them into two independent
+            // calls is the same per-accumulator addition order either way (bit-exact at UseSimd=false).
+            const float qss = simd::sumsq_choice<UseSimd>(qraw, dk);
+            const float kss = simd::sumsq_choice<UseSimd>(kraw, dk);
             const float qinv = 1.f / std::sqrt(qss + L2_EPS);
             const float kinv = 1.f / std::sqrt(kss + L2_EPS);
             const float qscale = qinv / std::sqrt(static_cast<float>(dk));   // L2-norm THEN 1/sqrt(dk) -- see header note
@@ -285,8 +296,8 @@ inline void forward(const Dims& d, int T,
         for (int hh = 0; hh < Hv; ++hh) {
             const float* cv = core_row + hh * dv;
             const float* zv = z_row + hh * dv;
-            float ms = 0.f;
-            for (int j = 0; j < dv; ++j) ms += cv[j] * cv[j];
+            // B34/B38: contiguous self-dot -- was a scalar reduction, see simd_reduce.hpp.
+            float ms = simd::sumsq_choice<UseSimd>(cv, dv);
             ms /= dv;
             const float rinv = 1.f / std::sqrt(ms + RMS_EPS);
             for (int j = 0; j < dv; ++j)
@@ -459,6 +470,8 @@ inline void recurrence_step_backward(int dk, int dv, float g_t, float beta_t,
 // throughout (same as forward(), see this file's header comment) -- NOT the raw fixture files'
 // PyTorch [out,in] convention (transpose first, as gdn_qwen4_fixture_tests.cpp's own transpose()
 // helper already does for forward()).
+// B34/B38: `UseSimd` (default false, today's exact scalar behavior), same reasoning as forward()'s own.
+template <bool UseSimd = false>
 inline void backward(const Dims& d, int T,
                       const float* x,
                       const float* w_qkv, const float* w_z, const float* w_b, const float* w_a,
@@ -550,8 +563,11 @@ inline void backward(const Dims& d, int T,
         for (int hk = 0; hk < Hk; ++hk) {
             const float* qraw = qkv_post + static_cast<std::size_t>(t) * conv_dim + q_off + hk * dk;
             const float* kraw = qkv_post + static_cast<std::size_t>(t) * conv_dim + k_off + hk * dk;
-            float qss = 0.f, kss = 0.f;
-            for (int a = 0; a < dk; ++a) { qss += qraw[a] * qraw[a]; kss += kraw[a] * kraw[a]; }
+            // B34/B38: contiguous self-dot -- was a combined scalar reduction, see simd_reduce.hpp. Each
+            // accumulator has no data dependency on the other, so splitting them into two independent
+            // calls is the same per-accumulator addition order either way (bit-exact at UseSimd=false).
+            const float qss = simd::sumsq_choice<UseSimd>(qraw, dk);
+            const float kss = simd::sumsq_choice<UseSimd>(kraw, dk);
             const float qinv = 1.f / std::sqrt(qss + L2_EPS);
             const float kinv = 1.f / std::sqrt(kss + L2_EPS);
             qinv_buf[static_cast<std::size_t>(t) * Hk + hk] = qinv;
@@ -616,8 +632,8 @@ inline void backward(const Dims& d, int T,
         for (int hh = 0; hh < Hv; ++hh) {
             const float* cv = core_row + hh * dv;
             const float* zv = z_row + hh * dv;
-            float ms = 0.f;
-            for (int j = 0; j < dv; ++j) ms += cv[j] * cv[j];
+            // B34/B38: contiguous self-dot -- was a scalar reduction, see simd_reduce.hpp.
+            float ms = simd::sumsq_choice<UseSimd>(cv, dv);
             ms /= dv;
             const float rinv = 1.f / std::sqrt(ms + RMS_EPS);
             rinv_buf[static_cast<std::size_t>(t) * Hv + hh] = rinv;

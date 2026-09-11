@@ -415,3 +415,44 @@ session owner's own host state has changed) the already-documented A/B result ho
 toggle's own definition, not just buried in the backlog. `tools/configurator.cpp` is touched by all three --
 each keeps its own addition small/localized (near `--prec-param`) to minimize merge friction; the session
 owner resolves any 3-way conflict at merge time.
+
+---
+
+**2026-09-11 Claude Code -- B38 done, on `feature/b38-simd-integration`, NOT merged.** Integrated B34's
+SIMD-reduce work as a real `--simd-reduce` configurator flag (`constexpr bool USE_SIMD_REDUCE`, default
+`false`). `include/sub0/simd_reduce.hpp` carries B34's `dot()`/`dot_seq()`/`sumsq()`/`sum()` unchanged plus
+three new `*_choice<UseSimd>()` dispatchers -- the one seam every kernel's reduction call site goes
+through via `if constexpr`, so `gdn_math.hpp`/`gated_residual_math.hpp`/`qsa_math.hpp`/`moe_math.hpp`'s
+surrounding logic (loop bounds, tiling, gating) stays written once and only the innermost reduction call
+differs by template arg. Every affected function (`gdn::forward`/`backward`, `gr::hc_norm`,
+`qsa::rms_norm_row`/`indexer_select_row`/`attn_project_row`/`attn_row`/`forward`,
+`moe::forward_row_via_run_ex` + its thin wrappers) gained a leading `bool UseSimd = false` template
+parameter, threaded explicitly from `USE_SIMD_REDUCE` at every real engine call site in
+`src/backends/cpu/{backend,decode}.cpp`. No file needed a duplicated-body fallback. `expert_ffn_row_source`'s
+three call sites stay on `simd::dot_seq` UNCONDITIONALLY -- outside the `UseSimd` parameter entirely --
+preserving B31's forward()/forward_one() bit-exactness pairing regardless of the flag, per this task's own
+explicit instruction and B34's own found-and-fixed correctness constraint.
+
+**Verification, real numbers**: `d196check`'s own historical corpora are git-LFS/untracked and absent from
+this isolated worktree, so the literal `816c4a54ad49b8cf` hash could not be reproduced directly. Used two
+independent routes instead: (a) `sub0_frontend_tests` (fixture-driven, needs no corpus, exercises all four
+kernel files at the REAL Qwen4 axes) reproduced the exact pre-existing 120,923/245 before any new test was
+added; (b) a synthetic `--vocab-exact` engine config with GDN+MoE+QSA+GR ALL live, built+run through the
+real compiled `sub0_core`/`sub0_tests`: `arch_identity_tests.cpp`'s forward/decode fingerprint reproduced
+identically (forward `0xdbf452a2d188e5b2`, decode `0x7510a105755db578`) across a from-scratch rebuild at
+`USE_SIMD_REDUCE=false`, and `forward_one`-vs-`forward` parity held (1.63e-7, inside the existing 1e-3
+tolerance). At `--simd-reduce 1` on the same axes: builds clean, parity still holds (1.60e-7), and BOTH
+fingerprint hashes CHANGE as expected (forward `0xbfeb0ff9602e504`, decode `0xbc4a564ef53a97b4`) --
+confirming the flag has real, live, deterministic effect through the compiled engine, not dead code. A new
+permanent test (`moe_quant_tests.cpp`, "moeq (B38)") instantiates `forward_row_via_run_ex<true>` directly
+against real sidecar-format bytes and requires both arms finite, close (loose tolerance, not bit-exact),
+and `expert_ffn_row_source`'s own output IDENTICAL between the two runs -- proving the flag stays scoped
+and never leaks into the routed-expert path. `sub0_frontend_tests` with the new case: 120,945/246, all
+green. **Real-artifact throughput spot-check NOT reproduced this session**: the 48-layer BF16 artifact (+
+~37 GiB MoE sidecar) B34's own ~20% number depends on was not present anywhere in this worktree or its
+accessible filesystem (searched, absent) -- flagged honestly rather than assumed; B34's own already
+independently-reconfirmed ~20% decode slowdown (3.09s -> 3.72s mean s/token) stands as the citable number
+pending a future session with access to that artifact re-measuring post-merge. `tools/configurator.cpp`
+touched ONLY for the one `--simd-reduce` option, nothing else restructured. Committed on
+`feature/b38-simd-integration`, not merged -- session owner reverifies before merging, matching every prior
+package this session. See `docs/INDEPENDENT_REVIEW_BACKLOG.md` B38 for full detail.

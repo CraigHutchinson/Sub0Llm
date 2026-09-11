@@ -27,6 +27,9 @@
 #include <cmath>
 #include <cstddef>
 
+#include "sub0/simd_reduce.hpp"  // B34/B38: sumsq_choice<UseSimd>() for this file's real scalar-reduction
+                                  // hot loop, hc_norm's `ms` (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
+
 namespace sub0::gr {
 
 // Every dimension the module needs, explicit rather than closed over a build's own constants -- same
@@ -77,7 +80,11 @@ inline float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 // read, so the promote happens in a register inside the loop and the bytes crossing the memory bus are
 // the narrow ones. Nothing in the body changed except `const float* wg` becoming `auto wg` -- see
 // include/sub0/param_store.hpp for why an out-of-loop promoted buffer could not have done this.
-template <class WP>
+// B34/B38: `UseSimd` (default false, today's exact scalar behavior) selects hc_norm's own reduction
+// strategy -- explicit template argument at the call site (src/backends/cpu/{backend,decode}.cpp), not a
+// global read, matching this file's own "explicit Dims, not closed over the build's own constants"
+// convention (see this file's own header comment).
+template <bool UseSimd = false, class WP>
 inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float* out_normed) {
     constexpr float EPS = 1e-6f;
     const int hs = d.hidden_size, hc = d.hc_count;
@@ -87,8 +94,8 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float
         for (int s = 0; s < hc; ++s) {
             const float* xg = xr + static_cast<std::size_t>(s) * hs;
             float* yg = yr + static_cast<std::size_t>(s) * hs;
-            float ms = 0.f;
-            for (int j = 0; j < hs; ++j) ms += xg[j] * xg[j];
+            // B34/B38: contiguous self-dot -- was a scalar reduction, see simd_reduce.hpp.
+            float ms = simd::sumsq_choice<UseSimd>(xg, hs);
             ms /= hs;
             const float rinv = 1.f / std::sqrt(ms + EPS);
             const auto wg = norm_w + static_cast<std::size_t>(s) * hs;

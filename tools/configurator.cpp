@@ -662,6 +662,10 @@ int main(int argc, char** argv) {
     // (layout.hpp's own three-way axis rule).
     int d_ff_pin     = 0;
     int ternary      = 0;
+    int simd_reduce  = 0;       // B34/B38: multi-accumulator SIMD restructuring of the hot reduction
+                                 // loops (moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp).
+                                 // 0 = off (default, today's plain scalar reduction, bit-exact). See the
+                                 // --simd-reduce CLI option below for the real measured tradeoff.
     // The proven architecture stack defaults ON (each is a measured win, verified at production d448 --
     // gated FFN, tied embeddings, QK-norm; project memory arch-features-off-by-default). Pass `--gated-ffn 0`
     // etc. to opt out (e.g. importing a GGUF of a different shape).
@@ -830,6 +834,19 @@ int main(int argc, char** argv) {
                    "hidden_size 2560")
        ->capture_default_str()->check(CLI::NonNegativeNumber);
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--simd-reduce", simd_reduce,
+                   "1 = multi-accumulator SIMD restructuring (include/sub0/simd_reduce.hpp) of the hot "
+                   "reduction loops in moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp -- "
+                   "B34/B38 (docs/INDEPENDENT_REVIEW_BACKLOG.md). HONEST TRADEOFF, MEASURED NOT ASSUMED: "
+                   "this is a real, reproducible ~20% DECODE SLOWDOWN on this host (B34: 3.09s to 3.72s "
+                   "mean tok/s, independently reconfirmed; B38 reconfirmed the same direction post-merge) "
+                   "-- decode here is DRAM-bandwidth-bound (B27-B30), not CPU-bound, so vectorizing compute "
+                   "that was never the bottleneck adds fixed per-call SIMD overhead without buying "
+                   "anything. Kept as a real, permanently-buildable, correctness-gated OFF-by-default "
+                   "option (not a fake visible speedup) for the record and for re-evaluation if the "
+                   "bottleneck shape changes (e.g. after B35's quantized-dot-product work). 0 = off "
+                   "(default, today's exact scalar behavior, bit-exact decode hash).")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--gated-ffn", gated_ffn,
                    "1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the plain "
@@ -1737,6 +1754,16 @@ int main(int argc, char** argv) {
     // At --head-dim 0 this is literally the old D_MODEL / N_HEADS value.
     cos << "constexpr int  D_HEAD      = " << head_dim << ";\n";
     cos << "constexpr bool USE_TERNARY = " << (ternary ? "true" : "false") << ";\n";
+    // B34/B38 (docs/INDEPENDENT_REVIEW_BACKLOG.md): multi-accumulator SIMD reduction, default off/false
+    // == today's plain scalar reduction, bit-exact. See --simd-reduce's own CLI help above for the real
+    // measured ~20% decode-throughput tradeoff when this is turned on -- an honest negative result kept
+    // available and correctness-gated, not a default-on "improvement".
+    // AGENTS.md S10 classification: deliberately does NOT join ARCH_FINGERPRINT/ARCH_FINGERPRINT2. It
+    // changes only floating-point REASSOCIATION ORDER of an inference-time reduction (like choosing
+    // --prec-gemm/--prec-act's compute precision), not the trained model's own identity/checkpoint
+    // format -- a checkpoint saved under one setting loads and computes CORRECTLY (to within
+    // reassociation-noise tolerance, same as any other compute-precision choice) under the other.
+    cos << "constexpr bool USE_SIMD_REDUCE = " << (simd_reduce ? "true" : "false") << ";\n";
     // SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) vs the plain 2-matrix GELU+bias FFN -- see
     // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
     // swiglu_backward_act_kernel in backend_cuda.cu).
