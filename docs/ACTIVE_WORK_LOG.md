@@ -276,3 +276,15 @@ capability. Correctness gate: same tolerance-based precedent as B24 Phase 1 (Q8_
 own ~0.199 L2 logit diff as the most recent real comparator), full suite green, real measured decode
 throughput AND peak resident memory before/after on the real 48-layer artifact. Do not touch other agents'
 shared files without checking this log first.
+
+---
+
+**2026-09-11 Claude Code — B31 dispatched (active), in parallel with B33 (no file overlap).** Cache-tiled
+fusion of the MoE resolve pipeline (dequant->transpose->FFN), per B30/B32's findings and the user's own
+explicit direction to make this L1/L2/L3-cache-aware with constexpr-derived tile sizes rather than merely
+reducing pass count. Files: `include/sub0/moe_quant.hpp`, `include/sub0/gguf.hpp` (dequant output shape),
+`src/sub0/transplant/*` or wherever `transpose_out_in` lives, `include/sub0/moe_math.hpp`
+(`expert_ffn_row`'s input contract), possibly `src/backends/cpu/decode.cpp`. Does NOT touch
+`param_store.hpp`/`bf16.hpp`/`fp8.hpp`/`model_file.hpp`/`configurator.cpp`/`sub0llm-transplant.cpp` --
+those are B33's. Gate: bit-exact numerical output (pure data-flow restructuring, no precision change),
+full suite green, real before/after decode throughput on the real 48-layer artifact.
