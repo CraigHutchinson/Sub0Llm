@@ -549,6 +549,15 @@ to pursue a branchless/lookup-table `fp8_widen` — the likely fix for the throu
 follow-up; not silently discarded, but not worth shipping as-is. See
 `docs/INDEPENDENT_REVIEW_BACKLOG.md`'s B33 entry for the summary-table record.
 
+**B37 (2026-09-11) — superseding update: integrated into `main` as a real, permanently-available
+`--prec-param fp8`/`PARAM_DTYPE::FP8` build option, NOT as a default.** The "NOT merged" call above was
+correct at the time (shipping FP8 AS THE DEFAULT, or dropping BF16, would have been a real regression),
+but the user's later, separate direction — "integrate the unmerged branches to main... make them A/B
+shootout compliant" — reframes the question: this is not "is FP8 worth replacing BF16 with" (no), it's
+"should a correctness-gated, honestly-documented negative result live as a permanently buildable,
+testable option instead of stranded on a branch nobody re-derives" (yes). Default `--prec-param`
+(unset or `1`) still means BF16, bit-for-bit unchanged from `main` before this merge. See
+`docs/INDEPENDENT_REVIEW_BACKLOG.md`'s B37 row for the integration's own verification detail.
 ---
 
 ## 3. What this document deliberately does not decide yet

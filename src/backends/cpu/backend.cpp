@@ -108,10 +108,11 @@ namespace sub0 {
 // hold gradients and AdamW moments, whose dynamic range is exactly what a reduced master-weight format
 // damages, and a bf16 build is inference-side by construction (the static_assert below).
 static_assert(PARAM_DTYPE == Dtype::F32 || FORWARD_ONLY,
-              "bf16 PARAMETER storage is an inference-side change (docs/BACKBONE_PRECISION.md S1): the "
-              "backward/optimizer path reads parameter leaves through Node::data, which a bf16 build "
-              "deliberately leaves empty, and training against bf16 master weights is a separate, "
-              "unvalidated question this phase does not answer. Configure --prec-param 1 only for a "
+              "bf16/fp8 PARAMETER storage is an inference-side change (docs/BACKBONE_PRECISION.md "
+              "S1/S2): the backward/optimizer path reads parameter leaves through Node::data, which a "
+              "bf16/fp8 build deliberately leaves empty, and training against reduced-precision master "
+              "weights is a separate, unvalidated question this phase does not answer. Configure "
+              "--prec-param 1/2 only for a "
               "forward-only build (Gated Residual / MoE / QSA on), or keep the F32 default.");
 static std::unique_ptr<param_t[]> g_param_data;
 static std::unique_ptr<float[]> g_param_grad;
@@ -223,6 +224,7 @@ static Node* mk_param(int r, int c, bool decay) {
 // build, caught building the sub4 correctness-gate pair. `t->pdata` itself picks the right overload by
 // ordinary overload resolution (ParamCPtr IS one concrete type or the other in any given build).
 static bf16*  param_write_ptr_of(Bf16CPtr p)      { return const_cast<bf16*>(p.p); }
+static fp8*   param_write_ptr_of(Fp8CPtr p)       { return const_cast<fp8*>(p.p); }
 static float* param_write_ptr_of(const float* p)  { return const_cast<float*>(p); }
 static param_t* param_write_ptr(Node* t) { return param_write_ptr_of(t->pdata); }
 static std::size_t param_count(const Node* t) {
@@ -344,6 +346,10 @@ static void maybe_ternarize(const float*& Wf, Node* W, Node* y, bool ternary) {
     }
 }
 static void maybe_ternarize(Bf16CPtr&, Node*, Node*, bool) {}
+// B33: USE_TERNARY is a trainable-path feature (see the comment above), and PARAM_DTYPE==FP8 is
+// restricted to FORWARD_ONLY by the SAME arena static_assert BF16 is -- so this is the identical
+// no-op, just for the third pointer type.
+static void maybe_ternarize(Fp8CPtr&, Node*, Node*, bool) {}
 
 static Node* op_linear(Node* x, Node* W, Node* bias, bool ternary) {
     const int T = x->rows, in = x->cols, out = W->cols;
@@ -2030,15 +2036,16 @@ bool load_moe_quant_sidecar(const char* model_path) {
 // and anything else that only needs BYTES uses param_store_ptr() below.
 [[noreturn]] static void refuse_f32_params() {
     std::println(stderr,
-                 "fatal: this build stores parameters as bf16 (--prec-param 1), so there is no f32 view "
+                 "fatal: this build stores parameters as {} (--prec-param 1/2), so there is no f32 view "
                  "of the parameter arena. A caller asking for params_ptr() wants either f32 master "
-                 "weights (a training path -- not supported in a bf16 build, see backend.cpp's own "
-                 "static_assert) or raw storage (use param_store_ptr()/param_store_bytes()).");
+                 "weights (a training path -- not supported in a bf16/fp8 build, see backend.cpp's own "
+                 "static_assert) or raw storage (use param_store_ptr()/param_store_bytes()).",
+                 param_dtype_name(static_cast<std::int32_t>(PARAM_FILE_DTYPE)));
     std::abort();
 }
 float*      params_ptr()       {
     ensure_shared_params();
-    if constexpr (PARAM_DTYPE == Dtype::BF16) refuse_f32_params();
+    if constexpr (PARAM_DTYPE != Dtype::F32) refuse_f32_params();
     else return reinterpret_cast<float*>(g_param_data.get());
 }
 void*       param_store_ptr()  { ensure_shared_params(); return g_param_data.get(); }
@@ -2048,7 +2055,7 @@ std::size_t param_store_bytes(){ return PARAM_FLOATS * sizeof(param_t); }
 // [[noreturn]] FORWARD_ONLY refusal. Kept as a named function so that reasoning lives in one place
 // rather than at each `g_param_data[i]` the optimizer touches.
 static float* param_master_f32() {
-    if constexpr (PARAM_DTYPE == Dtype::BF16) refuse_f32_params();
+    if constexpr (PARAM_DTYPE != Dtype::F32) refuse_f32_params();
     else return reinterpret_cast<float*>(g_param_data.get());
 }
 // reduced grad the optimizer reads / the two AdamW moments -- all three absent under FORWARD_ONLY.

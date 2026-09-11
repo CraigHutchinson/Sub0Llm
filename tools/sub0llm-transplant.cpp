@@ -35,6 +35,7 @@
 // unmatched-source list rather than silently skipped.
 
 #include "sub0/bf16.hpp"
+#include "sub0/fp8.hpp"
 #include "sub0/gguf.hpp"
 #include "sub0/layout.hpp"
 #include "sub0/model_file.hpp"
@@ -414,7 +415,8 @@ int main(int argc, char** argv) {
     CLI::App app{"sub0llm-transplant: a real Qwen4-preview GGUF -> this project's own S0L5 model file"};
     std::string gguf_dir, out_path, verify_path;
     bool dry_run = false;
-    int  param_dtype_opt = 0;   // B24 (docs/BACKBONE_PRECISION.md S1a-1): 0=f32 (default), 1=bf16
+    int  param_dtype_opt = 0;   // B24/B33 (docs/BACKBONE_PRECISION.md S1a-1/S2): 0=f32 (default),
+                                 // 1=bf16, 2=fp8 (E4M3)
     app.add_option("--gguf", gguf_dir, "directory holding the model's .gguf shards")->required();
     app.add_option("--out", out_path, "destination .bin (omit with --dry-run or --verify)");
     app.add_flag("--dry-run", dry_run,
@@ -425,10 +427,10 @@ int main(int argc, char** argv) {
     // the full-precision float. Round-to-nearest-even (bf16.hpp's f32_narrow), not truncation, so the
     // conversion has zero mean error rather than a systematic shrink over 4.9e9 weights.
     app.add_option("--param-dtype", param_dtype_opt,
-                   "Output element type for the parameter blob: 0=f32 (default), 1=bf16 (round-to-"
-                   "nearest-even). Must match the CONSUMING build's own --prec-param (tools/"
-                   "configurator.cpp) or load_model refuses the file.")
-       ->check(CLI::Range(0, 1));
+                   "Output element type for the parameter blob: 0=f32 (default), 1=bf16, 2=fp8/E4M3 "
+                   "(all round-to-nearest-even). Must match the CONSUMING build's own --prec-param "
+                   "(tools/configurator.cpp) or load_model refuses the file.")
+       ->check(CLI::Range(0, 2));
     // Re-runs the ENTIRE pipeline against an existing artifact and compares every destination tensor
     // BIT-FOR-BIT with what the transplant computes. Not redundant with the write: it is the only
     // thing that checks the bytes that actually landed on disk -- header size, tensor placement,
@@ -441,7 +443,9 @@ int main(int argc, char** argv) {
         std::println(stderr, "error: one of --out, --dry-run or --verify is required");
         return 2;
     }
-    const ParamDtype out_dtype = (param_dtype_opt == 1) ? ParamDtype::BF16 : ParamDtype::F32;
+    const ParamDtype out_dtype = (param_dtype_opt == 1) ? ParamDtype::BF16
+                                : (param_dtype_opt == 2) ? ParamDtype::FP8
+                                                          : ParamDtype::F32;
     const int elem_bytes = param_dtype_bytes(static_cast<std::int32_t>(out_dtype));
     if (!verify_path.empty()) dry_run = true;   // verifying never writes
 
@@ -524,6 +528,7 @@ int main(int argc, char** argv) {
     std::vector<std::uint8_t> raw;
     std::vector<float> src, src_b, dst, perm;
     std::vector<bf16> bf16_buf, vbf16;   // B24: --param-dtype 1's write/verify scratch (bf16.hpp)
+    std::vector<fp8>  fp8_buf, vfp8;     // B33: --param-dtype 2's write/verify scratch (fp8.hpp)
     const auto t0 = std::chrono::steady_clock::now();
     int last_pct = -1;
 
@@ -646,6 +651,14 @@ int main(int argc, char** argv) {
                 for (std::size_t k = 0; k < dst.size(); ++k) bf16_buf[k] = f32_narrow(dst[k]);
                 os.write(reinterpret_cast<const char*>(bf16_buf.data()),
                          static_cast<std::streamsize>(bf16_buf.size() * sizeof(bf16)));
+            } else if (out_dtype == ParamDtype::FP8) {
+                // B33: narrow through the SAME fp8_narrow(float)->fp8 the correctness gate below
+                // compares against (fp8.hpp; named distinctly from bf16.hpp's own f32_narrow since
+                // C++ cannot overload on return type alone -- see fp8.hpp's own comment).
+                fp8_buf.resize(dst.size());
+                for (std::size_t k = 0; k < dst.size(); ++k) fp8_buf[k] = fp8_narrow(dst[k]);
+                os.write(reinterpret_cast<const char*>(fp8_buf.data()),
+                         static_cast<std::streamsize>(fp8_buf.size() * sizeof(fp8)));
             } else {
                 os.write(reinterpret_cast<const char*>(dst.data()),
                          static_cast<std::streamsize>(dst.size() * sizeof(float)));
@@ -666,6 +679,17 @@ int main(int argc, char** argv) {
                         // Compare against the SAME rounding a fresh write of `dst` would produce, not
                         // against the pre-rounding float -- see this flag's own --verify comment above.
                         if (vbf16[k].bits != f32_narrow(dst[k]).bits) { values_match = false; break; }
+                    }
+            } else if (out_dtype == ParamDtype::FP8) {
+                vfp8.assign(n, fp8{});
+                vs.read(reinterpret_cast<char*>(vfp8.data()), static_cast<std::streamsize>(n * sizeof(fp8)));
+                short_read = static_cast<std::size_t>(vs.gcount()) != n * sizeof(fp8);
+                if (!short_read)
+                    for (std::size_t k = 0; k < n; ++k) {
+                        vbuf[k] = to_f32(vfp8[k]);
+                        // Same "compare against the SAME rounding a fresh write would produce" rule as
+                        // the bf16 branch above.
+                        if (vfp8[k].bits != fp8_narrow(dst[k]).bits) { values_match = false; break; }
                     }
             } else {
                 vs.read(reinterpret_cast<char*>(vbuf.data()), static_cast<std::streamsize>(n * sizeof(float)));

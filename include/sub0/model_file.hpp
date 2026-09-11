@@ -43,7 +43,10 @@ namespace sub0 {
 // enum at all (it is a model-axes header, not a full generated config). The FILE's own vocabulary of
 // element types must not depend on which of the two config headers a writer happened to be built
 // against. The engine maps its own `PARAM_DTYPE` onto this in engine_core.cpp.
-enum class ParamDtype : std::int32_t { F32 = 0, BF16 = 1 };
+// B33 (docs/BACKBONE_PRECISION.md S2): FP8 adds a third element width. It is a flat E4M3 float
+// (sub0/fp8.hpp), NOT any GGUF-style per-block-scaled quant format -- see that header's own comment for
+// why the two must not be confused.
+enum class ParamDtype : std::int32_t { F32 = 0, BF16 = 1, FP8 = 2 };
 
 // Bytes per stored element. Returns 0 for an unrecognised tag -- callers use that as the "refuse"
 // signal rather than guessing 4 (see load_model, which would otherwise read the wrong number of bytes
@@ -52,6 +55,7 @@ enum class ParamDtype : std::int32_t { F32 = 0, BF16 = 1 };
     switch (tag) {
         case static_cast<std::int32_t>(ParamDtype::F32):  return 4;
         case static_cast<std::int32_t>(ParamDtype::BF16): return 2;
+        case static_cast<std::int32_t>(ParamDtype::FP8):  return 1;
         default: return 0;
     }
 }
@@ -59,6 +63,7 @@ enum class ParamDtype : std::int32_t { F32 = 0, BF16 = 1 };
     switch (tag) {
         case static_cast<std::int32_t>(ParamDtype::F32):  return "f32";
         case static_cast<std::int32_t>(ParamDtype::BF16): return "bf16";
+        case static_cast<std::int32_t>(ParamDtype::FP8):  return "fp8";
         default: return "<unrecognised>";
     }
 }

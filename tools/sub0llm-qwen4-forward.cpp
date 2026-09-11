@@ -165,8 +165,12 @@ int main(int argc, char** argv) {
         return 2;
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::println("load_model: ACCEPTED in {:.1f}s ({:.2f} GiB of f32 parameters)", load_s,
-                 static_cast<double>(PARAM_FLOATS) * 4.0 / (1024.0 * 1024.0 * 1024.0));
+    // B33: was hardcoded "f32"/*4.0 bytes -- pre-existing since B24 added a second dtype, now generic
+    // over all three (PARAM_ELEM_BYTES/PARAM_FILE_DTYPE, param_store.hpp), boy-scouted while touching
+    // this file for the FP8 gate.
+    std::println("load_model: ACCEPTED in {:.1f}s ({:.2f} GiB of {} parameters)", load_s,
+                 static_cast<double>(PARAM_FLOATS) * PARAM_ELEM_BYTES / (1024.0 * 1024.0 * 1024.0),
+                 param_dtype_name(static_cast<std::int32_t>(PARAM_FILE_DTYPE)));
     report_memory("after load");
 
     // B24 (docs/BACKBONE_PRECISION.md): this whole tool predates PARAM_DTYPE and its raw-pointer
@@ -210,7 +214,8 @@ int main(int argc, char** argv) {
                      h.mean, h.rms, h.min, h.max);
     }
     } else {
-        std::println("\n--- 2. skipped: needs f32 params_ptr() (this build stores parameters as bf16) ---");
+        std::println("\n--- 2. skipped: needs f32 params_ptr() (this build stores parameters as {}) ---",
+                     param_dtype_name(static_cast<std::int32_t>(PARAM_FILE_DTYPE)));
     }
 
     std::println("\n--- 3. Model::forward on the real weights -------------------------------");
@@ -426,7 +431,8 @@ int main(int argc, char** argv) {
             std::println("worst relative disagreement, engine path vs math-core replay: "
                          "||h_in|| {:.3g}, ||delta|| {:.3g}", worst_h, worst_d);
     } else {
-        std::println("\n--- 3b. skipped: needs f32 params_ptr() (this build stores parameters as bf16) ---");
+        std::println("\n--- 3b. skipped: needs f32 params_ptr() (this build stores parameters as {}) ---",
+                     param_dtype_name(static_cast<std::int32_t>(PARAM_FILE_DTYPE)));
     }
 
     std::println("\n--- 4. forward vs forward_one parity at the real dims --------------------");
@@ -506,7 +512,8 @@ int main(int argc, char** argv) {
         std::println("    and the eps question that removal made moot: max|1e-5 - 1e-6| = {:.6g}", d56);
     }
     } else {
-        std::println("\n--- 5. skipped: needs f32 params_ptr() (this build stores parameters as bf16) ---");
+        std::println("\n--- 5. skipped: needs f32 params_ptr() (this build stores parameters as {}) ---",
+                     param_dtype_name(static_cast<std::int32_t>(PARAM_FILE_DTYPE)));
     }
 
     std::println("\n--- peak resource use ---------------------------------------------------");

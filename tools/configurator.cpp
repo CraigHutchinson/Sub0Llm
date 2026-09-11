@@ -676,15 +676,15 @@ int main(int argc, char** argv) {
     int bf16         = 2;       // float16 capability: 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)
     int prec_gemm    = 9;       // GEMM input precision: 0=F32,1=BF16,2=F16; 9=AUTO (16b if capable)
     int prec_act     = 9;       // saved-activation storage precision: same codes; 9=AUTO
-    int prec_param   = 0;       // B24: PARAMETER (backbone weight) storage precision, 0=F32 (default,
-                                 // unchanged) or 1=BF16. Deliberately NOT sharing --prec-gemm/--prec-act's
-                                 // 2=F16/9=AUTO codes: those two pick a COMPUTE precision on a device
-                                 // that may or may not support it, and AUTO is the right default there.
-                                 // This one picks the on-disk/in-RAM element type of the checkpoint's own
-                                 // weight blob (docs/BACKBONE_PRECISION.md S1), which is a deliberate,
-                                 // model-identity decision with a file-format consequence -- never
-                                 // something to infer from hardware. F16 is not offered because nothing
-                                 // reads it (AGENTS.md S8).
+    int prec_param   = 0;       // B24/B33: PARAMETER (backbone weight) storage precision, 0=F32
+                                 // (default, unchanged), 1=BF16, or 2=FP8 (E4M3, docs/BACKBONE_PRECISION.md
+                                 // S2). Deliberately NOT sharing --prec-gemm/--prec-act's 2=F16/9=AUTO
+                                 // codes: those two pick a COMPUTE precision on a device that may or may
+                                 // not support it, and AUTO is the right default there. This one picks
+                                 // the on-disk/in-RAM element type of the checkpoint's own weight blob,
+                                 // which is a deliberate, model-identity decision with a file-format
+                                 // consequence -- never something to infer from hardware. F16 is not
+                                 // offered because nothing reads it (AGENTS.md S8).
     int vocab_target = 0;       // 0 = auto-size from corpus scale (autosize_dims.vocab); nonzero pins it
     double size_scale = 1.0;    // multiplier on the auto-sizer's target-parameter budget: <1 = smaller/
                                  // faster/safer starting point, >1 = more generous -- same formula
@@ -858,10 +858,10 @@ int main(int argc, char** argv) {
     app.add_option("--prec-act", prec_act, "Saved-activation storage precision: 0=F32,1=BF16,2=F16,9=AUTO")
        ->capture_default_str()->check(CLI::Range(0, 9));
     app.add_option("--prec-param", prec_param,
-                   "Backbone weight STORAGE precision: 0=F32 (default), 1=BF16. Halves the resident "
-                   "parameter arena and the model file; changes the checkpoint format (see "
-                   "docs/BACKBONE_PRECISION.md)")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "Backbone weight STORAGE precision: 0=F32 (default), 1=BF16 (half the resident "
+                   "parameter arena and the model file), 2=FP8/E4M3 (a quarter -- coarser precision, see "
+                   "docs/BACKBONE_PRECISION.md S2). Changes the checkpoint format.")
+       ->capture_default_str()->check(CLI::Range(0, 2));
     app.add_option("--dump-vocab", dump_vocab,
                    "Write readable vocabulary-analysis dumps to <prefix>.{corpus_vocab,token_vocab,ngrams}.txt and exit");
     app.add_option("--vocab",  vocab_target, "Target vocabulary size (base + markers + word pieces; 0 = auto from corpus)")
@@ -1764,7 +1764,10 @@ int main(int argc, char** argv) {
     sos << "// Precision + hardware facts + tuned runtime defaults; regenerate per machine / after `tune`.\n";
     sos << "#pragma once\n\n";
     sos << "// --- Reduced precision: per-section Dtype (FP32 accumulate + FP32 master weights) ---\n";
-    sos << "enum class Dtype { F32, BF16, F16, Q8, Q4 };  // F16/Q8/Q4 reserved; only F32/BF16 wired\n";
+    // FP8 (B33, docs/BACKBONE_PRECISION.md S2): a flat E4M3 float (sub0/fp8.hpp), NOT the block-scaled
+    // quant mechanism Q8/Q4 were reserved for -- B24 Phase 2 (S2c) measured that mechanism a decisive
+    // 5-30x loser for a dense backbone access pattern, so this project deliberately does not build it.
+    sos << "enum class Dtype { F32, BF16, F16, Q8, Q4, FP8 };  // F16/Q8/Q4 reserved; F32/BF16/FP8 wired\n";
     sos << "constexpr bool  FLOAT16_OK    = " << (f16_ok ? "true" : "false") << ";\n";
     sos << "constexpr Dtype FLOAT16_KIND  = Dtype::BF16;\n";
     sos << "constexpr bool  BF16_OK       = " << (f16_ok ? "true" : "false") << ";\n";
@@ -1772,15 +1775,17 @@ int main(int argc, char** argv) {
     sos << "constexpr Dtype ACT_DTYPE     = Dtype::" << act_dt  << ";  // saved activations (VRAM)\n";
     sos << "constexpr Dtype MASTER_DTYPE  = Dtype::F32;\n";
     sos << "constexpr Dtype HEAD_DTYPE    = Dtype::F32;\n";
-    sos << "// PARAM_DTYPE (B24, docs/BACKBONE_PRECISION.md S1): the element type of the shared\n";
+    sos << "// PARAM_DTYPE (B24/B33, docs/BACKBONE_PRECISION.md S1/S2): the element type of the shared\n";
     sos << "// parameter arena AND of the model file's weight blob -- the one Dtype below that is read\n";
     sos << "// by the CPU backend rather than only by CUDA. F32 is the default and leaves every byte of\n";
-    sos << "// the previous behaviour alone; BF16 halves both. INFERENCE-SIDE ONLY: a BF16 arena has no\n";
-    sos << "// f32 span for backward/AdamW to read or write (Node::pdata's own comment), so\n";
-    sos << "// src/backends/cpu/backend.cpp static_asserts PARAM_DTYPE==BF16 implies FORWARD_ONLY -- pick\n";
-    sos << "// --prec-param 1 only for a forward-only build (Gated Residual / MoE / QSA on, the real\n";
+    sos << "// the previous behaviour alone; BF16 halves it, FP8 (E4M3, sub0/fp8.hpp) quarters it at a\n";
+    sos << "// real precision cost (S2d). INFERENCE-SIDE ONLY: a BF16/FP8 arena has no f32 span for\n";
+    sos << "// backward/AdamW to read or write (Node::pdata's own comment), so\n";
+    sos << "// src/backends/cpu/backend.cpp static_asserts PARAM_DTYPE!=F32 implies FORWARD_ONLY -- pick\n";
+    sos << "// --prec-param 1/2 only for a forward-only build (Gated Residual / MoE / QSA on, the real\n";
     sos << "// Qwen4-preview axes), never a trainable one.\n";
-    sos << "constexpr Dtype PARAM_DTYPE   = Dtype::" << (prec_param == 1 ? "BF16" : "F32") << ";\n\n";
+    sos << "constexpr Dtype PARAM_DTYPE   = Dtype::"
+        << (prec_param == 1 ? "BF16" : (prec_param == 2 ? "FP8" : "F32")) << ";\n\n";
     sos << "// --- Cached hardware facts + persisted tuned runtime defaults -----------\n";
     sos << "constexpr int  HW_CONCURRENCY            = " << hw_concurrency  << ";\n";
     sos << "constexpr int  MAX_WORKERS               = " << max_workers     << ";\n";
