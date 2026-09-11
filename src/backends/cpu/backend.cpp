@@ -150,6 +150,8 @@ static void ensure_shared_params() {
 }
 
 moeq::Store g_moe_quant;
+moeio::PlaneIo<MOE_IO_MAX_INFLIGHT> g_moe_decode_io;   // B36 -- opened alongside g_moe_quant below, only
+                                                        // under MOE_IO_PIPELINED
 
 std::array<std::unique_ptr<Worker>, MAX_WORKERS> g_workers{};
 thread_local Worker* W = nullptr;
@@ -2025,6 +2027,21 @@ bool load_moe_quant_sidecar(const char* model_path) {
                          (1024.0 * 1024.0 * 1024.0),
                      MOE_RESOLVE_SLOTS, MOE_EXPERT_SLOT_FLOATS,
                      static_cast<double>(MoeExpertCache::pool_bytes()) / (1024.0 * 1024.0));
+        // B36: decode's explicit-overlapped-I/O handle onto the SAME file -- a second, independent
+        // open (Windows allows concurrent read-only handles; FILE_SHARE_READ on both), because it needs
+        // FILE_FLAG_OVERLAPPED, which g_moe_quant's mmap-backed handle does not carry and does not need
+        // for the mmap-backed reactive path it still serves (default, and always for op_moe's batched
+        // path). Only opened under MOE_IO_PIPELINED -- the default (reactive) build never touches this
+        // handle at all, matching AGENTS.md S4's "zero effect on existing builds until explicitly
+        // enabled".
+        if constexpr (MOE_IO_PIPELINED) {
+            if (!g_moe_decode_io.open(path, err)) {
+                std::println(stderr,
+                             "error: B36 pipelined-I/O handle failed to open beside the S0Q1 sidecar: {}",
+                             err);
+                return false;
+            }
+        }
         return true;
     }
 }

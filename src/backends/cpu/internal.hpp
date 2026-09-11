@@ -21,6 +21,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/gdn_math.hpp"        // Gated DeltaNet dims/scratch sizing (calc_act_cap)
+#include "sub0/moe_io.hpp"          // B36: explicit overlapped I/O for decode's resolve path
 #include "sub0/moe_math.hpp"        // moe::ExpertWeights (moe_resolve) + scratch sizing
 #include "sub0/moe_quant.hpp"       // WP4e: the quantized-resident routed-expert store + pool
 #include "sub0/qsa_math.hpp"        // QSA scratch sizing (calc_act_cap) + the rotary tables' own math
@@ -307,6 +308,17 @@ inline constexpr int MOE_DECODE_THREADS = 1;
 // construction -- FORWARD_ONLY below -- so nothing can write a routed expert), hence shared across
 // threads without synchronization. The CACHE is per-Worker, because it is mutable scratch.
 extern moeq::Store g_moe_quant;
+
+// B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): decode's explicit-overlapped-I/O reader for the
+// sidecar's payload, opened only when MOE_IO_PIPELINED -- a SEPARATE open handle from g_moe_quant's own
+// read-only mapping (which stays exactly as it is, still used by the batched op_moe path and by
+// decode's own default/reactive resolve). One layer's worth of plane reads (EXPERTS_PER_TOK selected
+// experts * moeq::PerExpert planes each) is the largest `submit()` this pass ever issues, so that bounds
+// MaxInFlight at compile time (AGENTS.md S1); `> 0 ? ... : 1` mirrors MOE_DECODE_THREADS's own guard
+// against EXPERTS_PER_TOK == 0 in a MoE-off build, where this is declared but never opened or submitted
+// to (see backend.cpp's load_moe_quant_sidecar and decode.cpp's ParallelExperts::prefetch).
+inline constexpr int MOE_IO_MAX_INFLIGHT = (EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1) * moeq::PerExpert;
+extern moeio::PlaneIo<MOE_IO_MAX_INFLIGHT> g_moe_decode_io;
 
 struct ParamView { size_t off, n; bool decay; };
 
