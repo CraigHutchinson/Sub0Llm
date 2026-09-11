@@ -561,10 +561,28 @@ inline bool dequantize_iq2_xxs(std::span<const std::uint8_t> raw, std::uint64_t 
             for (int l = 0; l < 4; ++l) {
                 const std::uint64_t grid = IQ2XXS_GRID[aux8[l]];
                 const std::uint8_t signs = KSIGNS_IQ2XS[(aux[1] >> (7 * l)) & 127];
-                for (int j = 0; j < 8 && w < n; ++j, ++w) {
-                    const auto mag = static_cast<std::uint8_t>((grid >> (8 * j)) & 0xFFu);
-                    out[static_cast<std::size_t>(w)] =
-                        db * static_cast<float>(mag) * ((signs & KMASK_IQ2XS[j]) ? -1.f : 1.f);
+                // Perf (B28, see docs/CPU_PERF_BACKLOG.md 2d): the whole-group case (every group but
+                // possibly the very last of the tensor) uses a fixed, unrollable 8-iteration loop with
+                // no tail-bound check, and a branchless sign (KMASK_IQ2XS[j] == 1 << j, see
+                // gguf_quant_tables.hpp, so "bit j of signs" is (signs >> j) & 1 -- no data-dependent
+                // branch on essentially-random sign bits, which is where the real cost lived: the
+                // guarded loop shared with dequantize_iq1_s alone did not explain the 6x gap, since
+                // IQ1_S's inner loop is branch-free arithmetic). Numerically identical: 1.f - 2.f*bit
+                // is exact for bit in {0,1}, same as the prior ternary, and this is verified bit-exact
+                // against the ORIGINAL guarded/branching form (kept below for the genuine tail case).
+                if (w + 8 <= n) {
+                    for (int j = 0; j < 8; ++j) {
+                        const auto mag = static_cast<std::uint8_t>((grid >> (8 * j)) & 0xFFu);
+                        const float sign = 1.f - 2.f * static_cast<float>((signs >> j) & 1u);
+                        out[static_cast<std::size_t>(w + j)] = db * static_cast<float>(mag) * sign;
+                    }
+                    w += 8;
+                } else {
+                    for (int j = 0; j < 8 && w < n; ++j, ++w) {
+                        const auto mag = static_cast<std::uint8_t>((grid >> (8 * j)) & 0xFFu);
+                        out[static_cast<std::size_t>(w)] =
+                            db * static_cast<float>(mag) * ((signs & KMASK_IQ2XS[j]) ? -1.f : 1.f);
+                    }
                 }
             }
         }
