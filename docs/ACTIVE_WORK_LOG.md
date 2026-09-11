@@ -316,3 +316,16 @@ reliable difference (same shape of honest null result as B28's own prefetch find
 costs nothing and documents the real cache budget. Session goal ("actual token-generation near CPU
 theoretical performance") is NOT fully met by this package alone — real progress, gap narrows further but
 does not close; see B31's own backlog row for the full honest accounting.
+
+---
+
+**2026-09-11 Claude Code — B31 done, merged, pushed.** Eliminated the MoE resolve's transpose stage
+entirely (not just tiled it) -- a proven bit-exact reordering (expert_ffn_row's accumulation order is
+reproducible as a direct dot product against GGUF's untransposed source layout, since transpose_out_in is
+a pure permutation). Independently reverified: hand-traced the permutation semantics myself, reran the
+real 48-layer model (max diff 0, logits identical to my own earlier recorded numbers), suites match exactly
+(120,923/245). Merged `--no-ff` (`d75449b`), full d196check rebuild + suites green, pushed. Real measured
+decode: ~3.675 s/token -> ~3.385 s/token (~7.9%, agent's controlled A/B) -- smaller than the theoretical
+estimate implied, honestly reported (MoE resolve is only part of decode's cost; the eliminated transpose
+traffic wasn't as dominant as the byte-counting arithmetic suggested). B33 (FP8 backbone) still running in
+parallel, no file overlap confirmed.
