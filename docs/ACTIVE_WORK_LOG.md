@@ -343,3 +343,24 @@ it saves. Quality also markedly worse than BF16 (L2 0.43 vs 0.199). Kept unmerge
 docs/BACKBONE_PRECISION.md S2d and docs/INDEPENDENT_REVIEW_BACKLOG.md B33 for full detail. Session total
 this thread: B27->B28->B29->B31 real wins (baseline ~5.5-6.0 s/token -> ~3.38 s/token); B25 and B33 real,
 correctness-clean, but not currently worth shipping.
+
+---
+
+**2026-09-11 Claude Code — B34 dispatched (active).** User asked us to cross-check llama.cpp's own
+implementation for concrete techniques. Two real findings from directly reading `ggml`'s x86 quant kernels
+and probing our own codegen: (1) llama.cpp's core technique is quantized-activation x quantized-weight
+integer SIMD dot products (a genuinely different kernel shape, filed for a later dedicated pass, NOT this
+package); (2) more immediately actionable -- Sub0Llm's own hot reduction loops (`s += x[i]*w[i]` in
+moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp) do NOT auto-vectorize AT ALL, confirmed by
+compiling the exact loop shape standalone (Clang: "cannot prove it is safe to reorder floating-point
+operations") -- this is true regardless of `-march=native`/AVX2 already being enabled in our build configs
+(SUB0_NATIVE=ON), the compiler simply refuses to vectorize a strict scalar FP reduction. A quick multi-
+accumulator restructuring test got real SIMD codegen (SLP vectorizer kicked in, ymm registers appeared)
+immediately. B34 dispatched to apply this restructuring to every real hot reduction loop across the four
+`*_math.hpp` kernel files, `consteval`-derived lane count matching this host's AVX2 width (8 floats/ymm --
+confirmed via B24/B31's own host facts, no AVX-512 on Arrow Lake-HX). This WILL change summation order
+(reassociation across lanes), so it is NOT expected to be bit-exact -- gate is the honest ULP/L2-diff
+discipline this session has used throughout (B24/B31 precedent), not a bit-exact requirement. Files:
+`include/sub0/moe_math.hpp`, `include/sub0/gdn_math.hpp`, `include/sub0/qsa_math.hpp`,
+`include/sub0/gated_residual_math.hpp`. Does not touch param_store/fp8/bf16/model_file/configurator/
+transplant (B33's files, unmerged) or moe_quant.hpp/decode.cpp (B31's files, already merged).
