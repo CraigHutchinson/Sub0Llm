@@ -486,3 +486,13 @@ Updated `docs/INDEPENDENT_REVIEW_BACKLOG.md`'s B37 row with all of the above. No
 `prec_param` variable comment, its `CLI::App::add_option` help text/range, and the generated `Dtype`
 enum/`PARAM_DTYPE` line -- nothing else in the file). Committed, NOT merged, NOT pushed -- the session
 owner independently reverifies before merging, same as every prior package.
+
+---
+
+**2026-09-11 Claude Code — B37 done, merged, pushed.** FP8 integrated into `main` as a real, permanent,
+opt-in `--prec-param 2` build option (default stays BF16, byte-for-byte unaffected). Independently
+reverified (configurator.cpp diff localized as claimed, suites match exactly, real-model logits identical
+to earlier session recordings). Hit the same stale-generated-config issue B24 Phase 1's merge hit --
+rebuilt `sub0llm-configure`, regenerated `d196check`, full rebuild + suites green, decode hash unchanged.
+Merged `--no-ff` (`183230b`), pushed. Deleted the now-superseded `feature/b33-fp8-backbone` branch.
+B36/B38 still running in parallel.
