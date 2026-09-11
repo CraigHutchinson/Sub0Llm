@@ -380,3 +380,38 @@ B25/B33 precedent. This reinforces (alongside B28's prefetch null and B33's FP8 
 workload is DRAM-bandwidth-bound, not CPU-bound -- compute-side speedups don't help. B35 (quantized-dot-
 product, reduces bytes moved not just compute) remains the more promising next lever. See
 docs/INDEPENDENT_REVIEW_BACKLOG.md B34 for full detail.
+
+---
+
+**2026-09-11 Claude Code — B36/B37/B38 dispatched (active, in parallel).** User: "integrate the unmerged
+branches to main - but make them A/B shootout compliant so they are visible improvements and cleanly
+maintained." Integrating B25/B33/B34's real, correctness-clean-but-negative-result work into `main` as
+proper compile-time-selectable toggles (matching this project's existing `--prec-param`/`PARAM_DTYPE`
+idiom) rather than leaving them stranded on unmerged local branches -- each keeps its arm buildable,
+testable, and honestly documented, defaulting to today's best-known-good behavior.
+
+- **B36** (from `feature/b25-explicit-io-resolve`): a `--moe-io-mode reactive|pipelined` configurator flag
+  (`constexpr bool MOE_IO_PIPELINED`, default `false`/reactive == today's behavior). Must RECONCILE with
+  B31's already-merged `ExpertCacheSource`/`expert_ffn_row_source` fused resolve (B25's own branch predates
+  B31 -- rebase onto current `main`, don't just replay the old diff). Files: `include/sub0/moe_io.hpp`
+  (already exists on the branch), `include/sub0/moe_quant.hpp`, `src/backends/cpu/decode.cpp`,
+  `tools/configurator.cpp` (new flag only, near `--prec-param`).
+- **B37** (from `feature/b33-fp8-backbone`): merge FP8 as a real third `--prec-param fp8`/`PARAM_DTYPE::FP8`
+  option, default stays BF16. Files: `include/sub0/fp8.hpp`, `include/sub0/param_store.hpp`,
+  `include/sub0/model_file.hpp`, `tools/configurator.cpp` (new option value only), `tools/sub0llm-transplant.cpp`,
+  `src/backends/cpu/backend.cpp`, `src/engine_core.cpp`, `tests/fp8_tests.cpp` (merged in as permanent
+  regression coverage, runs regardless of the build's own PARAM_DTYPE).
+- **B38** (from `feature/b34-simd-unlock`): a `--simd-reduce` configurator flag (`constexpr bool
+  USE_SIMD_REDUCE`, default `false` == today's scalar behavior, bit-exact identical to current `main`).
+  Prefer a SHARED, templated kernel body (parameterized on the reduction primitive) over duplicating each
+  kernel twice, to avoid drift risk. Files: `include/sub0/simd_reduce.hpp`, `include/sub0/moe_math.hpp`,
+  `include/sub0/gdn_math.hpp`, `include/sub0/qsa_math.hpp`, `include/sub0/gated_residual_math.hpp`,
+  `tools/configurator.cpp` (new flag only).
+
+**Shared discipline across all three**: default arm must reproduce TODAY's exact behavior (bit-exact decode
+hash where applicable) -- these are additive capabilities, not replacements (AGENTS.md S4/S10). The
+alternate arm must still build, pass the existing correctness suite, and reproduce (or update, if the
+session owner's own host state has changed) the already-documented A/B result honestly inline near the
+toggle's own definition, not just buried in the backlog. `tools/configurator.cpp` is touched by all three --
+each keeps its own addition small/localized (near `--prec-param`) to minimize merge friction; the session
+owner resolves any 3-way conflict at merge time.
