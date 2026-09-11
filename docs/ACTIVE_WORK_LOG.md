@@ -524,3 +524,15 @@ means this pass is not a clean reproduction of B25's own precise ~1.4%-worse fig
 rather than forced. Docs updated: `docs/INDEPENDENT_REVIEW_BACKLOG.md` B36 row (full detail, file-by-file).
 Default arm's own regression gate and bit-exactness gate are both solid; the throughput comparison is the
 one honestly inconclusive part of this package, flagged as such.
+
+---
+
+**2026-09-11 Claude Code — B36 done, merged, pushed.** Pipelined MoE I/O integrated into `main` as a real,
+permanent, opt-in `--moe-io-mode pipelined` build option (default reactive, byte-for-byte unaffected).
+Independently reverified (design read in full, suites match, real-model logit dumps byte-identical between
+reactive/pipelined via `cmp`, own timing sanity check same direction as documented). Same stale-generated-
+config issue hit again -- rebuilt `sub0llm-configure`, regenerated `d196check`, full rebuild + suites green,
+decode hash unchanged. Merged (real conflict this time, both `docs/ACTIVE_WORK_LOG.md` and `docs/
+INDEPENDENT_REVIEW_BACKLOG.md` against B37's own already-merged entries -- resolved by keeping both
+packages' entries in full, nothing dropped). Pushed (`d59fe30`). Deleted the superseded
+`feature/b25-explicit-io-resolve` branch and its worktree. B38 done, awaiting review.
