@@ -232,3 +232,19 @@ not assumed) and `sub0_frontend_tests` 120,889/244 (exact match to the session's
 both green. Instrumentation confirmed reverted (`git diff --stat` on `decode.cpp` clean). See
 `docs/INDEPENDENT_REVIEW_BACKLOG.md` B29 (new) and B21 (closed by B29). Branch not merged — awaiting
 this session's own independent reverification per this session's standing practice.
+
+---
+
+**2026-09-11 Claude Code — B29 done, merged, pushed; B30/B31 filed, session goal status synthesized.**
+`MOE_DECODE_THREADS` pinned to 1 (`src/backends/cpu/internal.hpp`) -- independently reverified (own
+rebuild+rerun of both suites, own A/B on the real 48-layer artifact confirming direction if not exact
+magnitude), merged `--no-ff` (`b79c85c`), full `d196check` rebuild + suites green, decode hash unchanged
+from B28's merge (confirms numeric inertness), pushed. B21 closed. B30 synthesizes B27->B28->B29 into a
+single honest assessment of the session's `/goal` ("token-gen near CPU theoretical performance"): decode
+is DRAM-bandwidth-bound, a single thread already achieves ~44-52% of this host's real bandwidth ceiling,
+and the bottom-up computed floor (~2.8-3.0 s/token) now matches measured decode (~3.57-3.67 s/token)
+closely -- no more free/cheap levers of the kind found this session remain. Combined result:
+~5.5-6.0 s/token baseline -> ~3.57-3.67 s/token, ~35-40% faster, real and independently verified at every
+step. B31 filed (not started, scoped, Large effort): fusing the resolve pipeline's dequant/transpose/FFN
+stages to cut ~3 redundant DRAM round-trips per expert -- the one remaining structural lever, a genuine
+redesign not a same-pattern fix, deliberately not attempted opportunistically this pass.
