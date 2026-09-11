@@ -277,12 +277,27 @@ using MoeExpertCache = moeq::ExpertCache<MOE_RESOLVE_SLOTS, MOE_EXPERT_SLOT_FLOA
 // cost 150 MiB per thread to cache nothing.
 inline constexpr int MOE_DECODE_SLOTS = 1;
 using MoeDecodeExpertCache = moeq::ExpertCache<MOE_DECODE_SLOTS, MOE_EXPERT_SLOT_FLOATS>;
-// How wide decode fans out. Capped at EXPERTS_PER_TOK because that is how many independent items exist
-// -- a thread past the tenth would have nothing to take -- and each participating thread costs a pool
-// (18.75 MiB) plus its raw-decode scratch (6.25 MiB) at the real axes, so an unused one is not free.
-// Never below 1: EXPERTS_PER_TOK is 0 in a MoE-off build, where nothing ever enters this path anyway.
-inline constexpr int MOE_DECODE_THREADS =
-    EXPERTS_PER_TOK > 1 ? std::min(DEFAULT_THREADS, EXPERTS_PER_TOK) : 1;
+// How wide decode fans out. B29 (docs/INDEPENDENT_REVIEW_BACKLOG.md): this USED to be
+// min(DEFAULT_THREADS, EXPERTS_PER_TOK) -- one thread per selected expert, on the assumption that more
+// concurrent resolves means more overlapped work. Directly measured, on the real 48-layer BF16 artifact,
+// that assumption is FALSE on this host: a resolve (dequant+transpose+FFN) moves ~15-20 MB of DRAM
+// traffic per expert in ~5.5-7.5 ms, i.e. demands roughly 11-15 GB/s of memory bandwidth PER THREAD --
+// already 40-55% of this host's own measured ~28-33 GB/s ceiling (docs/BACKBONE_PRECISION.md S2c) for a
+// SINGLE thread. Wall-clock instrumentation of the live engine (temporary, reverted) showed the 10
+// requested threads do not overlap at all in steady state -- each expert's start times back-to-back with
+// the previous one's end, to sub-millisecond precision, at every layer sampled -- and per-expert cost
+// stays close to the single-thread isolated baseline rather than the earlier (pre-B28) 3-9x inflation.
+// Direct A/B on `sub0llm-qwen4-forward --tokens 6` (multiple interleaved runs, thermal-confound aware):
+// 1 thread 3.42-3.45 s/token vs. 3 or 10 threads 3.75-3.79 s/token -- fewer threads is not merely "no
+// worse", it is ~9% FASTER, reproducibly. This is consistent with concurrent large sequential DRAM
+// streams thrashing row-buffer locality worse than proportional bandwidth-sharing would predict, not just
+// simple saturation. Correctness is unaffected either way: forward_one's ANSWER never depends on which
+// thread computes which expert (moe_math.hpp's forward_row_via_run combines in original selection order
+// regardless of completion order) -- confirmed bit-exact (forward vs forward_one parity 0) at every
+// thread count tested. Pinned to 1 rather than left as a knob: AGENTS.md S2 prefers a baked compile-time
+// decision over a runtime one once the evidence is in, and nothing here needs to change without a
+// rebuild. Never below 1: EXPERTS_PER_TOK is 0 in a MoE-off build, where nothing ever enters this path.
+inline constexpr int MOE_DECODE_THREADS = 1;
 // The sidecar itself: read once by load_model, immutable thereafter (this is a forward-only build by
 // construction -- FORWARD_ONLY below -- so nothing can write a routed expert), hence shared across
 // threads without synchronization. The CACHE is per-Worker, because it is mutable scratch.
