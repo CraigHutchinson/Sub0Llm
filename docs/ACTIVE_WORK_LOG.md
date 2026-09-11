@@ -259,3 +259,20 @@ fork (commit ccc3646, 2026-09-07) and ran it CPU-only against the real source GG
 hardware/model**. This revises B30's "near the floor" conclusion: B31 (fusing the resolve pipeline's
 dequant->transpose->FFN stages to cut redundant DRAM round-trips) is now directly evidenced as real,
 available headroom, not speculative. See docs/INDEPENDENT_REVIEW_BACKLOG.md B32 for full numbers/caveats.
+
+---
+
+**2026-09-11 Claude Code — B33 dispatched (active).** Continuing docs/BACKBONE_PRECISION.md's own
+originally-planned Phase 2, per the user's explicit direction, now scoped precisely by B24 Phase 2's own
+decisive finding (inline block-dequant loses 5-30x -- do NOT build that): add a new resident `PARAM_DTYPE`
+value for a flat, block-free 8-bit float (FP8 E4M3), promoted exactly like `bf16.hpp`'s `Bf16CPtr` (cheap
+bit-manipulation, no per-block scale lookup, no auxiliary state) -- NOT a GGUF-style per-block-scaled
+Q8_0/Q4 format, which would repeat the already-ruled-out 2b shape. Files: new `include/sub0/fp8.hpp`
+(mirrors `bf16.hpp`'s structure exactly), `include/sub0/param_store.hpp` extension, `include/sub0/
+model_file.hpp` (`ParamDtype::FP8`), `tools/sub0llm-transplant.cpp` (`--prec-param fp8` output mode),
+`tools/configurator.cpp` (generated `Dtype`/`PARAM_DTYPE` plumbing). Kernels are already templated on
+weight-pointer type from B24 Phase 1 -- no `*_math.hpp` changes expected unless the proxy type needs a new
+capability. Correctness gate: same tolerance-based precedent as B24 Phase 1 (Q8_0-vs-F32 ~3.5e-3, BF16's
+own ~0.199 L2 logit diff as the most recent real comparator), full suite green, real measured decode
+throughput AND peak resident memory before/after on the real 48-layer artifact. Do not touch other agents'
+shared files without checking this log first.
