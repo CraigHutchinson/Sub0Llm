@@ -175,3 +175,16 @@ GDN/GR forward path or `gdn_math.hpp`/`gated_residual_math.hpp` need a real fix)
 **This section should be re-checked, not assumed stale-safe** — re-read this file's own Log table above
 before actually starting any of the "safe now" items, in case a new WP4 row has appeared since this was
 written.
+
+---
+
+**2026-09-11 Claude Code — B28 dispatched (active).** Following B27's finding that MoE resolve is now
+~100% compute-bound on this machine (I/O wait 0.02%), dispatching a Sonnet subagent (isolated worktree,
+`feature/b28-iq2xxs-dequant-fix`) to: (1) fix `gguf::dequantize_iq2_xxs`'s known ~6x-slower-than-neighbours
+defect (`docs/CPU_PERF_BACKLOG.md` §2d — hoist the tail-bound check out of the inner loop per that
+section's own diagnosed hypothesis), and (2) add software-prefetch hints to the dequant/transpose compute
+path in `moe_quant.hpp`/`moe_math.hpp` (the user's own suggestion). Files: `include/sub0/gguf.hpp`,
+`include/sub0/moe_quant.hpp`, `include/sub0/moe_math.hpp`, `tests/gguf_tests.cpp`,
+`benchmarks/moe_expert_bench.cpp`. Gate: bit-exact vs `tests/gguf_tests.cpp` + `--verify` against the real
+48-layer artifact (numerical decode, must not change), plus a real before/after decode-throughput
+measurement. Do not touch `docs/ACTIVE_WORK_LOG.md`'s shared rows above.
