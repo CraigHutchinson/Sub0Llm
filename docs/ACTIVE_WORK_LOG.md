@@ -248,3 +248,14 @@ closely -- no more free/cheap levers of the kind found this session remain. Comb
 step. B31 filed (not started, scoped, Large effort): fusing the resolve pipeline's dequant/transpose/FFN
 stages to cut ~3 redundant DRAM round-trips per expert -- the one remaining structural lever, a genuine
 redesign not a same-pattern fix, deliberately not attempted opportunistically this pass.
+
+---
+
+**2026-09-11 Claude Code — B32: real llama.cpp comparison on the same model/host.** User asked "how fast
+is llama.cpp latest with this model" -- built `llama-bench` from the local `D:\Craig\llama.cpp-qwen4exp`
+fork (commit ccc3646, 2026-09-07) and ran it CPU-only against the real source GGUF
+(`D:\ModelWeights\Qwen3.8-Flash-Next-GGUF\UD-IQ1_S`). Result: llama.cpp generates at ~1.0-1.7 t/s
+(~0.59-0.94 s/token) vs Sub0Llm's current ~3.57-3.67 s/token -- **llama.cpp is ~4-6x faster on the same
+hardware/model**. This revises B30's "near the floor" conclusion: B31 (fusing the resolve pipeline's
+dequant->transpose->FFN stages to cut redundant DRAM round-trips) is now directly evidenced as real,
+available headroom, not speculative. See docs/INDEPENDENT_REVIEW_BACKLOG.md B32 for full numbers/caveats.
