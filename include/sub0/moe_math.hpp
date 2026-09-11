@@ -345,6 +345,18 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
     int   topk_idx[TOPK_MAX];
     router_topk_row(d, x, router_w, probs, topk_w, topk_idx, norm_topk_prob);
 
+    // B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): if the runner offers a prefetch hook, give it
+    // the selected expert ids BEFORE any resolve/compute starts, so it can issue their bytes' reads as
+    // explicit, batched I/O up front (real queue depth from the start) instead of a reactive fault on
+    // first touch. Detected via `requires`, not required, so SerialExperts (and anything else with no
+    // such method -- op_moe's batched path keeps its own mmap-backed resolve entirely unchanged) takes
+    // the exact same path as before, no branch at all in that case (the `if constexpr` compiles away).
+    // Living HERE (the shared _ex core) rather than only in forward_row_via_run's own thin wrapper means
+    // BOTH entry points get it for free -- decode's own fused resolve (B31) calls this function directly.
+    if constexpr (requires { run_experts.prefetch(topk_idx, d.experts_per_tok); }) {
+        run_experts.prefetch(topk_idx, d.experts_per_tok);
+    }
+
     // Phase 1: every selected expert into its own buffer. Order-independent by construction.
     run_experts(d.experts_per_tok, ffn_scratch, g_scratch, [&](int k, float* ffn, float* g) {
         compute_expert(k, topk_idx[k], routed_out + static_cast<std::size_t>(k) * d.hidden_size, ffn, g);

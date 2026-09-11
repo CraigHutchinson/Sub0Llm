@@ -168,6 +168,23 @@ struct MoeDecodeThread {
 // overruns Windows' static-TLS block, the same hazard that made g_workers a pool rather than TLS.
 std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
 
+// B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): staging buffers for pipelined I/O's explicit reads,
+// one gate/up/down triple PER SELECTED EXPERT (indexed by k, the router's own top-k selection order --
+// NOT by decode thread: MOE_DECODE_THREADS is pinned to 1 (B29), so a single thread processes every k
+// serially, but ParallelExperts::prefetch below still issues ALL n experts' reads up front, before that
+// thread starts consuming the first one -- so up to EXPERTS_PER_TOK experts' bytes may be in flight or
+// resolved-but-not-yet-consumed at once, which is what MaxInFlight/MOE_IO_MAX_INFLIGHT already sizes
+// for). A plain global (not per-thread, not thread_local) for the same reason g_moe_decode is a pool
+// rather than TLS -- gen is single-threaded at the forward_one call level (this file's own header
+// comment), so nothing else can be using this stage concurrently.
+struct MoeIoStage {
+    std::array<std::vector<std::uint8_t>, static_cast<std::size_t>(MOE_IO_MAX_INFLIGHT)> buf{};
+    void allocate(std::size_t max_bytes) {
+        for (auto& b : buf) if (b.size() < max_bytes) b.resize(max_bytes);
+    }
+};
+MoeIoStage g_moe_io_stage{};
+
 // Runs one decode row's selected experts across MOE_DECODE_THREADS threads. Passed to
 // moe::forward_row_via_run, which computes each expert into its OWN output buffer and does the weighted
 // sum afterwards in the original selection order -- so this runner cannot change the answer, only who
@@ -175,7 +192,42 @@ std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
 //
 // `ffn`/`g` (the caller's single shared scratch pair) are deliberately IGNORED here: they would be a
 // data race across the team. Each thread uses its own pair out of g_moe_decode instead.
+//
+// B36: `layer_index` and `prefetch()` implement moe_math.hpp's own prefetch hook (forward_row_via_run_ex,
+// detected via `requires`) -- called single-threaded, before ANY of this struct's own parallel region
+// exists, with the row's EXPERTS_PER_TOK selected expert ids (already known from the router's own
+// top-k, before any resolve). Under MOE_IO_PIPELINED it issues every selected expert's THREE plane reads
+// as one explicit, batched overlapped-I/O submission into g_moe_io_stage, replacing the reactive
+// mmap-fault-on-first-touch the default (reactive) build still triggers inside `resolve()` itself. Off
+// that build config (MOE_IO_PIPELINED == false, the default) the body compiles away entirely and this
+// struct's behaviour, including its generated code, is unchanged from pre-B36 `main`.
 struct ParallelExperts {
+    int layer_index = 0;
+
+    void prefetch(const int* idx, int n) const {
+        if constexpr (USE_MOE_QUANT && MOE_IO_PIPELINED) {
+            g_moe_io_stage.allocate(static_cast<std::size_t>(g_moe_quant.max_desc_bytes()));
+            std::array<moeio::Request, static_cast<std::size_t>(MOE_IO_MAX_INFLIGHT)> reqs{};
+            int nr = 0;
+            for (int k = 0; k < n; ++k) {
+                for (int w = 0; w < moeq::PerExpert; ++w) {
+                    const moeq::Desc& d = g_moe_quant.desc(layer_index, idx[k], w);
+                    const int slot = k * moeq::PerExpert + w;
+                    reqs[static_cast<std::size_t>(nr++)] = moeio::Request{
+                        g_moe_quant.header().data_off + d.off, static_cast<std::uint32_t>(d.bytes),
+                        g_moe_io_stage.buf[static_cast<std::size_t>(slot)].data()};
+                }
+            }
+            std::string err;
+            if (!g_moe_decode_io.submit(std::span<const moeio::Request>(reqs.data(), static_cast<std::size_t>(nr)),
+                                        err)) {
+                std::println(stderr, "fatal: B36 pipelined-I/O prefetch submit failed at layer {}: {}",
+                             layer_index, err);
+                std::abort();
+            }
+        }
+    }
+
     template <class Body>
     void operator()(int n, float* /*ffn*/, float* /*g*/, Body&& body) const {
         #pragma omp parallel num_threads(MOE_DECODE_THREADS)
@@ -613,13 +665,41 @@ const float* Model::forward_one(int id, int pos) {
             // and moe::expert_ffn_row_source's own comments for the full mechanism and the bit-exactness
             // argument). The f32-resident (non-quantized) build keeps the original resolve+expert_ffn_row
             // pairing unchanged -- there is no transpose to fuse away there at all.
+            // B36: under MOE_IO_PIPELINED, ParallelExperts::prefetch() (moe_math.hpp's own hook, run
+            // once before run_experts) has already issued this row's EXPERTS_PER_TOK*PerExpert explicit
+            // reads into g_moe_io_stage before this lambda is ever called -- resolve_from_bytes waits
+            // for and consumes THIS iteration's (k's) three planes from that stage instead of
+            // ExpertCacheSource::resolve()'s own mmap-backed path. Off that build config (the default),
+            // this whole branch compiles away and `resolve()` runs exactly as it did pre-B36.
             moe::forward_row_via_run_ex(
                 MOE_DIMS, a, L.moe_router->pdata,
-                [&](int /*k*/, int e, float* out_ptr, float* ffn, float* g) {
+                [&](int k, int e, float* out_ptr, float* ffn, float* g) {
                     const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
                     MoeDecodeThread& S = *g_moe_decode[static_cast<std::size_t>(t)];
                     if constexpr (USE_MOE_QUANT) {
-                        const auto r = S.cache.resolve(g_moe_quant, l, e);
+                        MoeDecodeExpertCacheSource::Resolved r;
+                        if constexpr (MOE_IO_PIPELINED) {
+                            std::string err;
+                            for (int w = 0; w < moeq::PerExpert; ++w) {
+                                if (!g_moe_decode_io.wait(k * moeq::PerExpert + w, err)) {
+                                    std::println(stderr,
+                                                 "fatal: B36 pipelined-I/O read failed (layer {} expert "
+                                                 "{} plane {}): {}", l, e, w, err);
+                                    std::abort();
+                                }
+                            }
+                            const moeq::Desc d0 = g_moe_quant.desc(l, e, moeq::Gate);
+                            const moeq::Desc d1 = g_moe_quant.desc(l, e, moeq::Up);
+                            const moeq::Desc d2 = g_moe_quant.desc(l, e, moeq::Down);
+                            const int base = k * moeq::PerExpert;
+                            r = S.cache.resolve_from_bytes(
+                                g_moe_quant, l, e,
+                                std::span<const std::uint8_t>(g_moe_io_stage.buf[static_cast<std::size_t>(base + moeq::Gate)].data(), d0.bytes),
+                                std::span<const std::uint8_t>(g_moe_io_stage.buf[static_cast<std::size_t>(base + moeq::Up)].data(), d1.bytes),
+                                std::span<const std::uint8_t>(g_moe_io_stage.buf[static_cast<std::size_t>(base + moeq::Down)].data(), d2.bytes));
+                        } else {
+                            r = S.cache.resolve(g_moe_quant, l, e);
+                        }
                         if (r.gate == nullptr) {
                             std::println(stderr,
                                          "fatal: could not dequantize routed expert {} of layer {} from "
@@ -633,7 +713,7 @@ const float* Model::forward_one(int id, int pos) {
                         moe::expert_ffn_row(MOE_DIMS, a, w.gate, w.up, w.down, out_ptr, ffn, g);
                     }
                 },
-                ParallelExperts{},
+                ParallelExperts{l},
                 L.moe_shared_gate->pdata, L.moe_shared_up->pdata,
                 L.moe_shared_down->pdata, L.moe_shared_gate_proj->pdata,
                 proj, moe_scratch);

@@ -415,3 +415,31 @@ session owner's own host state has changed) the already-documented A/B result ho
 toggle's own definition, not just buried in the backlog. `tools/configurator.cpp` is touched by all three --
 each keeps its own addition small/localized (near `--prec-param`) to minimize merge friction; the session
 owner resolves any 3-way conflict at merge time.
+
+---
+
+**2026-09-11 Claude Code — B36 done, branch `feature/b36-io-integration`, NOT merged (session owner
+reverifies, same as every prior package).** Integrated B25's pipelined-I/O work into a real
+`--moe-io-mode reactive|pipelined` build option, default reactive (today's behavior, byte-for-byte).
+Required genuine re-targeting, not a diff replay: B25 predates B31 (which replaced the old
+`ExpertCache`+transpose resolve with `ExpertCacheSource`'s no-transpose one) AND predates B29 (which
+pinned `MOE_DECODE_THREADS` to 1, invalidating B25's own per-THREAD staging-buffer premise). New
+`ExpertCacheSource::resolve_from_bytes` (`moe_quant.hpp`) feeds `dequantize_expert_source` caller-supplied
+byte spans instead of `store.raw(d)`'s mmap span; a new `MoeIoStage` (`decode.cpp`) stages all
+`EXPERTS_PER_TOK` selected experts' plane reads by SELECTION ORDER (not thread, since there is only one
+decode thread now) so a single thread can walk them serially while the OS keeps completing the rest in
+the background; `moe_io.hpp`'s `moeio::PlaneIo` mechanism itself carried over unchanged (never depended on
+the resolve pool's shape). `moe_math.hpp`'s prefetch hook now lives in the SHARED `forward_row_via_run_ex`
+core so both entry points get it. `tools/configurator.cpp` touched by exactly one new flag (35 lines,
+localized near `--moe-quant-experts`), confirmed no overlap with B37/B38's own additions to that file.
+**Verified**: `sub0_frontend_tests` 120,923/245 exact match (default/reactive build unaffected). Bit-exact
+at BOTH settings on the real 48-layer BF16 artifact (`forward`/`forward_one` parity exactly 0 at each,
+per-row logit stats byte-identical between the reactive and pipelined builds). Throughput: measured WHILE
+B37/B38 were independently building/benchmarking on the SAME host in parallel (confirmed real contention,
+2x run-to-run variance within one build) -- the clean/least-contended sample cluster from each arm lands
+close together (~3.25-3.63 s/token reactive vs ~3.27-3.33 s/token pipelined), consistent with B25/B27's
+own "no measurable win, I/O not the bottleneck on this warm-cache host" finding, but today's contention
+means this pass is not a clean reproduction of B25's own precise ~1.4%-worse figure -- reported honestly
+rather than forced. Docs updated: `docs/INDEPENDENT_REVIEW_BACKLOG.md` B36 row (full detail, file-by-file).
+Default arm's own regression gate and bit-exactness gate are both solid; the throughput comparison is the
+one honestly inconclusive part of this package, flagged as such.

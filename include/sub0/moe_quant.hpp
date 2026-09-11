@@ -234,11 +234,16 @@ public:
             return false;
         }
         // And every descriptor must lie inside the payload. Checked once here so no resolve has to.
-        for (const Desc& d : descs_)
+        max_desc_bytes_ = 0;
+        for (const Desc& d : descs_) {
             if (d.off > h_.data_bytes || d.bytes > h_.data_bytes - d.off) {
                 err = path + ": a descriptor's byte range runs past the payload";
                 return false;
             }
+            // B36: the largest single plane, so an explicit-I/O consumer (moeio::PlaneIo) can size ITS
+            // OWN staging buffers once, up front, rather than per resolve (AGENTS.md S1).
+            if (d.bytes > max_desc_bytes_) max_desc_bytes_ = d.bytes;
+        }
         map_ = std::move(m);
         data_ = map_.data() + h_.data_off;
         return true;
@@ -260,11 +265,16 @@ public:
     // can say (docs/QWEN4_MEMORY_ORCHESTRATION.md's "a prediction is not a measurement").
     std::uint64_t resident_bytes() const { return h_.data_bytes; }
 
+    // B36: the largest single Desc::bytes in this sidecar -- what an explicit-I/O consumer's own
+    // per-plane staging buffer needs to be sized to, once, at load time.
+    std::uint64_t max_desc_bytes() const { return max_desc_bytes_; }
+
 private:
     Header                    h_{};
     std::vector<Desc>         descs_;
     FileMap                   map_;
     const std::uint8_t*       data_ = nullptr;   // map_.data() + h_.data_off, or null
+    std::uint64_t             max_desc_bytes_ = 0;
 };
 
 // --- the fixed-capacity resolve pool ------------------------------------------------------------------
@@ -401,6 +411,34 @@ public:
         }
         key_[static_cast<std::size_t>(s)] = key;
         live_[static_cast<std::size_t>(s)] = true;
+        ++misses_;
+        return at(s);
+    }
+
+    // B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): resolve expert (layer, expert) from raw bytes
+    // the CALLER already fetched (an explicit-I/O read into an owned buffer -- moeio::PlaneIo -- rather
+    // than a reactive mmap page fault) instead of `store.raw(desc)`'s mapped span. Otherwise identical
+    // to resolve() above: the SAME dequantize_expert_source call, on the SAME bytes (correctness
+    // requires the caller to have fetched exactly `store.desc(layer, expert, w).bytes` for each plane w,
+    // at that plane's own byte range -- decode.cpp's pipelined path is the one caller and does exactly
+    // that), producing bit-identical output to the mmap path by construction.
+    //
+    // Always writes slot 0 -- correct ONLY for a single-slot cache (decode's MoeDecodeExpertCacheSource;
+    // see MOE_DECODE_SLOTS's own comment for why decode's hit rate against any cache is provably zero,
+    // so there is no round-robin/hit-check to preserve here, unlike resolve() above).
+    Resolved resolve_from_bytes(const Store& store, int layer, int expert,
+                                 std::span<const std::uint8_t> raw_gate,
+                                 std::span<const std::uint8_t> raw_up,
+                                 std::span<const std::uint8_t> raw_down) {
+        static_assert(Slots == 1, "resolve_from_bytes assumes a single-slot cache -- see its own comment");
+        const int s = 0;
+        const std::span<const std::uint8_t> raws[PerExpert] = {raw_gate, raw_up, raw_down};
+        for (int w = 0; w < PerExpert; ++w) {
+            const Desc& d = store.desc(layer, expert, w);
+            if (!dequantize_expert_source(d, raws[w], plane_[static_cast<std::size_t>(s)][static_cast<std::size_t>(w)]))
+                return {nullptr, nullptr, nullptr};
+        }
+        live_[static_cast<std::size_t>(s)] = false;   // this path never participates in hit-checking
         ++misses_;
         return at(s);
     }

@@ -635,6 +635,20 @@ int main(int argc, char** argv) {
     // NUM_EXPERTS of them to f32 in the model blob. Off = today's behaviour, and the only value any
     // existing build takes.
     int moe_quant_experts  = 0;
+    // B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): decode's I/O strategy for a MOE_QUANT_EXPERTS
+    // sidecar. 0 = reactive (default, today's behaviour) -- each selected expert's bytes arrive via a
+    // plain mmap page fault on first touch, one at a time as the resolve loop reaches it. 1 = pipelined
+    // -- a whole layer's EXPERTS_PER_TOK selected experts' plane reads are issued as one explicit,
+    // batched FILE_FLAG_OVERLAPPED submission before any resolve/dequant starts, so the reads overlap
+    // each other and decode's own compute (moe_io.hpp). REAL MEASURED RESULT ON THIS HOST (B25,
+    // fully page-cache-warm sidecar, confirmed by B27): pipelined is ~1.4% WORSE, within noise -- I/O is
+    // not the bottleneck here once the 37 GiB sidecar is resident in the OS page cache. Kept as a real,
+    // independently-buildable capability for a machine/session where that premise does NOT hold: a cold
+    // page cache (fresh boot), a run that evicts the sidecar under memory pressure, or a host whose RAM
+    // cannot hold the sidecar at all (B23) -- there, real disk I/O is on the critical path and this
+    // mode is expected to win. Windows-only implementation (moe_io.hpp's own header comment); a POSIX
+    // build falls back to a synchronous, non-concurrent pread and gets no benefit from setting this.
+    int moe_io_pipelined  = 0;
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
     // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
@@ -786,6 +800,17 @@ int main(int argc, char** argv) {
                    "dequantize only the --experts-per-tok selected per token; 0 (default) = every expert "
                    "transplanted to f32 in the model blob. Requires --num-experts")
        ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--moe-io-mode", moe_io_pipelined,
+                   "Decode's I/O strategy for a --moe-quant-experts sidecar: reactive (0, default) = "
+                   "today's mmap-page-fault-on-first-touch resolve; pipelined (1) = explicit batched "
+                   "overlapped I/O, issuing a whole layer's selected experts' reads up front so they "
+                   "overlap each other and compute (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36). "
+                   "Measured ~1.4% WORSE on this host's current warm-page-cache state -- pipelined wins "
+                   "only when the sidecar is NOT already resident in the OS page cache (a cold boot, "
+                   "memory pressure evicting it, or a host too small to cache it at all). Windows-only.")
+       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"reactive", 0}, {"pipelined", 1}},
+                                           CLI::ignore_case))
+       ->default_str("reactive");
     // Qwen Sparse Attention (docs/QSA.md): Stage 0 -- every axis hard-clamped to 0. All five must be
     // set together; a half-configured QSA build is refused both here and by layout.hpp's static_assert.
     app.add_option("--qsa-indexer-n-heads", qsa_idx_n_heads,
@@ -1150,6 +1175,12 @@ int main(int argc, char** argv) {
     if (moe_quant_experts != 0 && num_experts < 2) {
         std::println(stderr, "configure error: moe-quant-experts requires MoE to be on (--num-experts "
                              ">= 2) -- there are no routed experts to keep quantized-resident");
+        return 1;
+    }
+    // B36: pipelined I/O has nothing to pipeline without a quantized-resident sidecar to read from.
+    if (moe_io_pipelined != 0 && moe_quant_experts == 0) {
+        std::println(stderr, "configure error: moe-io-mode pipelined requires --moe-quant-experts 1 -- "
+                             "there is no S0Q1 sidecar to issue overlapped reads against otherwise");
         return 1;
     }
     // QSA: mirrors layout.hpp's own static_asserts as a configure-time diagnostic naming the flags,
@@ -1712,6 +1743,10 @@ int main(int argc, char** argv) {
     // WP4e (layout.hpp's USE_MOE_QUANT). 0 = off, the default: every routed expert is an f32
     // PARAM_LAYOUT tensor, exactly as before. See docs/WP4_SCOPE.md WP4e.
     cos << "constexpr bool MOE_QUANT_EXPERTS = " << (moe_quant_experts ? "true" : "false") << ";\n";
+    // B36: decode's I/O strategy for the S0Q1 sidecar -- see --moe-io-mode's own help text for the
+    // measured result and when each mode is expected to win. false (reactive) reproduces today's
+    // behaviour bit-for-bit; true (pipelined) is include/sub0/moe_io.hpp's explicit overlapped I/O.
+    cos << "constexpr bool MOE_IO_PIPELINED = " << (moe_io_pipelined ? "true" : "false") << ";\n";
     // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
     cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
     cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";
