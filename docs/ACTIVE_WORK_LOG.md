@@ -415,3 +415,74 @@ session owner's own host state has changed) the already-documented A/B result ho
 toggle's own definition, not just buried in the backlog. `tools/configurator.cpp` is touched by all three --
 each keeps its own addition small/localized (near `--prec-param`) to minimize merge friction; the session
 owner resolves any 3-way conflict at merge time.
+
+---
+
+**2026-09-11 Claude Code — B37 DONE, branch `feature/b37-fp8-integration`, NOT merged (session owner
+reverifies, same as every prior package).** Cherry-picked B33's code commit (`8410aa7`) onto current
+`main` (merge-base `4098c49` had zero divergence from `main` in the touched files, so all 10 code files
+applied cleanly; only the three docs files needed conflict resolution, kept as `main`'s own already-landed
+narrative, plus a superseding pointer added to `docs/BACKBONE_PRECISION.md` S2d noting the "NOT merged"
+verdict there was about DEFAULT-ing to FP8, not about keeping it off `main` entirely as an opt-in option).
+Files: `include/sub0/fp8.hpp` (new), `include/sub0/param_store.hpp` (three-way `param_t`/`ParamCPtr`, plus
+a new prominent tradeoff comment naming the real measured cost at the top of the file), `include/sub0/
+model_file.hpp` (`ParamDtype::FP8`), `src/backends/cpu/backend.cpp` (two dispatch overloads +
+`==BF16`->`!=F32` generalizations), `src/engine_core.cpp` (three-way file-size discriminator), `tests/
+fp8_tests.cpp` (new, wired into `sub0_frontend_tests` UNCONDITIONALLY alongside `gguf_tests.cpp` --
+`tests/CMakeLists.txt`), `tools/configurator.cpp` (`--prec-param` 0-1 -> 0-2, localized near the existing
+option, no other changes), `tools/sub0llm-transplant.cpp` (`--param-dtype 2`), `tools/
+sub0llm-qwen4-forward.cpp` (boy-scouted the dtype-name println to be 3-way generic instead of
+hardcoded "bf16"). Default `--prec-param` (0/1=F32/BF16) is completely unaffected: config var default
+stays `0`.
+
+**Regression-safety gate (AGENTS.md S4), done as a real before/after at the SAME fresh config** (the
+worktree lacks `out/build/d196check`'s own build tree, and `data/gsm8k.txt`/`data/cosmopedia.txt` are
+untracked -- both hardlinked in locally from the main checkout for this run, then removed after):
+`sub0llm-configure --corpus data/gsm8k.txt --dmodel 196 --layers 11 --heads 7 --seq 256` (same recipe
+B33's own gate used, matches AGENTS.md's own "reconfigure and diff before vs after" discipline exactly).
+BEFORE (`main` tip `733b857`, PARAM_DTYPE=F32 default): `sub0_tests` 29,510,661 assertions/147 cases,
+decode hash `d1625d19ed2258f1`; `sub0_frontend_tests` 120,923/245 -- this LAST number matches B31's own
+documented main baseline exactly, confirming this fresh config is a faithful stand-in for `d196check`.
+AFTER (this branch, same config, same default PARAM_DTYPE=F32): `sub0_tests` 29,510,661/147, IDENTICAL
+hash `d1625d19ed2258f1`; `sub0_frontend_tests` 121,211/251 (120,923 + 288 = the new `fp8_tests.cpp`'s own
++288 assertions/+6 cases, exactly). **Default build byte-for-byte unaffected.** `fp8_tests.cpp` alone:
+288 assertions/6 cases, matching B33's own documented figure exactly.
+
+**Fresh FP8-artifact verification, my own independent build of the merged code against the real 48-layer
+artifacts already on disk** (`D:\ModelWeights\Sub0Llm-Qwen4-full48-fp8\model.bin` + `Sub0Llm-Qwen4-full48-
+bf16\qwen4_full48_q_bf16.bin`, built earlier this session by the session owner's own independent
+reverification pass -- reused rather than re-transplanted, since re-verifying the ALREADY-INDEPENDENTLY-
+VERIFIED bytes on disk via a fresh build of the merged code is the right check here, not re-running a
+169s transplant that changes nothing about what's being tested): configured the real Qwen4 axes
+(`--dmodel 2560 --layers 48 --heads 24 --kv-heads 2 ... --moe-quant-experts 1 --prec-param 2`, WP4d/e's own
+documented recipe, `--vocab 248202` against `data/cosmopedia.txt` landing `VOCAB=248320` exactly as
+required to match the artifact's own header). `load_model`: ACCEPTED, 4.8s, 4.58 GiB of fp8 parameters.
+`forward` [6x248320] 56.51s; `forward_one` over 6 positions 54.74s; **`max|forward-forward_one| = 0`
+(bit-exact)**. Logits vs the F32 reference (`D:\ModelWeights\full48_f32_logits.bin`, same fixture tokens):
+**L2-relative 0.4299, 3/6 argmax-agree -- reproduces the session owner's own just-recorded number
+(`full48_fp8_logits.bin`) EXACTLY**, both by re-deriving it from my own fresh dump and by directly diffing
+my dump against theirs (identical to the printed decimal). BF16 comparator run at the same config: `forward`
+50.33s/6, `forward_one` 25.90s/6, parity 0, logits vs F32 L2-relative 0.1989/5-6 -- also reproduces the
+documented ~0.198895/5-6 figure exactly.
+
+**Post-merge throughput sanity check (item 4, explicitly a sanity check not a full study per the task's
+own brief) -- CONTENTION CAVEAT, read before citing these numbers**: two OTHER agents' own `sub0llm-
+qwen4-forward`/`sub0_frontend_tests` processes were independently running on this same host during both
+of my timed runs (`ps aux` confirmed concurrent PIDs from `agent-ac1511124d7b9e7f4`'s B36 A/B and a third
+worktree's frontend suite), so these are NOT clean, uncontended numbers -- the direction is what's load-
+bearing here, not the magnitude. `forward`: BF16 8.39 s/token vs FP8 9.42 s/token (~12% slower). `forward_
+one` (the more decode-representative loop): BF16 4.32 s/token vs FP8 9.12 s/token (~111% slower). FP8
+being slower held in every one of these four numbers, consistent with B33's own clean ~40-60% finding;
+the inconsistency in magnitude between the `forward` and `forward_one` gaps within this same run is most
+likely the contention itself (FP8's branchy per-element widen plausibly starves harder under CPU
+oversubscription than BF16's single-shift widen does), not a merge-introduced change -- **the negative
+result is confirmed to still hold post-merge; the exact percentage should be re-measured on an idle host
+if a precise number is ever needed**, per this task's own "not required to be a full multi-run study"
+allowance.
+
+Updated `docs/INDEPENDENT_REVIEW_BACKLOG.md`'s B37 row with all of the above. No file overlap with B36
+(`moe_io.hpp`/`decode.cpp`) or B38 (`simd_reduce.hpp`/`*_math.hpp`) beyond the shared, localized
+`configurator.cpp` `--prec-param` block (confirmed: `configurator.cpp`'s diff here touches only the
+`prec_param` variable comment, its `CLI::App::add_option` help text/range, and the generated `Dtype`
+enum/`PARAM_DTYPE` line -- nothing else in the file). Committed, NOT merged, NOT pushed -- the session
+owner independently reverifies before merging, same as every prior package.

@@ -24,11 +24,25 @@
 // AdamW moments (those arenas are unchanged); what a bf16 build changes is the precision of the master
 // weight a step reads and writes back, which is a real and well-known training-quality regression and
 // is not what phase 1 is for. `--prec-param 1` is documented and defaulted accordingly.
+//
+// `--prec-param 2` (FP8/E4M3, B33/B37, docs/BACKBONE_PRECISION.md S2d) -- READ THIS BEFORE CHOOSING IT.
+// This is a REAL, HONEST NEGATIVE RESULT kept as a permanent, buildable, correctness-gated option, not
+// a recommendation. Measured on the real 48-layer Qwen4-preview artifact, independently reproduced
+// twice (S2d): a real ~4.63 GiB peak-memory win over BF16, traded for a ~40-60% decode THROUGHPUT
+// SLOWDOWN (most likely `Fp8CPtr::operator[]`'s multi-branch exponent-remap widen costing more
+// per-element CPU than the DRAM bytes it saves -- unlike bf16's branchless shift) AND a markedly worse
+// quality floor (logits vs F32 reference L2-relative ~0.43, vs BF16's own ~0.199). **BF16 (`--prec-param
+// 1`) remains the recommended reduced-precision choice; FP8 is not a faster or better default, it is a
+// smaller one, with a real and currently-unmitigated cost on both axes that matter more here.** Choose
+// it only if the ~4.63 GiB footprint reduction is worth those two costs for your own use case, or if you
+// are picking this format up specifically to pursue the named-but-unbuilt fix (a branchless/lookup-table
+// `fp8_widen`, `fp8.hpp`'s own comment) -- not by default and not without reading S2d first.
 
 #pragma once
 
 #include "sub0_config.hpp"   // generated: Dtype, PARAM_DTYPE
 #include "sub0/bf16.hpp"
+#include "sub0/fp8.hpp"
 #include "sub0/model_file.hpp"
 
 #include <cstddef>
@@ -37,25 +51,28 @@
 
 namespace sub0 {
 
-static_assert(PARAM_DTYPE == Dtype::F32 || PARAM_DTYPE == Dtype::BF16,
-              "PARAM_DTYPE selects the parameter arena's element type; only F32 and BF16 are wired "
-              "(the generated Dtype enum reserves F16/Q8/Q4 for later work -- see "
-              "docs/BACKBONE_PRECISION.md S2 for the native-quant phase those are aimed at)");
+static_assert(PARAM_DTYPE == Dtype::F32 || PARAM_DTYPE == Dtype::BF16 || PARAM_DTYPE == Dtype::FP8,
+              "PARAM_DTYPE selects the parameter arena's element type; only F32, BF16 and FP8 are wired "
+              "(the generated Dtype enum reserves F16/Q8/Q4 for a different, block-quantized mechanism "
+              "that B24 Phase 2's own measurement decisively ruled out for this project -- see "
+              "docs/BACKBONE_PRECISION.md S2c/S2d)");
 
 inline constexpr bool PARAM_BF16 = (PARAM_DTYPE == Dtype::BF16);
+inline constexpr bool PARAM_FP8  = (PARAM_DTYPE == Dtype::FP8);
 
 // The arena's element type, and the pointer a kernel reads it through. Under F32 both are exactly what
 // the code said before B24 existed.
-using param_t   = std::conditional_t<PARAM_BF16, bf16, float>;
-using ParamCPtr = std::conditional_t<PARAM_BF16, Bf16CPtr, const float*>;
+using param_t   = std::conditional_t<PARAM_BF16, bf16, std::conditional_t<PARAM_FP8, fp8, float>>;
+using ParamCPtr = std::conditional_t<PARAM_BF16, Bf16CPtr, std::conditional_t<PARAM_FP8, Fp8CPtr, const float*>>;
 
 inline constexpr int PARAM_ELEM_BYTES = static_cast<int>(sizeof(param_t));
-static_assert(PARAM_ELEM_BYTES == (PARAM_BF16 ? 2 : 4));
+static_assert(PARAM_ELEM_BYTES == (PARAM_BF16 ? 2 : (PARAM_FP8 ? 1 : 4)));
 
 // This build's element type as the FILE format names it (model_file.hpp's ParamDtype). The two enums
 // are deliberately separate -- one is a build's compute-precision vocabulary, the other is an on-disk
 // tag a tool with no generated config still has to write -- and this is the single place they meet.
-inline constexpr ParamDtype PARAM_FILE_DTYPE = PARAM_BF16 ? ParamDtype::BF16 : ParamDtype::F32;
+inline constexpr ParamDtype PARAM_FILE_DTYPE =
+    PARAM_BF16 ? ParamDtype::BF16 : (PARAM_FP8 ? ParamDtype::FP8 : ParamDtype::F32);
 
 // Make a readable pointer out of the arena base. Written as a pair of ORDINARY OVERLOADS on the
 // concrete pointee type, not as `if constexpr (PARAM_BF16)` inside one non-template function --
@@ -69,14 +86,17 @@ inline constexpr ParamDtype PARAM_FILE_DTYPE = PARAM_BF16 ? ParamDtype::BF16 : P
 // needs to be valid for ITS OWN pointee type, and exactly one of the two is ever actually called in a
 // given build, but both are always independently well-formed C++.
 [[nodiscard]] inline Bf16CPtr    param_cptr(const bf16* base) noexcept { return Bf16CPtr{base}; }
+[[nodiscard]] inline Fp8CPtr     param_cptr(const fp8* base) noexcept { return Fp8CPtr{base}; }
 [[nodiscard]] inline const float* param_cptr(const float* base) noexcept { return base; }
 
 // Read/write ONE stored parameter as a float. These are the seams the optimizer and the initializer
 // use; in the hot path a kernel goes through ParamCPtr's own indexing instead, which is the same shift
 // with no function-call shape around it. Overloaded for the same reason param_cptr is above.
 [[nodiscard]] inline float param_get(const bf16* base, std::size_t i) noexcept { return to_f32(base[i]); }
+[[nodiscard]] inline float param_get(const fp8* base, std::size_t i) noexcept { return to_f32(base[i]); }
 [[nodiscard]] inline float param_get(const float* base, std::size_t i) noexcept { return base[i]; }
 inline void param_set(bf16* base, std::size_t i, float v) noexcept { base[i] = f32_narrow(v); }
+inline void param_set(fp8* base, std::size_t i, float v) noexcept { base[i] = fp8_narrow(v); }
 inline void param_set(float* base, std::size_t i, float v) noexcept { base[i] = v; }
 
 }  // namespace sub0

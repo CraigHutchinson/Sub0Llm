@@ -148,27 +148,30 @@ bool load_model(const char* path) {
         std::println(stderr, "error: model was built with a different (constexpr) config");
         return false;
     }
-    // B24 (docs/BACKBONE_PRECISION.md S1): which dtype the blob was actually written at. The tag
+    // B24/B33 (docs/BACKBONE_PRECISION.md S1/S2): which dtype the blob was actually written at. The tag
     // (h.param_dtype) CANNOT be trusted alone for this -- it lives in bytes that were plain structure
     // padding in every file written before B24, and padding was never guaranteed to be zero, so a
     // pre-B24 f32 file's tag is whatever garbage sat on that writer's stack. The file's own TOTAL SIZE
     // is the independent, authoritative signal (model_file.hpp's model_file_bytes(), the same formula
-    // the write side used): exactly one of the f32/bf16 candidate sizes can match a well-formed file
-    // at this h.param_floats, so compute both and see which one the bytes on disk actually are.
+    // the write side used): at a given h.param_floats, f32/bf16/fp8 blobs are three DISTINCT sizes
+    // (elem_bytes 4/2/1 respectively), so exactly one of the three candidate sizes can match a
+    // well-formed file -- compute all three and see which one the bytes on disk actually are.
     const std::streampos data_start = is.tellg();
     is.seekg(0, std::ios::end);
     const auto file_bytes = static_cast<std::uint64_t>(is.tellg());
     is.seekg(data_start);
     const std::uint64_t want_f32  = model_file_bytes(sizeof(Header), h.param_floats, 4);
     const std::uint64_t want_bf16 = model_file_bytes(sizeof(Header), h.param_floats, 2);
+    const std::uint64_t want_fp8  = model_file_bytes(sizeof(Header), h.param_floats, 1);
     ParamDtype file_dtype;
     if (file_bytes == want_f32) file_dtype = ParamDtype::F32;
     else if (file_bytes == want_bf16) file_dtype = ParamDtype::BF16;
+    else if (file_bytes == want_fp8) file_dtype = ParamDtype::FP8;
     else {
         std::println(stderr,
-            "error: model file '{}' is {} bytes, which matches neither an f32 blob ({} bytes) nor a "
-            "bf16 one ({} bytes) for {} params -- truncated or corrupt", path, file_bytes, want_f32,
-            want_bf16, h.param_floats);
+            "error: model file '{}' is {} bytes, which matches none of an f32 blob ({} bytes), a bf16 "
+            "one ({} bytes), or an fp8 one ({} bytes) for {} params -- truncated or corrupt", path,
+            file_bytes, want_f32, want_bf16, want_fp8, h.param_floats);
         return false;
     }
     // Corroboration, not the decision: if the tag IS a recognised value (so not pre-B24 padding
