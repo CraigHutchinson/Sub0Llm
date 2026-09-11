@@ -188,3 +188,15 @@ path in `moe_quant.hpp`/`moe_math.hpp` (the user's own suggestion). Files: `incl
 `benchmarks/moe_expert_bench.cpp`. Gate: bit-exact vs `tests/gguf_tests.cpp` + `--verify` against the real
 48-layer artifact (numerical decode, must not change), plus a real before/after decode-throughput
 measurement. Do not touch `docs/ACTIVE_WORK_LOG.md`'s shared rows above.
+
+---
+
+**2026-09-11 Claude Code — B28 done, merged, pushed.** Fixed `dequantize_iq2_xxs`'s ~6x-slower decode
+(real cause: per-element branch on a sign bit, not just the tail-bound guard). Independently reverified
+(numbers, tests, and a real 48-layer decode rerun all reproduced) before merging `--no-ff` to `main`
+(`8ed590d`), full `d196check` rebuild + both suites green, pushed. Decode: ~4.78-4.85 s/token ->
+~3.94-3.98 s/token (~18-20% faster). Prefetch-hint task attempted, measured no benefit, reverted. See
+`docs/INDEPENDENT_REVIEW_BACKLOG.md` B28. Session `/goal` ("token-gen near CPU theoretical performance")
+still open -- theoretical floor under B27's compute-bound model is ~837 ms/token; next lever is B21's own
+concurrency-ceiling finding, now suspected to be a compute-side bandwidth/cache-contention ceiling rather
+than disk-related.
