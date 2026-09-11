@@ -36,7 +36,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -454,14 +457,26 @@ TEST_CASE("moeq (WP5b): a Store outlives the scope its FileMap was opened in", "
     REQUIRE(std::filesystem::remove(path));
 }
 
-TEST_CASE("moeq (B31): the fused no-transpose resolve produces the SAME output as dequant+transpose",
+TEST_CASE("moeq (B31/B34/B38): the fused no-transpose resolve produces the SAME output as dequant+transpose",
           "[moequant]") {
     // THE GATE for the whole B31 design. dequantize_expert_source + moe::expert_ffn_row_source is a
     // from-scratch REORDERING of the same math dequantize_expert + moe::expert_ffn_row already compute
     // (see moe_math.hpp's own comment on expert_ffn_row_source for the per-output summation-order
-    // argument this test exists to check, not merely restate): both paths must produce bit-identical
-    // FFN output over the SAME raw encoded bytes, for every one of the three plane roles, or the "one
-    // DRAM touch instead of three" design is measuring a coincidence rather than an identity.
+    // argument this test exists to check, not merely restate): both paths must produce the SAME FFN
+    // output over the SAME raw encoded bytes, for every one of the three plane roles, or the "one DRAM
+    // touch instead of three" design is measuring a coincidence rather than an identity.
+    //
+    // B34/B38 (docs/INDEPENDENT_REVIEW_BACKLOG.md B38): expert_ffn_row_source's gate/up/down reductions
+    // go through simd_reduce.hpp's `dot_seq` (strict left-to-right), NEVER `dot()`/`dot_choice<UseSimd>`
+    // -- and NOT gated on USE_SIMD_REDUCE at all, regardless of the build's own flag setting: an earlier
+    // pass of this work used the reordered multi-accumulator `dot()` here, which broke this test's own
+    // bit-exactness (expert_ffn_row's own scatter-accumulated sum is NOT reorderable without losing its
+    // deliberate input-major cache locality, so it stays a strict scalar sum, and expert_ffn_row_source
+    // has to match that order term-for-term to stay bit-identical). `dot_seq` still drops the old
+    // `if(xi==0.f) continue` branch (see moe_math.hpp's own comment) -- that part is a genuine, proven
+    // no-op (0.f*finite=0.f exactly), not a reordering. So this stays a bit-exact memcmp, unaffected by
+    // whichever way USE_SIMD_REDUCE is set for the rest of the build: the two paths compute the same
+    // addends in the same order, only the branch is gone. See simd_reduce.hpp's own `dot_seq` comment.
     const std::string path = temp_path("sub0_moeq_fused.bin");
     const Built built = build_sidecar(2, path);
     {
@@ -495,6 +510,88 @@ TEST_CASE("moeq (B31): the fused no-transpose resolve produces the SAME output a
             for (float v : out_t) any_nonzero = any_nonzero || (v != 0.f);
             REQUIRE(any_nonzero);
         }
+    }
+    REQUIRE(std::filesystem::remove(path));
+}
+
+TEST_CASE("moeq (B38): forward_row_via_run_ex<UseSimd=true> builds, runs, and stays close to the "
+          "default scalar arm, while expert_ffn_row_source stays untouched by the flag",
+          "[moequant]") {
+    // B38's own correctness gate for the ONE call site forward_row_via_run_ex's `UseSimd` template
+    // parameter actually controls (the shared-expert gate logit, moe_math.hpp): instantiate both arms
+    // over the SAME real sidecar bytes and SAME input row, and require (a) both compile/run/produce
+    // finite output -- the templating itself is exercised, not merely assumed to compile because
+    // `sub0_core` happened to link somewhere else, (b) the two arms' outputs are close (tolerance, NOT
+    // bit-exact -- reassociating a sum changes the last bits by construction, same as every other
+    // reordering this project has already accepted, e.g. B24/B31's own precedent), and (c) the routed
+    // experts' own output (expert_ffn_row_source, untouched by `UseSimd`) is IDENTICAL between the two
+    // runs -- proving the flag really does stay scoped to only the shared-expert gate logit, not leak
+    // into the routed-expert path it must never touch (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
+    const std::string path = temp_path("sub0_moeq_b38_simd.bin");
+    const Built built = build_sidecar(1, path);
+    {
+    moeq::Store store;
+    std::string err;
+    REQUIRE(store.open(path, err));
+
+    const moe::Dims dims{kIn, kOut, kExperts, 2};
+    std::vector<float> x(kIn);
+    for (int i = 0; i < kIn; ++i) x[static_cast<std::size_t>(i)] = 0.3f - 0.017f * static_cast<float>(i);
+
+    // Shared-expert weights: reuse routed expert 0's own planes as stand-ins (this test only needs SOME
+    // real, non-degenerate weight bytes; the shared expert's identity is irrelevant to what's gated).
+    moeq::ExpertCacheSource<1, kPerExpert> fused;
+    fused.allocate();
+    const auto shared = fused.resolve(store, 0, 0);
+    REQUIRE(shared.gate != nullptr);
+
+    // A trivial router: [hidden_size, num_experts], f32, zero-initialized (uniform routing -- this test
+    // does not care WHICH experts are picked, only that the shared-expert gate logit reduction differs).
+    std::vector<float> router_w_mut(static_cast<std::size_t>(kIn) * kExperts, 0.01f);
+    std::vector<float> shared_gate_proj_w_mut(kIn);
+    for (int i = 0; i < kIn; ++i) shared_gate_proj_w_mut[static_cast<std::size_t>(i)] = 0.02f * static_cast<float>(i % 7 - 3);
+    const std::vector<float>& router_w = router_w_mut;
+    const std::vector<float>& shared_gate_proj_w = shared_gate_proj_w_mut;
+
+    std::vector<float> scratch(moe::scratch_floats(dims));
+    std::vector<float> out_false(kIn), out_true(kIn);
+    std::vector<float> routed_false(kIn), routed_true(kIn);   // expert 0's own routed output, captured
+
+    auto run = [&](bool use_simd, std::vector<float>& out, std::vector<float>& routed_out) {
+        auto compute_expert = [&](int /*k*/, int e, float* out_ptr, float* ffn, float* g) {
+            const auto r = fused.resolve(store, 0, e % kExperts);
+            moe::expert_ffn_row_source(dims, x.data(), r.gate, r.up, r.down, out_ptr, ffn, g);
+            std::memcpy(routed_out.data(), out_ptr, routed_out.size() * sizeof(float));
+        };
+        if (use_simd) {
+            moe::forward_row_via_run_ex<true>(dims, x.data(), router_w.data(), compute_expert,
+                                               moe::SerialExperts{}, shared.gate, shared.up, shared.down,
+                                               shared_gate_proj_w.data(), out.data(), scratch.data());
+        } else {
+            moe::forward_row_via_run_ex<false>(dims, x.data(), router_w.data(), compute_expert,
+                                                moe::SerialExperts{}, shared.gate, shared.up, shared.down,
+                                                shared_gate_proj_w.data(), out.data(), scratch.data());
+        }
+    };
+    run(false, out_false, routed_false);
+    run(true,  out_true,  routed_true);
+
+    // (c) the routed expert's own output (expert_ffn_row_source, never touched by UseSimd) is identical.
+    REQUIRE(std::memcmp(routed_false.data(), routed_true.data(), routed_false.size() * sizeof(float)) == 0);
+
+    // (a)/(b): both finite; close but not required to be bit-identical (the shared-expert gate logit's
+    // reduction order differs, so sigmoid(gate_logit) differs at ULP scale, which the weighted-sum
+    // combine can then amplify slightly -- bounded by a loose tolerance, not asserted to be zero).
+    double max_abs_diff = 0.0, max_abs = 0.0;
+    for (std::size_t i = 0; i < out_false.size(); ++i) {
+        REQUIRE(std::isfinite(out_false[i]));
+        REQUIRE(std::isfinite(out_true[i]));
+        max_abs_diff = std::max(max_abs_diff, static_cast<double>(std::fabs(out_false[i] - out_true[i])));
+        max_abs = std::max(max_abs, static_cast<double>(std::fabs(out_false[i])));
+    }
+    REQUIRE(max_abs > 0.0);                        // not a degenerate all-zero run
+    REQUIRE(max_abs_diff < 1e-3 * std::max(1.0, max_abs));   // same loose tolerance engine_tests.cpp's
+                                                              // own forward_one-vs-forward parity check uses
     }
     REQUIRE(std::filesystem::remove(path));
 }

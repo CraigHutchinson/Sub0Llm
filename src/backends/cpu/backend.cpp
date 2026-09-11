@@ -1141,7 +1141,7 @@ static void backward_node(Node& n) {
         // needs no special-casing for LoopSplit (a repeated middle layer's several GDN executions all
         // point at the same 9 underlying parameter Nodes and correctly accumulate into them).
         const GdnLink& L = g_gdn_link.links[static_cast<std::size_t>(n.gdn_link)];
-        gdn::backward(GDN_DIMS, n.rows, n.a->data.data(),
+        gdn::backward<USE_SIMD_REDUCE>(GDN_DIMS, n.rows, n.a->data.data(),
                       L.in_qkv->data.data(), L.in_z->data.data(), L.in_b->data.data(), L.in_a->data.data(),
                       L.conv->data.data(), L.dt_bias->data.data(), L.a_log->data.data(), L.norm->data.data(),
                       L.out_proj->data.data(),
@@ -1242,7 +1242,7 @@ static Node* op_gdn(Node* a, Layer& L) {
     // not by itself fail it) could catch this from the CPU side alone -- Stage 3's CUDA port, built
     // independently from the verified gdn_math.hpp reference rather than copied from this call site,
     // disagreed with the CPU engine's real forward output at a real mixed-layer model and exposed it.
-    gdn::forward(GDN_DIMS, T, a->data.data(),
+    gdn::forward<USE_SIMD_REDUCE>(GDN_DIMS, T, a->data.data(),
                  L.gdn_in_qkv->pdata, L.gdn_in_z->pdata,
                  L.gdn_in_b->pdata, L.gdn_in_a->pdata,
                  L.gdn_conv->pdata, L.gdn_dt_bias->pdata, L.gdn_a_log->pdata,
@@ -1274,7 +1274,7 @@ static Node* op_gr_mix(Node* wide, Node* norm_w, Node* down_w, Node* up_w) {
     Node* out = mk_node(Op::GrMix, T, D_MODEL);
     out->a = wide; out->b = norm_w; out->w = down_w; out->bias = up_w;
     auto [normed, normed_g] = arena_alloc(gr::normed_scratch_floats(GR_DIMS, T));
-    gr::hc_norm(GR_DIMS, T, wide->data.data(), norm_w->pdata, normed.data());
+    gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, T, wide->data.data(), norm_w->pdata, normed.data());
     auto [dscr, dscr_g] = arena_alloc(gr::mix_scratch_floats(GR_DIMS, T));
     gr::mix(GR_DIMS, T, normed.data(), down_w->pdata, up_w->pdata, out->data.data(), dscr.data());
     return out;
@@ -1285,7 +1285,7 @@ static Node* op_gr_gate(Node* wide, Node* norm_w, Node* block_inject_w) {
     Node* out = mk_node(Op::GrGate, T, HC_COUNT);
     out->a = wide; out->b = norm_w; out->w = block_inject_w;
     auto [normed, normed_g] = arena_alloc(gr::normed_scratch_floats(GR_DIMS, T));
-    gr::hc_norm(GR_DIMS, T, wide->data.data(), norm_w->pdata, normed.data());
+    gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, T, wide->data.data(), norm_w->pdata, normed.data());
     gr::gate(GR_DIMS, T, normed.data(), block_inject_w->pdata, out->data.data());
     return out;
 }
@@ -1319,7 +1319,9 @@ static Node* op_moe(Node* x, Layer& L, int layer_index) {
     // The batched path stays SERIAL and stays on this Worker's own 8-slot pool: it is already inside
     // train_batch's parallel team when training, and its cache has a real cross-row hit rate that
     // decode's does not (see MOE_DECODE_SLOTS in internal.hpp). B20 part 2 changed decode, not this.
-    moe::forward_via(MOE_DIMS, T, x->data.data(), L.moe_router->pdata,
+    // B34/B38: UseSimd explicit template arg selects the shared-expert gate-logit reduction strategy;
+    // see docs/INDEPENDENT_REVIEW_BACKLOG.md B38 and include/sub0/simd_reduce.hpp.
+    moe::forward_via<USE_SIMD_REDUCE>(MOE_DIMS, T, x->data.data(), L.moe_router->pdata,
                      [&](int e) { return moe_resolve(L, layer_index, e, W->moe_cache); },
                      L.moe_shared_gate->pdata, L.moe_shared_up->pdata,
                      L.moe_shared_down->pdata, L.moe_shared_gate_proj->pdata,
@@ -1342,7 +1344,7 @@ static Node* op_qsa(Node* a, Layer& L) {
     Node* out = mk_node(Op::Qsa, T, D_MODEL);
     out->a = a;
     auto [scratch, scratch_g] = arena_alloc(qsa::scratch_floats(QSA_DIMS_BUF, T));
-    qsa::forward(QSA_DIMS, T, a->data.data(),
+    qsa::forward<USE_SIMD_REDUCE>(QSA_DIMS, T, a->data.data(),
                  L.qsa_idx_qk->pdata, L.qsa_idx_qnorm->pdata, L.qsa_idx_knorm->pdata,
                  L.qsa_q->pdata, L.qsa_gate->pdata, L.qsa_k->pdata,
                  L.qsa_v->pdata, L.qsa_qnorm->pdata, L.qsa_knorm->pdata,

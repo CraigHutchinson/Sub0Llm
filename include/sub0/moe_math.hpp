@@ -28,6 +28,14 @@
 #include <cmath>
 #include <cstddef>
 
+#include "sub0/simd_reduce.hpp"  // B34/B38: dot_choice<UseSimd>() for this file's real scalar-reduction
+                                  // hot loop (the shared-expert gate logit in forward_row_via_run_ex) --
+                                  // see that header for why a plain scalar `s += a[i]*b[i]` never
+                                  // auto-vectorizes here, and its own note on `dot_seq`, used
+                                  // UNCONDITIONALLY (regardless of USE_SIMD_REDUCE) by
+                                  // expert_ffn_row_source below to preserve B31's forward()/forward_one()
+                                  // bit-exactness invariant with expert_ffn_row.
+
 namespace sub0::moe {
 
 // Every dimension the module needs, explicit rather than closed over a build's own constants -- same
@@ -181,15 +189,16 @@ inline void expert_ffn_row_source(const Dims& d, const float* x, WP gate_src, WP
         for (int o = ot; o < o_end; ++o) {
             const auto gr = gate_src + static_cast<std::size_t>(o) * d.hidden_size;
             const auto ur = up_src   + static_cast<std::size_t>(o) * d.hidden_size;
-            float gs = 0.f, ps = 0.f;
-            for (int i = 0; i < d.hidden_size; ++i) {
-                const float xi = x[i];
-                if (xi == 0.f) continue;
-                gs += xi * gr[i];
-                ps += xi * ur[i];
-            }
-            g_scratch[o] = gs;
-            pre_scratch[o] = ps;
+            // B34/B38: branch-free (was a scalar `if(xi==0.f) continue;`-guarded reduction -- 0.f*finite
+            // =0.f exactly under IEEE754, so dropping the skip changes nothing). Deliberately `dot_seq`,
+            // NOT `dot()`/`dot_choice<UseSimd>`, and NOT gated on USE_SIMD_REDUCE at all: this value must
+            // stay bit-identical to expert_ffn_row's own scatter-accumulated sum (forward()'s path for
+            // the same routed expert) for forward()/forward_one() parity to hold, regardless of the
+            // build's reduction-strategy toggle -- see simd_reduce.hpp's own `dot_seq` comment for the
+            // full reasoning (B34, found and fixed while verifying this file's change end-to-end against
+            // the real 48-layer artifact, which is precisely what caught this).
+            g_scratch[o] = simd::dot_seq(x, gr, d.hidden_size);
+            pre_scratch[o] = simd::dot_seq(x, ur, d.hidden_size);
         }
     }
     for (int o = 0; o < d.d_ff; ++o) pre_scratch[o] = detail::silu(g_scratch[o]) * pre_scratch[o];
@@ -199,13 +208,11 @@ inline void expert_ffn_row_source(const Dims& d, const float* x, WP gate_src, WP
         const int j_end = std::min(jt + down_tile, d.hidden_size);
         for (int j = jt; j < j_end; ++j) {
             const auto dr = down_src + static_cast<std::size_t>(j) * d.d_ff;
-            float s = 0.f;
-            for (int o = 0; o < d.d_ff; ++o) {
-                const float po = pre_scratch[o];
-                if (po == 0.f) continue;
-                s += po * dr[o];
-            }
-            out[j] = s;
+            // B34/B38: same branch-free reasoning as the gate/up loop above -- pre_scratch[o]==0.f
+            // (post-SiLU-gated sparsity) contributes exactly 0.f to the sum either way. `dot_seq`, not
+            // `dot()`/`dot_choice`, and not gated on USE_SIMD_REDUCE, for the same forward()/forward_one()
+            // parity reason (see simd_reduce.hpp).
+            out[j] = simd::dot_seq(pre_scratch, dr, d.d_ff);
         }
     }
 }
@@ -330,7 +337,10 @@ struct SerialExperts {
 // phase 2.
 //
 // B24: `WP` is the PARAMETER-ARENA pointer type (router + shared expert).
-template <class WP, class ComputeExpert, class RunExperts>
+// B34/B38: `UseSimd` selects the shared-expert gate-logit reduction strategy (simd::dot_choice<UseSimd>
+// below), defaulted false so every existing untouched call site keeps today's exact scalar behavior --
+// callers that want USE_SIMD_REDUCE pass it as an explicit template argument (src/backends/cpu/decode.cpp).
+template <bool UseSimd = false, class WP, class ComputeExpert, class RunExperts>
 inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
                                     ComputeExpert&& compute_expert, RunExperts&& run_experts,
                                     WP shared_gate_w, WP shared_up_w,
@@ -374,8 +384,10 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
     // f32-resident: it runs for EVERY token, so there is nothing for a quantized-resident form to save
     // (see include/sub0/moe_quant.hpp's own header comment).
     expert_ffn_row(d, x, shared_gate_w, shared_up_w, shared_down_w, expert_out, ffn_scratch, g_scratch);
-    float gate_logit = 0.f;
-    for (int i = 0; i < d.hidden_size; ++i) gate_logit += x[i] * shared_gate_proj_w[i];  // [hidden_size,1]
+    // B34/B38: was a scalar `for(i) gate_logit += x[i]*w[i];` reduction -- see simd_reduce.hpp. Gated on
+    // USE_SIMD_REDUCE via the `UseSimd` template parameter above; UseSimd=false reproduces the exact
+    // original scalar accumulation order.
+    const float gate_logit = simd::dot_choice<UseSimd>(x, shared_gate_proj_w, d.hidden_size);  // [hidden_size,1]
     const float sg = detail::sigmoid(gate_logit);
     for (int j = 0; j < d.hidden_size; ++j) out[j] += sg * expert_out[j];
 }
@@ -384,13 +396,13 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
 // tests) uses: `resolve(idx) -> ExpertWeights`, then this function's own expert_ffn_row call, exactly as
 // before B31 -- now a thin wrapper over forward_row_via_run_ex so there is exactly one copy of the two-
 // phase/order-independence machinery, not two that could drift apart.
-template <class WP, class Resolve, class RunExperts>
+template <bool UseSimd = false, class WP, class Resolve, class RunExperts>
 inline void forward_row_via_run(const Dims& d, const float* x, WP router_w, Resolve&& resolve,
                                  RunExperts&& run_experts,
                                  WP shared_gate_w, WP shared_up_w,
                                  WP shared_down_w, WP shared_gate_proj_w,
                                  float* out, float* scratch, bool norm_topk_prob = true) {
-    forward_row_via_run_ex(
+    forward_row_via_run_ex<UseSimd>(
         d, x, router_w,
         [&](int /*k*/, int idx, float* out_ptr, float* ffn, float* g) {
             const ExpertWeights w = resolve(idx);
@@ -404,25 +416,25 @@ inline void forward_row_via_run(const Dims& d, const float* x, WP router_w, Reso
 // experts run one after another on this thread, reusing the one scratch pair. Kept as its own name (and
 // its own unchanged signature) because that is what op_moe's batched T-row path, the f32-resident
 // wrappers below, and every test call -- none of which are the decode hot path B20 measured -- want.
-template <class WP, class Resolve>
+template <bool UseSimd = false, class WP, class Resolve>
 inline void forward_row_via(const Dims& d, const float* x, WP router_w, Resolve&& resolve,
                              WP shared_gate_w, WP shared_up_w,
                              WP shared_down_w, WP shared_gate_proj_w,
                              float* out, float* scratch, bool norm_topk_prob = true) {
-    forward_row_via_run(d, x, router_w, resolve, SerialExperts{}, shared_gate_w, shared_up_w,
+    forward_row_via_run<UseSimd>(d, x, router_w, resolve, SerialExperts{}, shared_gate_w, shared_up_w,
                         shared_down_w, shared_gate_proj_w, out, scratch, norm_topk_prob);
 }
 
 // The f32-resident form: `expert_gate_w`/`expert_up_w`/`expert_down_w` are arrays of `num_experts`
 // pointers, one per routed expert. A thin wrapper, deliberately -- see forward_row_via's comment.
-template <class WP>
+template <bool UseSimd = false, class WP>
 inline void forward_row(const Dims& d, const float* x, WP router_w,
                          const WP* expert_gate_w, const WP* expert_up_w,
                          const WP* expert_down_w,
                          WP shared_gate_w, WP shared_up_w, WP shared_down_w,
                          WP shared_gate_proj_w,
                          float* out, float* scratch, bool norm_topk_prob = true) {
-    forward_row_via(d, x, router_w,
+    forward_row_via<UseSimd>(d, x, router_w,
                     [&](int e) {
                         return ExpertWeightsOf<WP>{expert_gate_w[e], expert_up_w[e], expert_down_w[e]};
                     },
@@ -432,7 +444,7 @@ inline void forward_row(const Dims& d, const float* x, WP router_w,
 
 // Batched T-row wrapper. Rows are independent (this file's own header comment) so `scratch` is reused
 // across the loop, not sized per-row -- one scratch_floats(d)-sized buffer serves any T.
-template <class WP>
+template <bool UseSimd = false, class WP>
 inline void forward(const Dims& d, int T, const float* x, WP router_w,
                      const WP* expert_gate_w, const WP* expert_up_w,
                      const WP* expert_down_w,
@@ -440,7 +452,7 @@ inline void forward(const Dims& d, int T, const float* x, WP router_w,
                      WP shared_gate_proj_w,
                      float* out, float* scratch, bool norm_topk_prob = true) {
     for (int t = 0; t < T; ++t) {
-        forward_row(d, x + static_cast<std::size_t>(t) * d.hidden_size, router_w,
+        forward_row<UseSimd>(d, x + static_cast<std::size_t>(t) * d.hidden_size, router_w,
                     expert_gate_w, expert_up_w, expert_down_w,
                     shared_gate_w, shared_up_w, shared_down_w, shared_gate_proj_w,
                     out + static_cast<std::size_t>(t) * d.hidden_size, scratch, norm_topk_prob);
@@ -451,13 +463,13 @@ inline void forward(const Dims& d, int T, const float* x, WP router_w,
 // default argument because the two have genuinely different call sites, and because `resolve` must be
 // reused across the T-row loop -- resolving per row is what makes the small pool pay for itself when
 // several rows of one batch pick the same expert.
-template <class WP, class Resolve>
+template <bool UseSimd = false, class WP, class Resolve>
 inline void forward_via(const Dims& d, int T, const float* x, WP router_w, Resolve&& resolve,
                          WP shared_gate_w, WP shared_up_w, WP shared_down_w,
                          WP shared_gate_proj_w,
                          float* out, float* scratch, bool norm_topk_prob = true) {
     for (int t = 0; t < T; ++t) {
-        forward_row_via(d, x + static_cast<std::size_t>(t) * d.hidden_size, router_w, resolve,
+        forward_row_via<UseSimd>(d, x + static_cast<std::size_t>(t) * d.hidden_size, router_w, resolve,
                         shared_gate_w, shared_up_w, shared_down_w, shared_gate_proj_w,
                         out + static_cast<std::size_t>(t) * d.hidden_size, scratch, norm_topk_prob);
     }

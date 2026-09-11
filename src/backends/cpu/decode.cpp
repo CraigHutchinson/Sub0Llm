@@ -423,7 +423,7 @@ const float* Model::forward_one(int id, int pos) {
     auto gr_read_row = [&](const float* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w,
                             Node* ln, float* out_a) {
         if constexpr (USE_GATED_RESIDUAL) {
-            gr::hc_norm(GR_DIMS, 1, wide, norm_w->pdata, gr_normed);
+            gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, wide, norm_w->pdata, gr_normed);
             gr::mix(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed, gr_mixscr);
             gr::gate(GR_DIMS, 1, gr_normed, inject_w->pdata, gr_inj);
             // WP4b blocker D: the mixer reads mixed_input DIRECTLY -- no Ln1/Ln2 exists under GR
@@ -589,11 +589,11 @@ const float* Model::forward_one(int id, int pos) {
             // QsaRopeTables (internal.hpp); it was D_HEAD before --rotary-dim became an axis.
             const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * ROTARY_DIM;
             const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * ROTARY_DIM;
-            qsa::indexer_project_row(QSA_DIMS, a, L.qsa_idx_qk->pdata,
+            qsa::indexer_project_row<USE_SIMD_REDUCE>(QSA_DIMS, a, L.qsa_idx_qk->pdata,
                                       L.qsa_idx_qnorm->pdata, cos_pos, sin_pos, qsa::RMS_EPS,
                                       qsa_idx_q,
                                       raw_k_base + static_cast<size_t>(pos) * QSA_INDEXER_HEAD_DIM);
-            qsa::attn_project_row(QSA_DIMS, a, L.qsa_q->pdata, L.qsa_gate->pdata,
+            qsa::attn_project_row<USE_SIMD_REDUCE>(QSA_DIMS, a, L.qsa_q->pdata, L.qsa_gate->pdata,
                                    L.qsa_k->pdata, L.qsa_v->pdata,
                                    L.qsa_qnorm->pdata, L.qsa_knorm->pdata,
                                    cos_pos, sin_pos, qsa::RMS_EPS,
@@ -601,12 +601,12 @@ const float* Model::forward_one(int id, int pos) {
             // The pooled block keys persist across decode steps in this execution's own QsaCache
             // slot, exactly as the raw keys above already do -- the decode counterpart of the
             // batched path's in-scratch cache, filled by the SAME primitive (docs/QSA.md S11).
-            qsa::indexer_select_row(QSA_DIMS, qsa_idx_q, raw_k_base, pos + 1,
+            qsa::indexer_select_row<USE_SIMD_REDUCE>(QSA_DIMS, qsa_idx_q, raw_k_base, pos + 1,
                                      L.qsa_idx_knorm->pdata, g_qsa_rope.cos.data(),
                                      g_qsa_rope.sin.data(), qsa::RMS_EPS,
                                      g_qsa_cache.block_base(e), g_qsa_cache.n_cached_of(e),
                                      qsa_mask, qsa_sel_scr);
-            qsa::attn_row(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
+            qsa::attn_row<USE_SIMD_REDUCE>(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
                            qsa_mask, L.qsa_o->pdata, proj, qsa_att_scr);
             gr_write_row(h, proj);                                           // residual (write step)
         };
@@ -634,7 +634,7 @@ const float* Model::forward_one(int id, int pos) {
                 // Same dt_bias/a_log ARGUMENT-ORDER fix as op_gdn's batched forward (backend.cpp) (this
                 // decode path had the identical swap, independently) -- see that call site's comment.
                 float gdn_scratch[GDN_SCRATCH1];
-                gdn::forward(GDN_DIMS, 1, a,
+                gdn::forward<USE_SIMD_REDUCE>(GDN_DIMS, 1, a,
                              L.gdn_in_qkv->pdata, L.gdn_in_z->pdata,
                              L.gdn_in_b->pdata, L.gdn_in_a->pdata,
                              L.gdn_conv->pdata, L.gdn_dt_bias->pdata,
@@ -671,7 +671,12 @@ const float* Model::forward_one(int id, int pos) {
             // for and consumes THIS iteration's (k's) three planes from that stage instead of
             // ExpertCacheSource::resolve()'s own mmap-backed path. Off that build config (the default),
             // this whole branch compiles away and `resolve()` runs exactly as it did pre-B36.
-            moe::forward_row_via_run_ex(
+            // B34/B38: the explicit <USE_SIMD_REDUCE> template arg selects the shared-expert gate-logit
+            // reduction strategy inside forward_row_via_run_ex; see docs/INDEPENDENT_REVIEW_BACKLOG.md
+            // B38 and include/sub0/simd_reduce.hpp. expert_ffn_row_source below (this lambda's own call)
+            // is NEVER gated by this -- it always uses simd::dot_seq regardless, to preserve B31's
+            // forward()/forward_one() bit-exactness invariant.
+            moe::forward_row_via_run_ex<USE_SIMD_REDUCE>(
                 MOE_DIMS, a, L.moe_router->pdata,
                 [&](int k, int e, float* out_ptr, float* ffn, float* g) {
                     const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
@@ -755,7 +760,7 @@ const float* Model::forward_one(int id, int pos) {
     // own exit-collapse placement: use_combine=False, so just the mix half (no gate/combine) --
     // last_hidden captures the FULLY-COLLAPSED, D_MODEL-wide representation, same as the GR-off path.
     if constexpr (USE_GATED_RESIDUAL) {
-        gr::hc_norm(GR_DIMS, 1, h, gr_top_norm->pdata, gr_normed);
+        gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, h, gr_top_norm->pdata, gr_normed);
         gr::mix(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed, gr_mixscr);
         for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = gr_mixed[j];
         // No final norm under GR -- the exit collapse's own hc_norm is it, so mixed_input feeds the

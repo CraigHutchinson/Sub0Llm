@@ -37,6 +37,10 @@
 #include <cstddef>
 #include <limits>
 
+#include "sub0/simd_reduce.hpp"  // B34/B38: dot_choice/sumsq_choice/sum_choice<UseSimd>() for this
+                                  // file's real scalar-reduction hot loops (docs/INDEPENDENT_REVIEW_
+                                  // BACKLOG.md B38).
+
 namespace sub0::qsa {
 
 // Every dimension the mechanism needs, explicit rather than closed over a build's own constants -- same
@@ -134,10 +138,14 @@ inline constexpr std::size_t scratch_floats(const Dims& d, int T) {
 // B24: `w` is a WEIGHT pointer, templated so a bf16-parameter build promotes inside the loop rather
 // than through a materialised f32 buffer (include/sub0/param_store.hpp). `const float*` deduces exactly
 // as before -- some callers legitimately pass an f32 scratch row rather than a parameter.
-template <class WP>
+// B34/B38: `UseSimd` (default false, today's exact scalar behavior) selects this function's own
+// reduction strategy -- threaded as an explicit template argument from qsa::forward down through every
+// caller in this file, ultimately from the generated `USE_SIMD_REDUCE` at
+// src/backends/cpu/{backend,decode}.cpp's own qsa::forward()/indexer_select_row()/attn_row() call sites.
+template <bool UseSimd = false, class WP>
 inline void rms_norm_row(const float* x, WP w, int n, float eps, float* out) {
-    float ms = 0.f;
-    for (int i = 0; i < n; ++i) ms += x[i] * x[i];
+    // B34/B38: contiguous self-dot -- was a scalar reduction, see simd_reduce.hpp.
+    const float ms = simd::sumsq_choice<UseSimd>(x, n);
     const float inv = 1.f / std::sqrt(ms / static_cast<float>(n) + eps);
     for (int i = 0; i < n; ++i) out[i] = x[i] * inv * (1.f + w[i]);
 }
@@ -186,7 +194,7 @@ inline void linear_row(const float* x, WP w, int in_n, int out_n, float* out) {
 // q_layernorm'd per head and rotated at this row's position; the KEY half is left COMPLETELY RAW
 // (k_layernorm and RoPE happen later, on the POOLED block key, at the block's own start position).
 // qk_proj_w: [hidden_size, idx_qk_out()]. q_ln_w: [idx_head_dim].
-template <class WP>
+template <bool UseSimd = false, class WP>
 inline void indexer_project_row(const Dims& d, const float* x, WP qk_proj_w,
                                  WP q_ln_w, const float* cos_pos, const float* sin_pos,
                                  float eps, float* out_q, float* out_raw_k) {
@@ -205,7 +213,7 @@ inline void indexer_project_row(const Dims& d, const float* x, WP qk_proj_w,
     }
     for (int h = 0; h < d.idx_n_heads; ++h) {
         float* qh = out_q + static_cast<std::size_t>(h) * d.idx_head_dim;
-        rms_norm_row(qh, q_ln_w, d.idx_head_dim, eps, qh);
+        rms_norm_row<UseSimd>(qh, q_ln_w, d.idx_head_dim, eps, qh);
         rope_apply_row(qh, cos_pos, sin_pos, d.rotary_dim, d.idx_head_dim);
     }
 }
@@ -234,7 +242,7 @@ inline void indexer_project_row(const Dims& d, const float* x, WP qk_proj_w,
 // the same value for every query that can see it, and recomputing it per query was pure repeated work.
 //
 // `out`: [idx_head_dim], this block's cache slot. Bumps stats::pool_block_key_calls.
-template <class WP>
+template <bool UseSimd = false, class WP>
 inline void pool_block_key(const Dims& d, const float* raw_keys, int block, WP k_ln_w,
                            const float* cos, const float* sin, float eps, float* out) {
     ++stats::pool_block_key_calls;
@@ -247,7 +255,7 @@ inline void pool_block_key(const Dims& d, const float* raw_keys, int block, WP k
     }
     const float inv_ratio = 1.f / static_cast<float>(ratio);
     for (int j = 0; j < d.idx_head_dim; ++j) out[j] *= inv_ratio;
-    rms_norm_row(out, k_ln_w, d.idx_head_dim, eps, out);
+    rms_norm_row<UseSimd>(out, k_ln_w, d.idx_head_dim, eps, out);
     // Rotated at the BLOCK's own first token position (`group_starts`), not at the query's -- which is
     // the other half of why this is query-independent and therefore cacheable at all.
     rope_apply_row(out, cos + static_cast<std::size_t>(start) * d.rotary_dim,
@@ -272,7 +280,7 @@ inline void pool_block_key(const Dims& d, const float* raw_keys, int block, WP k
 // `*n_cached`; the buffer's contents need no clearing, since only its first `*n_cached` entries are
 // ever read. Never shrinks `*n_cached`: a shorter kv_len is a PREFIX of the same blocks, whose keys are
 // unchanged (that is what makes forward()'s row loop and forward_one()'s call sequence agree bitwise).
-template <class WP>
+template <bool UseSimd = false, class WP>
 inline int indexer_select_row(const Dims& d, const float* q, const float* raw_keys, int kv_len,
                                WP k_ln_w, const float* cos, const float* sin, float eps,
                                float* block_keys, int* n_cached, float* out_mask, float* scratch) {
@@ -284,7 +292,7 @@ inline int indexer_select_row(const Dims& d, const float* q, const float* raw_ke
     // Extend the cache over exactly the newly-completed blocks. This is the whole optimization: the
     // pooling+norm+rotate work below is O(blocks completed since the last call), not O(all blocks).
     for (int b = *n_cached; b < nb; ++b)
-        pool_block_key(d, raw_keys, b, k_ln_w, cos, sin, eps,
+        pool_block_key<UseSimd>(d, raw_keys, b, k_ln_w, cos, sin, eps,
                        block_keys + static_cast<std::size_t>(b) * d.idx_head_dim);
     if (nb > *n_cached) *n_cached = nb;
     for (int b = 0; b < nb; ++b) {
@@ -292,9 +300,9 @@ inline int indexer_select_row(const Dims& d, const float* q, const float* raw_ke
         float s = 0.f;
         for (int h = 0; h < d.idx_n_heads; ++h) {
             const float* qh = q + static_cast<std::size_t>(h) * d.idx_head_dim;
-            float dot = 0.f;
-            for (int j = 0; j < d.idx_head_dim; ++j) dot += qh[j] * pooled[j];
-            s += dot > 0.f ? dot : 0.f;             // relu BEFORE the head-sum (docs/QSA.md S1a)
+            // B34/B38: contiguous dot -- was a scalar reduction, see simd_reduce.hpp.
+            const float qk = simd::dot_choice<UseSimd>(qh, pooled, d.idx_head_dim);
+            s += qk > 0.f ? qk : 0.f;                // relu BEFORE the head-sum (docs/QSA.md S1a)
         }
         scores[b] = s * inv_sqrt_hd;
     }
@@ -323,7 +331,7 @@ inline int indexer_select_row(const Dims& d, const float* q, const float* raw_ke
 // arithmetic (a chunk of a bias-free Linear's output axis is a partition of its weight rows) -- see
 // docs/QSA.md S2b.4 for why, and for the per-head chunk order a future weight transplant must respect.
 // q_norm_w/k_norm_w: [head_dim], applied PER HEAD, BEFORE RoPE. v is neither normed nor rotated.
-template <class WP>
+template <bool UseSimd = false, class WP>
 inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
                               WP k_w, WP v_w, WP q_norm_w,
                               WP k_norm_w, const float* cos_pos, const float* sin_pos,
@@ -334,12 +342,12 @@ inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
     linear_row(x, v_w,    d.hidden_size, d.kv_width(), out_v);
     for (int h = 0; h < d.n_heads; ++h) {
         float* qh = out_q + static_cast<std::size_t>(h) * d.head_dim;
-        rms_norm_row(qh, q_norm_w, d.head_dim, eps, qh);
+        rms_norm_row<UseSimd>(qh, q_norm_w, d.head_dim, eps, qh);
         rope_apply_row(qh, cos_pos, sin_pos, d.rotary_dim, d.head_dim);
     }
     for (int h = 0; h < d.n_kv_heads; ++h) {
         float* kh = out_k + static_cast<std::size_t>(h) * d.head_dim;
-        rms_norm_row(kh, k_norm_w, d.head_dim, eps, kh);
+        rms_norm_row<UseSimd>(kh, k_norm_w, d.head_dim, eps, kh);
         rope_apply_row(kh, cos_pos, sin_pos, d.rotary_dim, d.head_dim);
     }
 }
@@ -350,7 +358,7 @@ inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
 // cannot happen here because indexer_select_row always keeps at least the query's own tail position.
 // k_cache/v_cache: [kv_len, kv_width()]. o_proj_w: [q_width(), hidden_size].
 // `scratch`: >= attn_scratch_floats(d, kv_len).
-template <class WP>
+template <bool UseSimd = false, class WP>
 inline void attn_row(const Dims& d, const float* q, const float* gate, const float* k_cache,
                       const float* v_cache, int kv_len, const float* mask, WP o_proj_w,
                       float* out, float* scratch) {
@@ -365,17 +373,20 @@ inline void attn_row(const Dims& d, const float* q, const float* gate, const flo
         for (int j = 0; j < kv_len; ++j) {
             if (mask[j] == 0.f) { sc[j] = -std::numeric_limits<float>::infinity(); continue; }
             const float* kj = k_cache + static_cast<std::size_t>(j) * d.kv_width() + off_kv;
-            float s = 0.f;
-            for (int a = 0; a < d.head_dim; ++a) s += q[off + a] * kj[a];
-            s *= scale;
+            // B34/B38: contiguous QK dot -- was a scalar reduction, see simd_reduce.hpp. This is the
+            // dominant per-token attention cost (n_heads * kv_len dot products of width head_dim).
+            const float s = simd::dot_choice<UseSimd>(q + off, kj, d.head_dim) * scale;
             sc[j] = s;
             mx = std::max(mx, s);
         }
-        float Z = 0.f;
-        for (int j = 0; j < kv_len; ++j) {
+        for (int j = 0; j < kv_len; ++j)
             sc[j] = (sc[j] == -std::numeric_limits<float>::infinity()) ? 0.f : std::exp(sc[j] - mx);
-            Z += sc[j];
-        }
+        // B34/B38: softmax normalizer -- was a scalar reduction over kv_len, see simd_reduce.hpp. This
+        // structural split (exp values first, then a separate sum pass) does not change the accumulation
+        // ORDER of Z at UseSimd=false (each sc[j] value is unchanged, only the sum's own loop is now a
+        // named call instead of interleaved with the exp loop), so this is still bit-exact with today's
+        // `main` at the default.
+        const float Z = simd::sum_choice<UseSimd>(sc, kv_len);
         for (int a = 0; a < d.head_dim; ++a) ao[off + a] = 0.f;
         for (int j = 0; j < kv_len; ++j) {
             if (sc[j] == 0.f) continue;
@@ -393,7 +404,7 @@ inline void attn_row(const Dims& d, const float* q, const float* gate, const flo
 // helpers above, so the engine's batched Model::forward and its single-token Model::forward_one provably
 // run the SAME arithmetic (the forward-vs-forward_one parity test is what gates that -- docs/QSA.md S9).
 // `cos`/`sin`: [>= T, rotary_dim]. `out`: [T, hidden_size]. `scratch`: >= scratch_floats(d, T).
-template <class WP>
+template <bool UseSimd = false, class WP>
 inline void forward(const Dims& d, int T, const float* hidden,
                      WP idx_qk_proj_w, WP idx_q_ln_w, WP idx_k_ln_w,
                      WP q_w, WP gate_w, WP k_w, WP v_w,
@@ -421,14 +432,14 @@ inline void forward(const Dims& d, int T, const float* hidden,
         const float* sin_t = sin + static_cast<std::size_t>(t) * d.rotary_dim;
         // The indexer's raw key for THIS token must exist before it can be selected, and the reference
         // caches raw keys for the whole visible prefix -- so project every row's key as we go.
-        indexer_project_row(d, x, idx_qk_proj_w, idx_q_ln_w, cos_t, sin_t, eps, idx_q,
+        indexer_project_row<UseSimd>(d, x, idx_qk_proj_w, idx_q_ln_w, cos_t, sin_t, eps, idx_q,
                              raw_keys + static_cast<std::size_t>(t) * d.idx_head_dim);
-        attn_project_row(d, x, q_w, gate_w, k_w, v_w, q_norm_w, k_norm_w, cos_t, sin_t, eps,
+        attn_project_row<UseSimd>(d, x, q_w, gate_w, k_w, v_w, q_norm_w, k_norm_w, cos_t, sin_t, eps,
                           q_row, gate_row, k_cache + static_cast<std::size_t>(t) * kvw,
                           v_cache + static_cast<std::size_t>(t) * kvw);
-        indexer_select_row(d, idx_q, raw_keys, t + 1, idx_k_ln_w, cos, sin, eps, blk_keys, &n_cached,
+        indexer_select_row<UseSimd>(d, idx_q, raw_keys, t + 1, idx_k_ln_w, cos, sin, eps, blk_keys, &n_cached,
                             mask, sel_scr);
-        attn_row(d, q_row, gate_row, k_cache, v_cache, t + 1, mask, o_proj_w,
+        attn_row<UseSimd>(d, q_row, gate_row, k_cache, v_cache, t + 1, mask, o_proj_w,
                   out + static_cast<std::size_t>(t) * d.hidden_size, att_scr);
     }
 }
