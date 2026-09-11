@@ -589,3 +589,18 @@ conflict at `decode.cpp`'s MoE call site (B36's pipelined-I/O lambda + B38's `<U
 arg on the same call, combined). Could not reconstruct the exact real-48-layer-axes CLI recipe to run a
 direct real-model check (non-obvious flags, reconstruction-effort limitation, not a code defect) --
 superseded by the by-construction correctness argument. Pushed.
+
+---
+
+**2026-09-11 Claude Code — B36/B37/B38 ALL DONE, merged, pushed. Integration sweep complete.** All three
+previously-unmerged branches (B25/B33/B34) are now real, permanent, correctness-gated, default-off build
+options on `main`: `--moe-io-mode pipelined` (B36, `d59fe30`), `--prec-param fp8` (B37, `183230b`),
+`--simd-reduce` (B38, `1e161f4`). Every default arm independently verified byte-for-byte/bit-exact
+unaffected; every non-default arm's honest measured result (B25 ~1.4% worse, B33 ~40-60% worse + worse
+quality, B34 ~20% worse) documented prominently at its own CLI option, not just in the backlog. Hit the
+stale-generated-config issue three times in a row (same root cause each time: a new `constexpr` the
+`d196check` build's generated header predated) -- rebuilt `sub0llm-configure` and regenerated each time,
+matching the B24-Phase-1-established precedent. Two real merge conflicts (B36-vs-B37 docs, B36-vs-B38
+`decode.cpp`'s shared MoE call site) resolved by hand, both verified correct by rebuilding+testing after.
+All three source branches (`feature/b25-explicit-io-resolve`, `feature/b33-fp8-backbone`,
+`feature/b34-simd-unlock`) and their worktrees deleted -- their content lives on `main` now via B36/B37/B38.
