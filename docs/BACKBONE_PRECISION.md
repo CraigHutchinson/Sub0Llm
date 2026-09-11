@@ -382,6 +382,175 @@ loser its higher bytes/element might suggest at a glance.
 
 ---
 
+---
+
+### 2d. B33 — what was actually built: FP8 (E4M3) as a third resident `PARAM_DTYPE`
+
+**STATUS: DONE, branch `feature/b33-fp8-backbone`.** Per §2c's own recommendation ("Phase 2 reduces to a
+resident-format choice for `sub0llm-transplant`'s output, not a new hot-path engine mechanism"), this adds
+a SECOND resident format alongside BF16 -- not the block-scaled Q8/Q4 mechanism §2c decisively ruled out,
+a genuinely different, flat, block-free 8-bit float. Mirrors Phase 1's own architecture exactly, one more
+`param_t`.
+
+**Encoding choice, stated precisely.** OCP/NVIDIA **E4M3**, specifically the **`e4m3fn`** convention (1
+sign, 4 exponent bits/bias 7, 3 mantissa bits; NO infinities -- the exponent-all-ones/mantissa-all-ones
+code point 0x7f/0xff is the ONE reserved NaN encoding, every other exponent-all-ones mantissa is an
+ordinary finite value, pushing the true max magnitude to 1.75 x 2^8 = 448). This is the same convention
+`torch.float8_e4m3fn` uses, and the reason it was chosen over the OCP variant WITH infinity: it is the
+convention most weight-only FP8 quantization already targets, and "overflow saturates to NaN" is a
+simpler, single failure mode than juggling a real (but rarely hit, at real weight magnitudes) infinity
+encoding. `+-Infinity` and any overflowing finite input both saturate to the same NaN code point on
+narrow.
+
+**Files, new or changed:**
+- `include/sub0/fp8.hpp` (NEW) -- `fp8` (1-byte struct), `fp8_widen`/`to_f32` (exact bit-decode, a real
+  exponent remap unlike bf16's pure truncation -- e4m3's exponent range/bias genuinely differ from f32's),
+  `fp8_narrow` (f32->fp8, round-to-nearest-even, one shift-based construction covering both the normal
+  and subnormal output ranges plus their mutual overflow/carry cases), `Fp8CPtr` (the same minimal
+  read-only proxy interface as `Bf16CPtr`). **Named `fp8_narrow`, not `f32_narrow`** -- `bf16.hpp`
+  already defines `f32_narrow(float) -> bf16` in the same namespace, and C++ cannot overload on return
+  type alone, so reusing that name is a hard redefinition error the moment both headers are included
+  together (which `param_store.hpp` does) -- caught by the standalone syntax-check before it ever reached
+  a real build.
+- `include/sub0/param_store.hpp` -- `param_t`/`ParamCPtr` extended to a three-way `std::conditional_t`
+  chain (F32/BF16/FP8); `param_cptr`/`param_get`/`param_set` gain a third overload each (`const fp8*`);
+  the header's own `static_assert` now allows all three `Dtype` values.
+- `include/sub0/model_file.hpp` -- `ParamDtype` gains `FP8 = 2`; `param_dtype_bytes`/`param_dtype_name`
+  extended.
+- `tools/configurator.cpp` -- generated `Dtype` enum gains `FP8` (not a repurposed `Q8`/`Q4` -- those
+  names are reserved for the block-quant mechanism §2c ruled out, and reusing them would misleadingly
+  imply that mechanism); `--prec-param` extended to `0=F32|1=BF16|2=FP8`.
+- `tools/sub0llm-transplant.cpp` -- `--param-dtype 2` output mode: same dequant-to-f32-then-narrow shape
+  as the existing BF16 branch, write/verify scratch buffers added in parallel.
+- `src/backends/cpu/backend.cpp` -- **two dispatch-overload sites needed a third overload each**
+  (`param_write_ptr_of(Fp8CPtr)`, `maybe_ternarize(Fp8CPtr&, ...)`) -- these are the same
+  "ordinary-overloads-not-`if constexpr`" pattern `param_store.hpp`'s own comment documents, at the ONE
+  other layer (backend.cpp's own dispatch functions, not the `*_math.hpp` kernels) that names `Bf16CPtr`
+  by its concrete type rather than going through the generic `WP` template parameter. Both are trivial:
+  `USE_TERNARY`/ternarization is a trainable-path feature, and `PARAM_DTYPE != F32` is FORWARD_ONLY by
+  the same arena `static_assert` BF16 already required, so the FP8 overload is the identical no-op.
+  Two `refuse_f32_params()` call sites (`params_ptr()`, `param_master_f32()`) generalized from
+  `PARAM_DTYPE == Dtype::BF16` to `PARAM_DTYPE != Dtype::F32` -- previously a BF16-only guard that would
+  have silently reinterpreted an FP8 arena as f32 had it been left unchanged.
+- `src/engine_core.cpp`'s `load_model` -- the file-size-based dtype discriminator (the authoritative
+  signal per B24's own established discipline; the on-disk tag is corroboration only, since it can be
+  pre-B24 padding garbage) extended from a two-way (f32/bf16) to a three-way (f32/bf16/fp8) candidate-size
+  comparison.
+- **`include/sub0/*_math.hpp` kernels needed ZERO changes** -- confirmed by building and running the real
+  48-layer artifact end to end: every kernel is already templated on its weight-pointer type (`WP`) from
+  B24 Phase 1, so `Fp8CPtr` deduces into the exact same kernel source `Bf16CPtr`/`const float*` do, with no
+  `is_same<WP,...>`-style dispatch anywhere in the codebase to break. The only real code beyond `fp8.hpp`
+  itself was the two `backend.cpp` dispatch-overload sites above, which sit OUTSIDE the `WP`-templated
+  kernels by construction.
+
+**Round-trip correctness (`fp8_probe.cpp`, run standalone before any engine build):**
+- All 256 fp8 code points, widened then narrowed, reproduce the identical bit pattern exactly (the 254
+  finite/zero values) or a NaN (the 2 reserved NaN codes) -- a full, exhaustive self-consistency sweep of
+  the entire domain, not a sample.
+- Exact small values (0, -0, 1.0, -1.0, 2.0, 0.5, the max finite +-448) narrow to their hand-derived bit
+  patterns and round-trip exactly.
+- Overflow (1e30, +-infinity) and NaN-in all saturate to the reserved NaN code point.
+- RNE tie-breaking verified both directions: 1.0625 (exact tie between mantissa 000/even and 001/odd)
+  rounds DOWN to even (000); 1.1875 (tie between 001/odd and 010/even) rounds UP to even (010).
+- Subnormal exactness: the smallest subnormal (2^-9) round-trips exactly; exactly half of it rounds to
+  zero (RNE ties-to-even at zero).
+
+**Real-model correctness gate, on the actual Qwen3.8-Flash-Next UD-IQ1_S GGUF shards, mirroring B24's own
+gate exactly (quantized-resident-MoE variant, `--moe-quant-experts 1`, the same shape B24's own "95
+tensors, 1.581B params" / "1074 tensors, 4.915B params" figures describe -- the first attempt at this gate
+mistakenly used the DENSE, non-quantized-experts transplant target, which segfaults on THIS machine at
+real MoE dims regardless of backbone dtype -- confirmed by reproducing the identical segfault on a freshly
+transplanted BF16 artifact at the same dense-MoE shape; not an FP8 defect, a pre-existing gap in dense-MoE
+support at these dims that nothing had exercised before, named here rather than silently worked around):**
+
+- **4-layer sub-stack** (95 tensors, 1,581,285,280 floats, 22.6s transplant, 0/94 level-2 stat mismatches,
+  0/95 `--verify` bit-for-bit mismatches). `forward`/`forward_one` parity **bit-exact (max diff 0)**.
+  Logits vs the F32 reference: L2-relative ~1.05, 0/6 argmax agreement -- reproduces BF16's own documented
+  4-layer figure (also ~1.05, 0/6, re-measured here as ~1.05/0/6 on a fresh BF16 transplant too) almost
+  exactly. **Not representative of either format's real precision**, for the same reason §1d already
+  gives: this artifact has no final norm layer (`LnF` absent by construction), and F32's own un-normalized
+  readout is independently measured (400% here also present) to be unstable at this truncation -- both
+  BF16 and FP8 land in the same "essentially uncorrelated" band at 4 layers, which is a property of the
+  4-layer truncation, not of either reduced-precision format.
+- **48-layer real model (the actual target)**: 1074 tensors, 4,915,107,200 floats, 169.2s transplant, 0
+  stat mismatches, sidecar identical to BF16's own (73,728 expert tensors, 37.11 GiB, encoding is
+  independent of the backbone's `PARAM_DTYPE`). `forward`/`forward_one` parity **bit-exact (max diff 0)**.
+  **Logits vs the F32 reference: L2-relative diff 0.4299 (43.0%), 3/6 rows argmax-identical.** Measured on
+  the SAME 6-token fixture, same machine, same session as a fresh BF16-vs-F32 re-measurement, which
+  reproduced BF16's own documented ~0.199/5-6 figure closely (0.198895, 5/6, matching §1d's own number to
+  four significant figures -- confirms the comparison methodology itself is sound). **FP8 is markedly
+  worse than BF16 here, as physically expected** given e4m3's ~3 effective mantissa bits vs bf16's 7 --
+  reported plainly rather than minimized, per this item's own instruction to be honest about a real
+  precision/quality tradeoff.
+- **Peak resident memory, measured on the SAME host in the SAME session (the directly comparable
+  apples-to-apples pair, since the two builds' `PARAM_FILE_DTYPE`-driven arena size is the only axis that
+  differs)**: BF16 19.31 GiB -> FP8 14.68 GiB, **-4.63 GiB**, closely matching the a-priori theoretical
+  expectation (~4.5 GiB, three-quarters of the 6.14 GiB the FP8-vs-BF16 backbone-alone difference should
+  be at these params, the remainder shared between both builds' identical MoE resolve-pool/activation
+  arenas).
+- **Decode throughput -- the honest, surprising result.** Two interleaved runs each, `sub0llm-qwen4-forward
+  --tokens 6` (the same tool/methodology as B24's own §1d measurement), on the SAME host in the SAME
+  session immediately after each other (thermal/cache-state as comparable as this session could make it
+  without a reboot): **FP8 forward 8.21s/tok then 6.93s/tok (mean 7.57s/tok); BF16 forward 6.11s/tok then
+  3.38s/tok (mean 4.74s/tok) -- FP8 measured ~60% SLOWER than BF16, not the modest few-percent win the
+  session's own prior arithmetic anticipated.** `forward_one` shows the same direction (FP8 mean
+  7.27s/tok vs BF16 mean 4.34s/tok). Both formats' SECOND run is markedly faster than their first (page
+  cache warming the 37.11 GiB shared `.moeq` sidecar, the same effect B27 documented) -- a real confound
+  this pass could only partially control for (two runs each, not the fully interleaved/repeated design
+  B29's own A/B used, given this session's time budget), so the exact MAGNITUDE of the gap is not fully
+  pinned down. But the DIRECTION held at both a cold and a warmer measurement for both formats, which is
+  evidence against pure cache-state coincidence. **The most likely real explanation, not yet independently
+  confirmed**: `Fp8CPtr::operator[]`'s widen is a genuine multi-branch exponent remap (subnormal check,
+  NaN-code check, a 2-way ternary to locate a subnormal's leading bit) executed on EVERY element read at
+  the backbone's 100%-density access pattern, where `Bf16CPtr::operator[]`'s widen is a single branchless
+  16-bit shift -- i.e. e4m3's per-element CPU decode cost plausibly outweighs the DRAM-bandwidth bytes it
+  saves over bf16, the same "measure the real per-element cost, don't assume the bandwidth side of the
+  ledger wins" lesson §2c's own B24 measurement already taught for block-quant formats, now showing up
+  again at a smaller but real scale for a flat format. **Named as the load-bearing open question for
+  anyone reviving this format, not silently rationalized away**: if this hypothesis is right, a
+  branchless/table-driven `fp8_widen` (e.g. the 256-entry lookup table this header's own comment names as
+  an available alternative, not yet built) could plausibly close some or all of this gap -- untested here.
+- **Generation-quality qualitative check: NOT run.** `sub0llm-qwen4-gen`'s real Qwen tokenizer files
+  (`data/qwen_tokenizer/` or `$SUB0_QWEN_TOKENIZER_DIR`) are absent from this environment -- the same gap
+  `sub0_frontend_tests`' own qwen-tokenizer test cases already report as "skipping" in this environment.
+  The logit-level L2/argmax comparison above is the substitute quantitative signal; no qualitative
+  "is the generated English still coherent" read was possible here. Flagged rather than glossed over: a
+  0.43 L2-relative diff with only half the rows' argmax agreeing is a real, material risk to generation
+  coherence that this pass could not directly verify one way or the other.
+
+**Full suite (neutral small config, freshly reconfigured against `data/gsm8k.txt --dmodel 196` in this
+worktree -- a DIFFERENT vocab/config than the session's own established `d196check` baseline, so the
+absolute counts below do not match 28,969,623/147 and 120,889/244; the counts are compared BEFORE vs AFTER
+this change at the SAME fresh config instead, which is the actual AGENTS.md S4 gate):**
+- `sub0_frontend_tests`: **120,889 assertions / 244 cases**, all green -- exact match to the session's own
+  established baseline (this suite is engine/config-independent, so it should and does match regardless of
+  which engine config is active).
+- `sub0_tests` (default F32/trainable, unmodified `PARAM_DTYPE`): **20,586,739 assertions / 147 cases**,
+  all green, identical hashes (`arch_identity_tests`' own forward/grad/decode fingerprints) -- confirmed
+  BYTE-IDENTICAL to a baseline run with this change's files reverted (via a tagged `git stash`) at the
+  exact same fresh config, satisfying AGENTS.md S4 directly rather than by inference: the default F32
+  build is provably unaffected by this change.
+
+**Not run, and why**: `sub0_tests` cannot link against a FORWARD_ONLY (MoE/Gated-Residual/QSA-on) or
+real-axes config at all, by the same pre-existing architectural fact §1d's own gate already documented
+for BF16 -- `sub0llm-qwen4-forward`'s own `forward`/`forward_one` parity gate is what substitutes, exactly
+as it did for Phase 1.
+
+**Independently reverified, session owner (2026-09-11)**: reran the FP8-specific tests myself (288
+assertions/6 cases, exact match) and the full frontend suite (121,177/250, exact match). Rebuilt and ran
+my own quick interleaved A/B on the real 48-layer artifacts (`Sub0Llm-Qwen4-full48-bf16` vs
+`Sub0Llm-Qwen4-full48-fp8`, 2 runs each, `sub0llm-qwen4-forward --tokens 3`): BF16 ~3.53-3.71 s/token vs
+FP8 ~5.14-5.20 s/token — a real ~40-46% slowdown in my own sample, same direction and same order of
+magnitude as the agent's own reported ~60%, confirming this is a genuine regression, not a fluke, a build
+artifact, or noise. **Decision: NOT merged.** A real ~4.63 GiB memory win does not offset a real throughput
+regression and a markedly worse quality floor than BF16 — the opposite trade a smaller/faster format is
+supposed to offer. Kept on `feature/b33-fp8-backbone` (correctness-gated, reproducible) for whoever wants
+to pursue a branchless/lookup-table `fp8_widen` — the likely fix for the throughput regression — as a
+follow-up; not silently discarded, but not worth shipping as-is. See
+`docs/INDEPENDENT_REVIEW_BACKLOG.md`'s B33 entry for the summary-table record.
+
+---
+
 ## 3. What this document deliberately does not decide yet
 
 - Whether BF16's promote-on-load (1a's option (a)) or BF16-aware kernels (option (b)) is the right shape —

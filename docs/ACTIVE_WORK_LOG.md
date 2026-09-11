@@ -329,3 +329,17 @@ decode: ~3.675 s/token -> ~3.385 s/token (~7.9%, agent's controlled A/B) -- smal
 estimate implied, honestly reported (MoE resolve is only part of decode's cost; the eliminated transpose
 traffic wasn't as dominant as the byte-counting arithmetic suggested). B33 (FP8 backbone) still running in
 parallel, no file overlap confirmed.
+
+---
+
+**2026-09-11 Claude Code — B33 done, NOT merged (real negative result).** FP8 (E4M3) as a third resident
+`PARAM_DTYPE` (following BF16's own architecture exactly) is correctly implemented and correctness-gated
+(bit-exact parity, exhaustive round-trip tests, zero kernel changes needed), but real-model measurement
+showed a ~60% decode SLOWDOWN vs BF16 (agent's number) and a ~40-46% slowdown (my own independent
+interleaved A/B on the real 48-layer artifacts) -- the opposite of the modest win expected, most likely
+because `Fp8CPtr`'s multi-branch exponent-remap widen costs more per-element CPU than the DRAM bandwidth
+it saves. Quality also markedly worse than BF16 (L2 0.43 vs 0.199). Kept unmerged on
+`feature/b33-fp8-backbone` for a future branchless/lookup-table `fp8_widen` follow-up. See
+docs/BACKBONE_PRECISION.md S2d and docs/INDEPENDENT_REVIEW_BACKLOG.md B33 for full detail. Session total
+this thread: B27->B28->B29->B31 real wins (baseline ~5.5-6.0 s/token -> ~3.38 s/token); B25 and B33 real,
+correctness-clean, but not currently worth shipping.
