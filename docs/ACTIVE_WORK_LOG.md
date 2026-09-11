@@ -364,3 +364,19 @@ discipline this session has used throughout (B24/B31 precedent), not a bit-exact
 `include/sub0/moe_math.hpp`, `include/sub0/gdn_math.hpp`, `include/sub0/qsa_math.hpp`,
 `include/sub0/gated_residual_math.hpp`. Does not touch param_store/fp8/bf16/model_file/configurator/
 transplant (B33's files, unmerged) or moe_quant.hpp/decode.cpp (B31's files, already merged).
+
+---
+
+**2026-09-11 Claude Code — B34 done, NOT merged (real negative result, independently confirmed).**
+Multi-accumulator SIMD restructuring of the engine's hot reduction loops is correctly built and
+correctness-gated (parity 0, logit L2-diff 6.76e-06, vectorization independently confirmed via assembly),
+but real measured decode throughput is ~20% SLOWER (agent's thermal-confound-aware A/B) -- independently
+reproduced by me (own rebuild+rerun, same direction, ~3.65 vs ~3.38 s/token post-B31 baseline). First
+implementation attempt hit an API rate limit mid-task; resumed in the SAME worktree by a fresh agent per
+this session's established precedent, which also found and fixed a real correctness bug (a reordered dot
+product inside expert_ffn_row_source broke B31's own bit-exactness invariant with expert_ffn_row -- fixed
+with a second, unreordered `dot_seq` primitive). Kept unmerged on `feature/b34-simd-unlock`, matching the
+B25/B33 precedent. This reinforces (alongside B28's prefetch null and B33's FP8 regression) that this
+workload is DRAM-bandwidth-bound, not CPU-bound -- compute-side speedups don't help. B35 (quantized-dot-
+product, reduces bytes moved not just compute) remains the more promising next lever. See
+docs/INDEPENDENT_REVIEW_BACKLOG.md B34 for full detail.
