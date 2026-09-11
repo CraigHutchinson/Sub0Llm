@@ -211,3 +211,24 @@ Files: temporary instrumentation only in `src/backends/cpu/decode.cpp` (reverted
 and B27's own precedent), plus a possible new isolated harness variant with a large resident-ballast
 footprint if the existing one (B21's own harness, referenced in this file's B21 section) doesn't already
 cover the post-B28 numbers. Do not touch other agents' shared files without checking this log first.
+
+---
+
+**2026-09-11 Claude Code (subagent) — B29 done, on `feature/b29-concurrency-ceiling`, NOT merged.**
+Confirmed the bandwidth-ceiling hypothesis directly: `moe_expert_bench`'s own real per-arm numbers imply
+a single thread's resolve+FFN already demands ~12-15 GB/s against this host's own measured ~28-33 GB/s
+ceiling (`docs/BACKBONE_PRECISION.md` §2c). Live-engine wall-clock instrumentation (reverted, same
+technique as B21/B27) found a REGIME CHANGE from B21's own finding: post-B28, every sampled
+`ParallelExperts` call shows FULL serialization (zero measured overlap, not B21's earlier "~2-3x
+partial"), with per-expert cost close to the isolated single-thread baseline (no more of B21's 3-9x
+inflation). Direct A/B on `sub0llm-qwen4-forward --tokens 6` (real 48-layer BF16 artifact, interleaved
+runs): `MOE_DECODE_THREADS` 10 -> 3.75-3.79 s/token; forced to 3 -> 3.79 s/token (no change); forced to 1
+-> **3.42-3.47 s/token, ~9% FASTER** — concurrency above 1 has a real, measured, negative cost here, not
+just no benefit. `forward`/`forward_one` parity stayed exactly 0 at every thread count. **Fix merged into
+this branch**: `MOE_DECODE_THREADS` pinned to `1` in `src/backends/cpu/internal.hpp` (was
+`min(DEFAULT_THREADS, EXPERTS_PER_TOK)`), also freeing ~225 MiB of decode-thread pools. Regression:
+`sub0_tests` 9,540,077/147 (bit-for-bit identical with/without the change at the same toy config, checked
+not assumed) and `sub0_frontend_tests` 120,889/244 (exact match to the session's established baseline),
+both green. Instrumentation confirmed reverted (`git diff --stat` on `decode.cpp` clean). See
+`docs/INDEPENDENT_REVIEW_BACKLOG.md` B29 (new) and B21 (closed by B29). Branch not merged — awaiting
+this session's own independent reverification per this session's standing practice.
