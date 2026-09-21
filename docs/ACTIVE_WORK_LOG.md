@@ -639,3 +639,33 @@ running during any timed run (checked before each batch).
 flag of it is wrong (`--loop-middle-layers 4` should be absent); the working recipe is recorded in full in
 `docs/MOE_QUANT_DOT.md` S6h. It was recovered by differencing `out/build/wp5c_full48/generated/
 sub0_corpus.hpp` against a fresh configure.
+
+---
+
+**2026-09-21 Claude Code — B35 done, merged `341e37b`, pushed. First real throughput win of the
+B24-B38 thread.** Fused quantized MoE dot products (`--moe-quant-dot`, `constexpr MOE_QUANT_DOT`,
+default false). New engine-free `include/sub0/moe_quant_dot.hpp`: three ~20-line per-format unpackers
+(`Iq1SPlane`/`Iq2XxsPlane`/`Iq4NlPlane`) over ONE shared `detail::gemv` + ONE shared `detail::dot_group`,
+with `Plane::kHasDelta` compiling IQ1_S's delta term away for the other two. No raw intrinsics needed —
+integer addition has no reassociation barrier (unlike B34/B38's float reductions), so Clang vectorizes
+the portable loop on its own; verified in generated asm (`vpmaddwd` / `vpmulld` shapes).
+
+**Independently reverified before merging.** Interleaved, zero competing processes, real 48-layer BF16
+artifact, two build arms differing only in the toggle: default 3.561/3.632/3.705 (mean **3.633 s/token**)
+vs fused 1.516/1.508/1.510 (mean **1.511 s/token**) = **2.40x**, matching the agent's own ~2.4x claim,
+with the fused arm notably stable (±0.5%). Gates on merged `main`: decode hash `816c4a54ad49b8cf`
+unchanged, `sub0_tests` 28,969,623/147, `sub0_frontend_tests` 122,385/256 (+1,152/+4, exactly B35's own
+new tests). Confirmed `forward()` output is BIT-IDENTICAL between arms — op_moe's batched path was
+deliberately left unfused (decision 1), and my own dump comparison proves it held.
+
+**The honest cost, not to be glossed**: this buys speed WITH quality, it is not a free win. Default arm
+`forward`/`forward_one` parity is exactly 0; the fused arm's is max |diff| **4.94** on a ±15 logit range,
+L2-relative **0.2938**, argmax **4/6** — i.e. 2 of 6 rows pick a different top token, which changes
+generated text under greedy decode. Against precedent: BF16 0.199 at 5/6 (shipped as default), FP8 0.43
+at 3/6 (shipped default-off, not recommended). B35 sits between them and ships default-off for the same
+reason — but unlike FP8 (which was slower AND worse, strictly dominated) this is a REAL tradeoff a user
+can choose: 2.4x for a measurable quality cost.
+
+Also merged: the agent's correction to this session's real-axes configure recipe (my own was incomplete
+and silently produced `PARAM_FLOATS 2570717696` + a rejected artifact — it cost me B38's real-model
+verification earlier). Canonical copy now in `docs/MOE_QUANT_DOT.md` §6h and in project memory.
