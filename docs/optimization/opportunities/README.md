@@ -58,7 +58,20 @@ re-run it, rather than something noticed months later.
 operating point). MoE **68.7%**, mixer GDN/QSA **21.2%**, lm_head 5.4%, gated-residual 4.6%. Lever
 selection must cite this, not the pre-B35 numbers.
 
-**Open follow-ups named but not yet briefed**: IQ1_S narrowing (47% of planes, the one format landing on the wider `vpmulld` shape); a
+### Briefed and ready
+
+| ID | Opportunity | Status | Evidence |
+|---|---|---|---|
+| [O1](O1_iq2xxs_sign_fold.md) | Fold IQ2_XXS's sign application into the dot | pending | IQ2_XXS moves bytes **3.6x slower** than IQ4_NL (0.34 vs 1.22 GB/s); 37% of MoE dot time from 19.4% of planes |
+
+**Retracted**: *IQ1_S narrowing*, previously named by B35 as the next lever on the grounds that its dot
+uses the 8-lane `vpmulld` shape. The per-format profile refutes it — IQ1_S is the **cheapest** format
+per plane (326 µs vs IQ4_NL 757 and IQ2_XXS 1227). Lane width is not the binding constraint. Do not
+brief it until something measures it as a problem.
+
+**Open follow-ups not yet briefed**: IQ4_NL is 39.1% of MoE dot time — the largest single slice and
+unexamined (though already at the best GB/s of the three); the mixer (GDN/QSA) at 21.2% of total needs
+its own O1 split (48 GDN layers vs 12 QSA) before any lever is picked there; a
 branchless/lookup-table `fp8_widen` (the named fix for B33's regression); reducing B35's
 activation-quantization error, which is the whole of its quality cost and the only reason it ships
 default-off.
