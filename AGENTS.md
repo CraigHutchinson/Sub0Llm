@@ -215,6 +215,29 @@ nothing but inclusion. And handle the fallout rather than leaving it dangling: a
 consumer was the gated spike should say so at its declaration (keep it if it is the substrate that work
 would resume from), and any recorded baseline that cited the spike's config must be re-recorded.
 
+## 12. Correctness and performance gates do NOT substitute for a code-quality gate
+
+Every work package in this repo is gated on correctness (parity/fixtures) and, where relevant, a real
+measured throughput number. Both are necessary. Neither says anything about whether the code that
+landed is code we want to maintain.
+
+**Caught 2026-09-21, after the fact, across ~1,650 lines merged in one session.** Six packages merged on
+green suites and honest measurements. A `cpp-review` pass afterwards found: a direct §1 violation
+(scratch buffers sized inside a per-layer-per-token hot path, first call heap-allocating *inside*
+decode); an established project convention silently dropped (`[[nodiscard]]` absent from every new
+failure-signal API — `submit`/`wait`/`dequantize_*` all returning success flags a caller could drop on
+the floor — in the two headers written fresh, while the one header modelled on an existing well-formed
+header inherited it correctly); and verbatim copy-pasted loop scaffolding inside a brand-new header.
+
+None of that was catchable by the gates those packages passed. All of it was catchable by reading the
+diff against the project's own standards.
+
+**Rule**: before merging new or substantially-changed C++, run the `cpp-review` standard over the diff
+and fix what it finds. When *authoring* — especially when delegating to a subagent — load `cpp-write`
+first, so the first commit targets zero MUST findings rather than acquiring them and needing a
+follow-up pass. The empirical signal above is blunt: the header written against a good existing
+template came out clean; the ones written fresh under time pressure did not.
+
 ## Before you ship — quick checklist
 
 - [ ] Any new per-step/per-call code path: zero heap allocation, scratch reused not reallocated (§1)
@@ -232,5 +255,7 @@ would resume from), and any recorded baseline that cited the spike's config must
 - [ ] Import/interop features validated against a real external file/corpus, not fixtures alone (§9)
 - [ ] Any changed shared width/semantic/format/config axis: consumers enumerated repo-wide, full suite
       run unfiltered with the feature ON, new compile-time axis classified against `ARCH_FINGERPRINT` (§10)
+- [ ] New/changed C++ reviewed against the `cpp-review` standard BEFORE merge, not only for
+      correctness+perf (§12)
 - [ ] Spike whose finding has merged (no `src/`/`tools/` include of its header): gated out of the default
       build, gate verified as a round trip, orphaned API + baselines updated (§11)
