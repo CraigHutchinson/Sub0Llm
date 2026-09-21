@@ -649,6 +649,11 @@ int main(int argc, char** argv) {
     // mode is expected to win. Windows-only implementation (moe_io.hpp's own header comment); a POSIX
     // build falls back to a synchronous, non-concurrent pread and gets no benefit from setting this.
     int moe_io_pipelined  = 0;
+    // B35 (docs/MOE_QUANT_DOT.md): decode's routed-expert resolve computes its dot products directly
+    // against the sidecar's native IQ1_S/IQ2_XXS/IQ4_NL bytes instead of dequantizing each selected
+    // expert to f32 first. 0 = off (default, today's dequantize-then-f32-dot path, bit-exact). See the
+    // --moe-quant-dot CLI option below for the measured accuracy and throughput tradeoff.
+    int moe_quant_dot     = 0;
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
     // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
@@ -815,6 +820,19 @@ int main(int argc, char** argv) {
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"reactive", 0}, {"pipelined", 1}},
                                            CLI::ignore_case))
        ->default_str("reactive");
+    app.add_option("--moe-quant-dot", moe_quant_dot,
+                   "1 = decode's routed-expert resolve takes its dot products DIRECTLY against the "
+                   "--moe-quant-experts sidecar's native IQ1_S/IQ2_XXS/IQ4_NL bytes, quantizing the "
+                   "activation row to int8 once per layer, instead of dequantizing each selected expert "
+                   "to 18.75 MiB of f32 planes first (B35, docs/MOE_QUANT_DOT.md). Cuts per-resolve DRAM "
+                   "traffic 39.05 -> 1.55 MiB and replaces the scalar gguf::to_f32 decode with "
+                   "auto-vectorized integer SIMD. NOT bit-exact and not claimed to be: the int8 "
+                   "activation is a real (small) new error source with no precedent in this engine -- "
+                   "see docs/INDEPENDENT_REVIEW_BACKLOG.md B35 for the isolated per-dot error and the "
+                   "measured end-to-end logit diff against the existing path. Requires "
+                   "--moe-quant-experts 1. 0 = off (default, today's exact behavior, bit-exact decode "
+                   "hash).")
+       ->capture_default_str()->check(CLI::Range(0, 1));
     // Qwen Sparse Attention (docs/QSA.md): Stage 0 -- every axis hard-clamped to 0. All five must be
     // set together; a half-configured QSA build is refused both here and by layout.hpp's static_assert.
     app.add_option("--qsa-indexer-n-heads", qsa_idx_n_heads,
@@ -1198,6 +1216,13 @@ int main(int argc, char** argv) {
     if (moe_io_pipelined != 0 && moe_quant_experts == 0) {
         std::println(stderr, "configure error: moe-io-mode pipelined requires --moe-quant-experts 1 -- "
                              "there is no S0Q1 sidecar to issue overlapped reads against otherwise");
+        return 1;
+    }
+    // B35: the fused dot has nothing to dot against without a quantized-resident sidecar -- the f32
+    // build's experts are already plain floats in the model blob, with no encoded form to fuse.
+    if (moe_quant_dot != 0 && moe_quant_experts == 0) {
+        std::println(stderr, "configure error: moe-quant-dot requires --moe-quant-experts 1 -- there "
+                             "are no native quantized expert bytes to compute against otherwise");
         return 1;
     }
     // QSA: mirrors layout.hpp's own static_asserts as a configure-time diagnostic naming the flags,
@@ -1764,6 +1789,19 @@ int main(int argc, char** argv) {
     // measured result and when each mode is expected to win. false (reactive) reproduces today's
     // behaviour bit-for-bit; true (pipelined) is include/sub0/moe_io.hpp's explicit overlapped I/O.
     cos << "constexpr bool MOE_IO_PIPELINED = " << (moe_io_pipelined ? "true" : "false") << ";\n";
+    // B35: fused quantized dot products against the sidecar's native bytes -- see --moe-quant-dot's own
+    // help text for the measured accuracy/throughput tradeoff. false reproduces today's
+    // dequantize-then-f32-dot resolve bit-for-bit.
+    //
+    // AGENTS.md S10 classification: deliberately does NOT join ARCH_FINGERPRINT/ARCH_FINGERPRINT2, for
+    // the same reason --prec-param and --simd-reduce do not. It changes the arithmetic PRECISION of an
+    // inference-time reduction, not the trained model's identity or any on-disk shape: the same model
+    // file and the same sidecar load and compute correctly under either setting, and PARAM_FLOATS is
+    // untouched. It DOES break forward()/forward_one() bit-exact parity by construction when on --
+    // op_moe's batched path keeps the f32 resolve (it has a real cross-row cache hit rate, B24 Phase 2's
+    // own winning case), so the two paths genuinely compute different arithmetic. That is expected and
+    // gated as a tolerance rather than an equality; see docs/MOE_QUANT_DOT.md S5.
+    cos << "constexpr bool MOE_QUANT_DOT = " << (moe_quant_dot ? "true" : "false") << ";\n";
     // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
     cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
     cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";

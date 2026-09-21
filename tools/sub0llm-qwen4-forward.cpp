@@ -439,23 +439,40 @@ int main(int argc, char** argv) {
     kv_reset();
     double max_abs = 0.0, max_rel = 0.0;
     int worst_t = -1, worst_v = -1;
+    // B35: the two summary statistics this project already judges a precision change by (B24's BF16
+    // ~0.199 and B33's FP8 ~0.43 are both quoted as L2-relative + argmax agreement). Max-abs alone
+    // cannot say whether a build that deliberately computes forward_one at a different precision from
+    // forward -- which MOE_QUANT_DOT does, by construction -- is comparable to those precedents or
+    // materially worse. Computed unconditionally: in every other build both are 0 and 100%, which is
+    // itself the clearest possible statement that nothing changed.
+    double sq_diff = 0.0, sq_ref = 0.0;
+    int argmax_agree = 0;
     std::vector<float> hidden_last(D_MODEL, 0.f);
     const auto t2 = std::chrono::steady_clock::now();
     for (int t = 0; t < T; ++t) {
         const float* one = forward_one(kTokens[t], t);
         if (t == T - 1) std::copy_n(last_hidden_ptr(), D_MODEL, hidden_last.begin());
         const float* ref = batched.data() + static_cast<std::size_t>(t) * VOCAB;
+        int am_one = 0, am_ref = 0;
         for (int v = 0; v < VOCAB; ++v) {
             const double d = std::abs(static_cast<double>(one[v]) - ref[v]);
             const double r = d / (std::abs(static_cast<double>(ref[v])) + 1e-6);
             if (d > max_abs) { max_abs = d; worst_t = t; worst_v = v; }
             max_rel = std::max(max_rel, r);
+            sq_diff += d * d;
+            sq_ref  += static_cast<double>(ref[v]) * ref[v];
+            if (one[v] > one[am_one]) am_one = v;
+            if (ref[v] > ref[am_ref]) am_ref = v;
         }
+        argmax_agree += (am_one == am_ref) ? 1 : 0;
     }
     const double dec_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
-    std::println("forward_one over {} positions in {:.2f}s", T, dec_s);
+    std::println("forward_one over {} positions in {:.2f}s ({:.3f} s/token)", T, dec_s,
+                 dec_s / std::max(1, T));
     std::println("max |forward - forward_one| = {:.6g}  (at row {}, vocab id {}); max relative = {:.6g}",
                  max_abs, worst_t, worst_v, max_rel);
+    std::println("L2-relative logit diff = {:.6g}; argmax agreement {}/{}",
+                 (sq_ref > 0.0) ? std::sqrt(sq_diff / sq_ref) : 0.0, argmax_agree, T);
     report_memory("after forward_one");
 
     // B24: needs raw params_ptr() (P, lmh, lmb) -- skipped under BF16, see the guard comment above section 2.
