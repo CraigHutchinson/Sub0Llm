@@ -54,9 +54,11 @@ re-run it, rather than something noticed months later.
 | B35 | Fused quantized MoE dot products (`--moe-quant-dot`) | implemented (default-off by quality, not perf) | **+2.4x** (3.63 → 1.51 s/token) | 1 |
 | B39 | Compile-time kernel shape | parked-branch | −3.3% after 1 fix (was −8.3%) | 1 of 3 |
 
-**Open follow-ups named but not yet briefed**: re-profile decode at the fused operating point (process
-doc §5 — the current profile predates B35's 2.4x and no lever choice should be trusted until it is
-redone); IQ1_S narrowing (47% of planes, the one format landing on the wider `vpmulld` shape); a
+**Current profile: [`../profile_post_b35.md`](../profile_post_b35.md)** (measured 2026-09-21 at the fused
+operating point). MoE **68.7%**, mixer GDN/QSA **21.2%**, lm_head 5.4%, gated-residual 4.6%. Lever
+selection must cite this, not the pre-B35 numbers.
+
+**Open follow-ups named but not yet briefed**: IQ1_S narrowing (47% of planes, the one format landing on the wider `vpmulld` shape); a
 branchless/lookup-table `fp8_widen` (the named fix for B33's regression); reducing B35's
 activation-quantization error, which is the whole of its quality cost and the only reason it ships
 default-off.

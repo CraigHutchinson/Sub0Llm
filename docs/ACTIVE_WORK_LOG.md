@@ -718,3 +718,27 @@ re-derived it. Continuing to pick levers against the old profile is guessing.
 the next optimization, then iterate 3x on whatever it actually names. Candidate levers stay parked and
 toggleable, never reverted: `--simd-reduce` (B34/B38), `--prec-param fp8` (B33/B37), `--moe-io-mode
 pipelined` (B25/B36), `feature/b39-constexpr-shape` (B39, −3.3% after one fix, two passes unspent).
+
+---
+
+**2026-09-21 Claude Code — O0/O1 re-profile at the fused operating point.** Required by
+`docs/OPTIMIZATION_PROCESS.md` §5 (re-derive after any >20% change; B35 was 2.4x). Temporary phase
+scaffold in `decode.cpp`, reverted immediately, `git status` clean. Result in
+`docs/optimization/profile_post_b35.md`:
+
+  MoE 68.7% | mixer GDN/QSA 21.2% | lm_head 5.4% | gated-residual 4.6% | unattributed 0.0%
+
+**This corrects a claim I made earlier in this thread.** When dispatching the B34-on-B35 combination I
+said B35 had shifted the constraint off the MoE path. Half right: the mixer's share did grow. Wrong on
+the load-bearing half: **MoE is still 68.7% dominant** — B35 made the dominant phase 2.4x cheaper, it
+did not stop it being dominant. That fully explains the −4% combination result: `--simd-reduce` targets
+reductions inside a slice that caps at ~21% of total, so even a strong win there is bounded, while the
+multi-accumulator scaffolding's fixed per-call cost is paid across many small reductions. The profile
+would have predicted that before the experiment ran — a textbook §5a failure (picking an O3/O4 lever
+without re-establishing O0/O1 first).
+
+Next levers, now evidence-backed rather than guessed: (1) MoE remains the target by a wide margin —
+B35's own IQ1_S follow-up (47% of planes, the one format on the wider `vpmulld` shape) is an O2/O4
+change *inside the dominant phase*, the right shape; (2) the mixer at 21.2% is genuinely untouched and
+deserves its own O1 split (GDN vs QSA) before any lever is picked; (3) lm_head and gated-residual are
+not worth touching yet.
