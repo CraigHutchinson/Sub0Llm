@@ -157,9 +157,48 @@ def evaluate_gates(results: dict, gates: dict) -> list[dict]:
     return verdicts
 
 
+VTUNE = pathlib.Path(r"C:\Program Files (x86)\Intel\oneAPI\vtune\2026.4\bin64\vtune.exe")
+
+
+def stage_vtune(build: pathlib.Path, flags: list[str], tokens: int, outdir: pathlib.Path) -> dict:
+    """Top-Down microarchitecture analysis -- the measurement the roofline arithmetic cannot make.
+
+    The roofline says which roofs are NOT saturated (docs/optimization/roofline_post_b35.md found
+    2.7% of memory and 2.2% of SIMD, i.e. neither). It cannot say why. `uarch-exploration` splits
+    the pipeline into Retiring / Front-End Bound / Bad Speculation / Back-End Bound, and the last
+    into Memory Bound vs Core Bound -- which is exactly the missing discriminator.
+
+    Run unelevated, per this project's own precedent ([[cpu-profiling-tooling-backlog]]).
+    """
+    if not VTUNE.exists():
+        return {"error": f"vtune not found at {VTUNE}"}
+    configure(build, flags)
+    build_target(build, "sub0llm-qwen4-forward")
+    res = outdir / "vtune_uarch"
+    if res.exists():
+        import shutil as _sh
+        _sh.rmtree(res, ignore_errors=True)
+    run([str(VTUNE), "-collect", "uarch-exploration", "-r", str(res), "--",
+         str(build / "sub0llm-qwen4-forward.exe"), "--model", ARTIFACT, "--tokens", str(tokens)],
+        timeout=5400)
+    rep = run([str(VTUNE), "-report", "summary", "-r", str(res)], timeout=1800)
+    def pct(label):
+        m = re.search(rf"{label}[^\n]*?([\d.]+)%", rep)
+        return float(m.group(1)) if m else None
+    return {
+        "retiring_pct": pct("Retiring"),
+        "front_end_bound_pct": pct("Front-End Bound"),
+        "bad_speculation_pct": pct("Bad Speculation"),
+        "back_end_bound_pct": pct("Back-End Bound"),
+        "memory_bound_pct": pct("Memory Bound"),
+        "core_bound_pct": pct("Core Bound"),
+        "result_dir": str(res),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--stage", action="append", choices=["suites", "quality", "perf", "compete"],
+    ap.add_argument("--stage", action="append", choices=["suites", "quality", "perf", "compete", "vtune"],
                     help="repeatable; default is perf only")
     ap.add_argument("--arm", action="append", default=[],
                     help='"name:flags", e.g. "fused:--moe-quant-dot 1". First arm is the baseline.')
@@ -198,6 +237,11 @@ def main() -> int:
         if args.runs < 3:
             print("warning: policy minimum is 3 runs per arm", file=sys.stderr)
         results["perf"] = stage_perf(build, arms, args.runs, args.tokens)
+
+    if "vtune" in stages:
+        # Profiles the LAST arm -- normally the one under investigation, since profiling the baseline
+        # tells you about code you are not changing.
+        results["vtune"] = stage_vtune(build, arms[-1][1], args.tokens, REPORT.parent)
 
     verdicts = evaluate_gates(results, gates)
     results["gates"] = verdicts

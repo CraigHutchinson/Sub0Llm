@@ -170,6 +170,39 @@ intuition. Both are installed on this host and both were unused for the whole B2
   an instruction sequence, **without running it**. The cheapest way to compare two candidate kernel
   bodies before committing to either.
 
+Both are **automated**, so neither is a manual ritual anyone has to remember:
+
+| Command | What it answers |
+|---|---|
+| `python scripts/analyze_kernel.py --probe <header>` | static: vectorization, instruction mix, port pressure, aliasing, alignment |
+| `python scripts/run_perf_suite.py --stage vtune --arm "x:<flags>"` | dynamic: Top-Down split (Retiring / Front-End / Bad-Spec / Back-End, and Memory Bound vs Core Bound) |
+
+`analyze_kernel.py` carries a registry of independent analyzers; **adding one is a single decorated
+function**, and the set is expected to grow as we learn what else informs a decision. The current five
+and why each earns its place:
+
+- **vectorize** — clang optimization records: did the loop vectorize, at what width, and if not, the
+  compiler's own stated reason. A kernel at 2% of the SIMD roof usually has an answer waiting here.
+- **asm** — instruction census. The `ymm` vs `xmm` ratio catches half-width vectorization (real code
+  running at 128-bit when 256 is available), and the named MAC shapes (`vpmaddwd` 16-lane vs `vpmulld`
+  8-lane) say which form the compiler actually picked.
+- **mca** — static port pressure and IPC without executing. The cheapest way to compare candidate
+  kernel bodies *before* committing to a rebuild, and the place a "neither roof saturated" kernel
+  usually confesses: one port oversubscribed while the vector units idle is a different fix from a
+  dependent-load chain.
+- **alias** — raw pointer parameters lacking `__restrict`. Without it the compiler must assume the
+  output may alias an input, which forces a reload per iteration and frequently blocks vectorization
+  outright. Heuristic: it reports candidates, it does not assert a defect.
+- **align** — SIMD-consumed arrays lacking `alignas`. B39's lesson, automated: swapping `std::vector`
+  for `std::array` to satisfy §1's no-heap rule silently forfeits heap alignment, because
+  `std::array<int8_t, N>` has natural alignment **1**. That cost ~5% and was found by hand.
+
+Candidates for future analyzers, when a decision needs them: loop-carried dependence distance;
+gather/scatter density; L1/L2 miss rates from VTune's memory-access collection; branch-misprediction
+rate; unroll factor vs I-cache pressure; `-Rpass=inline` for hot calls that failed to inline (the
+`vectorize` analyzer already surfaces "call instruction cannot be vectorized", which is that problem
+wearing a different hat).
+
 Use them when the roofline says neither roof is saturated: the arithmetic tells you *where* to look,
 but only a core-utilisation measurement distinguishes dependent-load latency from port contention from
 issue-width limits.
