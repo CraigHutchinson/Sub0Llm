@@ -604,3 +604,38 @@ matching the B24-Phase-1-established precedent. Two real merge conflicts (B36-vs
 `decode.cpp`'s shared MoE call site) resolved by hand, both verified correct by rebuilding+testing after.
 All three source branches (`feature/b25-explicit-io-resolve`, `feature/b33-fp8-backbone`,
 `feature/b34-simd-unlock`) and their worktrees deleted -- their content lives on `main` now via B36/B37/B38.
+
+---
+
+**2026-09-21 Claude Code (subagent) -- B35 STARTED, status: active.** Branch `feature/b35-quant-dot`,
+ISOLATED worktree (`.claude/worktrees/agent-ac62bba3ae4a5a30d`), so no shared-tree file contention.
+Files/areas: `include/sub0/moe_quant_dot.hpp` (new), `src/backends/cpu/decode.cpp` (the decode MoE
+lambda only), `src/backends/cpu/internal.hpp`, `tools/configurator.cpp` (one new option),
+`tests/moe_quant_tests.cpp`, `docs/MOE_QUANT_DOT.md`, `docs/INDEPENDENT_REVIEW_BACKLOG.md`.
+**Perf-sensitive**: will run real 48-layer decode timings against
+`D:\ModelWeights\Sub0Llm-Qwen4-full48-bf16\qwen4_full48_q_bf16.bin` -- if another agent is timing on this
+host at the same time, both sets of numbers are suspect (`[[thermal-confounds-ab-wallclock-testing]]`).
+
+---
+
+**2026-09-21 Claude Code (subagent) -- B35 DONE, status: done (committed, NOT merged, NOT pushed).**
+Branch `feature/b35-quant-dot`. **This is the first real decode win in the B24-B38 thread: 3.66 -> ~1.51
+s/token on the real 48-layer artifact, ~2.4x**, closing B32's llama.cpp gap from ~4-6x to ~1.6-2.6x. New
+`include/sub0/moe_quant_dot.hpp` computes decode's routed-expert dot products directly against the
+sidecar's native IQ1_S/IQ2_XXS/IQ4_NL bytes with an int8-quantized activation, never materializing an f32
+plane; behind `--moe-quant-dot` -> `constexpr bool MOE_QUANT_DOT`, default false, B36/B37/B38's idiom.
+**All three block layouts agree between `gguf.hpp` and ggml** -- nothing to report there. **Correctness,
+honestly**: the weight decode is exact (2.0e-8 / 8.7e-8 / 4.2e-7 vs `gguf::to_f32` with the activation
+error removed by construction), the int8 activation alone costs 0.48-3.3% on a single dot, and end-to-end
+`forward` vs `forward_one` on the real artifact is **L2-relative 0.2938, argmax 4/6** -- between BF16
+(~0.199, 5/6) and FP8 (~0.43). That is a real cost, not a rounding artefact, and it is stated as such.
+`forward`/`forward_one` bit-exactness is deliberately given up in the FUSED build only (op_moe keeps the
+f32 resolve); `engine_tests.cpp`'s parity gate is now tolerance-based under that flag, with the reason at
+the gate. **Default build unaffected**: `sub0_tests` reproduces decode hash `816c4a54ad49b8cf` exactly
+(28,969,623 / 147 green); `sub0_frontend_tests` 122,385 / 256 vs `main`'s 121,233 / 252, the delta being
+exactly the four new B35 cases. No file contention -- isolated worktree, and no competing process was
+running during any timed run (checked before each batch).
+**Incidental finding worth propagating**: this session's real-48-layer CLI recipe is INCOMPLETE and one
+flag of it is wrong (`--loop-middle-layers 4` should be absent); the working recipe is recorded in full in
+`docs/MOE_QUANT_DOT.md` S6h. It was recovered by differencing `out/build/wp5c_full48/generated/
+sub0_corpus.hpp` against a fresh configure.

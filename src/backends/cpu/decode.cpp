@@ -161,6 +161,11 @@ struct MoeDecodeThread {
     // expert_ffn_row's two d_ff-wide accumulators. Never zero-length (D_FF >= 1 always), so this stays
     // a valid array bound in a MoE-off build where nothing ever reads it.
     std::array<float, 2 * static_cast<std::size_t>(D_FF)> ffn{};
+    // B35: the down projection's own int8-quantized input. PER EXPERT, unlike the row activation (which
+    // is hoisted to g_moe_act_q below), because silu(gate(x))*up(x) differs per expert -- so it lives
+    // here, beside the accumulators it is computed from, and is sized once on first use. Empty and
+    // untouched in every build but MOE_QUANT_DOT.
+    moeqd::ActBlocks pre_q{};
 };
 // Lazily heap-allocated per participating thread, once, and reused for the process lifetime (AGENTS.md
 // S1): only the threads a run actually uses allocate, and none of it sits in the DLL's static image
@@ -184,6 +189,37 @@ struct MoeIoStage {
     }
 };
 MoeIoStage g_moe_io_stage{};
+
+// B36: block until selected-expert `k`'s three staged plane reads have landed, or die. A failed read
+// is not recoverable here -- there is no correct expert to substitute -- so this aborts rather than
+// returning. Shared by the resolve path and B35's fused path: the wait is identical at both, only what
+// consumes the bytes afterwards differs. [[maybe_unused]] because a reactive build never calls it.
+[[maybe_unused]] void moe_io_wait_expert(int k, int layer, int expert) {
+    std::string err;
+    for (int w = 0; w < moeq::PerExpert; ++w) {
+        if (!g_moe_decode_io.wait(k * moeq::PerExpert + w, err)) {
+            std::println(stderr,
+                         "fatal: B36 pipelined-I/O read failed (layer {} expert {} plane {}): {}",
+                         layer, expert, w, err);
+            std::abort();
+        }
+    }
+}
+
+// B36: the bytes staged for selected-expert `k`'s plane `which`, as its descriptor sizes them.
+[[maybe_unused]] std::span<const std::uint8_t> moe_io_staged(int k, int which,
+                                                              const moeq::Desc& d) {
+    return {g_moe_io_stage.buf[static_cast<std::size_t>(k * moeq::PerExpert + which)].data(),
+            static_cast<std::size_t>(d.bytes)};
+}
+
+// B35 (docs/MOE_QUANT_DOT.md S4): the MoE row activation, quantized to int8 ONCE per (token, layer) and
+// then reused by all EXPERTS_PER_TOK fused resolves of that layer. The hoist is the whole reason the
+// activation-side cost is negligible: O(hidden_size) quantization against O(hidden_size * d_ff *
+// experts_per_tok) of dot-product work. A plain global for the same reason g_moe_io_stage is one --
+// forward_one is single-threaded at the call level, and MOE_DECODE_THREADS is 1 (B29), so the fan-out
+// below only ever READS this. Empty and untouched in every build but MOE_QUANT_DOT.
+moeqd::ActBlocks g_moe_act_q{};
 
 // Runs one decode row's selected experts across MOE_DECODE_THREADS threads. Passed to
 // moe::forward_row_via_run, which computes each expert into its OWN output buffer and does the weighted
@@ -235,7 +271,11 @@ struct ParallelExperts {
             const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
             if (!g_moe_decode[static_cast<std::size_t>(t)]) {
                 g_moe_decode[static_cast<std::size_t>(t)] = std::make_unique<MoeDecodeThread>();
-                if constexpr (USE_MOE_QUANT) g_moe_decode[static_cast<std::size_t>(t)]->cache.allocate();
+                // B35: the fused path never materializes an f32 plane, so it never needs the resolve
+                // pool's 18.75 MiB of slot storage either -- not allocating it is the memory half of
+                // this package's own claim, and leaving it allocated would quietly contradict it.
+                if constexpr (USE_MOE_QUANT && !MOE_QUANT_DOT)
+                    g_moe_decode[static_cast<std::size_t>(t)]->cache.allocate();
             }
             // FTZ/DAZ is per-thread MXCSR state, and a thread that skipped it would compute DIFFERENT
             // floats from thread 0 the moment an intermediate went subnormal -- not merely slower ones.
@@ -676,32 +716,58 @@ const float* Model::forward_one(int id, int pos) {
             // B38 and include/sub0/simd_reduce.hpp. expert_ffn_row_source below (this lambda's own call)
             // is NEVER gated by this -- it always uses simd::dot_seq regardless, to preserve B31's
             // forward()/forward_one() bit-exactness invariant.
+            // B35: quantize this row's activation ONCE, here, for every selected expert of this layer
+            // to share (docs/MOE_QUANT_DOT.md S4 -- the cost is O(hidden_size) against
+            // O(hidden_size * d_ff * experts_per_tok) of dot work, but only if it is genuinely hoisted
+            // out of the per-expert lambda, which is the point of doing it at this line).
+            if constexpr (USE_MOE_QUANT && MOE_QUANT_DOT) g_moe_act_q.quantize(a, MOE_DIMS.hidden_size);
             moe::forward_row_via_run_ex<USE_SIMD_REDUCE>(
                 MOE_DIMS, a, L.moe_router->pdata,
                 [&](int k, int e, float* out_ptr, float* ffn, float* g) {
                     const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
                     MoeDecodeThread& S = *g_moe_decode[static_cast<std::size_t>(t)];
-                    if constexpr (USE_MOE_QUANT) {
+                    if constexpr (USE_MOE_QUANT && MOE_QUANT_DOT) {
+                        // B35 (docs/MOE_QUANT_DOT.md): no resolve at all. The three planes' encoded
+                        // bytes go straight into the FFN's dot products against g_moe_act_q, the
+                        // activation this layer quantized once before the call -- nothing is
+                        // dequantized, nothing is written to DRAM, nothing is read back.
+                        const moeq::Desc& dg = g_moe_quant.desc(l, e, moeq::Gate);
+                        const moeq::Desc& du = g_moe_quant.desc(l, e, moeq::Up);
+                        const moeq::Desc& dd = g_moe_quant.desc(l, e, moeq::Down);
+                        moeqd::ExpertPlanes planes{{dg, {}}, {du, {}}, {dd, {}}};
+                        if constexpr (MOE_IO_PIPELINED) {
+                            // The same staged bytes B36's resolve arm consumes, at the same three
+                            // slots; only what happens to them afterwards differs.
+                            moe_io_wait_expert(k, l, e);
+                            planes.gate.bytes = moe_io_staged(k, moeq::Gate, dg);
+                            planes.up.bytes   = moe_io_staged(k, moeq::Up, du);
+                            planes.down.bytes = moe_io_staged(k, moeq::Down, dd);
+                        } else {
+                            planes.gate.bytes = g_moe_quant.raw(dg);
+                            planes.up.bytes   = g_moe_quant.raw(du);
+                            planes.down.bytes = g_moe_quant.raw(dd);
+                        }
+                        if (!moeqd::expert_ffn_row_quant(MOE_DIMS, g_moe_act_q, planes, out_ptr, ffn, g,
+                                                         S.pre_q)) {
+                            std::println(stderr,
+                                         "fatal: routed expert {} of layer {} cannot be fused by the B35 "
+                                         "quantized-dot path -- an unsupported GGML type, a row width "
+                                         "that is not a multiple of {}, or a plane whose declared "
+                                         "geometry disagrees with this build's axes",
+                                         e, l, moeqd::GROUP);
+                            std::abort();
+                        }
+                    } else if constexpr (USE_MOE_QUANT) {
                         MoeDecodeExpertCacheSource::Resolved r;
                         if constexpr (MOE_IO_PIPELINED) {
-                            std::string err;
-                            for (int w = 0; w < moeq::PerExpert; ++w) {
-                                if (!g_moe_decode_io.wait(k * moeq::PerExpert + w, err)) {
-                                    std::println(stderr,
-                                                 "fatal: B36 pipelined-I/O read failed (layer {} expert "
-                                                 "{} plane {}): {}", l, e, w, err);
-                                    std::abort();
-                                }
-                            }
+                            moe_io_wait_expert(k, l, e);
                             const moeq::Desc d0 = g_moe_quant.desc(l, e, moeq::Gate);
                             const moeq::Desc d1 = g_moe_quant.desc(l, e, moeq::Up);
                             const moeq::Desc d2 = g_moe_quant.desc(l, e, moeq::Down);
-                            const int base = k * moeq::PerExpert;
-                            r = S.cache.resolve_from_bytes(
-                                g_moe_quant, l, e,
-                                std::span<const std::uint8_t>(g_moe_io_stage.buf[static_cast<std::size_t>(base + moeq::Gate)].data(), d0.bytes),
-                                std::span<const std::uint8_t>(g_moe_io_stage.buf[static_cast<std::size_t>(base + moeq::Up)].data(), d1.bytes),
-                                std::span<const std::uint8_t>(g_moe_io_stage.buf[static_cast<std::size_t>(base + moeq::Down)].data(), d2.bytes));
+                            r = S.cache.resolve_from_bytes(g_moe_quant, l, e,
+                                                            moe_io_staged(k, moeq::Gate, d0),
+                                                            moe_io_staged(k, moeq::Up, d1),
+                                                            moe_io_staged(k, moeq::Down, d2));
                         } else {
                             r = S.cache.resolve(g_moe_quant, l, e);
                         }

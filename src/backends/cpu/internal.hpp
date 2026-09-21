@@ -24,6 +24,7 @@
 #include "sub0/moe_io.hpp"          // B36: explicit overlapped I/O for decode's resolve path
 #include "sub0/moe_math.hpp"        // moe::ExpertWeights (moe_resolve) + scratch sizing
 #include "sub0/moe_quant.hpp"       // WP4e: the quantized-resident routed-expert store + pool
+#include "sub0/moe_quant_dot.hpp"   // B35: fused dot products against the sidecar's native bytes
 #include "sub0/qsa_math.hpp"        // QSA scratch sizing (calc_act_cap) + the rotary tables' own math
 #include "sub0/layout.hpp"
 #include "sub0/scratch_slots.hpp"   // ScratchBindings / PersistentBindings / SentinelBindings

@@ -191,8 +191,17 @@ TEST_CASE("forward_one (KV-cache) matches the full forward per position", "[engi
                 worst = std::max(worst, maxabs / maxmag);
             }
         }
+        // B35 (docs/MOE_QUANT_DOT.md S5): under MOE_QUANT_DOT the two paths no longer compute the same
+        // arithmetic AT ALL, deliberately. forward_one's routed experts dot an int8-quantized
+        // activation against the sidecar's native quantized bytes; forward()'s op_moe keeps the f32
+        // resolve, because its batched path has a real cross-row cache hit rate and is exactly the case
+        // B24 Phase 2's dequantize-once verdict legitimately wins. So this check becomes a
+        // "same model, different precision" agreement gate -- the same status the --prec-param BF16/FP8
+        // builds already have -- rather than the reduction-noise gate it is in every other build, and
+        // the tolerance is widened to say so honestly instead of quietly passing a tighter one.
+        constexpr double kParityTol = (sub0::USE_MOE_QUANT && MOE_QUANT_DOT) ? 5e-2 : 1e-3;
         INFO("worst per-position rel diff = " << worst);
-        REQUIRE(worst < 1e-3);
+        REQUIRE(worst < kParityTol);
     }
 }
 
