@@ -669,3 +669,24 @@ can choose: 2.4x for a measurable quality cost.
 Also merged: the agent's correction to this session's real-axes configure recipe (my own was incomplete
 and silently produced `PARAM_FLOATS 2570717696` + a rejected artifact — it cost me B38's real-model
 verification earlier). Canonical copy now in `docs/MOE_QUANT_DOT.md` §6h and in project memory.
+
+---
+
+**2026-09-21 Claude Code — B39 done, measured NET REGRESSION, NOT merged.** Applied AGENTS.md §2 to
+B35's fused kernel (template on `moe::Dims` as a C++23 NTTP — works cleanly; `ActBlocks<N>` on
+`std::array`; geometry checks lifted to `static_assert`). Numerics bit-identical. But interleaved,
+zero-contention measurement says it is **slower**: B35 1.470 vs B39 1.518 s/token (−3.3%) after an
+alignment fix, and −8.3% before it. Agent hit the session rate limit mid-self-review; I finished and
+measured it myself rather than re-dispatch into the same limit.
+
+Two findings worth keeping. (1) **`alignas` bug this change introduced**: `std::array<std::int8_t, N>`
+has natural alignment 1, so embedding it to satisfy §1 forfeited the heap alignment `std::vector` gave
+for free, and `dot_group`'s vector loads went unaligned — worth ~5%. (2) **The templating itself bought
+nothing**: `sub0_core.dll` size differs by 0.02% between arms, so Clang was already constant-folding the
+dims through inlining from the `constexpr MOE_DIMS` call site. §2's own rationale ("the unused branch
+compiles away entirely") did not apply — there was no runtime branch to eliminate.
+
+I also disagreed with one of the agent's own self-review findings: it flagged `decode.cpp:142`'s
+`static_assert` as duplicating `ActBlocks`' own. Kept both — the low one is the backstop for any width,
+the high one names the actual configurator axis and cites the doc rather than surfacing as a
+template-instantiation error. That is a deliberate two-level guard, not duplication.
