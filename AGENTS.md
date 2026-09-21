@@ -238,6 +238,17 @@ first, so the first commit targets zero MUST findings rather than acquiring them
 follow-up pass. The empirical signal above is blunt: the header written against a good existing
 template came out clean; the ones written fresh under time pressure did not.
 
+## 13. Performance work follows `docs/OPTIMIZATION_PROCESS.md`
+
+All optimization work — measurement protocol, KPI gates, park-never-revert, the three-pass rule, the
+layered O0-O4 review, and the combination matrix — is codified in `docs/OPTIMIZATION_PROCESS.md`, with
+machine-readable gates in `docs/optimization/kpi_gates.json` and automation in
+`scripts/run_perf_suite.py`. Adapted from `Sub0h264`'s proven practice. Read it before starting, and
+use the script rather than hand-rolling a measurement — hand-rolled measurement is where the mistakes
+came from.
+
+The headline rule, stated here because it is the one most often broken:
+
 ## 13. One negative measurement is a starting point, not a verdict — iterate three times
 
 The failure mode this rule exists to stop, observed repeatedly in the B24-B39 thread: implement an

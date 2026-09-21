@@ -1,0 +1,79 @@
+{
+  "_doc": "KPI gates for Sub0Llm performance work. See docs/OPTIMIZATION_PROCESS.md for the policy these enforce. Shape borrowed from Sub0h264's docs/optimization/kpi_gates.json, which is the proven original.",
+  "_format": "Each gate: id, label, stage, metric, op (gte|lte|eq), threshold, severity (hard|soft).",
+  "_severity": "hard = must not land on main if it fails -- PARK behind a default-off constexpr toggle (docs/OPTIMIZATION_PROCESS.md S3), never revert. soft = tracked, warning only.",
+  "_noise_floor": "Decode s/token on this host reproduces to +-1.5% at zero contention. Any |delta| < 2% is 'no measurable change'. Sub-floor wins are still kept and logged -- they are what compounds (S4).",
+
+  "gates": [
+    {
+      "id": "G-HASH",
+      "label": "neutral-build decode fingerprint unchanged",
+      "stage": "sub0_tests @ d196check",
+      "metric": "decode hash",
+      "op": "eq",
+      "threshold": "816c4a54ad49b8cf",
+      "severity": "hard",
+      "_note": "AGENTS.md S4. Proves the change did not leak into the default path. Every merge in the B24-B39 thread held this."
+    },
+    {
+      "id": "G-SUITE-ENGINE",
+      "label": "sub0_tests assertion count",
+      "stage": "sub0_tests @ d196check",
+      "metric": "assertions",
+      "op": "eq",
+      "threshold": 28969623,
+      "severity": "hard",
+      "_note": "Exact, or a delta fully attributable to tests this change added. An unattributable count change is an unexplained behaviour change."
+    },
+    {
+      "id": "G-SUITE-FRONTEND",
+      "label": "sub0_frontend_tests assertion count",
+      "stage": "sub0_frontend_tests @ d196check",
+      "metric": "assertions",
+      "op": "gte",
+      "threshold": 122385,
+      "severity": "hard",
+      "_note": "Grows as tests are added; must never shrink. 122385/256 as of the B35 merge."
+    },
+    {
+      "id": "G-PARITY",
+      "label": "forward vs forward_one bit-exact",
+      "stage": "sub0llm-qwen4-forward @ real 48-layer",
+      "metric": "max |forward - forward_one|",
+      "op": "eq",
+      "threshold": 0.0,
+      "severity": "hard",
+      "_note": "Waived ONLY for an arm that deliberately breaks it and says so at the toggle (currently --moe-quant-dot, which gives up op_moe-vs-decode agreement by design). B34 broke this accidentally and had to repair it."
+    },
+    {
+      "id": "G-QUALITY",
+      "label": "logit L2-relative vs the unfused path",
+      "stage": "sub0llm-qwen4-forward @ real 48-layer",
+      "metric": "L2 relative",
+      "op": "lte",
+      "threshold": 0.43,
+      "severity": "hard",
+      "_note": "0.43 is the FP8 precedent (B33/B37) -- the worst quality this project has been willing to ship even default-off. Reference points: BF16 0.199 @5/6 argmax (shipped default), B35 fused 0.2938 @4/6 (shipped default-off)."
+    },
+    {
+      "id": "G-PERF",
+      "label": "no decode throughput regression beyond the noise floor",
+      "stage": "sub0llm-qwen4-forward @ real 48-layer, interleaved, zero contention",
+      "metric": "s/token vs the arm's own default",
+      "op": "lte",
+      "threshold": 1.02,
+      "severity": "hard",
+      "_note": "Ratio, not absolute. 2% = the measured noise floor. Failing this means PARK, not revert."
+    },
+    {
+      "id": "G-COMPETITOR",
+      "label": "llama.cpp gap on the same host and model",
+      "stage": "llama-bench -ngl 0 -t 24, UD-IQ1_S GGUF",
+      "metric": "s/token ratio",
+      "op": "lte",
+      "threshold": 1.0,
+      "severity": "soft",
+      "_note": "The external bar, not a blocker. B32 measured ~4-6x; post-B35 it is ~1.7-2.5x at the fused setting. Re-measure whenever an internal 'we are near the floor' argument is about to close down a line of work -- that is exactly the argument B32 falsified."
+    }
+  ]
+}
