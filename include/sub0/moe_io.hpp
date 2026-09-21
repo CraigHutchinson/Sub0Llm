@@ -86,7 +86,7 @@ public:
     PlaneIo(const PlaneIo&) = delete;
     PlaneIo& operator=(const PlaneIo&) = delete;
 
-    bool open(const std::string& path, std::string& err) {
+    [[nodiscard]] bool open(const std::string& path, std::string& err) {
         close();
 #if defined(_WIN32)
         file_ = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -112,7 +112,7 @@ public:
 #endif
     }
 
-    bool ready() const {
+    [[nodiscard]] bool ready() const {
 #if defined(_WIN32)
         return file_ != INVALID_HANDLE_VALUE;
 #else
@@ -126,7 +126,7 @@ public:
     // between one layer's resolve and the next's `prefetch()`. Returns false (fatal, matching
     // `moe_resolve`'s own "a resolve failure is fatal, not a miss" contract) only on a real submission
     // error.
-    bool submit(std::span<const Request> reqs, std::string& err) {
+    [[nodiscard]] bool submit(std::span<const Request> reqs, std::string& err) {
         const int n = static_cast<int>(reqs.size());
 #if defined(_WIN32)
         for (int i = 0; i < n; ++i) {
@@ -160,7 +160,7 @@ public:
     // `wait()` on different tags concurrently, each cooperatively pumping the shared port; this is the
     // pipelining property the whole class exists for (see the file header comment). Returns false on a
     // real I/O error for THIS tag.
-    bool wait(int tag, std::string& err) {
+    [[nodiscard]] bool wait(int tag, std::string& err) {
 #if defined(_WIN32)
         while (!done_[static_cast<std::size_t>(tag)].load(std::memory_order_acquire)) {
             DWORD bytes = 0; ULONG_PTR key = 0; LPOVERLAPPED lpo = nullptr;

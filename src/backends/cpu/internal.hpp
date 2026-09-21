@@ -320,6 +320,24 @@ extern moeq::Store g_moe_quant;
 inline constexpr int MOE_IO_MAX_INFLIGHT = (EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1) * moeq::PerExpert;
 extern moeio::PlaneIo<MOE_IO_MAX_INFLIGHT> g_moe_decode_io;
 
+// B36: staging buffers pipelined I/O reads into -- one gate/up/down triple PER SELECTED EXPERT, indexed
+// by the router's own top-k selection order k (NOT by decode thread: MOE_DECODE_THREADS is 1 since B29,
+// so one thread walks every k serially while prefetch() keeps all n experts' reads in flight ahead of
+// it). A plain global for the same reason g_moe_decode is a pool rather than TLS -- gen is
+// single-threaded at the forward_one call level, so nothing else can be using the stage concurrently.
+//
+// SIZED ONCE, at sidecar-open time (backend.cpp's load_moe_quant_sidecar), never per call: the buffers
+// are per-call scratch in the strict AGENTS.md S1 sense -- prefetch() runs once per layer per token, so
+// sizing them there would put the first token's heap allocation inside decode's own hot path and pay a
+// redundant size check on every call thereafter. `reserve` is named to say so at the call site.
+struct MoeIoStage {
+    std::array<std::vector<std::uint8_t>, static_cast<std::size_t>(MOE_IO_MAX_INFLIGHT)> buf{};
+    void reserve(std::size_t max_bytes) {
+        for (auto& b : buf) if (b.size() < max_bytes) b.resize(max_bytes);
+    }
+};
+extern MoeIoStage g_moe_io_stage;
+
 struct ParamView { size_t off, n; bool decay; };
 
 // All per-thread state for a data-parallel window lives in one Worker. Workers are a pool indexed

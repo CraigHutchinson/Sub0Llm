@@ -168,22 +168,6 @@ struct MoeDecodeThread {
 // overruns Windows' static-TLS block, the same hazard that made g_workers a pool rather than TLS.
 std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
 
-// B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): staging buffers for pipelined I/O's explicit reads,
-// one gate/up/down triple PER SELECTED EXPERT (indexed by k, the router's own top-k selection order --
-// NOT by decode thread: MOE_DECODE_THREADS is pinned to 1 (B29), so a single thread processes every k
-// serially, but ParallelExperts::prefetch below still issues ALL n experts' reads up front, before that
-// thread starts consuming the first one -- so up to EXPERTS_PER_TOK experts' bytes may be in flight or
-// resolved-but-not-yet-consumed at once, which is what MaxInFlight/MOE_IO_MAX_INFLIGHT already sizes
-// for). A plain global (not per-thread, not thread_local) for the same reason g_moe_decode is a pool
-// rather than TLS -- gen is single-threaded at the forward_one call level (this file's own header
-// comment), so nothing else can be using this stage concurrently.
-struct MoeIoStage {
-    std::array<std::vector<std::uint8_t>, static_cast<std::size_t>(MOE_IO_MAX_INFLIGHT)> buf{};
-    void allocate(std::size_t max_bytes) {
-        for (auto& b : buf) if (b.size() < max_bytes) b.resize(max_bytes);
-    }
-};
-MoeIoStage g_moe_io_stage{};
 
 // Runs one decode row's selected experts across MOE_DECODE_THREADS threads. Passed to
 // moe::forward_row_via_run, which computes each expert into its OWN output buffer and does the weighted
@@ -206,7 +190,6 @@ struct ParallelExperts {
 
     void prefetch(const int* idx, int n) const {
         if constexpr (USE_MOE_QUANT && MOE_IO_PIPELINED) {
-            g_moe_io_stage.allocate(static_cast<std::size_t>(g_moe_quant.max_desc_bytes()));
             std::array<moeio::Request, static_cast<std::size_t>(MOE_IO_MAX_INFLIGHT)> reqs{};
             int nr = 0;
             for (int k = 0; k < n; ++k) {

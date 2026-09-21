@@ -100,25 +100,37 @@ inline constexpr int kLanes = 8;
 // which is what every hot call site actually is (routed-expert dequantized planes, resident f32
 // activations) -- a proxy-typed call still computes the CORRECT value either way, it may just not
 // vectorize as well, which is a performance-only difference, never a correctness one.
-template <class A, class B>
-inline float dot(A a, B b, int n) {
+// The shared multi-accumulator shape every reduction below is built from -- ONE copy of the lane
+// scaffolding (8 independent accumulators, the vectorize pragma, the horizontal fold, the scalar tail),
+// parameterised only by what a single index contributes. `term` is called exactly once per index, in
+// ascending order, and the accumulator each index lands in is fixed by i % kLanes -- so every caller
+// gets the identical addend set in the identical order, and any two callers differing only in `term`
+// are guaranteed to agree bit-for-bit with a hand-written copy of this loop. Inlined away entirely:
+// `term` is always a non-capturing-by-value lambda over raw pointers at every call site below.
+template <class Term>
+[[nodiscard]] inline float reduce8(int n, Term term) {
     float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f, s5 = 0.f, s6 = 0.f, s7 = 0.f;
     int i = 0;
     const int n8 = n - (n % kLanes);
     #pragma clang loop vectorize(enable)
     for (; i < n8; i += kLanes) {
-        s0 += a[i + 0] * b[i + 0];
-        s1 += a[i + 1] * b[i + 1];
-        s2 += a[i + 2] * b[i + 2];
-        s3 += a[i + 3] * b[i + 3];
-        s4 += a[i + 4] * b[i + 4];
-        s5 += a[i + 5] * b[i + 5];
-        s6 += a[i + 6] * b[i + 6];
-        s7 += a[i + 7] * b[i + 7];
+        s0 += term(i + 0);
+        s1 += term(i + 1);
+        s2 += term(i + 2);
+        s3 += term(i + 3);
+        s4 += term(i + 4);
+        s5 += term(i + 5);
+        s6 += term(i + 6);
+        s7 += term(i + 7);
     }
     float s = (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
-    for (; i < n; ++i) s += a[i] * b[i];
+    for (; i < n; ++i) s += term(i);
     return s;
+}
+
+template <class A, class B>
+[[nodiscard]] inline float dot(A a, B b, int n) {
+    return reduce8(n, [&](int i) { return a[i] * b[i]; });
 }
 
 // Strict left-to-right sum_i a[i]*b[i] -- deliberately NOT reordered. Exists for exactly one reason,
@@ -141,7 +153,7 @@ inline float dot(A a, B b, int n) {
 //
 // B38: used UNCONDITIONALLY at `expert_ffn_row_source`'s three call sites, regardless of USE_SIMD_REDUCE
 // -- this correctness-pinned pairing is never touched by the build-time reduction-strategy toggle.
-inline float dot_seq(const float* a, const float* b, int n) {
+[[nodiscard]] inline float dot_seq(const float* a, const float* b, int n) {
     float s = 0.f;
     for (int i = 0; i < n; ++i) s += a[i] * b[i];
     return s;
@@ -150,22 +162,12 @@ inline float dot_seq(const float* a, const float* b, int n) {
 // sum_i a[i]*a[i] -- the same primitive specialised for a self-dot (RMS/L2-norm sum-of-squares). A
 // distinct name rather than always writing dot(a,a,n) at call sites so those reads stay self-documenting;
 // implemented in terms of dot() so there is exactly one copy of the accumulator shape.
-inline float sumsq(const float* a, int n) { return dot(a, a, n); }
+[[nodiscard]] inline float sumsq(const float* a, int n) { return dot(a, a, n); }
 
 // Plain sum_i a[i], the same multi-accumulator shape, for reductions that are not a product (e.g.
 // softmax's normalizer).
-inline float sum(const float* a, int n) {
-    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f, s5 = 0.f, s6 = 0.f, s7 = 0.f;
-    int i = 0;
-    const int n8 = n - (n % kLanes);
-    #pragma clang loop vectorize(enable)
-    for (; i < n8; i += kLanes) {
-        s0 += a[i + 0]; s1 += a[i + 1]; s2 += a[i + 2]; s3 += a[i + 3];
-        s4 += a[i + 4]; s5 += a[i + 5]; s6 += a[i + 6]; s7 += a[i + 7];
-    }
-    float s = (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
-    for (; i < n; ++i) s += a[i];
-    return s;
+[[nodiscard]] inline float sum(const float* a, int n) {
+    return reduce8(n, [&](int i) { return a[i]; });
 }
 
 // ---- B38: USE_SIMD_REDUCE dispatchers -----------------------------------------------------------
@@ -183,7 +185,7 @@ inline float sum(const float* a, int n) {
 // contract), so USE_SIMD_REDUCE=false is bit-exact with today's `main`.
 
 template <bool UseSimd, class A, class B>
-inline float dot_choice(A a, B b, int n) {
+[[nodiscard]] inline float dot_choice(A a, B b, int n) {
     if constexpr (UseSimd) {
         return dot(a, b, n);
     } else {
@@ -194,7 +196,7 @@ inline float dot_choice(A a, B b, int n) {
 }
 
 template <bool UseSimd>
-inline float sumsq_choice(const float* a, int n) {
+[[nodiscard]] inline float sumsq_choice(const float* a, int n) {
     if constexpr (UseSimd) {
         return sumsq(a, n);
     } else {
@@ -205,7 +207,7 @@ inline float sumsq_choice(const float* a, int n) {
 }
 
 template <bool UseSimd>
-inline float sum_choice(const float* a, int n) {
+[[nodiscard]] inline float sum_choice(const float* a, int n) {
     if constexpr (UseSimd) {
         return sum(a, n);
     } else {

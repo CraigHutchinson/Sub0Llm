@@ -165,7 +165,7 @@ inline bool dequantize_expert(const Desc& d, std::span<const std::uint8_t> raw, 
 // read-back, no transpose write. Paired with moe::expert_ffn_row_source (moe_math.hpp), which reads
 // exactly this layout and is proven (see that function's own comment) to produce bit-identical output to
 // expert_ffn_row on dequantize_expert's transposed planes.
-inline bool dequantize_expert_source(const Desc& d, std::span<const std::uint8_t> raw,
+[[nodiscard]] inline bool dequantize_expert_source(const Desc& d, std::span<const std::uint8_t> raw,
                                       std::vector<float>& dst) {
     gguf::TensorInfo t;
     t.type_raw = d.type_raw;
@@ -267,7 +267,7 @@ public:
 
     // B36: the largest single Desc::bytes in this sidecar -- what an explicit-I/O consumer's own
     // per-plane staging buffer needs to be sized to, once, at load time.
-    std::uint64_t max_desc_bytes() const { return max_desc_bytes_; }
+    [[nodiscard]] std::uint64_t max_desc_bytes() const { return max_desc_bytes_; }
 
 private:
     Header                    h_{};
@@ -426,7 +426,7 @@ public:
     // Always writes slot 0 -- correct ONLY for a single-slot cache (decode's MoeDecodeExpertCacheSource;
     // see MOE_DECODE_SLOTS's own comment for why decode's hit rate against any cache is provably zero,
     // so there is no round-robin/hit-check to preserve here, unlike resolve() above).
-    Resolved resolve_from_bytes(const Store& store, int layer, int expert,
+    [[nodiscard]] Resolved resolve_from_bytes(const Store& store, int layer, int expert,
                                  std::span<const std::uint8_t> raw_gate,
                                  std::span<const std::uint8_t> raw_up,
                                  std::span<const std::uint8_t> raw_down) {

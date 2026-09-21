@@ -150,6 +150,7 @@ static void ensure_shared_params() {
 }
 
 moeq::Store g_moe_quant;
+MoeIoStage g_moe_io_stage;                              // B36 -- sized once, beside the open below
 moeio::PlaneIo<MOE_IO_MAX_INFLIGHT> g_moe_decode_io;   // B36 -- opened alongside g_moe_quant below, only
                                                         // under MOE_IO_PIPELINED
 
@@ -2037,6 +2038,11 @@ bool load_moe_quant_sidecar(const char* model_path) {
         // handle at all, matching AGENTS.md S4's "zero effect on existing builds until explicitly
         // enabled".
         if constexpr (MOE_IO_PIPELINED) {
+            // AGENTS.md S1: size the staging buffers ONCE, here, not per prefetch() call --
+            // prefetch() runs once per layer per token, so sizing there would put the first
+            // token's heap allocation inside decode's hot path. max_desc_bytes() is final the
+            // moment the descriptor table is parsed, which g_moe_quant.open() above just did.
+            g_moe_io_stage.reserve(static_cast<std::size_t>(g_moe_quant.max_desc_bytes()));
             if (!g_moe_decode_io.open(path, err)) {
                 std::println(stderr,
                              "error: B36 pipelined-I/O handle failed to open beside the S0Q1 sidecar: {}",
