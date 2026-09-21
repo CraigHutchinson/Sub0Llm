@@ -690,3 +690,31 @@ I also disagreed with one of the agent's own self-review findings: it flagged `d
 `static_assert` as duplicating `ActBlocks`' own. Kept both — the low one is the backstop for any width,
 the high one names the actual configurator axis and cites the doc rather than surfacing as a
 template-instantiation error. That is a deliberate two-level guard, not duplication.
+
+---
+
+**2026-09-21 Claude Code — combination matrix, iteration 1 (AGENTS.md §13).** User's correction: four
+mechanisms had each been retired on a SINGLE measurement, and optimizations interact — measure
+combinations, iterate three times, never revert. Recorded as §13; first combination measured here.
+
+Hypothesis tested: **B34 (`--simd-reduce`) was measured against the wrong baseline.** Its −20% was
+diagnosed as "vectorization landed only on small reductions because the dominant call site
+(`expert_ffn_row_source`) was pinned unvectorized by B31's parity invariant." B35's fused path does not
+call that function at all and cut decode 3.6s→1.5s, so the remaining float reductions (GDN/QSA/GR,
+shared-expert gate) are now a far larger share of what is left.
+
+Measured, real 48-layer artifact, zero contention, one build dir reconfigured between arms:
+- **B35 alone**: 1.488 / 1.442 / 1.483 → mean **1.471 s/token**
+- **B35 + `--simd-reduce`**: 1.535 / 1.529 / 1.532 → mean **1.532 s/token** (−4%)
+
+So the hypothesis did NOT pay at iteration 1. Per §13 this is not a verdict on the combination — but it
+does expose a methodological problem worth more than another toggle permutation: **every profile this
+thread is reasoning from predates B35.** B27's I/O-vs-compute split (0.02%/99.98%), B30's per-resolve
+byte accounting, B31/B34's "which call site dominates" — all measured when decode was ~3.6s and MoE
+resolve was ~80% of it. B35 cut that path by 2.4x, so the cost distribution has moved and nobody has
+re-derived it. Continuing to pick levers against the old profile is guessing.
+
+**Next action (not yet done): re-profile decode at the current fused operating point** before choosing
+the next optimization, then iterate 3x on whatever it actually names. Candidate levers stay parked and
+toggleable, never reverted: `--simd-reduce` (B34/B38), `--prec-param fp8` (B33/B37), `--moe-io-mode
+pipelined` (B25/B36), `feature/b39-constexpr-shape` (B39, −3.3% after one fix, two passes unspent).
