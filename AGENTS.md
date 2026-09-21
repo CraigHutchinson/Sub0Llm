@@ -238,6 +238,42 @@ first, so the first commit targets zero MUST findings rather than acquiring them
 follow-up pass. The empirical signal above is blunt: the header written against a good existing
 template came out clean; the ones written fresh under time pressure did not.
 
+## 13. One negative measurement is a starting point, not a verdict — iterate three times
+
+The failure mode this rule exists to stop, observed repeatedly in the B24-B39 thread: implement an
+optimization, measure once, get a negative or null number, park it, move on. Four separate mechanisms
+(prefetch, FP8 backbone, SIMD reductions, compile-time kernel shaping) were each retired on a SINGLE
+first measurement. That is treating a first implementation's number as a property of the *mechanism*,
+when it is usually a property of that first implementation.
+
+**Rule — iterate three times before judging a mechanism.** A first milestone that merely works is
+proof the mechanism is viable, not evidence it pays. Take two more optimization passes on it. If a pass
+breaks even or improves, continue. Only park after three passes have failed to move it, and then park
+it *documented and toggleable*, never reverted — see §4's default-off pattern and B36/B37/B38 for how
+that is done here.
+
+**Never fully back a change out.** Keep it in the tree behind its own `constexpr` toggle so the next
+person can resume from a measured state instead of re-deriving it. A reverted branch is a finding
+thrown away; a parked toggle is a finding banked.
+
+**Measure combinations, not just isolated arms.** These optimizations interact, and the interactions
+are frequently where the benefit is — isolated single-digit wins compound. Two concrete examples from
+this repo:
+
+- **B34 (SIMD reductions) was measured against the wrong baseline.** It looked like a 20% regression
+  because the dominant call site (`expert_ffn_row_source`) had to stay unvectorized for B31's parity
+  invariant, leaving vectorization only on small reductions. B35 then removed that call site from
+  decode's fused path entirely and cut decode 3.6s→1.5s, which makes the remaining float reductions a
+  far larger share of what is left. The B34 number says nothing about B34 *on top of B35*.
+- **B39 (compile-time kernel shape) was parked after one fix.** Its first measurement was −8.3%; a
+  single alignment fix (`alignas` on an `std::array` that had silently forfeited the heap alignment
+  `std::vector` gave for free) took it to −3.3%. Two more passes had not been attempted.
+
+**Reason about performance-critical code as an implementation, not an experiment.** "Does SIMD help?"
+is not the question; "is this the right memory layout, alignment, access order and call shape for this
+data, on this machine" is. A naive first cut answering the first question tells you almost nothing
+about the second.
+
 ## Before you ship — quick checklist
 
 - [ ] Any new per-step/per-call code path: zero heap allocation, scratch reused not reallocated (§1)
@@ -257,5 +293,7 @@ template came out clean; the ones written fresh under time pressure did not.
       run unfiltered with the feature ON, new compile-time axis classified against `ARCH_FINGERPRINT` (§10)
 - [ ] New/changed C++ reviewed against the `cpp-review` standard BEFORE merge, not only for
       correctness+perf (§12)
+- [ ] Optimization measured negative: did it get THREE passes, and was it measured in COMBINATION
+      with the other live toggles, before being parked? Parked never means reverted (§13)
 - [ ] Spike whose finding has merged (no `src/`/`tools/` include of its header): gated out of the default
       build, gate verified as a round trip, orphaned API + baselines updated (§11)
