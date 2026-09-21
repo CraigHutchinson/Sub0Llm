@@ -126,6 +126,23 @@ struct QsaCache {
 };
 thread_local QsaCache g_qsa_cache;   // only ever populated/consulted when USE_QSA
 
+// B39: the geometry B35's fused kernels are compiled FOR, in the never-degenerate form layout.hpp's own
+// GR_DIMS_BUF/NUM_EXPERTS_BUF established. moeqd::ActBlocks<N> is legal only at a whole multiple of
+// moeqd::GROUP, and a non-fused build's D_MODEL (196 at this project's own smoke config) is not one --
+// yet an `if constexpr` inside a non-template function still has its discarded arm fully type-checked,
+// so the fused arm's TYPES must stay valid in every build even where its code is dead. Substituting
+// GROUP for both widths there keeps them valid, for 32 int8 plus two 4-byte lanes nothing ever reads.
+inline constexpr moe::Dims MOE_QD_DIMS_BUF =
+    MOE_QUANT_DOT ? MOE_DIMS
+                  : moe::Dims{moeqd::GROUP, moeqd::GROUP, MOE_DIMS.num_experts,
+                              MOE_DIMS.experts_per_tok};
+// The compile-time replacement for the row-width half of B35's own runtime `fusable()`, placed at the
+// one seam that can name WHICH build axis is wrong: the kernels index by whole groups and have no
+// partial-group form, so a fused build at an unaligned width has no correct answer to give at all.
+static_assert(!MOE_QUANT_DOT || (D_MODEL % moeqd::GROUP == 0 && D_FF % moeqd::GROUP == 0),
+              "--moe-quant-dot needs D_MODEL and D_FF to be whole multiples of moeqd::GROUP (32) -- "
+              "the real Qwen4 axes (2560 / 640) are; see docs/MOE_QUANT_DOT.md S6d");
+
 // --- decode's per-expert parallelism (B20 part 2) --------------------------------------------------
 //
 // THE PROBLEM, MEASURED. VTune on a live 48-layer decode run reported `Total Thread Count: 1` for a
@@ -163,9 +180,10 @@ struct MoeDecodeThread {
     std::array<float, 2 * static_cast<std::size_t>(D_FF)> ffn{};
     // B35: the down projection's own int8-quantized input. PER EXPERT, unlike the row activation (which
     // is hoisted to g_moe_act_q below), because silu(gate(x))*up(x) differs per expert -- so it lives
-    // here, beside the accumulators it is computed from, and is sized once on first use. Empty and
-    // untouched in every build but MOE_QUANT_DOT.
-    moeqd::ActBlocks pre_q{};
+    // here, beside the accumulators it is computed from. B39 made its width a template argument, so it
+    // is plain inline storage with no allocation of any kind; degenerate and untouched in every build
+    // but MOE_QUANT_DOT.
+    moeqd::ActBlocks<MOE_QD_DIMS_BUF.d_ff> pre_q{};
 };
 // Lazily heap-allocated per participating thread, once, and reused for the process lifetime (AGENTS.md
 // S1): only the threads a run actually uses allocate, and none of it sits in the DLL's static image
@@ -202,8 +220,8 @@ std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
 // activation-side cost is negligible: O(hidden_size) quantization against O(hidden_size * d_ff *
 // experts_per_tok) of dot-product work. A plain global for the same reason g_moe_io_stage is one --
 // forward_one is single-threaded at the call level, and MOE_DECODE_THREADS is 1 (B29), so the fan-out
-// below only ever READS this. Empty and untouched in every build but MOE_QUANT_DOT.
-moeqd::ActBlocks g_moe_act_q{};
+// below only ever READS this. Degenerate and untouched in every build but MOE_QUANT_DOT.
+moeqd::ActBlocks<MOE_QD_DIMS_BUF.hidden_size> g_moe_act_q{};
 
 // Runs one decode row's selected experts across MOE_DECODE_THREADS threads. Passed to
 // moe::forward_row_via_run, which computes each expert into its OWN output buffer and does the weighted
@@ -703,7 +721,7 @@ const float* Model::forward_one(int id, int pos) {
             // to share (docs/MOE_QUANT_DOT.md S4 -- the cost is O(hidden_size) against
             // O(hidden_size * d_ff * experts_per_tok) of dot work, but only if it is genuinely hoisted
             // out of the per-expert lambda, which is the point of doing it at this line).
-            if constexpr (USE_MOE_QUANT && MOE_QUANT_DOT) g_moe_act_q.quantize(a, MOE_DIMS.hidden_size);
+            if constexpr (USE_MOE_QUANT && MOE_QUANT_DOT) g_moe_act_q.quantize(a);
             moe::forward_row_via_run_ex<USE_SIMD_REDUCE>(
                 MOE_DIMS, a, L.moe_router->pdata,
                 [&](int k, int e, float* out_ptr, float* ffn, float* g) {
@@ -730,8 +748,8 @@ const float* Model::forward_one(int id, int pos) {
                             planes.up.bytes   = g_moe_quant.raw(du);
                             planes.down.bytes = g_moe_quant.raw(dd);
                         }
-                        if (!moeqd::expert_ffn_row_quant(MOE_DIMS, g_moe_act_q, planes, out_ptr, ffn, g,
-                                                         S.pre_q)) {
+                        if (!moeqd::expert_ffn_row_quant<MOE_QD_DIMS_BUF>(g_moe_act_q, planes, out_ptr,
+                                                                          ffn, g, S.pre_q)) {
                             std::println(stderr,
                                          "fatal: routed expert {} of layer {} cannot be fused by the B35 "
                                          "quantized-dot path -- an unsupported GGML type, a row width "

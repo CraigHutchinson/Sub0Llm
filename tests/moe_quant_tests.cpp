@@ -690,8 +690,8 @@ TEST_CASE("moeq (B35): the fused unpackers decode the SAME weights gguf::to_f32 
                                     : static_cast<int>(rng() % 253u) - 126;
             x[static_cast<std::size_t>(g * moeqd::GROUP + j)] = static_cast<float>(v);
         }
-    moeqd::ActBlocks xq;
-    xq.quantize(x.data(), kN);
+    moeqd::ActBlocks<kN> xq;
+    xq.quantize(x.data());
     for (int g = 0; g < kN / moeqd::GROUP; ++g)
         REQUIRE(xq.scale[static_cast<std::size_t>(g)] == 1.0f);      // the lossless premise, checked
     for (int i = 0; i < kN; ++i)
@@ -704,7 +704,7 @@ TEST_CASE("moeq (B35): the fused unpackers decode the SAME weights gguf::to_f32 
         const std::vector<std::uint8_t> raw = make_iq_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
                                                               77u + raw_t);
         std::vector<float> fused(kRows, 0.f);
-        REQUIRE(moeqd::gemv_plane(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, fused.data()));
+        REQUIRE(moeqd::gemv_plane<kRows>(raw_t, std::span<const std::uint8_t>(raw), xq, fused.data()));
 
         double worst_rel = 0.0;
         for (int row = 0; row < kRows; ++row) {
@@ -741,15 +741,15 @@ TEST_CASE("moeq (B35): the int8 activation is the only new error source, and thi
     std::normal_distribution<float> normal(0.f, 1.f);
     for (float& v : x) v = normal(rng);
 
-    moeqd::ActBlocks xq;
-    xq.quantize(x.data(), kN);
+    moeqd::ActBlocks<kN> xq;
+    xq.quantize(x.data());
 
     for (const gguf::TensorType type : kFusedFormats) {
         INFO("format " << format_name(type));
         const auto raw_t = static_cast<std::uint32_t>(type);
         const std::vector<std::uint8_t> raw = make_iq_blocks(type, kN, 909u + raw_t);
         float fused = 0.f;
-        REQUIRE(moeqd::gemv_plane(raw_t, std::span<const std::uint8_t>(raw), 1, kN, xq, &fused));
+        REQUIRE(moeqd::gemv_plane<1>(raw_t, std::span<const std::uint8_t>(raw), xq, &fused));
         const double ref = reference_dot(type, std::span<const std::uint8_t>(raw), kN, x);
         REQUIRE(std::isfinite(fused));
         REQUIRE(std::fabs(ref) > 0.0);
@@ -770,14 +770,14 @@ TEST_CASE("moeq (B35): expert_ffn_row_quant computes the same expert the dequant
     constexpr int kHidden = 256, kFf = 64;      // both multiples of 32; kFf deliberately NOT a multiple
                                                  // of 256, so down-projection rows start at every
                                                  // sub-block offset a real d_ff=640 plane would hit
-    const moe::Dims dims{kHidden, kFf, 4, 2};
+    constexpr moe::Dims dims{kHidden, kFf, 4, 2};   // B39: a template argument now, so `constexpr`
 
     std::vector<float> x(kHidden);
     std::mt19937 rng(31337);
     std::normal_distribution<float> normal(0.f, 1.f);
     for (float& v : x) v = normal(rng);
-    moeqd::ActBlocks xq;
-    xq.quantize(x.data(), kHidden);
+    moeqd::ActBlocks<kHidden> xq;
+    xq.quantize(x.data());
 
     for (const gguf::TensorType type : kFusedFormats) {
         INFO("format " << format_name(type));
@@ -799,20 +799,21 @@ TEST_CASE("moeq (B35): expert_ffn_row_quant computes the same expert the dequant
         moe::expert_ffn_row_source(dims, x.data(), wg.data(), wu.data(), wd.data(), out_ref.data(),
                                     pre.data(), g.data());
 
-        moeqd::ActBlocks pq;
+        moeqd::ActBlocks<kFf> pq;
         std::vector<float> out_fused(kHidden);
         const moeqd::ExpertPlanes planes{{dg, std::span<const std::uint8_t>(rg)},
                                           {du, std::span<const std::uint8_t>(ru)},
                                           {dd, std::span<const std::uint8_t>(rd)}};
-        REQUIRE(moeqd::expert_ffn_row_quant(dims, xq, planes, out_fused.data(), pre.data(), g.data(),
-                                             pq));
+        REQUIRE(moeqd::expert_ffn_row_quant<dims>(xq, planes, out_fused.data(), pre.data(), g.data(),
+                                                   pq));
 
-        // The geometry guard is not decoration: a swapped gate/down pair, or a sidecar built at other
-        // axes, must be refused rather than decoded into plausible garbage.
+        // The geometry guard is not decoration, and B39 did not weaken it: in_f/out_f come from the
+        // sidecar FILE, so a swapped gate/down pair or a sidecar built at other axes must still be
+        // refused at RUNTIME rather than decoded into plausible garbage.
         const moeqd::ExpertPlanes swapped{planes.down, planes.up, planes.gate};
         std::vector<float> out_reject(kHidden, 7.f);
-        REQUIRE_FALSE(moeqd::expert_ffn_row_quant(dims, xq, swapped, out_reject.data(), pre.data(),
-                                                   g.data(), pq));
+        REQUIRE_FALSE(moeqd::expert_ffn_row_quant<dims>(xq, swapped, out_reject.data(), pre.data(),
+                                                         g.data(), pq));
         REQUIRE(out_reject[0] == 7.f);
 
         double num = 0.0, den = 0.0;
@@ -836,22 +837,32 @@ TEST_CASE("moeq (B35): a format the fused path cannot handle is refused, not sil
     // The sidecar's formats are per-tensor, not per-role (moe_quant.hpp's own header comment), so a
     // model quantized with a mix this path does not cover is a real possibility rather than a
     // hypothetical -- and the failure mode of guessing would be a plausible-looking wrong answer.
-    // Q8_0 stands in for "some other real format"; the width checks use rows that are not a multiple
-    // of GROUP, which no real Qwen4 axis produces but a future one could.
-    REQUIRE(moeqd::fusable(static_cast<std::uint32_t>(gguf::TensorType::IQ1_S), 2560));
-    REQUIRE(moeqd::fusable(static_cast<std::uint32_t>(gguf::TensorType::IQ2_XXS), 640));
-    REQUIRE(moeqd::fusable(static_cast<std::uint32_t>(gguf::TensorType::IQ4_NL), 32));
-    REQUIRE_FALSE(moeqd::fusable(static_cast<std::uint32_t>(gguf::TensorType::Q8_0), 2560));
-    REQUIRE_FALSE(moeqd::fusable(static_cast<std::uint32_t>(gguf::TensorType::F32), 2560));
-    REQUIRE_FALSE(moeqd::fusable(static_cast<std::uint32_t>(gguf::TensorType::IQ1_S), 48));
-    REQUIRE_FALSE(moeqd::fusable(static_cast<std::uint32_t>(gguf::TensorType::IQ1_S), 0));
+    // Q8_0 stands in for "some other real format". B39 split B35's single `fusable(type, width)` in
+    // two along the line that actually matters: the TYPE is a file's word and stays a runtime refusal,
+    // while the WIDTH is a build axis and is now a compile-time contract -- so the width half is
+    // pinned here as a `static_assert` on the same predicate ActBlocks itself asserts on, and a fused
+    // build at a width that is not a multiple of GROUP no longer links, let alone runs.
+    REQUIRE(moeqd::fusable_type(static_cast<std::uint32_t>(gguf::TensorType::IQ1_S)));
+    REQUIRE(moeqd::fusable_type(static_cast<std::uint32_t>(gguf::TensorType::IQ2_XXS)));
+    REQUIRE(moeqd::fusable_type(static_cast<std::uint32_t>(gguf::TensorType::IQ4_NL)));
+    REQUIRE_FALSE(moeqd::fusable_type(static_cast<std::uint32_t>(gguf::TensorType::Q8_0)));
+    REQUIRE_FALSE(moeqd::fusable_type(static_cast<std::uint32_t>(gguf::TensorType::F32)));
+    // The K-quants specifically: they are what this project's own BACKBONE tensors are stored as
+    // (docs/MOE_QUANT_DOT.md S1), so an expert sidecar carrying them is the most likely real form of
+    // "a format this path does not cover" -- and Q4_K/Q6_K sit adjacent to the fusable three in the
+    // same switch, where a mis-placed `case` label would fall through unnoticed.
+    REQUIRE_FALSE(moeqd::fusable_type(static_cast<std::uint32_t>(gguf::TensorType::Q4_K)));
+    REQUIRE_FALSE(moeqd::fusable_type(static_cast<std::uint32_t>(gguf::TensorType::Q6_K)));
+    static_assert(moeqd::fusable_width(2560) && moeqd::fusable_width(640)
+                  && moeqd::fusable_width(moeqd::GROUP));
+    static_assert(!moeqd::fusable_width(48) && !moeqd::fusable_width(0) && !moeqd::fusable_width(-32));
 
     const std::vector<std::uint8_t> q8 = make_q8_0(256, 5u);
     std::vector<float> x(256, 0.5f);
-    moeqd::ActBlocks xq;
-    xq.quantize(x.data(), 256);
+    moeqd::ActBlocks<256> xq;
+    xq.quantize(x.data());
     float out = 1234.f;
-    REQUIRE_FALSE(moeqd::gemv_plane(static_cast<std::uint32_t>(gguf::TensorType::Q8_0),
-                                     std::span<const std::uint8_t>(q8), 1, 256, xq, &out));
+    REQUIRE_FALSE(moeqd::gemv_plane<1>(static_cast<std::uint32_t>(gguf::TensorType::Q8_0),
+                                        std::span<const std::uint8_t>(q8), xq, &out));
     REQUIRE(out == 1234.f);                       // refused means untouched, not partially written
 }

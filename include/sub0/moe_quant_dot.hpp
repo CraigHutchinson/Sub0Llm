@@ -50,8 +50,15 @@
 // 640 % 32 == 0. A per-32 activation scale is also strictly more accurate than a per-256 one, which is
 // a free consequence rather than the goal.
 //
-// NO HEAP ALLOCATION PER CALL (AGENTS.md S1): ActBlocks is caller-owned and sized once; every kernel
-// writes only into caller-supplied buffers and its own stack.
+// EVERY SHAPE IS COMPILE-TIME (B39, AGENTS.md S1 + S2). The model this path serves has exactly one
+// geometry: gate and up are d_ff rows of hidden_size, down is hidden_size rows of d_ff, and both
+// widths are generated `constexpr` (layout.hpp's MOE_DIMS). So the trip counts, the group counts and
+// the activation buffers are template parameters, not arguments -- `ActBlocks<N>` is a std::array and
+// touches the heap NOWHERE (not even amortized on a width change), and the geometry conditions that a
+// runtime check could only ever report are `static_assert`s instead. What stayed runtime is exactly
+// what a file can still contradict: a plane's `type_raw` and byte count come out of the `.moeq`
+// sidecar, and a sidecar built at other axes must still be REFUSED (detail::plane_ok) rather than
+// decoded into plausible garbage.
 
 #pragma once
 
@@ -66,13 +73,21 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
-#include <vector>
 
 namespace sub0::moeqd {
 
 /// The one granularity at which this engine's real row shapes (hidden_size 2560, d_ff 640) and all
 /// three sidecar formats' internal sub-block structure simultaneously align -- see the file header.
 inline constexpr int GROUP = 32;
+
+/** Is `n` a row width these kernels can address?
+ *
+ * `consteval`, not `constexpr`: after B39 every width this path sees is a generated model axis, so
+ * this is a build-time contract -- it is what ActBlocks' own `static_assert` checks, and through that
+ * every trip count below. The FORMAT half of the pre-B39 combined `fusable()` check is a genuinely
+ * runtime question and stayed one; see fusable_type.
+ */
+[[nodiscard]] consteval bool fusable_width(int n) { return n > 0 && n % GROUP == 0; }
 
 // --- the quantized activation row -----------------------------------------------------------------
 
@@ -83,16 +98,30 @@ inline constexpr int GROUP = 32;
  * delta, so its dot product needs `sum_j q_j` as a separate term -- the same job llama.cpp's
  * `block_q8_K::bsums` does at its own coarser granularity.
  *
- * @note Caller-owned and sized once (AGENTS.md S1); quantize() allocates only on the first call for a
- *       given width, and decode reuses one instance per layer for the whole run.
+ * @tparam N the row width in elements. Fixed at compile time because this engine only ever has two of
+ *         them -- hidden_size for the shared activation row, d_ff for the down projection's own input
+ *         -- and both are generated `constexpr` (AGENTS.md S2). That is what makes the storage a
+ *         std::array rather than three vectors, so nothing here touches the heap at all (AGENTS.md S1).
  */
+template <int N>
 struct ActBlocks {
-    std::vector<std::int8_t>  qs;       ///< n quantized values
-    std::vector<float>        scale;    ///< n / GROUP group scales
-    std::vector<std::int32_t> gsum;     ///< n / GROUP group sums of qs
-    int                       n = 0;    ///< element count this instance is currently sized for
+    static_assert(fusable_width(N),
+                  "an ActBlocks width must be a positive multiple of moeqd::GROUP -- the kernels index "
+                  "by whole groups and have no partial-group form");
 
-    /** Symmetric round-to-nearest int8 quantization of `n_elems` floats, one scale per GROUP.
+    /// Group count, derived once here so no caller re-divides the width (the pre-B39 code did, twice).
+    static constexpr int kGroups = N / GROUP;
+
+    // alignas(64): a bare std::array<std::int8_t, N> has natural alignment 1, so embedding it in a
+    // struct (MoeDecodeThread, or the g_moe_act_q global) lets it land at any byte offset -- and
+    // dot_group's vector loads over it then run unaligned. The std::vector this replaced got heap
+    // alignment for free, which is why dropping to std::array for AGENTS.md S1 silently cost ~8%
+    // until this was put back explicitly. Measured, not assumed -- see docs/MOE_QUANT_DOT.md S7.
+    alignas(64) std::array<std::int8_t, N>        qs{};      ///< N quantized values
+    alignas(64) std::array<float, kGroups>        scale{};   ///< one scale per group
+    alignas(64) std::array<std::int32_t, kGroups> gsum{};    ///< one sum-of-qs per group
+
+    /** Symmetric round-to-nearest int8 quantization of N floats, one scale per GROUP.
      *
      * The only way to put an ActBlocks into a usable state -- there is deliberately no separate
      * `resize()`, so the object is never sized-but-stale.
@@ -100,18 +129,9 @@ struct ActBlocks {
      * @note The divisor is 127, not 128, so the encoding is symmetric and -128 never occurs. That
      *       bound is what keeps the products below in range for a 16-bit intermediate (127*127*2 =
      *       32258 < 32767), which is the same headroom argument llama.cpp's own kernels rely on.
-     * @note `n_elems` must be a multiple of GROUP -- guaranteed by fusable() at the one call site.
-     * @note Allocates only when the width changes, so the steady state is allocation-free
-     *       (AGENTS.md S1): decode reuses one instance per layer for the whole run.
      */
-    void quantize(const float* x, int n_elems) {
-        n = n_elems;
-        const auto elems  = static_cast<std::size_t>(n_elems);
-        const auto groups = static_cast<std::size_t>(n_elems / GROUP);
-        if (qs.size() != elems)     qs.assign(elems, 0);
-        if (scale.size() != groups) scale.assign(groups, 0.f);
-        if (gsum.size() != groups)  gsum.assign(groups, 0);
-        for (int g = 0, ng = n_elems / GROUP; g < ng; ++g) {
+    void quantize(const float* x) {
+        for (int g = 0; g < kGroups; ++g) {
             const float* xg = x + static_cast<std::size_t>(g) * GROUP;
             float amax = 0.f;
             for (int j = 0; j < GROUP; ++j) amax = std::max(amax, std::fabs(xg[j]));
@@ -269,7 +289,7 @@ namespace detail {
     return s;
 }
 
-/** One plane's whole GEMV: `out[r] = sum_i plane[r * row_elems + i] * x[i]` for r in [0, n_rows).
+/** One plane's whole GEMV: `out[r] = sum_i plane[r * RowElems + i] * x[i]` for r in [0, NRows).
  *
  * The only thing that varies between the three formats is `Plane::group()`; the row walk, the integer
  * MAC, the scale fold and the delta term are written once, here. `Plane::kHasDelta` compiles the delta
@@ -277,14 +297,19 @@ namespace detail {
  *
  * Accumulation is group-ascending, matching the element order a sequential f32 dot would use; each
  * group's integer part is exact, so the only float rounding is the one accumulate per group.
+ *
+ * @tparam NRows rows of this plane -- a model axis, so both loop bounds are literals in the emitted
+ *         code and the row stride is a compile-time constant (B39; AGENTS.md S2).
+ * @tparam RowElems deduced from `x`, which the activation row already fixes.
  */
-template <class Plane>
-void gemv(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, float* out) {
-    const int ng = row_elems / GROUP;
-    for (int r = 0; r < n_rows; ++r) {
-        const std::uint64_t base = static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems);
+template <int NRows, class Plane, int RowElems>
+void gemv(const Plane& plane, const ActBlocks<RowElems>& x, float* out) {
+    static_assert(NRows > 0, "a plane with no rows is not a plane");
+    constexpr int kGroups = ActBlocks<RowElems>::kGroups;
+    for (int r = 0; r < NRows; ++r) {
+        const std::uint64_t base = static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(RowElems);
         float acc = 0.f;
-        for (int g = 0; g < ng; ++g) {
+        for (int g = 0; g < kGroups; ++g) {
             const std::size_t gi = static_cast<std::size_t>(g);
             const WeightGroup wg = plane.group(base + static_cast<std::uint64_t>(g) * GROUP);
             const int isum = dot_group(wg.q.data(), x.qs.data() + gi * GROUP);
@@ -298,13 +323,14 @@ void gemv(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, flo
 
 }  // namespace detail
 
-/** Can this plane be fused at all?
+/** Can a plane in this GGML format be fused at all?
  *
- * Checked once per plane, never per row: an unsupported format or a row width that is not a multiple
- * of GROUP has no fused form, and the caller must report that rather than compute something wrong.
+ * Genuinely runtime, and deliberately kept so: `type_raw` is read out of the `.moeq` sidecar's own
+ * descriptor, so a model quantized with a mix this path does not cover is a real possibility rather
+ * than a hypothetical, and guessing would produce a finite, plausibly-scaled, wrong answer. Checked
+ * once per plane, never per row. The width half of this test is `fusable_width`, at compile time.
  */
-[[nodiscard]] inline bool fusable(std::uint32_t type_raw, int row_elems) {
-    if (row_elems <= 0 || row_elems % GROUP != 0) return false;
+[[nodiscard]] constexpr bool fusable_type(std::uint32_t type_raw) {
     switch (static_cast<gguf::TensorType>(type_raw)) {
         case gguf::TensorType::IQ1_S:
         case gguf::TensorType::IQ2_XXS:
@@ -321,7 +347,7 @@ void gemv(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, flo
  *
  * @return 0 if the type is unknown or the geometry is not a whole number of blocks.
  */
-[[nodiscard]] inline std::uint64_t plane_bytes(std::uint32_t type_raw, std::uint64_t elems) {
+[[nodiscard]] constexpr std::uint64_t plane_bytes(std::uint32_t type_raw, std::uint64_t elems) {
     const gguf::BlockSpec spec = gguf::block_spec(type_raw);
     if (spec.elems == 0 || elems % spec.elems != 0) return 0;
     return elems / spec.elems * spec.bytes;
@@ -333,23 +359,27 @@ void gemv(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, flo
  * so gate and up in the SAME layer may be different formats. The dispatch happens once per plane, so
  * the row loop inside stays monomorphic.
  *
+ * @tparam NRows rows of this plane; `RowElems` is deduced from `x`.
  * @return false if the format is not one this path can fuse, or if `raw` is shorter than the geometry
- *         requires -- the caller must treat either as fatal, and `out` is left untouched.
+ *         requires -- the caller must treat either as fatal, and `out` is left untouched. Both are
+ *         properties of bytes read from a file, which is why they are still checked at runtime.
  */
-[[nodiscard]] inline bool gemv_plane(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
-                                     int n_rows, int row_elems, const ActBlocks& x, float* out) {
-    const std::uint64_t need = plane_bytes(type_raw, static_cast<std::uint64_t>(n_rows)
-                                                      * static_cast<std::uint64_t>(row_elems));
+template <int NRows, int RowElems>
+[[nodiscard]] bool gemv_plane(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
+                              const ActBlocks<RowElems>& x, float* out) {
+    constexpr std::uint64_t kElems = static_cast<std::uint64_t>(NRows)
+                                     * static_cast<std::uint64_t>(RowElems);
+    const std::uint64_t need = plane_bytes(type_raw, kElems);
     if (need == 0 || raw.size() < need) return false;
     switch (static_cast<gguf::TensorType>(type_raw)) {
         case gguf::TensorType::IQ1_S:
-            detail::gemv(Iq1SPlane{raw.data()}, n_rows, row_elems, x, out);
+            detail::gemv<NRows>(Iq1SPlane{raw.data()}, x, out);
             return true;
         case gguf::TensorType::IQ2_XXS:
-            detail::gemv(Iq2XxsPlane{raw.data()}, n_rows, row_elems, x, out);
+            detail::gemv<NRows>(Iq2XxsPlane{raw.data()}, x, out);
             return true;
         case gguf::TensorType::IQ4_NL:
-            detail::gemv(Iq4NlPlane{raw.data()}, n_rows, row_elems, x, out);
+            detail::gemv<NRows>(Iq4NlPlane{raw.data()}, x, out);
             return true;
         default:
             return false;
@@ -375,11 +405,18 @@ struct ExpertPlanes {
 
 namespace detail {
 
-/// Is `p` readable as `n_rows` rows of `row_elems` in its own declared format and geometry?
-[[nodiscard]] inline bool plane_ok(const EncodedPlane& p, int n_rows, int row_elems) {
-    return fusable(p.desc.type_raw, row_elems)
-           && p.desc.in_f == static_cast<std::uint32_t>(row_elems)
-           && p.desc.out_f == static_cast<std::uint32_t>(n_rows);
+/** Is `p` readable as NRows rows of RowElems in its own declared format and geometry?
+ *
+ * Every one of these three comparisons is between a compile-time build axis and a field the sidecar
+ * FILE supplied, so none of them can be lifted to a `static_assert`: a sidecar built at other axes,
+ * or a gate/down pair passed in the wrong order, must be refused at runtime rather than decoded into
+ * plausible garbage. B35 added this guard deliberately and moe_quant_tests.cpp pins it.
+ */
+template <int NRows, int RowElems>
+[[nodiscard]] bool plane_ok(const EncodedPlane& p) {
+    return fusable_type(p.desc.type_raw)
+           && p.desc.in_f == static_cast<std::uint32_t>(RowElems)
+           && p.desc.out_f == static_cast<std::uint32_t>(NRows);
 }
 
 }  // namespace detail
@@ -387,12 +424,18 @@ namespace detail {
 /** moe::expert_ffn_row_source's computation -- `out = down(silu(gate(x)) * up(x))` -- with the
  * dequantize step removed entirely: every GEMV runs straight against the encoded planes.
  *
+ * @tparam D this build's MoE geometry, passed as a non-type template parameter (moe::Dims is a
+ *         structural type) so hidden_size and d_ff reach every trip count, every row stride and both
+ *         ActBlocks widths as literals. The one call site already had it as a `constexpr` object --
+ *         layout.hpp's MOE_DIMS -- so nothing about it was ever a runtime choice (AGENTS.md S2).
  * @param xq  the row's activation, quantized ONCE by the caller and reused across all selected experts
  *            of this layer (docs/MOE_QUANT_DOT.md S4 -- the hoist is real: this never re-quantizes it).
  * @param pq  caller-owned scratch for the down projection's input, which is per-expert and so must be
  *            quantized here: d_ff = 640 elements against d_ff*hidden_size dot terms, ~0.04% of the work.
- * @return false if any plane's format is unfusable, its declared geometry disagrees with `d`, or its
+ * @return false if any plane's format is unfusable, its declared geometry disagrees with `D`, or its
  *         byte span is shorter than that geometry needs. Nothing is written in any of those cases.
+ *         All three are properties of the sidecar FILE, which is why they outlived B39's move to
+ *         compile-time shapes while the width and trip-count checks did not.
  *
  * @note Plane geometry, re-derived rather than assumed (AGENTS.md S5): a Desc's in_f/out_f are the GGUF
  *       DECLARED extents with ne[0] fastest-varying, so element (out o, in i) lives at o*in_f + i. For
@@ -404,22 +447,21 @@ namespace detail {
  *       expert_ffn_row_source uses. Each plane is then read as one contiguous stream, and the reused
  *       vector (x, 10 KiB at the real axes) stays L1-resident across both either way.
  */
-[[nodiscard]] inline bool expert_ffn_row_quant(const moe::Dims& d, const ActBlocks& xq,
-                                               const ExpertPlanes& planes, float* out,
-                                               float* pre_scratch, float* g_scratch, ActBlocks& pq) {
-    if (xq.n != d.hidden_size) return false;
-    if (!detail::plane_ok(planes.gate, d.d_ff, d.hidden_size)) return false;
-    if (!detail::plane_ok(planes.up, d.d_ff, d.hidden_size)) return false;
-    if (!detail::plane_ok(planes.down, d.hidden_size, d.d_ff)) return false;
+template <moe::Dims D>
+[[nodiscard]] bool expert_ffn_row_quant(const ActBlocks<D.hidden_size>& xq,
+                                        const ExpertPlanes& planes, float* out,
+                                        float* pre_scratch, float* g_scratch,
+                                        ActBlocks<D.d_ff>& pq) {
+    if (!detail::plane_ok<D.d_ff, D.hidden_size>(planes.gate)) return false;
+    if (!detail::plane_ok<D.d_ff, D.hidden_size>(planes.up)) return false;
+    if (!detail::plane_ok<D.hidden_size, D.d_ff>(planes.down)) return false;
 
-    if (!gemv_plane(planes.gate.desc.type_raw, planes.gate.bytes, d.d_ff, d.hidden_size, xq, g_scratch))
-        return false;
-    if (!gemv_plane(planes.up.desc.type_raw, planes.up.bytes, d.d_ff, d.hidden_size, xq, pre_scratch))
-        return false;
-    for (int o = 0; o < d.d_ff; ++o) pre_scratch[o] = moe::detail::silu(g_scratch[o]) * pre_scratch[o];
+    if (!gemv_plane<D.d_ff>(planes.gate.desc.type_raw, planes.gate.bytes, xq, g_scratch)) return false;
+    if (!gemv_plane<D.d_ff>(planes.up.desc.type_raw, planes.up.bytes, xq, pre_scratch)) return false;
+    for (int o = 0; o < D.d_ff; ++o) pre_scratch[o] = moe::detail::silu(g_scratch[o]) * pre_scratch[o];
 
-    pq.quantize(pre_scratch, d.d_ff);
-    return gemv_plane(planes.down.desc.type_raw, planes.down.bytes, d.hidden_size, d.d_ff, pq, out);
+    pq.quantize(pre_scratch);
+    return gemv_plane<D.hidden_size>(planes.down.desc.type_raw, planes.down.bytes, pq, out);
 }
 
 }  // namespace sub0::moeqd
