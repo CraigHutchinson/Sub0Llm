@@ -30,6 +30,15 @@ A number that does not follow this protocol is not evidence, and must not be quo
 - **Prefer ONE build directory reconfigured between arms** over two directories, unless you have
   verified both were built from the same source tree. A stale sibling build dir silently compares the
   wrong thing.
+- **Report both roofs, not wall-clock alone.** A delta in seconds says something got faster; it does
+  not say whether anything is left. Every perf claim must state achieved **GB/s against the ~30 GB/s
+  measured bus ceiling** and achieved **IOPS/FLOPS against the ISA-width ceiling for the data type in
+  question**. The logic is decisive: if bandwidth is not saturated the limit must be compute; if
+  neither is saturated the kernel is latency- or dependency-bound and tuning either roof is wasted
+  effort. **Use the right unit width** — measuring an int8 kernel against a scalar ALU ceiling reports
+  "35% utilised, little left" where measuring against AVX2 reports 2.2% and ~45x of headroom. See
+  `docs/optimization/roofline_post_b35.md` for the worked example, which overturned this thread's
+  governing assumption.
 - State the artifact and the axes. The real 48-layer recipe is in `docs/MOE_QUANT_DOT.md` §6h — a
   partial recipe yields `PARAM_FLOATS 2570717696` and a rejected model, with no hint which axis is wrong.
 
@@ -136,10 +145,34 @@ apparent exception, B28's dequant fix, is not a micro-optimization at all — it
 data-dependent branch that made one format 6x slower than its siblings. Repairing a pathology is not
 the same activity as tuning a healthy loop.
 
+**Read that table as history, not as a standing law — it has already expired once.** "O3/O4 levers
+lose here" was a property of the pre-B35 constraint (a path moving ~39 MB per resolve), not a property
+of this codebase. B35 cut that 25x, and the phase that is now 68.7% of decode sits at 2.7% of the
+memory roof and 2.2% of the integer-SIMD roof: **unpack-bound, at roughly scalar issue rate**. ISA-level
+work is now aimed at the right layer for the first time in this thread. See
+`docs/optimization/roofline_post_b35.md`.
+
 The corollary, and the reason §5's re-profiling rule exists: **the layer of the constraint moves as you
 fix it.** B35 shifted the binding constraint off the MoE resolve path; every O3/O4 lever selected
 against the pre-B35 profile is now aimed at the wrong layer by construction. Re-derive O0/O1 after any
 change over ~20%, before picking the next lever.
+
+## 5b. Analytical tooling
+
+Wall-clock A/B says *whether*; these say *why*, and they are what stop a lever being chosen by
+intuition. Both are installed on this host and both were unused for the whole B24-B39 thread.
+
+- **VTune 2026.4** (`C:\Program Files (x86)\Intel\oneAPItune6.4in64tune.exe`) — real core
+  utilisation and the memory-bound vs core-bound classification. Run unelevated with the
+  standalone-benchmark + `-target-pid` pattern (`[[cpu-profiling-tooling-backlog]]`); that pattern has
+  already found one real MoE defect in this repo that code reading missed.
+- **llvm-mca** (`C:\Program Files\LLVMin\llvm-mca.exe`) — static port-pressure and IPC analysis of
+  an instruction sequence, **without running it**. The cheapest way to compare two candidate kernel
+  bodies before committing to either.
+
+Use them when the roofline says neither roof is saturated: the arithmetic tells you *where* to look,
+but only a core-utilisation measurement distinguishes dependent-load latency from port contention from
+issue-width limits.
 
 ## 6. The external bar
 
