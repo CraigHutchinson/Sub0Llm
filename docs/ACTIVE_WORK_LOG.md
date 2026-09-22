@@ -789,8 +789,14 @@ commits ahead of `origin/main`, **not pushed**.
     3 passes. It was inconclusive and was REVERTED rather than parked behind a toggle, contrary to
     AGENTS.md §13. Untried candidates: an 8-row unroll, and forcing the private tile for narrow per-thread
     slices.
-- **O5 phase 2a (paused): Sonnet agent in its own worktree**, asked to commit WIP and stop. Its hand-off
-  message names the branch, commit and next step.
+- **O5 phase 2a (paused): branch `worktree-agent-a78e6dee2662ebb49` @ `7c070b0`, not merged.**
+  - Task 1 done: the Q4_K anomaly is that clang does NOT auto-vectorize `Q4KPlane::group()`'s unpack but
+    does vectorize Q5_K's. Denormals were tested and ruled out. See `docs/BACKBONE_NATIVE_QUANT.md` §12a.
+  - Streaming unpack kernels are designed and verified bit-exact in a scratch harness, banked at
+    `docs/optimization/wip/o5p2a_streaming_verify.cpp` on that branch (not built). Q4_K measured
+    ~9.4–10.5 GB/s/thread (from 1.1), cache-resident; Q5_K/Q6_K not yet timed.
+  - Not started: porting into the header, threading, the bench fix, in-tree tests. The resume steps are
+    in §12c on that branch.
   - Target: a streaming unpack at >= 10 GB/s of compressed bytes per thread (see
     `docs/BACKBONE_NATIVE_QUANT.md` §8a).
   - Phase 2b (engine wiring) waits on O4's merge.
