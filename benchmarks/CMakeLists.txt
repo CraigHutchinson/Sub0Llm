@@ -12,6 +12,9 @@
 #                          BACKBONE's own real Q5_K/Q6_K/Q8_0 tensors at 100% (dense) access density,
 #                          vs the sidecar's ~2%-density case moe_expert_bench.cpp already measured.
 #                          Same plain-main() reasoning; see that file's own header.
+#   backbone_quant_dot_bench.cpp — O5 phase 1: sub0::bbqd's fused GEMV (backbone_quant_dot.hpp) at real
+#                          backbone shapes, threaded by output row at 1/4/8 threads, portable vs AVX2,
+#                          vs a bf16-promote-dot baseline. Same plain-main() reasoning.
 
 CPMAddPackage("gh:catchorg/Catch2@3.7.1")   # no-op if the tests already fetched it (CPM dedups)
 
@@ -38,6 +41,16 @@ add_executable(sub0_backbone_dequant_bench backbone_dequant_bench.cpp)
 target_include_directories(sub0_backbone_dequant_bench PRIVATE "${CMAKE_SOURCE_DIR}/include")
 if(SUB0_HAS_OPENMP_SIMD_FLAG)
   target_compile_options(sub0_backbone_dequant_bench PRIVATE -fopenmp-simd)
+endif()
+
+# gguf.hpp + backbone_quant_dot.hpp + bf16.hpp only -- same engine-free reasoning. Needs std::thread
+# (its own row-range threading arm), so links the platform thread library explicitly.
+add_executable(sub0_backbone_quant_dot_bench backbone_quant_dot_bench.cpp)
+target_include_directories(sub0_backbone_quant_dot_bench PRIVATE "${CMAKE_SOURCE_DIR}/include")
+find_package(Threads REQUIRED)
+target_link_libraries(sub0_backbone_quant_dot_bench PRIVATE Threads::Threads)
+if(SUB0_HAS_OPENMP_SIMD_FLAG)
+  target_compile_options(sub0_backbone_quant_dot_bench PRIVATE -fopenmp-simd)
 endif()
 
 # Header-only numerical core; recognize its SIMD pragmas just as the CPU engine does.
