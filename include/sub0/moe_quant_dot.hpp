@@ -329,14 +329,25 @@ struct Iq4NlPlane {
     static constexpr bool kHasDelta = false;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
-    [[nodiscard]] WeightGroup group(std::uint64_t p) const {
+    /// The group's fields: the ONE place this format's layout is read (see Iq1SPlane::Fields).
+    struct Fields {
+        std::uint16_t       d_bits = 0;
+        const std::uint8_t* qn     = nullptr;   ///< non-owning; the block's 16 packed nibble-pair bytes
+    };
+    [[nodiscard]] Fields fields(std::uint64_t p) const noexcept {
         const std::uint8_t* blk = plane + (p / 32) * 18;
-        std::uint16_t d_bits = 0;
-        std::memcpy(&d_bits, blk, sizeof d_bits);
-        const std::uint8_t* qn = blk + 2;
+        Fields f;
+        f.qn = blk + 2;
+        std::memcpy(&f.d_bits, blk, sizeof f.d_bits);
+        return f;
+    }
+
+    [[nodiscard]] WeightGroup group(std::uint64_t p) const {
+        const Fields f = fields(p);
+        const std::uint8_t* qn = f.qn;
 
         WeightGroup wg;
-        wg.scale = gguf::f16_to_f32(d_bits);
+        wg.scale = gguf::f16_to_f32(f.d_bits);
         for (int j = 0; j < 16; ++j) {
             wg.q[static_cast<std::size_t>(j)]      = gguf::KVALUES_IQ4NL[qn[j] & 0xF];
             wg.q[static_cast<std::size_t>(j) + 16] = gguf::KVALUES_IQ4NL[qn[j] >> 4];
@@ -348,16 +359,14 @@ struct Iq4NlPlane {
     /// Both nibble halves decoded by ONE `vpshufb` against the 16-entry codebook broadcast to both
     /// 128-bit lanes: low nibbles land in bytes 0-15 (elements 0-15), high nibbles in 16-31.
     [[nodiscard]] WeightGroupV group_v(std::uint64_t p) const noexcept {
-        const std::uint8_t* blk = plane + (p / 32) * 18;
-        std::uint16_t d_bits = 0;
-        std::memcpy(&d_bits, blk, sizeof d_bits);
-        const __m128i raw  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
+        const Fields f = fields(p);
+        const __m128i raw  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(f.qn));
         const __m128i m4   = _mm_set1_epi8(0x0F);
         const __m256i idx  = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(raw, 4), m4), _mm_and_si128(raw, m4));
         const __m256i book = _mm256_broadcastsi128_si256(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(gguf::KVALUES_IQ4NL)));
         const __m256i w = _mm256_shuffle_epi8(book, idx);
-        return {_mm256_sign_epi8(w, w), w, _cvtsh_ss(d_bits), 0.f};
+        return {_mm256_sign_epi8(w, w), w, _cvtsh_ss(f.d_bits), 0.f};
     }
 #endif
 };

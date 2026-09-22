@@ -62,7 +62,7 @@ selection must cite this, not the pre-B35 numbers.
 
 | ID | Opportunity | Status | Evidence |
 |---|---|---|---|
-| [O1](O1_iq2xxs_sign_fold.md) | Fold IQ2_XXS's sign application into the dot | pending | IQ2_XXS moves bytes **3.6x slower** than IQ4_NL (0.34 vs 1.22 GB/s); 37% of MoE dot time from 19.4% of planes |
+| [O1](O1_iq2xxs_sign_fold.md) | AVX2 fused MoE GEMV: vector accumulator per row (widened from "fold IQ2_XXS signs") | **merged** | **+2.14x decode** (1.508 → 0.705 s/token); L2 0.2938 → 0.2325 | 1 |
 
 **Retracted**: *IQ1_S narrowing*, previously named by B35 as the next lever on the grounds that its dot
 uses the 8-lane `vpmulld` shape. The per-format profile refutes it — IQ1_S is the **cheapest** format
