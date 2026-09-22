@@ -32,6 +32,7 @@ constexpr Shape kShapes[] = {
     {"gdn in_qkv", 2560, 10240}, {"gdn in_z", 2560, 6144},  {"gdn out", 6144, 2560},
     {"qsa k/v", 2560, 512},      {"shared gate", 2560, 640}, {"shared down", 640, 2560},
     {"router", 2560, 512},       {"lm_head", 2560, 248320},
+    {"gr down", 10240, 320},     {"gr up", 320, 10240},       // Gated Residual mix, 96 calls/token
 };
 
 template <int Threads>
@@ -58,8 +59,8 @@ int main(int argc, char** argv) {
 
     std::mt19937 rng(11);
     std::uniform_int_distribution<int> bits(0x3c00, 0x3f80);   // bf16 patterns in ~[0.0078, 1)
-    std::printf("%-12s %6s %7s | %10s %10s %10s %10s   (us/GEMV; GB/s)\n", "shape", "in", "out", "1 thr",
-                "2 thr", "4 thr", "8 thr");
+    std::printf("%-12s %6s %7s | %12s %12s %12s %12s %12s %12s   (us/GEMV / GB/s)\n", "shape", "in", "out",
+                "1 thr", "2 thr", "4 thr", "8 thr", "12 thr", "16 thr");
     for (const Shape& sh : kShapes) {
         const std::size_t elems = static_cast<std::size_t>(sh.in) * static_cast<std::size_t>(sh.out);
         const std::size_t bytes = elems * sizeof(sub0::bf16);
@@ -71,10 +72,12 @@ int main(int argc, char** argv) {
         std::vector<float> x(static_cast<std::size_t>(sh.in)), y(static_cast<std::size_t>(sh.out));
         for (auto& v : x) v = static_cast<float>(rng() % 1000) / 1000.f - 0.5f;
 
-        const double t[4] = {time_shape<1>(sh, pool, x.data(), y.data(), min_seconds),
+        const double t[6] = {time_shape<1>(sh, pool, x.data(), y.data(), min_seconds),
                              time_shape<2>(sh, pool, x.data(), y.data(), min_seconds),
                              time_shape<4>(sh, pool, x.data(), y.data(), min_seconds),
-                             time_shape<8>(sh, pool, x.data(), y.data(), min_seconds)};
+                             time_shape<8>(sh, pool, x.data(), y.data(), min_seconds),
+                             time_shape<12>(sh, pool, x.data(), y.data(), min_seconds),
+                             time_shape<16>(sh, pool, x.data(), y.data(), min_seconds)};
         std::printf("%-12s %6d %7d |", sh.name, sh.in, sh.out);
         for (const double us : t) std::printf(" %7.0f/%4.1f", us, static_cast<double>(bytes) / (us * 1e-6) / 1e9);
         std::printf("\n");

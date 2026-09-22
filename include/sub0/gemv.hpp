@@ -81,45 +81,62 @@ inline void axpy_range_scalar(const float* x, WP W, int in, int out, int o0, int
  * Order per output is still i = 0, 1, 2, ... exactly, one FMA per term -- bit-identical to the scalar
  * reference at any o-range split.
  */
+/// acc[0, o1-o0) = x . W[:, o0:o1). The one inner kernel; `acc` is either y itself or a private tile.
 template <class Raw>
-inline void axpy_range_avx2(const float* x, const Raw* W, int in, int out, int o0, int o1, float* y) noexcept {
+inline void accumulate_avx2(const float* x, const Raw* W, int in, int out, int o0, int o1, float* acc) noexcept {
     const auto stride = static_cast<std::size_t>(out);
     const auto ld = [](const Raw* p) {
         if constexpr (std::is_same_v<Raw, bf16>) return widen8(p);
         else                                     return load8(p);
     };
-    const int o_vec = o0 + (o1 - o0) / 8 * 8;   // [o0, o_vec) in 8-lane groups, [o_vec, o1) scalar
-    for (int o = o0; o < o1; ++o) y[o] = 0.f;
+    const int n = o1 - o0;
+    const int n_vec = n / 8 * 8;                 // [0, n_vec) in 8-lane groups, [n_vec, n) scalar
+    for (int o = 0; o < n; ++o) acc[o] = 0.f;
+    const Raw* base = W + o0;
     int i = 0;
     for (; i + 4 <= in; i += 4) {
         const __m256 x0 = _mm256_set1_ps(x[i]), x1 = _mm256_set1_ps(x[i + 1]);
         const __m256 x2 = _mm256_set1_ps(x[i + 2]), x3 = _mm256_set1_ps(x[i + 3]);
-        const Raw* w0 = W + static_cast<std::size_t>(i) * stride;
+        const Raw* w0 = base + static_cast<std::size_t>(i) * stride;
         const Raw* w1 = w0 + stride;
         const Raw* w2 = w1 + stride;
         const Raw* w3 = w2 + stride;
-        for (int o = o0; o < o_vec; o += 8) {
-            __m256 a = _mm256_loadu_ps(y + o);
+        for (int o = 0; o < n_vec; o += 8) {
+            __m256 a = _mm256_loadu_ps(acc + o);
             a = _mm256_fmadd_ps(x0, ld(w0 + o), a);
             a = _mm256_fmadd_ps(x1, ld(w1 + o), a);
             a = _mm256_fmadd_ps(x2, ld(w2 + o), a);
             a = _mm256_fmadd_ps(x3, ld(w3 + o), a);
-            _mm256_storeu_ps(y + o, a);
+            _mm256_storeu_ps(acc + o, a);
         }
-        for (int o = o_vec; o < o1; ++o) {
-            float a = y[o];
+        for (int o = n_vec; o < n; ++o) {
+            float a = acc[o];
             a = std::fma(x[i], widen1(w0[o]), a);
             a = std::fma(x[i + 1], widen1(w1[o]), a);
             a = std::fma(x[i + 2], widen1(w2[o]), a);
             a = std::fma(x[i + 3], widen1(w3[o]), a);
-            y[o] = a;
+            acc[o] = a;
         }
     }
     for (; i < in; ++i) {                       // < 4 trailing rows, same order
         const __m256 xi = _mm256_set1_ps(x[i]);
-        const Raw* w = W + static_cast<std::size_t>(i) * stride;
-        for (int o = o0; o < o_vec; o += 8) _mm256_storeu_ps(y + o, _mm256_fmadd_ps(xi, ld(w + o), _mm256_loadu_ps(y + o)));
-        for (int o = o_vec; o < o1; ++o) y[o] = std::fma(x[i], widen1(w[o]), y[o]);
+        const Raw* w = base + static_cast<std::size_t>(i) * stride;
+        for (int o = 0; o < n_vec; o += 8) _mm256_storeu_ps(acc + o, _mm256_fmadd_ps(xi, ld(w + o), _mm256_loadu_ps(acc + o)));
+        for (int o = n_vec; o < n; ++o) acc[o] = std::fma(x[i], widen1(w[o]), acc[o]);
+    }
+}
+
+/// Outputs at or below this span accumulate in a private stack tile and write `y` once (see axpy).
+inline constexpr int kLocalTile = 128;
+
+template <class Raw>
+inline void axpy_range_avx2(const float* x, const Raw* W, int in, int out, int o0, int o1, float* y) noexcept {
+    if (o1 - o0 <= kLocalTile) {
+        alignas(32) float tile[kLocalTile];
+        accumulate_avx2(x, W, in, out, o0, o1, tile);
+        std::copy_n(tile, o1 - o0, y + o0);
+    } else {
+        accumulate_avx2(x, W, in, out, o0, o1, y + o0);
     }
 }
 #endif
@@ -141,8 +158,13 @@ inline void axpy_range(const float* x, WP W, int in, int out, int o0, int o1, fl
 
 /** y[0,out) = x[0,in) . W[in,out], split across `Threads` threads by output column.
  *
- * @tparam Threads  compile-time fan-out (1 = serial). Chunks are multiples of 32 outputs (whole
- *                  cache lines of f32 y) so threads never share a line of y.
+ * @tparam Threads  compile-time fan-out (1 = serial).
+ *
+ * Chunking depends on how many outputs each thread gets. WIDE (> kLocalTile per thread): multiples of
+ * 32 outputs, whole cache lines of f32 y, so no two threads ever write the same line while accumulating
+ * in place. NARROW: multiples of 8, so all threads get work (Gated Residual's 10240 -> 320 down
+ * projection used only 5 of 8 threads at 32-granularity, ~28 GB/s); each thread then accumulates in a
+ * private stack tile and writes y once, so the finer split cannot false-share.
  * @note `y` must not alias `x` or `W`. No heap, no locks (AGENTS.md S1).
  */
 template <int Threads = 1, class WP>
@@ -153,7 +175,8 @@ inline void axpy(const float* x, WP W, int in, int out, float* y) noexcept {
     } else {
 #if defined(_OPENMP)
         if (!omp_in_parallel()) {
-            const int chunk = ((out + Threads - 1) / Threads + 31) / 32 * 32;
+            const int per = (out + Threads - 1) / Threads;
+            const int chunk = per > detail::kLocalTile ? (per + 31) / 32 * 32 : (per + 7) / 8 * 8;
             #pragma omp parallel for num_threads(Threads) schedule(static)
             for (int t = 0; t < Threads; ++t) {
                 const int o0 = std::min(out, t * chunk), o1 = std::min(out, o0 + chunk);

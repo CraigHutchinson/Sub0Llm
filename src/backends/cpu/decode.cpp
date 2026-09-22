@@ -659,6 +659,7 @@ const float* Model::forward_one(int id, int pos) {
                 // matching comment for why those are out of scope for a GDN layer).
                 // Same dt_bias/a_log ARGUMENT-ORDER fix as op_gdn's batched forward (backend.cpp) (this
                 // decode path had the identical swap, independently) -- see that call site's comment.
+                [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> gdn_phase(prof::Phase::MixerGdn);
                 float gdn_scratch[GDN_SCRATCH1];
                 gdn::forward<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(GDN_DIMS, 1, a,
                              L.gdn_in_qkv->pdata, L.gdn_in_z->pdata,

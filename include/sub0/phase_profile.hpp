@@ -18,9 +18,9 @@
 // static: sub0_core is a DLL on Windows, where a function-local static in an inline header function gets
 // a separate copy per module -- the tool would read its own empty counters while decode filled the DLL's.
 //
-// Single-threaded by design: forward_one runs its phases on one thread (MoE's expert fan-out is
-// MOE_DECODE_THREADS = 1 since B29), so the counters are plain integers. A scope opened from a worker
-// thread would race; none is.
+// Single-threaded by design: every scope is opened on the thread running forward_one, never inside an
+// OpenMP team (the routed-expert scope wraps ParallelExperts' whole team from the calling thread), so the
+// counters are plain integers. A scope opened from a worker thread would race; none is.
 
 #pragma once
 
@@ -35,13 +35,14 @@
 namespace sub0::prof {
 
 /// Decode's O1-level phases (docs/optimization/profile_post_b35.md's rows). Other = uncovered time.
-/// MoeRouted nests inside Moe (one scope per selected expert), so Moe is what is LEFT: router,
-/// activation quantize, shared expert and the weighted combine.
-enum class Phase : std::uint8_t { Other, Mixer, Moe, MoeRouted, GatedResidual, LmHead, Count };
+/// MoeRouted nests inside Moe (one scope around the routed-expert team), so Moe is what is LEFT:
+/// router, activation quantize, shared expert and the weighted combine.
+/// Mixer is the full-attention mixer (QSA, or softmax attention); MixerGdn is the Gated DeltaNet mixer.
+enum class Phase : std::uint8_t { Other, Mixer, MixerGdn, Moe, MoeRouted, GatedResidual, LmHead, Count };
 
 inline constexpr std::array<std::string_view, static_cast<std::size_t>(Phase::Count)> kPhaseNames{
-    "unattributed", "mixer (GDN/QSA/attention)", "MoE: router + shared + combine", "MoE: routed experts",
-    "Gated Residual", "lm_head (+ final norm)"};
+    "unattributed", "mixer: QSA/attention", "mixer: GDN", "MoE: router + shared + combine",
+    "MoE: routed experts", "Gated Residual", "lm_head (+ final norm)"};
 
 /** Per-phase accumulated nanoseconds and the phase currently being charged.
  *
