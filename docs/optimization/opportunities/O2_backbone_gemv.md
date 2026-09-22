@@ -90,7 +90,7 @@ L2 is 0.23252 at every point (bit-identical).
 (The vectorized-only row is from its own A/B, whose pre-O2 arm read 0.690.) G-HASH `816c4a54ad49b8cf`,
 suites 28,969,623 / 147 and 141,609 / 257, all unchanged.
 
-**Recommended real-axes decode flags:** `--moe-quant-dot 1 --decode-gemv-threads 8 --moe-decode-threads 10`.
+**Recommended real-axes decode flags:** `--moe-quant-dot 1 --decode-gemv-threads 8 --moe-decode-threads 10` (O3 adds `--decode-omp-spin 1`).
 Both thread axes stay default 1 in the configurator, because they are machine-shaped (P-core count).
 
 ## 7. Next constraint

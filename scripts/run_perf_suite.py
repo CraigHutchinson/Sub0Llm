@@ -121,6 +121,10 @@ def run(cmd, cwd=None, timeout=3600, check: bool = True) -> str:
 
 
 def configure(build: pathlib.Path, extra: list[str]) -> None:
+    # Rebuild the configurator FIRST: a new generated constant (a new --flag) is otherwise unknown to the
+    # build dir's stale configurator binary, and the engine then fails to compile against a header that
+    # lacks it. A no-op when it is already current.
+    build_target(build, "sub0llm-configure")
     run([str(build / "sub0llm-configure.exe"), *REAL_AXES, *extra], cwd=build)
 
 

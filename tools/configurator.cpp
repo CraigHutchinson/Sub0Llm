@@ -684,6 +684,7 @@ int main(int argc, char** argv) {
     int profile_phases = 0;     // 1 = exclusive-time decode phase profiler (include/sub0/phase_profile.hpp)
     int moe_decode_threads = 1; // decode's routed-expert fan-out width (src/backends/cpu/internal.hpp)
     int decode_gemv_threads = 1; // O2: decode's backbone GEMV fan-out (include/sub0/gemv.hpp)
+    int decode_omp_spin = 0;     // O3: keep decode's OpenMP workers spinning between regions (decode.cpp kv_reset)
     int simd_reduce  = 0;       // B34/B38: multi-accumulator SIMD restructuring of the hot reduction
                                  // loops (moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp).
                                  // 0 = off (default, today's plain scalar reduction, bit-exact). See the
@@ -892,6 +893,12 @@ int main(int argc, char** argv) {
                    "-- mixer projections, shared expert, router, lm_head. 1 (default) = serial. Bit-exact at "
                    "every value: each output keeps its own sequential sum; threads split only across outputs.")
        ->capture_default_str()->check(CLI::Range(1, 64));
+    app.add_option("--decode-omp-spin", decode_omp_spin,
+                   "1 = decode keeps its OpenMP workers spinning between parallel regions instead of sleeping "
+                   "(kmp_set_blocktime, set in kv_reset). Decode forks ~600 short regions per token, so a "
+                   "sleeping worker pays an OS wake-up each time: measured 0.267-0.336 -> 0.223-0.238 s/token. "
+                   "Costs idle workers' cores for the duration of a generation. 0 = libomp default (off).")
+       ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--moe-decode-threads", moe_decode_threads,
                    "threads decode fans a row's routed experts across (internal.hpp MOE_DECODE_THREADS). "
                    "Default 1. B29's '1 is fastest' was an artefact of every decode team being confined to one "
@@ -1863,6 +1870,7 @@ int main(int argc, char** argv) {
     // Scheduling only (the combine order is fixed): not an ARCH_FINGERPRINT axis (AGENTS.md S10).
     cos << "constexpr int  MOE_DECODE_THREADS_CFG = " << moe_decode_threads << ";\n";
     cos << "constexpr int  DECODE_GEMV_THREADS = " << decode_gemv_threads << ";\n";
+    cos << "constexpr bool DECODE_OMP_SPIN = " << (decode_omp_spin ? "true" : "false") << ";\n";
     // SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) vs the plain 2-matrix GELU+bias FFN -- see
     // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
     // swiglu_backward_act_kernel in backend_cuda.cu).

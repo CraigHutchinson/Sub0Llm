@@ -64,6 +64,7 @@ selection must cite this, not the pre-B35 numbers.
 |---|---|---|---|
 | [O1](O1_iq2xxs_sign_fold.md) | AVX2 fused MoE GEMV: vector accumulator per row (widened from "fold IQ2_XXS signs") | **merged** | **+2.14x decode** (1.508 → 0.705 s/token); L2 0.2938 → 0.2325 | 1 |
 | [O2](O2_backbone_gemv.md) | One GEMV primitive for the bf16 backbone: vectorized + threaded; B40 pin fix | **merged** | **+2.42x decode** (0.757 → 0.313 s/token), bit-identical | 2 |
+| [O3](O3_gr_threads_and_spin.md) | Gated Residual via the GEMV primitive; `--decode-omp-spin` | **merged** | **0.313 → 0.213 s/token** (spin alone −20%, spread halved) | 1 |
 
 **Retracted**: *IQ1_S narrowing*, previously named by B35 as the next lever on the grounds that its dot
 uses the 8-lane `vpmulld` shape. The per-format profile refutes it — IQ1_S is the **cheapest** format

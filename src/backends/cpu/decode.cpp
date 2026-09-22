@@ -21,6 +21,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 // OpenMP gate, the same one backend.cpp carries and for the same reason -- see its copy for the full
@@ -840,6 +841,16 @@ namespace cpu_detail {
 // Also resets GdnCache's decode-persistent recurrent state -- `if constexpr` so this costs nothing
 // (not even the vector-emptiness check) on a build with GDN off, per AGENTS.md S4.
 void kv_reset() {
+    // DECODE_OMP_SPIN (`sub0llm-configure --decode-omp-spin 1`): decode forks ~600 short OpenMP regions per
+    // token (every threaded GEMV is one), so a worker that SLEEPS between them pays an OS wake-up on every
+    // one. Measured on the real artifact at the O2 operating point: default 0.267 / 0.336 s/token (with the
+    // Gated Residual phase swinging 43 -> 94 ms between runs) vs spinning 0.223 / 0.238. Set here, on the
+    // thread that masters decode's teams, because libomp teams inherit their master's blocktime. The cost
+    // is idle workers burning their cores between regions for the duration of a generation. libomp-only
+    // (KMP_VERSION_MAJOR comes from LLVM's omp.h); any other runtime skips it.
+#if defined(_OPENMP) && defined(KMP_VERSION_MAJOR)
+    if constexpr (DECODE_OMP_SPIN) kmp_set_blocktime(std::numeric_limits<int>::max());
+#endif
     g_kv.reset();
     if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset();
     if constexpr (USE_QSA) g_qsa_cache.reset();   // the indexer's own raw-key store -- docs/QSA.md S6
