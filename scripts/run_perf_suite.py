@@ -37,6 +37,7 @@ docs/optimization/perf_report.md with a gate panel on top.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import pathlib
 import re
@@ -238,7 +239,20 @@ def main() -> int:
     ap.add_argument("--label", default="", help="opportunity ID, tags the history row (e.g. B35)")
     ap.add_argument("--allow-contention", action="store_true",
                     help="measure anyway. Produces a number that policy says is not evidence.")
+    ap.add_argument("--sandbox", action="store_true",
+                    help="confine other processes to 2 housekeeping E-cores for the run (perf_sandbox.py); "
+                         "the load gate then checks the RESERVED cores, not the whole box")
     args = ap.parse_args()
+    with contextlib.ExitStack() as stack:
+        sb = None
+        if args.sandbox:
+            import perf_sandbox
+            sb = stack.enter_context(perf_sandbox.Sandbox(max_seconds=4 * 3600))
+            print(f"sandbox: {json.dumps(sb.report())}", file=sys.stderr)
+        return run(args, sb)
+
+
+def run(args, sb) -> int:
 
     stages = args.stage or ["perf"]
     gates = json.loads(GATES.read_text(encoding="utf-8"))
@@ -246,16 +260,23 @@ def main() -> int:
     results_load = None
     if "perf" in stages or "quality" in stages or "vtune" in stages:
         n = contention_count()
-        load = system_load_pct()
-        results_load = {"named_processes": n, "background_load_pct": load}
+        if sb is not None:
+            import perf_sandbox
+            time.sleep(5)   # let confined processes' in-flight quanta drain off the reserved cores
+            load = perf_sandbox.bench_core_load(sb.bench_cpus)
+        else:
+            load = system_load_pct()
+        results_load = {"named_processes": n, "background_load_pct": load,
+                        "sandbox": sb.report() if sb is not None else None}
         problems = []
         if n != 0:
             problems.append(f"{n} named competing process(es) (sibling builds/benchmarks)")
         if load is None:
             problems.append("background load UNKNOWN (counter unavailable) -- not treated as idle")
         elif load > MAX_BACKGROUND_LOAD_PCT:
-            problems.append(f"background CPU load {load:.1f}% > {MAX_BACKGROUND_LOAD_PCT:.0f}% "
-                            "(post-boot updaters, browsers, indexing all count)")
+            where = ("on the sandbox's RESERVED cores -- i.e. from what it cannot confine unelevated: "
+                     "SYSTEM services, kernel threads, DPCs (OPTIMIZATION_PROCESS.md S1a)") if sb is not None                 else "(post-boot updaters, browsers, indexing all count; try --sandbox)"
+            problems.append(f"background CPU load {load:.1f}% > {MAX_BACKGROUND_LOAD_PCT:.0f}% {where}")
         if problems and not args.allow_contention:
             print("REFUSING TO MEASURE:\n  - " + "\n  - ".join(problems) + "\n"
                   "A contended measurement is not a slow measurement, it is a meaningless one\n"

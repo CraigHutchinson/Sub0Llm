@@ -54,6 +54,58 @@ A number that does not follow this protocol is not evidence, and must not be quo
 - State the artifact and the axes. The real 48-layer recipe is in `docs/MOE_QUANT_DOT.md` §6h — a
   partial recipe yields `PARAM_FLOATS 2570717696` and a rejected model, with no hint which axis is wrong.
 
+## 1a. The CPU sandbox (`--sandbox`)
+
+Waiting for a quiet host does not scale: after a reboot this machine sat at 8-17% load for 40+ minutes.
+`run_perf_suite.py --sandbox` (implemented in `scripts/perf_sandbox.py`) reserves most of the CPU for
+the run instead, for a bounded time, and puts everything back afterwards.
+
+**Windows (implemented, best-effort).** "Reverse affinity": every other process the user can open is
+confined to 2 housekeeping E-cores at BELOW_NORMAL priority. The benchmark keeps the other 22 logical
+CPUs, all 8 P-cores included. The OS reports the core map (`GetSystemCpuSetInformation`), because on
+this part the P-cores are logical `[0,1,10,11,12,13,22,23]`, interleaved with the E-cores. The run also
+switches to the High Performance power plan. New processes are re-swept every 10 s, a watchdog restores
+everything after the time limit, and the original state is saved to disk *before* any change, so
+`python scripts/perf_sandbox.py --restore` undoes a sandbox whose owner crashed.
+
+**What the Windows sandbox cannot do.** Measured on this host, unelevated (Medium integrity):
+
+- It cannot reach SYSTEM services, protected processes (Defender's `MsMpEng` is PPL even to an admin),
+  kernel threads, interrupts or DPCs. On first use, 191 processes were confined, but the residual load
+  on the reserved cores was **~7%**. That load came from `System` (kernel threads, ~78% of one core)
+  and `compattelrunner` (a Windows compatibility-telemetry task that runs as SYSTEM, ~36%). User
+  processes together came to ~1%.
+- So the sandbox **reduces** contention but does not **guarantee** exclusivity. The load gate still
+  applies, measured on the **reserved cores** rather than the whole machine (the housekeeping cores are
+  supposed to be busy). If the sandbox is on and the gate still refuses, the leftover load is out of
+  reach. The answer is to wait for it or to run elevated. Do not pass `--allow-contention` to get past
+  it.
+- Elevated, it could also confine SYSTEM services such as `compattelrunner`. Kernel threads and DPCs
+  are out of reach on Windows at any privilege level.
+
+**Linux (designed, not built: no consumer on this host, AGENTS.md §8).** Linux can give real
+exclusivity at runtime, with no reboot:
+`systemctl set-property --runtime user.slice system.slice init.scope AllowedCPUs=<housekeeping>`
+moves every existing and future task in those slices onto the housekeeping CPUs. The benchmark then
+runs in its own scope (`systemd-run --scope -p AllowedCPUs=<bench>`), or in a cgroup v2 cpuset
+partition (`cpuset.cpus.partition=isolated`, kernel 6.1+) for full scheduler isolation. Add the
+`performance` governor, and move IRQ affinity (`/proc/irq/*/smp_affinity_list`) onto the housekeeping
+CPUs. `--runtime` means a reboot restores everything. `isolcpus=`/`nohz_full=` go further, but they
+need a kernel command-line change and a reboot, which is out of scope for a time-limited sandbox.
+
+**Accelerators (backlog, not scheduled).** Exclusive access to the dGPU, iGPU and NPU raises the same
+question and is deferred until work on them resumes. Starting points: on the NVIDIA dGPU,
+`nvidia-smi -c EXCLUSIVE_PROCESS` (compute mode, needs admin) and locked clocks (`nvidia-smi -lgc`) to
+take boost variance out. Also check what else holds the device (`nvidia-smi` process list: browsers,
+MSI Afterburner overlays). The iGPU and NPU have no equivalent exclusive mode that we know of; the
+same measure-then-verify approach (confine what we can, verify the residual load, refuse above a
+threshold) would apply.
+
+**The sandbox must earn its place.** It exists to cut run-to-run variance. Before its numbers are
+treated as better evidence than unsandboxed ones, show on this host that sandboxed spread is lower than
+unsandboxed spread at the same background load. Until then it is a tool for *reaching* the 5% gate,
+not a change to the noise floor.
+
 ## 2. KPI gates
 
 Machine-readable in `docs/optimization/kpi_gates.json`. **Hard** gates block landing on `main`; **soft**
