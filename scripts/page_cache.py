@@ -105,13 +105,21 @@ def evict(path: str) -> None:
 
 
 def evict_verified(paths: list[str]) -> dict[str, dict]:
-    """Evict every path, then prove each is cold. Raises if any is not -- never returns a warm "cold".
+    """Evict every path, then prove the purge acted. Raises if not -- never returns a warm "cold".
 
-    Probes with a fresh seed each call, so it never measures pages an earlier probe itself cached.
+    CANARY, not random sampling: most of a 37 GiB sidecar is never touched by a few tokens of decode, so
+    random pages read from disk whether or not eviction worked -- a random-sample check cannot fail. So
+    a fixed canary sample is read (cached) FIRST, then the file is evicted, then the SAME canary must
+    come back from disk. That proves the purge acted on this file, now; a purge blocked by a live mapping
+    leaves the canary cached and is refused.
     """
+    canary = 0x5EED
     for p in paths:
+        probe(p, seed=canary)                                  # plant: cache the canary pages
+        if probe(p, seed=canary)["from_disk"] > 1 - COLD_THRESHOLD:
+            raise RuntimeError(f"canary did not cache for {p}; the probe cannot tell cold from warm here")
         evict(p)
-    result = {p: probe(p, seed=time.perf_counter_ns()) for p in paths}
+    result = {p: probe(p, seed=canary) for p in paths}
     warm = {p: r for p, r in result.items() if r["from_disk"] < COLD_THRESHOLD}
     if warm:
         raise RuntimeError(f"eviction did not take (something may still map the file): {warm}")
