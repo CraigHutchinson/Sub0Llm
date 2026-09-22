@@ -446,7 +446,7 @@ const float* Model::forward_one(int id, int pos) {
         [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> phase(prof::Phase::GatedResidual);
         if constexpr (USE_GATED_RESIDUAL) {
             gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, wide, norm_w->pdata, gr_normed);
-            gr::mix(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed, gr_mixscr);
+            gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed, gr_mixscr);
             gr::gate(GR_DIMS, 1, gr_normed, inject_w->pdata, gr_inj);
             // WP4b blocker D: the mixer reads mixed_input DIRECTLY -- no Ln1/Ln2 exists under GR
             // (`ln` is nullptr), and gr::hc_norm above already applied the real model's own
@@ -818,7 +818,7 @@ const float* Model::forward_one(int id, int pos) {
     [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> head_phase(prof::Phase::LmHead);
     if constexpr (USE_GATED_RESIDUAL) {
         gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, h, gr_top_norm->pdata, gr_normed);
-        gr::mix(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed, gr_mixscr);
+        gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed, gr_mixscr);
         for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = gr_mixed[j];
         // No final norm under GR -- the exit collapse's own hc_norm is it, so mixed_input feeds the
         // head directly. Mirrors forward()'s own branch exactly (the forward-vs-forward_one parity

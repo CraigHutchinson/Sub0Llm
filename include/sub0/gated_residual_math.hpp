@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstddef>
 
+#include "sub0/gemv.hpp"
 #include "sub0/simd_reduce.hpp"  // B34/B38: sumsq_choice<UseSimd>() for this file's real scalar-reduction
                                   // hot loop, hc_norm's `ms` (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
 
@@ -111,7 +112,7 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float
 // simplification, not an oversight; see that section for why the duplicated cost is bounded and cheap).
 // down_w: [wide, hc_lowrank], up_w: [hc_lowrank, wide], this project's own [in,out] convention.
 // out_mixed: [T, hidden_size]. scratch: >= T*hc_lowrank floats (the down-projection's pre-activation).
-template <class WP>
+template <int Threads = 1, class WP>
 inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
                  float* out_mixed, float* scratch) {
     const int hs = d.hidden_size, hc = d.hc_count, wide = d.wide(), lr = d.hc_lowrank;
@@ -120,12 +121,7 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
     for (int t = 0; t < T; ++t) {
         const float* xr = normed + static_cast<std::size_t>(t) * wide;
         float* dr = down_pre + static_cast<std::size_t>(t) * lr;
-        for (int o = 0; o < lr; ++o) dr[o] = 0.f;
-        for (int i = 0; i < wide; ++i) {
-            const float xi = xr[i];
-            const auto Wr = down_w + static_cast<std::size_t>(i) * lr;
-            for (int o = 0; o < lr; ++o) dr[o] += xi * Wr[o];
-        }
+        gemv::axpy<Threads>(xr, down_w, wide, lr, dr);   // O3: include/sub0/gemv.hpp, same per-output order
         for (int o = 0; o < lr; ++o) dr[o] = detail::silu(dr[o] / static_cast<float>(hc));
     }
     const float inv_hc = 1.f / static_cast<float>(hc);
@@ -142,12 +138,7 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
         // any cache line) found in a post-merge performance review, not present at this stage's own
         // small test scale. Purely a summation-ORDER change -- same terms, same result within float32
         // rounding (gated by this test file's own 5e-5 tolerance, comfortably wider than reordering noise).
-        for (int col = 0; col < wide; ++col) up_val[col] = 0.f;
-        for (int i = 0; i < lr; ++i) {
-            const float di = dr[i];
-            const auto Wr = up_w + static_cast<std::size_t>(i) * wide;
-            for (int col = 0; col < wide; ++col) up_val[col] += di * Wr[col];
-        }
+        gemv::axpy<Threads>(dr, up_w, lr, wide, up_val);   // O3: see the down projection above
         for (int j = 0; j < hs; ++j) out[j] = 0.f;
         for (int s = 0; s < hc; ++s) {
             for (int j = 0; j < hs; ++j) {
