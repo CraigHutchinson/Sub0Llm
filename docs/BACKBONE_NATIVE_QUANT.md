@@ -17,7 +17,7 @@ study, three measured optimization passes (AGENTS.md §13), and the honest gate 
 kernels clear the ~10 GB/s/thread bar only approximately (within run-to-run noise) and do NOT clear the
 ~60 GB/s/8-thread aggregate bar, but DO beat the real `gemv::axpy` bf16 kernel on WALL-CLOCK time per row
 at 8 threads for every format (the metric that answers "is a real token faster"), because native bytes
-read are 2.4–3.9x fewer even though the native kernel's own GB/s is lower. Parked at this state per
+read are 1.9–3.6x fewer even though the native kernel's own GB/s is lower. Parked at this state per
 AGENTS.md §13 (a genuine 3-pass mechanism, not reverted); the concrete next lever is named in §12f.
 
 Mirrors `docs/MOE_QUANT_DOT.md`'s own structure and rigour, applied to the BACKBONE instead of the routed
@@ -74,13 +74,20 @@ complete and correctly scoped.
 
 ### 2a. Per-format totals (1073 tensors, 4,914,858,880 elements)
 
+**bytes/elem corrected at integration (2026-09-22):** the K-quant rows first read 0.5391/0.5250/0.6250.
+The true per-element cost is each format's block size over 256 elements — Q4_K 144/256 = 0.5625, Q5_K
+176/256 = 0.6875, Q6_K 210/256 = 0.8203 — which is what this table's own MiB and element counts already
+implied. Only the derived column was wrong; the byte totals, the 3.59 GiB figure and every fit claim
+come from the totals and are unaffected. The bf16-to-native ratio per format is therefore 1.88x (Q8_0),
+2.44x (Q6_K), 2.91x (Q5_K), 3.56x (Q4_K), not the 2.4–3.9x first stated.
+
 | Format | Tensors | Elements | Native bytes | bytes/elem | Consumers (representative) |
 |---|---:|---:|---:|---:|---|
 | F32 | 553 | 78.3M | 298.70 MiB | 4.000 | norms, router (`ffn_gate_inp`), `ssm_alpha`/`ssm_beta`, `hc_*_inject`, biases |
 | Q8_0 | 242 | 714.3M | 723.83 MiB | 1.0625 | Gated Residual up/down (`hc_attn_up/down`, `hc_ffn_up/down`), MoE shared-expert down |
-| Q4_K | 2 | 1271.4M | 682.03 MiB | 0.5391 | `token_embd.weight` (embed), `output.weight` (untied lm_head) |
-| Q5_K | 212 | 2219.7M | 1455.35 MiB | 0.5250 | GDN in-proj (`attn_qkv`, `attn_gate`), QSA (`attn_q/k/v/output`), MoE shared gate/up |
-| Q6_K | 40 | 611.5M | 478.34 MiB | 0.6250 | GDN out-proj (`ssm_out`) |
+| Q4_K | 2 | 1271.4M | 682.03 MiB | 0.5625 | `token_embd.weight` (embed), `output.weight` (untied lm_head) |
+| Q5_K | 212 | 2219.7M | 1455.35 MiB | 0.6875 | GDN in-proj (`attn_qkv`, `attn_gate`), QSA (`attn_q/k/v/output`), MoE shared gate/up |
+| Q6_K | 40 | 611.5M | 478.34 MiB | 0.8203 | GDN out-proj (`ssm_out`) |
 | BF16 | 24 | 19.7M | 37.50 MiB | 2.000 | QSA indexer (`indexer.q_proj`/`k_proj`) |
 
 **Grand totals**: 4,914,858,880 elements. Native bytes **3,854,307,840 (3.59 GiB)**. Today's resident bf16
@@ -237,7 +244,7 @@ For context, this project's own precedent (`docs/MOE_QUANT_DOT.md` S6e): B35's i
 the MoE path was 0.48%-3.3% (single-dot, Gaussian) and produced a 0.29 end-to-end logit L2-relative diff
 against the BF16 backbone's own 0.199. The backbone numbers above (0.12%-3.85%) sit in the SAME band as
 B35's — **Q4_K's 3.85% is the outlier worth flagging**, plausibly because it is the format with the fewest
-mantissa-equivalent bits among the four (0.5391 bytes/elem, the lowest of any format here) applied to two
+mantissa-equivalent bits among the four (0.5625 bytes/elem, the lowest of any format here) applied to two
 very large, statistically dense tensors (`token_embd`/`output.weight`, both 635.7M elements) — named as
 the one number worth re-checking first if this design is revived, not glossed over.
 
@@ -666,7 +673,7 @@ measured); Q4_K reaches 49.57 GB/s at 16 threads, the closest any format gets.
 
 **The metric that actually answers "is a real token faster", computed from the SAME table (wall-clock
 time per output row, native vs. bf16 `axpy`, at the matching logical `(row_elems, out_dim)` shape)**:
-despite lower raw GB/s, native reads 2.4–3.9x fewer bytes per row (§7's own ratio table), so total time
+despite lower raw GB/s, native reads 1.9–3.6x fewer bytes per row (§7's own ratio table), so total time
 can still be lower. At **8 threads, native wins on wall-clock time for all four formats**: Q8_0 15% faster,
 Q4_K 40% faster (1.67x), Q5_K 48% faster (1.93x), Q6_K 42% faster (1.72x). At 1 thread the result is mixed:
 Q4_K 19% faster, Q5_K 4% faster, but Q8_0 27% SLOWER and Q6_K 47% SLOWER than `gemv::axpy` at 1 thread —
@@ -709,3 +716,43 @@ per-256 scheme before adopting it, per the same discipline §5b already establis
 - `~[backbonequant]`: **141,609 assertions in 257 test cases** — matches the required baseline exactly,
   confirming nothing in this phase leaked into any other test path.
 - Full suite: **145,500 assertions in 267 test cases**.
+
+## 12i. Integration re-verification (primary agent, 2026-09-22)
+
+Rebuilt from the merge on a quiet host (no other agent running) and re-run independently.
+
+**Gates reproduce exactly:** `[backbonequant]` 3,891 / 10; `~[backbonequant]` 141,609 / 257, unchanged
+from main; full frontend suite 145,500 / 267.
+
+**Throughput reproduces**, within this host's noise (my run / the branch's run, GB/s of compressed bytes
+at 1 thread): Q8_0 14.5 / 12.6, Q4_K 9.1 / 10.1, Q5_K 8.7 / 9.9, Q6_K 7.9 / 8.0. At 8 threads:
+35.8 / 35.6, 37.1 / 28.7, 34.9 / 35.1, 28.0 / 32.3.
+
+**The wall-clock claim holds, and is the number that matters.** Same logical GEMV, same row width, native
+against the real `gemv::axpy`, 8 threads, µs per output row derived from each arm's own bytes and GB/s:
+
+| format | row_elems | native µs/row | bf16 µs/row | native speedup |
+|---|---:|---:|---:|---:|
+| Q8_0 | 320 | 0.010 | 0.012 | 1.21x |
+| Q4_K | 2560 | 0.039 | 0.085 | 2.17x |
+| Q5_K | 2560 | 0.050 | 0.097 | 1.93x |
+| Q6_K | 6144 | 0.180 | 0.327 | 1.82x |
+
+So the literal gate (≥10 GB/s/thread, ~60 GB/s at 8) is the wrong gate, and it was mine: it assumed the
+kernel had to reach the bf16 path's bandwidth to win. It does not, because it moves 1.9–3.6x fewer bytes
+to do the same arithmetic. **On the question phase 2 exists to answer — is a token faster — the answer at
+8 threads is yes for all four formats.** The GB/s gate is retained as the measure of how much of the
+DRAM roof is still unused (28–37 of ~79 GB/s), which is what §12g's fourth pass would target.
+
+**Corrections applied at merge:** §2a's bytes/elem column (see the note there) and the 2.4–3.9x ratio,
+which is really 1.9–3.6x once Q8_0's 1.88x is included.
+
+**One finding recorded, not fixed:** `Gsum16` heap-allocates inside `gemv_plane_avx2`, per call and per
+thread. That is an AGENTS.md §1 violation the moment a decode loop calls it, so phase 2b must pass in a
+caller-owned buffer. A `TODO(phase 2b)` now sits at the allocation, because §12 of AGENTS.md exists
+precisely because this class of thing merges quietly and is not found until a profile says so.
+
+**What is still unproven:** everything end-to-end. No engine call site uses this header, so there is no
+decode throughput number and no logit-quality number. The per-row win above is a kernel measurement;
+whether it survives contact with the real decode depends on phase 2b's layout reconciliation (§3d), which
+is unsolved.

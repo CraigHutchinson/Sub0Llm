@@ -67,7 +67,7 @@
 // of the four formats reach the ~60 GB/s/8-thread aggregate gate (28-36 GB/s measured). The honest,
 // complete picture is not "gate met" -- but it is not "gate missed" either: at 8 threads the streaming
 // kernels beat the REAL `gemv::axpy` bf16 kernel on WALL-CLOCK time per output row for all four formats
-// (15-93% faster) BECAUSE native bytes read are 2.4-3.9x fewer even though native's own GB/s is lower;
+// (15-93% faster) BECAUSE native bytes read are 1.9-3.6x fewer even though native's own GB/s is lower;
 // at 1 thread this holds for Q4_K/Q5_K but not Q8_0/Q6_K. S12g names the concrete architectural reason
 // (8 independent horizontal reductions per superblock, a consequence of keeping ActBlocks' per-32 float
 // activation scale rather than adopting llama.cpp's own per-256 Q8_K-style scheme) and the 4th-pass lever
@@ -872,6 +872,10 @@ namespace detail {
                     row_elems, x);
             return true;
         case gguf::TensorType::Q6_K: {
+            // TODO(phase 2b): Gsum16 heap-allocates per call, and per THREAD when gemv_plane<Threads>
+            // splits rows -- an AGENTS.md S1 violation the moment decode calls this per token. It stays
+            // here only because phase 2a has no call site that could own the buffer across calls; wiring
+            // must hand in a caller-owned, reused one (Gsum16's own @note).
             Gsum16 gsum16;
             gsum16.build(x);
             for (int r = row_lo; r < row_hi; ++r)

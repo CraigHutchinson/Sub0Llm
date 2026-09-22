@@ -66,6 +66,7 @@ selection must cite this, not the pre-B35 numbers.
 | [O2](O2_backbone_gemv.md) | One GEMV primitive for the bf16 backbone: vectorized + threaded; B40 pin fix | **merged** | **+2.42x decode** (0.757 → 0.313 s/token), bit-identical | 2 |
 | [O3](O3_gr_threads_and_spin.md) | Gated Residual via the GEMV primitive; `--decode-omp-spin` | **merged** | **0.313 → 0.213 s/token** (spin alone −20%, spread halved) | 1 |
 | [O4](O4_gdn_threads_and_moe_schedule.md) | Thread GDN across heads/channels; `schedule(dynamic)` for routed experts | **merged** | **0.236 → 0.211 s/token**; GDN phase −18.5%, bit-exact. MoE lever did NOT reproduce (−2.4%, in noise) | 1 |
+| [O5](../../BACKBONE_NATIVE_QUANT.md) | Native-quant backbone: keep the unsloth GGUF's Q8_0/Q4_K/Q5_K/Q6_K bytes resident, fused int8-activation dot | phase 1 + 2a **merged**, kernels isolated; phase 2b (engine wiring) NOT started | Kernel-level: **1.2–2.2x faster per row than `gemv::axpy` at 8 threads**, 1.9–3.6x fewer bytes; resident 3.59 vs 9.15 GiB. No end-to-end number yet | 3 |
 
 **Retracted**: *IQ1_S narrowing*, previously named by B35 as the next lever on the grounds that its dot
 uses the 8-lane `vpmulld` shape. The per-format profile refutes it — IQ1_S is the **cheapest** format
