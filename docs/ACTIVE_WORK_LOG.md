@@ -742,3 +742,12 @@ B35's own IQ1_S follow-up (47% of planes, the one format on the wider `vpmulld` 
 change *inside the dominant phase*, the right shape; (2) the mixer at 21.2% is genuinely untouched and
 deserves its own O1 split (GDN vs QSA) before any lever is picked; (3) lm_head and gated-residual are
 not worth touching yet.
+
+---
+
+**2026-09-22 Claude Code — post-reboot / PSU-swap re-baseline (CPU-heavy, active).** Host rebooted and
+PSU swapped to correct wattage. Every baseline in `docs/optimization/kpi_gates.json` and the ~30 GB/s
+DRAM ceiling the roofline rests on may have been measured power-limited, so they need re-deriving.
+First post-boot runs were contaminated by 6-19% background load (fixed the contention check to catch
+this, `423659d`). Now waiting for sustained load < 5%, then `run_perf_suite.py` default vs fused arms,
+3 runs each, label `post-psu-baseline`. **Do not run CPU-heavy work on this host until this completes.**
