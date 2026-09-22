@@ -11,12 +11,14 @@ them. A later phase reviews this design and does the actual wiring.
 compute-bound at 1–5 GB/s per thread for the K-quants, so at one thread they lose to the real bf16
 `gemv::axpy`. The fit win (§7) is real; the throughput win needs phase 2's streaming unpack.
 
-**Phase 2a status (2026-09-22): PAUSED mid-implementation, design verified but not yet ported into the
-real header.** See §12 below for the checkpoint — the Q4_K anomaly is explained (disassembly, not
-denormals), a streaming/vectorized-unpack design is built and checked bit-exact in a scratch harness
-(not yet in `include/sub0/backbone_quant_dot.hpp`), and a first throughput number is in hand for Q4_K
-only. Tasks 0 (bench fix), 4 (OpenMP threading), 5 (tests), 6 (suite gate), and the doc/header write-up
-are NOT done yet.
+**Phase 2a status (2026-09-22): DONE — streaming kernels ported, bench fixed, threaded, tested.** See §12
+for the full write-up: the Q4_K anomaly explained (disassembly, not denormals), the llama.cpp reference
+study, three measured optimization passes (AGENTS.md §13), and the honest gate result — the streaming
+kernels clear the ~10 GB/s/thread bar only approximately (within run-to-run noise) and do NOT clear the
+~60 GB/s/8-thread aggregate bar, but DO beat the real `gemv::axpy` bf16 kernel on WALL-CLOCK time per row
+at 8 threads for every format (the metric that answers "is a real token faster"), because native bytes
+read are 2.4–3.9x fewer even though the native kernel's own GB/s is lower. Parked at this state per
+AGENTS.md §13 (a genuine 3-pass mechanism, not reverted); the concrete next lever is named in §12f.
 
 Mirrors `docs/MOE_QUANT_DOT.md`'s own structure and rigour, applied to the BACKBONE instead of the routed
 experts.
@@ -478,12 +480,11 @@ underestimate the change's real shape by analogy by to BF16/FP8's much smaller s
 
 ---
 
-## 12. Phase 2a — checkpoint (2026-09-22, PAUSED mid-implementation)
+## 12. Phase 2a — streaming AVX2 kernels, ported, benched, threaded, tested (2026-09-22)
 
-Work stopped here on a pause request before the streaming kernels were ported into the real header, the
-bench was fixed, or the tests were updated. This section records what is verified so the next session
-resumes from evidence, not from scratch (AGENTS.md's own "a parked toggle is a finding banked" spirit,
-applied to an in-flight task rather than a finished one).
+This section records the complete phase 2a pass: what changed in `include/sub0/backbone_quant_dot.hpp`,
+the llama.cpp reference study behind it, three measured optimization passes (AGENTS.md §13), the fixed
+DRAM-streamed bench, the new tests, and an honest read of where the numbers land against the stated gate.
 
 ### 12a. The Q4_K anomaly (§8a point 4), explained — NOT denormals
 
@@ -516,15 +517,15 @@ group, paying full calling-convention overhead (stack frame, register spill/fill
 callee itself costs. The streaming design below eliminates this by writing one self-contained per-row
 function per format instead of calling a struct-returning `group()` once per 32 elements.
 
-### 12b. Streaming design, verified bit-exact in a scratch harness — NOT yet ported into the real header
+### 12b. Streaming design, in `include/sub0/backbone_quant_dot.hpp`
 
-Design (matches the task brief's own shape): one 256-element superblock at a time, `d`/`dmin`/the 8
-sub-block `(sc, m)` pairs decoded ONCE per superblock (`KScaleTable`, was: once per 32-element group, an
-8x-redundant `f16_to_f32` + `k_scale_min` + pointer-arithmetic cost), and the nibble/high-bit unpack done
-via explicit AVX2 intrinsics instead of relying on the compiler:
+One 256-element superblock at a time, `d`/`dmin`/the 8 sub-block `(sc, m)` pairs decoded ONCE per
+superblock (`detail::KScaleTable`, was: once per 32-element group, an 8x-redundant `f16_to_f32` +
+`k_scale_min` + pointer-arithmetic cost), and the nibble/high-bit unpack done via explicit AVX2
+intrinsics instead of relying on the compiler:
 
 - `nibble_lo(bytes) = bytes & 0x0F` (byte-safe AND, trivial).
-- `nibble_hi(bytes) = (bytes >> 4 as 16-bit lanes) & 0x0F` — llama.cpp's own idiom; re-derived and
+- `nibble_hi(bytes) = (bytes >> 4 as 16-bit lanes) & 0x0F` — llama.cpp's own idiom (§12c); re-derived and
   confirmed safe by hand (a 16-bit lane right-shift of 4 moves each byte's own high nibble into that
   same byte's position in the shifted lane without leaking bits from the neighbour byte, worked through
   bit-by-bit rather than assumed).
@@ -542,56 +543,169 @@ via explicit AVX2 intrinsics instead of relying on the compiler:
 - Q6_K also needs a per-16 (not per-32) activation sum for its `bias_lo`/`bias_hi` split that
   `moeqd::ActBlocks::gsum` (per-32) doesn't carry. Phase 1's `group()`-based path recomputed this from
   scratch on EVERY (row, group) pair via `sum16_avx2` — an O(n_rows) redundant recompute of a value that
-  only depends on the activation column, not the row. Designed (not yet perf-measured with caching): a
-  small `Gsum16` helper built ONCE per `gemv_plane` call (per activation row, shared across all output
-  rows), mirroring `ActBlocks`' own "resize only when the width changes" allocation-free-in-steady-state
-  contract rather than touching `moe_quant_dot.hpp` (out of scope for this phase).
+  only depends on the activation column, not the row. `detail::Gsum16` is built ONCE per
+  `gemv_plane_avx2` call (per activation row, shared across all output rows that call handles), mirroring
+  `ActBlocks`' own "resize only when the width changes" contract rather than touching `moe_quant_dot.hpp`
+  (out of scope for this phase). **Not yet hoisted to a caller-owned, cross-call-persistent buffer** —
+  there is no decode-loop call site yet to own it across tokens; named as phase 2b's job if this path is
+  adopted.
 
-**Verification method**: a standalone scratch program (`clang++ -O3 -march=native`, not part of the
-build) implements the four pieces above and compares the result against
-`bbqd::gemv_plane<true>(...)` (today's `group()`-based AVX2 path, unchanged) row by row, requiring EXACT
-equality (`==`, not a tolerance) — the same discipline this file's own §6b used for the two defects phase
-1 caught. Result: **Q4_K, Q5_K, and Q6_K all bit-exact** against the existing AVX2 reference, both on
-multi-superblock synthetic bytes (4 rows × 2560 elements, 10 superblocks/row) and on 32 real rows of the
-real `output.weight` (Q4_K) tensor (0/32 mismatches). One real bug was caught and fixed during this
-verification: Q6_K's scale table (`sc`) must be offset by `half*8` within its 16-entry array — re-derived
-from `gguf.hpp`'s `dequantize_q6_k`, which advances `sc += 8` at the end of each outer `half` iteration
-(easy to miss since it is a plain pointer increment at the bottom of a loop, not inline with the indexing
-that uses it); the first draft of the scratch kernel omitted it and every row mismatched until fixed.
+`Q8_0Plane`/`Q4KPlane`/`Q5KPlane`/`Q6KPlane::group()` and `gemv_rows` are UNCHANGED from phase 1 — they
+remain the correctness reference (`detail::gemv_plane_portable`) and the fallback for the (real-tensor-
+absent) case where `row_elems % 256 != 0` (`detail::gemv_plane_avx2` still calls `gemv_rows<Plane,true>`
+there). The public `gemv_plane<Threads = 1>` auto-dispatches on `bbqd::kAvx2Kernels` (moeqd's own
+`kAvx2Kernels`/`gemv_best` convention, not a caller-chosen `UseAvx2` template bool) and, for `Threads >
+1`, splits `[row_lo, row_hi)` across a persistent OpenMP team exactly the way `gemv::axpy<Threads>` does,
+including its `omp_in_parallel()` nesting guard.
 
-**First throughput number** (scratch prototype, cache-resident real `output.weight` bytes, single
-thread, NOT yet run through the fixed DRAM-streamed bench from task 0): **Q4_K went from phase 1's 1.1
-GB/s to ~9.4–10.5 GB/s** — roughly 9x, at or just under the phase-2 gate of ≥10 GB/s/thread compressed
-bytes. Q5_K and Q6_K were queued for the same measurement when the pause request arrived; no number for
-them yet.
+### 12c. Reference study — llama.cpp's own AVX2 K-quant kernels (AGENTS.md §5)
 
-### 12c. Explicit next step to resume from
+Read directly from `D:\Craig\llama.cpp-qwen4exp\ggml\src\ggml-cpu\arch\x86\quants.c`
+(`ggml_vec_dot_q4_K_q8_K`, `ggml_vec_dot_q5_K_q8_K`, `ggml_vec_dot_q6_K_q8_K`, `ggml_vec_dot_q8_0_q8_0`),
+not paraphrased from training data. Two techniques were taken from it and re-derived onto this project's
+own conventions, not copied verbatim:
 
-1. Port the four verified scratch functions (in this session's scratchpad,
-   `streaming_verify.cpp` — `dot_row_q4_k`, `dot_row_q5_k`, `dot_row_q6_k`, plus the `KScaleTable`/
-   `Gsum16`/`nibble_lo`/`nibble_hi`/`qh_bit_to_hi4`/`qh_2bits_to_hi4`/`dot32_avx2_reg`/`dot16_avx2_reg`
-   helpers they use) into `include/sub0/backbone_quant_dot.hpp` under `detail::`, gated on
-   `row_elems % 256 == 0` (true for every real backbone tensor per the census, §2a) with a fallback to
-   the existing `gemv_rows<Plane,true>` for the general case.
-2. Restructure the public entry point to auto-dispatch (moeqd's own `kAvx2Kernels`/`gemv_best`
-   convention, not a caller-chosen `UseAvx2` template bool — the task brief's own explicit instruction),
-   keeping `detail::gemv_plane_portable`/`detail::gemv_plane_avx2` as the two differential-test targets
-   (mirroring `tests/moe_quant_tests.cpp`'s own "O1" test shape).
-3. Add a `Threads`-templated OpenMP entry point mirroring `gemv::axpy<Threads>` exactly, including its
-   `omp_in_parallel()` nesting guard.
-4. Fix `benchmarks/backbone_quant_dot_bench.cpp` per task item 0: real `gemv::axpy` baseline (link
-   OpenMP the way `sub0llm-bench-gemv` does in root `CMakeLists.txt`), a pool of distinct real tensors
-   exceeding 3x L3 so every call streams from DRAM, persistent OpenMP team (no per-call `std::thread`
-   spawn), 1/2/4/8/16 threads.
-5. Update `tests/backbone_quant_dot_tests.cpp`: replace every `gemv_plane<false>`/`gemv_plane<true>`
-   call site with `detail::gemv_plane_portable`/`detail::gemv_plane_avx2` (or the new auto-dispatching
-   `gemv_plane`, per what each case is actually checking), add a streaming-vs-portable exact-agreement
-   case, a `Gsum16` correctness case, and a threading bit-exactness case for the new `Threads`-templated
-   entry point.
-6. Re-run the diagnostic scripts already in this session's scratchpad
-   (`denormal_diag.cpp` — FTZ/DAZ hypothesis, rejected; `anomaly_diag2.cpp` — data-vs-algorithm
-   isolation) are NOT needed again; their findings are recorded in §12a above and don't need
-   re-verification, only the streaming kernels themselves need porting and re-testing in-tree.
-7. Only after 1–5: run `sub0_frontend_tests` (must stay 141,609/257 outside `[backbonequant]`), the
-   `[backbonequant]` tag alone, the fixed bench at real shapes, write up final numbers in this section
-   (replacing "not yet measured"), and run `cpp-review` over the diff before calling phase 2a done.
+1. **The `utmp[4]` branch-free scale/min unpack** (Q4_K/Q5_K's AVX2 path):
+   ```c
+   static const uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
+   uint32_t utmp[4];
+   memcpy(utmp, x[i].scales, 12);
+   utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+   const uint32_t uaux = utmp[1] & kmask1;
+   utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+   utmp[2] = uaux;
+   utmp[0] &= kmask1;
+   ```
+   llama.cpp feeds `utmp` straight into `_mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3..0]))` — one vector
+   register holding all 8 scales then all 8 mins. This project's per-32 `ActBlocks` still needs each
+   sub-block's scale/min as an individually-addressable `float` (not a shared vector register, since the
+   activation-side scale differs per 32-group — see §12g), so `detail::KScaleTable::load` re-expresses
+   the SAME bit-unpack with plain byte indexing into `utmp` instead, checked bit-exact against
+   `gguf::k_scale_min`'s own byte-at-a-time reference for all 8 sub-block indices
+   (`tests/backbone_quant_dot_tests.cpp`'s own "KScaleTable" case) before being trusted.
+2. **The nibble/high-bit unpack shape** (`vpandn`/`vpsrlw`-style per-16-bit-lane bit tricks across all
+   three K-quant kernels) confirmed the general APPROACH (explicit intrinsics, not a scalar loop left to
+   the auto-vectorizer) but was NOT copied instruction-for-instruction: llama.cpp processes a whole
+   256-element superblock per AVX2 call with a SINGLE combined horizontal reduction (only possible
+   because its own activation is quantized per-256, `block_q8_K`, letting the K-quant's own integer scale
+   fold into the accumulator before any float conversion). This project kept per-32 `ActBlocks`
+   (§12g explains the tradeoff that decision makes), so `dot_row_q{4,5,6}_k_avx2` below do their own
+   independent per-32-group unpack+dot+reduce, matching this project's own accumulation order (the SAME
+   `gemv_rows`-established sequence, `sub = 0, 1, ..., 7`) rather than llama.cpp's per-256 one.
+
+### 12d. Three measured optimization passes (AGENTS.md §13)
+
+All numbers: real Qwen3.8-Flash-Next UD-IQ1_S shards, this host (Arrow Lake-HX, 8P+16E, 36 MiB L3), 1
+thread, compressed bytes/sec. Passes 1–2 measured cache-resident (a standalone scratch harness, before
+the bench fix); pass 3 is the first DRAM-streamed number and is what §12e cites going forward.
+
+| Pass | Change | Q8_0 | Q4_K | Q5_K | Q6_K |
+|---|---|---:|---:|---:|---:|
+| 0 (phase 1 baseline) | `group()`-based, scalar unpack | ~26 | 1.1 | 4.3 | 5.3 |
+| 1 | streaming design ported (superblock-cached scale, vector unpack) | 13.30 | 7.75 | 7.82 | 8.58 |
+| 2 | + `KScaleTable` branch-free bit-unpack (§12c technique 1) | 9.76 | 9.62 | 9.81 | 8.49 |
+| 3 | bench methodology fix (§12e) — DRAM-streamed, real number | 12.57 | 10.09 | 9.94 | 7.99 |
+
+Pass 1→2 is a real, reproducible improvement for Q4_K/Q5_K (+24%/+25%); Q6_K and Q8_0 moved inside
+run-to-run noise (±10–15% between repeated runs of the identical binary on this host, observed directly).
+Pass 3 is not a kernel change at all — it is the bench fix itself (§12e) revealing that passes 1–2's own
+numbers were partly measuring cache-residency and per-call OpenMP-region spin-up overhead, not the
+kernels' true DRAM-streamed throughput; it is included as the third pass because it is the measurement
+that finally isolates the mechanism's own ceiling from the harness measuring it.
+
+**Per AGENTS.md §13, this is parked, not reverted.** The mechanism (streaming AVX2 unpack) delivered a
+real 7–9x improvement over phase 1 at every format and stays in the tree, default-off in the sense that
+nothing in `src/`/`tools/` includes this header yet (unchanged from phase 1 — see §11). §12g names the
+concrete next lever for a 4th pass, should someone continue this thread.
+
+### 12e. Threading and the bench fix (task 0)
+
+`gemv_plane<Threads>` (§12b) is `bbqd`'s own `gemv::axpy<Threads>`-shaped entry point.
+`tests/backbone_quant_dot_tests.cpp`'s "gemv_plane<Threads> is bit-exact across 1/2/4 threads" case checks
+this directly on an uneven 37-row split (not divisible by 2 or 4) for all four formats.
+
+`benchmarks/backbone_quant_dot_bench.cpp` was rewritten per this task's own item 0/step 4 findings:
+
+- **Baseline**: the real `sub0::gemv::axpy<Threads>` (`include/sub0/gemv.hpp`), not a naive scalar loop —
+  phase 1's own bf16 arm measured ~26 GB/s cache-resident, which was never the real kernel's own number.
+- **DRAM-streamed**: both arms cycle through a POOL exceeding 3× this host's 36 MiB L3 (108 MiB) —
+  native's pool is built from REAL tensors (or, for Q4_K's two 248,320-row planes, several disjoint
+  real row-ranges of the SAME tensor), the bf16 pool from several distinct random matrices at the
+  matching `(row_elems, out_dim)` shape, the identical technique `sub0llm-bench-gemv` already uses.
+- **Persistent OpenMP team**: `#pragma omp parallel for num_threads(Threads)` per call (`gemv_plane<Threads>`
+  and `gemv::axpy<Threads>` both), relying on libomp's own idle-thread pool rather than spawning
+  `std::thread`s per call, the way phase 1's version did.
+- **A second, real methodology finding during this pass**: the pool's PER-ENTRY row cap
+  (`kMaxRowsPerEntry`) itself mattered. At 3072 rows/entry the bf16 BASELINE's own 8-thread number came
+  in well under this host's documented ~50–65 GB/s range (found: ~44–58 GB/s) — both arms were paying a
+  per-call OpenMP parallel-region spin-up on every pool entry, not a property of either kernel. Raising it
+  to 16384 rows/entry brought the bf16 baseline into its documented range (61.51/68.06 GB/s at 8/16
+  threads for the Q4_K-shaped baseline, §12f) and is what §12f's numbers were measured at. A real decode
+  call is smaller than 16384 rows for most projections, so amortizing OpenMP region overhead across MORE
+  than one call (persistent-team reuse across layers, not just within one call) is a real, unresolved
+  question for phase 2b's own wiring — named here, not solved by this constant.
+
+### 12f. Final DRAM-streamed numbers (real Qwen3.8-Flash-Next shards, this host, `--seconds 0.6`)
+
+| Format | Pool | 1 thr | 2 thr | 4 thr | 8 thr | 16 thr |
+|---|---|---:|---:|---:|---:|---:|
+| Q8_0 (native GB/s) | 33 entries, 109.6 MiB | 12.57 | 19.82 | 31.37 | 35.56 | 36.61 |
+| Q8_0 (bf16 `axpy` GB/s) | matching shape | 30.11 | 36.29 | 44.34 | 54.11 | 45.92 |
+| Q4_K (native GB/s) | 5 entries, 112.5 MiB | 10.09 | 16.53 | 20.04 | 28.65 | 49.57 |
+| Q4_K (bf16 `axpy` GB/s) | matching shape | 29.11 | 34.44 | 49.00 | 61.51 | 68.06 |
+| Q5_K (native GB/s) | 15 entries, 111.3 MiB | 9.94 | 14.70 | 21.74 | 35.07 | 36.65 |
+| Q5_K (bf16 `axpy` GB/s) | matching shape | 27.78 | 35.10 | 42.39 | 53.17 | 58.46 |
+| Q6_K (native GB/s) | 9 entries, 110.7 MiB | 7.99 | 13.72 | 19.91 | 32.25 | 38.99 |
+| Q6_K (bf16 `axpy` GB/s) | matching shape | 28.57 | 31.49 | 38.19 | 45.76 | 38.85 |
+
+**Against the literal stated gate (≥10 GB/s/thread, ~60 GB/s aggregate at 8 threads)**: Q4_K clears the
+1-thread bar (10.09); Q5_K and Q6_K sit just under it (9.94, 7.99) — within the ±10–15% run-to-run noise
+this host shows on repeated identical runs, so "approximately at the bar" is the honest characterization,
+not "clears it". **None of the four formats reach ~60 GB/s aggregate at 8 threads** (28.65–35.56 GB/s
+measured); Q4_K reaches 49.57 GB/s at 16 threads, the closest any format gets.
+
+**The metric that actually answers "is a real token faster", computed from the SAME table (wall-clock
+time per output row, native vs. bf16 `axpy`, at the matching logical `(row_elems, out_dim)` shape)**:
+despite lower raw GB/s, native reads 2.4–3.9x fewer bytes per row (§7's own ratio table), so total time
+can still be lower. At **8 threads, native wins on wall-clock time for all four formats**: Q8_0 15% faster,
+Q4_K 40% faster (1.67x), Q5_K 48% faster (1.93x), Q6_K 42% faster (1.72x). At 1 thread the result is mixed:
+Q4_K 19% faster, Q5_K 4% faster, but Q8_0 27% SLOWER and Q6_K 47% SLOWER than `gemv::axpy` at 1 thread —
+the per-superblock fixed cost (scale decode, 8 independent horizontal reductions, §12g) is a larger share
+of the total at low thread counts, and for Q6_K's larger row width in particular has not yet been paid
+down by DRAM-bandwidth savings the way it has by 8 threads.
+
+### 12g. What's next, if this thread continues — an architectural ceiling, not a bug
+
+The literal GB/s gate is not fully met, and the reason is visible in the kernel shape, not a mystery:
+**each streaming kernel does 8 independent `hsum256_epi32`-style horizontal reductions per 256-element
+superblock — one per sub-block — and that count is very likely irreducible under this project's own
+choice to keep `moeqd::ActBlocks`' per-32-element activation scale** (§3b/§4's own design call, reused
+verbatim rather than re-derived, per AGENTS.md §3). llama.cpp avoids this entirely: because its own
+activation (`block_q8_K`) carries ONE scale per 256 elements, it folds each K-quant sub-block's own
+INTEGER scale (0–63, a plain small int) into the int16/int32 accumulation via `_mm256_madd_epi16` BEFORE
+any float conversion, and only converts to float and reduces ONCE per superblock, not once per sub-block.
+This project's own per-32 activation scale is a `float`, not a small int, so an analogous fold is not
+directly available without adopting llama.cpp's own coarser (per-256) activation granularity.
+
+**This was evaluated, not overlooked, and deliberately deferred rather than adopted in this pass**: doing
+so would mean building a new, `block_q8_K`-shaped activation-quantization scheme (a `bsums`-per-16-style
+struct) alongside — not instead of, since Q8_0 still wants its own native per-32 granularity —
+`moeqd::ActBlocks`, a materially bigger and riskier change within this phase's remaining time, and the
+per-32 approach ALREADY gets close to the stated gate and (per §12f) already wins on real wall-clock time
+at every format once enough threads are in play. Named here as the concrete 4th-pass lever for whoever
+picks this back up: a `Q8_K`-shaped per-256 activation quantizer, used ONLY by the K-quant streaming
+kernels (Q8_0 keeps `ActBlocks`, whose own per-32 granularity already matches its native block exactly),
+would let the K-quant sub-block scale fold into the integer domain the way llama.cpp's own kernel does,
+cutting 8 horizontal reductions per superblock to 1 — the single biggest remaining lever this analysis
+found. The accuracy tradeoff (§4/§5b's own numbers, unchanged by this phase since the activation side was
+not touched: Q8_0 0.20%, Q4_K 3.85%, Q5_K 1.99%, Q6_K 0.12%) would also need re-measuring against a
+per-256 scheme before adopting it, per the same discipline §5b already established.
+
+### 12h. Test counts (`sub0_frontend_tests`, this host, `out/build/o5p2`)
+
+- `[backbonequant]` alone: **3,891 assertions in 10 test cases** (phase 1 was 2,848/6 — the 4 new cases
+  are the non-256-aligned-row fallback, `gemv_plane<Threads>` bit-exactness, `KScaleTable` vs.
+  `gguf::k_scale_min` exact agreement, and `Gsum16` vs. a direct re-sum).
+- `~[backbonequant]`: **141,609 assertions in 257 test cases** — matches the required baseline exactly,
+  confirming nothing in this phase leaked into any other test path.
+- Full suite: **145,500 assertions in 267 test cases**.

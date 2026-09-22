@@ -1,9 +1,19 @@
-// backbone_quant_dot_tests.cpp -- O5 phase 1: unit tests for sub0::bbqd (include/sub0/backbone_quant_dot.hpp),
+// backbone_quant_dot_tests.cpp -- O5 phase 2a: unit tests for sub0::bbqd (include/sub0/backbone_quant_dot.hpp),
 // the fused int8-activation x native-quant-weight dot product for the BACKBONE's four real quantized
 // formats (Q8_0, Q4_K, Q5_K, Q6_K -- docs/BACKBONE_NATIVE_QUANT.md's own census of the real Qwen3.8-
 // Flash-Next UD-IQ1_S shards). Structured after tests/moe_quant_tests.cpp's own B35 section, which this
 // mirrors deliberately (same split into "is the weight decode exact" vs "how big is the activation
 // quantization error", AGENTS.md S6/S9).
+//
+// PHASE 2a ADDITIONS (streaming AVX2 kernels, docs/BACKBONE_NATIVE_QUANT.md S12): `bbqd::gemv_plane` now
+// auto-dispatches on `bbqd::kAvx2Kernels` (moeqd's own `kAvx2Kernels`/`gemv_best` convention, not a
+// caller-chosen template bool), and carries a `Threads` template parameter mirroring `gemv::axpy`'s own
+// shape. `bbqd::detail::gemv_plane_portable`/`bbqd::detail::gemv_plane_avx2` stay individually callable
+// for the differential tests below (mirroring `tests/moe_quant_tests.cpp`'s own "O1" test, which reaches
+// into `moeqd::detail::gemv` directly for the same reason). New cases here cover: the streaming kernels'
+// exact agreement with the unchanged portable reference at real multi-superblock scale, the non-256-
+// aligned-row fallback, `Threads`-count bit-exactness, and the `KScaleTable` bit-unpack trick's exact
+// agreement with `gguf::k_scale_min`.
 //
 // WHAT EACH CASE EXISTS TO RULE OUT, rather than merely exercise (mirroring moe_quant_tests.cpp's own
 // discipline):
@@ -242,9 +252,18 @@ TEST_CASE("bbqd: the fused unpackers decode the SAME weights gguf::to_f32 does (
         const gguf::BlockSpec spec = gguf::block_spec(raw_t);
         const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
                                                            77u + raw_t);
-        std::vector<float> fused(kRows, 0.f);
-        REQUIRE(bbqd::gemv_plane<false>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
-                                        fused.data()));
+
+        // Both kernels: the portable reference and the streaming fast path -- this specific test's own
+        // kN=2560 is a multiple of 256, so every K-quant format actually exercises
+        // detail::dot_row_q{4,5,6}_k_avx2, not just the fallback. Like the rest of this project's SIMD
+        // tests (tests/moe_quant_tests.cpp), this assumes the AVX2 build this project always targets
+        // (SUB0_NATIVE=ON) rather than guarding for a hypothetical non-AVX2 host.
+        std::vector<float> portable(kRows, 0.f);
+        REQUIRE(bbqd::detail::gemv_plane_portable(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
+                                                   portable.data(), 0, kRows));
+        std::vector<float> avx2(kRows, 0.f);
+        REQUIRE(bbqd::detail::gemv_plane_avx2(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
+                                              avx2.data(), 0, kRows));
 
         double worst_rel = 0.0;
         for (int row = 0; row < kRows; ++row) {
@@ -254,10 +273,13 @@ TEST_CASE("bbqd: the fused unpackers decode the SAME weights gguf::to_f32 does (
                 type, std::span<const std::uint8_t>(raw).subspan(
                           byte_off, static_cast<std::size_t>(kN / spec.elems * spec.bytes)),
                 kN, x);
-            REQUIRE(std::isfinite(fused[static_cast<std::size_t>(row)]));
+            REQUIRE(std::isfinite(portable[static_cast<std::size_t>(row)]));
+            REQUIRE(std::isfinite(avx2[static_cast<std::size_t>(row)]));
             REQUIRE(std::fabs(ref) > 0.0);
-            worst_rel = std::max(worst_rel,
-                                  std::fabs(fused[static_cast<std::size_t>(row)] - ref) / std::fabs(ref));
+            worst_rel = std::max(
+                worst_rel, std::fabs(portable[static_cast<std::size_t>(row)] - ref) / std::fabs(ref));
+            worst_rel =
+                std::max(worst_rel, std::fabs(avx2[static_cast<std::size_t>(row)] - ref) / std::fabs(ref));
         }
         INFO("worst relative disagreement vs gguf::to_f32 = " << worst_rel);
         REQUIRE(worst_rel < 1e-5);   // float-rounding scale only, same bound moe_quant_tests.cpp uses
@@ -285,14 +307,136 @@ TEST_CASE("bbqd: the AVX2 path agrees EXACTLY with the portable path (integer ar
         const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
                                                            321u + raw_t);
         std::vector<float> portable(kRows, -1.f), avx2(kRows, -2.f);
-        REQUIRE(bbqd::gemv_plane<false>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
-                                        portable.data()));
-        REQUIRE(bbqd::gemv_plane<true>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
-                                       avx2.data()));
+        REQUIRE(bbqd::detail::gemv_plane_portable(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
+                                                   portable.data(), 0, kRows));
+        REQUIRE(bbqd::detail::gemv_plane_avx2(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
+                                              avx2.data(), 0, kRows));
         for (int r = 0; r < kRows; ++r) {
             INFO("row " << r);
             REQUIRE(portable[static_cast<std::size_t>(r)] == avx2[static_cast<std::size_t>(r)]);
         }
+    }
+}
+
+TEST_CASE("bbqd (O5 phase 2a): the streaming AVX2 kernels agree EXACTLY with the portable path when the "
+          "row does NOT start/end on a 256-element superblock boundary (the fallback path)",
+          "[backbonequant]") {
+    // Real backbone tensors always have row_elems as a multiple of 256 (docs/BACKBONE_NATIVE_QUANT.md
+    // S2a's census), so this case is defensive rather than load-bearing today -- but gemv_plane_avx2's
+    // own contract promises correctness for ANY row_elems that is merely a multiple of GROUP=32 (falling
+    // back to gemv_rows<Plane,true> when row_elems % 256 != 0), and that fallback path deserves its own
+    // exact-agreement check rather than being assumed correct by inspection. row_elems=96, n_rows=8 keeps
+    // the TOTAL (768 = 3*256) a whole number of superblocks -- required for the bytes to be valid Q4_K/
+    // Q5_K/Q6_K data at all -- while individual row boundaries (96, 192, 288, ...) do not land on 256.
+    constexpr int kN = 96, kRows = 8;
+    std::mt19937 rng(55);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    std::vector<float> x(kN);
+    for (float& v : x) v = normal(rng);
+    bbqd::ActBlocks xq;
+    xq.quantize(x.data(), kN);
+
+    for (const gguf::TensorType type : {gguf::TensorType::Q4_K, gguf::TensorType::Q5_K, gguf::TensorType::Q6_K}) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
+                                                           606u + raw_t);
+        std::vector<float> portable(kRows, -1.f), avx2(kRows, -2.f);
+        REQUIRE(bbqd::detail::gemv_plane_portable(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
+                                                   portable.data(), 0, kRows));
+        REQUIRE(bbqd::detail::gemv_plane_avx2(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
+                                              avx2.data(), 0, kRows));
+        for (int r = 0; r < kRows; ++r) {
+            INFO("row " << r);
+            REQUIRE(portable[static_cast<std::size_t>(r)] == avx2[static_cast<std::size_t>(r)]);
+        }
+    }
+}
+
+TEST_CASE("bbqd (O5 phase 2a): gemv_plane<Threads> is bit-exact across 1/2/4 threads on an uneven split",
+          "[backbonequant]") {
+    // The Threads-templated public entry point (mirroring gemv::axpy<Threads>'s own shape) must produce
+    // the identical result regardless of how many OpenMP workers split the row range -- the same
+    // "threaded by output row, bit-exact across thread counts" contract the row_lo/row_hi split below
+    // checks manually, now exercised through the actual threading seam a real caller would use.
+    constexpr int kN = 2560, kRows = 37;   // 37 is not evenly divisible by 2 or 4
+    std::mt19937 rng(202);
+    std::normal_distribution<float> normal(0.f, 1.5f);
+    std::vector<float> x(kN);
+    for (float& v : x) v = normal(rng);
+    bbqd::ActBlocks xq;
+    xq.quantize(x.data(), kN);
+
+    for (const gguf::TensorType type : kFormats) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
+                                                           808u + raw_t);
+        std::vector<float> t1(kRows, -1.f), t2(kRows, -2.f), t4(kRows, -3.f);
+        REQUIRE(bbqd::gemv_plane<1>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, t1.data()));
+        REQUIRE(bbqd::gemv_plane<2>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, t2.data()));
+        REQUIRE(bbqd::gemv_plane<4>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, t4.data()));
+        for (int r = 0; r < kRows; ++r) {
+            INFO("row " << r);
+            REQUIRE(t1[static_cast<std::size_t>(r)] == t2[static_cast<std::size_t>(r)]);
+            REQUIRE(t1[static_cast<std::size_t>(r)] == t4[static_cast<std::size_t>(r)]);
+        }
+    }
+}
+
+TEST_CASE("bbqd (O5 phase 2a): KScaleTable's branch-free bit-unpack agrees EXACTLY with gguf::k_scale_min "
+          "for all 8 sub-block indices",
+          "[backbonequant]") {
+    // AGENTS.md S13 pass 2 replaced 8 branchy gguf::k_scale_min calls per superblock with the
+    // branch-free bit-manipulation llama.cpp's own AVX2 Q4_K/Q5_K kernels use (this file's own header
+    // comment on KScaleTable::load). Checked here independently of any GEMV: for several random 12-byte
+    // scale blocks, every sub-block's (scale, min) must match gguf::k_scale_min's own byte-at-a-time
+    // reference exactly -- integers, so "exactly" is the only meaningful bar.
+    std::mt19937 rng(2026);
+    for (int trial = 0; trial < 32; ++trial) {
+        std::array<std::uint8_t, 16> blk{};   // [0..1]=d, [2..3]=dmin (unused here), [4..15]=packed scales
+        for (auto& b : blk) b = static_cast<std::uint8_t>(rng() & 0xFFu);
+        // KScaleTable::load reads d/dmin as f16 from blk+0/+2 and folds them into sc[i]/m[i] -- pin them
+        // to 1.0f (f16 0x3C00) so this case isolates the BIT-UNPACK itself, not the d/dmin multiply.
+        blk[0] = 0x00; blk[1] = 0x3C; blk[2] = 0x00; blk[3] = 0x3C;
+
+        bbqd::detail::KScaleTable t;
+        t.load(blk.data());
+
+        const std::uint8_t* scales = blk.data() + 4;
+        for (int i = 0; i < 8; ++i) {
+            std::uint8_t sc_ref = 0, m_ref = 0;
+            gguf::k_scale_min(i, scales, sc_ref, m_ref);
+            INFO("trial " << trial << " sub-block " << i);
+            REQUIRE(t.sc[static_cast<std::size_t>(i)] == static_cast<float>(sc_ref));
+            REQUIRE(t.m[static_cast<std::size_t>(i)] == -static_cast<float>(m_ref));
+        }
+    }
+}
+
+TEST_CASE("bbqd (O5 phase 2a): Gsum16 matches a direct per-16-element sum of the quantized activation",
+          "[backbonequant]") {
+    // Q6_K's own per-16 activation-sum cache (Gsum16), checked independently of any GEMV against a
+    // direct scalar re-sum of the same ActBlocks::qs bytes.
+    constexpr int kN = 2560;
+    std::mt19937 rng(4321);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    std::vector<float> x(kN);
+    for (float& v : x) v = normal(rng);
+    bbqd::ActBlocks xq;
+    xq.quantize(x.data(), kN);
+
+    bbqd::detail::Gsum16 g16;
+    g16.build(xq);
+    REQUIRE(g16.v.size() == static_cast<std::size_t>(kN / bbqd::GROUP) * 2);
+
+    for (int g = 0; g < kN / bbqd::GROUP; ++g) {
+        std::int32_t lo = 0, hi = 0;
+        for (int l = 0; l < 16; ++l) lo += xq.qs[static_cast<std::size_t>(g) * bbqd::GROUP + static_cast<std::size_t>(l)];
+        for (int l = 0; l < 16; ++l) hi += xq.qs[static_cast<std::size_t>(g) * bbqd::GROUP + 16 + static_cast<std::size_t>(l)];
+        INFO("group " << g);
+        REQUIRE(g16.v[static_cast<std::size_t>(g) * 2 + 0] == lo);
+        REQUIRE(g16.v[static_cast<std::size_t>(g) * 2 + 1] == hi);
     }
 }
 
@@ -314,8 +458,7 @@ TEST_CASE("bbqd: threading by output row is bit-exact across any row split", "[b
         const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
                                                            555u + raw_t);
         std::vector<float> whole(kRows, 0.f);
-        REQUIRE(bbqd::gemv_plane<false>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
-                                        whole.data()));
+        REQUIRE(bbqd::gemv_plane(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, whole.data()));
 
         // Split into three uneven ranges (not a clean divisor of kRows), each written into its own slot
         // of a shared output buffer -- exactly how a real multi-threaded caller would use this.
@@ -324,8 +467,8 @@ TEST_CASE("bbqd: threading by output row is bit-exact across any row split", "[b
         for (int c = 0; c < 3; ++c) {
             const int lo = cuts[c], hi = cuts[c + 1];
             std::vector<float> part(static_cast<std::size_t>(hi - lo), -1.f);
-            REQUIRE(bbqd::gemv_plane<false>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
-                                            part.data(), lo, hi));
+            REQUIRE(bbqd::gemv_plane(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, part.data(),
+                                     lo, hi));
             std::memcpy(split.data() + lo, part.data(), part.size() * sizeof(float));
         }
         for (int r = 0; r < kRows; ++r) {
@@ -344,18 +487,26 @@ TEST_CASE("bbqd: gemv_plane refuses an unfusable format or a too-short span, unt
     float out = 1234.f;
 
     // An expert-only format this path does not (and must not) claim to handle.
-    REQUIRE_FALSE(bbqd::gemv_plane<false>(static_cast<std::uint32_t>(gguf::TensorType::IQ1_S),
-                                          std::span<const std::uint8_t>(q8), 1, 256, xq, &out));
+    REQUIRE_FALSE(bbqd::gemv_plane(static_cast<std::uint32_t>(gguf::TensorType::IQ1_S),
+                                   std::span<const std::uint8_t>(q8), 1, 256, xq, &out));
     REQUIRE(out == 1234.f);   // refused means untouched, not partially written
 
     // Correct format, but the span is shorter than the declared geometry needs.
-    REQUIRE_FALSE(bbqd::gemv_plane<false>(static_cast<std::uint32_t>(gguf::TensorType::Q8_0),
-                                          std::span<const std::uint8_t>(q8).first(10), 1, 256, xq, &out));
+    REQUIRE_FALSE(bbqd::gemv_plane(static_cast<std::uint32_t>(gguf::TensorType::Q8_0),
+                                   std::span<const std::uint8_t>(q8).first(10), 1, 256, xq, &out));
     REQUIRE(out == 1234.f);
 
     // A row range outside [0, n_rows] must also be refused, not clamped.
-    REQUIRE_FALSE(bbqd::gemv_plane<false>(static_cast<std::uint32_t>(gguf::TensorType::Q8_0),
-                                          std::span<const std::uint8_t>(q8), 1, 256, xq, &out, 0, 5));
+    REQUIRE_FALSE(bbqd::gemv_plane(static_cast<std::uint32_t>(gguf::TensorType::Q8_0),
+                                   std::span<const std::uint8_t>(q8), 1, 256, xq, &out, 0, 5));
+    REQUIRE(out == 1234.f);
+
+    // The SAME refusal contract holds through the Threads>1 entry point, checked up front (before any
+    // thread starts) rather than per-thread -- see gemv_plane<Threads>'s own comment on why an earlier
+    // thread's own in-bounds sub-range must not write while a later thread's own sub-range is the one
+    // that is actually invalid.
+    REQUIRE_FALSE(bbqd::gemv_plane<4>(static_cast<std::uint32_t>(gguf::TensorType::Q8_0),
+                                      std::span<const std::uint8_t>(q8), 1, 256, xq, &out, 0, 5));
     REQUIRE(out == 1234.f);
 }
 
@@ -379,8 +530,8 @@ TEST_CASE("bbqd (AGENTS.md S9): validated against REAL bytes from the Qwen3.8-Fl
         bbqd::ActBlocks xq;
         xq.quantize(x.data(), row_elems);
         float fused = 0.f;
-        REQUIRE(bbqd::gemv_plane<false>(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
-                                        row_elems, xq, &fused));
+        REQUIRE(bbqd::detail::gemv_plane_portable(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
+                                                   row_elems, xq, &fused, 0, 1));
         const double ref = reference_dot(static_cast<gguf::TensorType>(pk.info.type_raw), raw, row_elems, x);
         REQUIRE(std::isfinite(fused));
         REQUIRE(std::fabs(ref) > 0.0);
@@ -388,10 +539,11 @@ TEST_CASE("bbqd (AGENTS.md S9): validated against REAL bytes from the Qwen3.8-Fl
         INFO("relative disagreement on real bytes = " << rel);
         REQUIRE(rel < 1e-5);
 
-        // AVX2 agrees exactly on the real bytes too.
+        // AVX2 (the streaming kernel, since every real pick's own row_elems is a multiple of 256 --
+        // docs/BACKBONE_NATIVE_QUANT.md S2a's census) agrees exactly on the real bytes too.
         float fused_avx2 = 0.f;
-        REQUIRE(bbqd::gemv_plane<true>(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
-                                       row_elems, xq, &fused_avx2));
+        REQUIRE(bbqd::detail::gemv_plane_avx2(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
+                                              row_elems, xq, &fused_avx2, 0, 1));
         REQUIRE(fused == fused_avx2);
 
         // (b) the activation-quantization error, measured on the model's OWN real weight statistics
@@ -405,8 +557,8 @@ TEST_CASE("bbqd (AGENTS.md S9): validated against REAL bytes from the Qwen3.8-Fl
         bbqd::ActBlocks xqg;
         xqg.quantize(xg.data(), row_elems);
         float fused_g = 0.f;
-        REQUIRE(bbqd::gemv_plane<false>(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
-                                        row_elems, xqg, &fused_g));
+        REQUIRE(bbqd::detail::gemv_plane_portable(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
+                                                   row_elems, xqg, &fused_g, 0, 1));
         const double ref_g = reference_dot(static_cast<gguf::TensorType>(pk.info.type_raw), raw, row_elems, xg);
         REQUIRE(std::fabs(ref_g) > 0.0);
         const double rel_g = std::fabs(static_cast<double>(fused_g) - ref_g) / std::fabs(ref_g);
