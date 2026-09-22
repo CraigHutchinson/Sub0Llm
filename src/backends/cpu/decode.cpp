@@ -272,18 +272,13 @@ struct ParallelExperts {
             // OpenMP worker has been seen before.
             set_flush_denormals();
             MoeDecodeThread& S = *g_moe_decode[static_cast<std::size_t>(t)];
-            // O4 lever 2: `dynamic`, not `static`. A token's EXPERTS_PER_TOK experts are NOT uniform
-            // work items -- each selected plane is a different sidecar format, and the O1 kernel
-            // microbenchmark measured a real per-format cost spread even after the AVX2 fusion (~97-118
-            // us/plane, docs/optimization/opportunities/O1_iq2xxs_sign_fold.md). `static` gives each
-            // thread a FIXED expert (or, at MOE_DECODE_THREADS < EXPERTS_PER_TOK -- this host's 8
-            // P-cores against a real EXPERTS_PER_TOK of 10 -- a fixed pair for 2 unlucky threads) with no
-            // way to rebalance if that draw happens to be the expensive format. `dynamic` lets any
-            // thread that finishes its current expert immediately claim the next pending one, which is
-            // ordinary OpenMP work-stealing -- it leaves `body`'s per-expert contract untouched and
-            // costs nothing to prove bit-exact: moe_math.hpp's forward_row_via_run_ex already computes
-            // phase 1 order-independently into per-k buffers and sums them in FIXED k order in phase 2,
-            // so which thread computes k, and when, was never part of the answer.
+            // O4 lever 2: `dynamic`, not `static`, because a token's selected experts are not uniform
+            // work -- each plane may be a different sidecar format, with a real per-format cost spread
+            // (O1's kernel bench). Bit-exact either way: forward_row_via_run_ex computes phase 1 into
+            // per-k buffers and sums them in fixed k order, so which thread runs k never entered the
+            // answer. Honest about the evidence: re-verification measured only -2.4% on the
+            // routed-expert phase, inside its own spread -- do not cite this as a win
+            // (docs/optimization/opportunities/O4_gdn_threads_and_moe_schedule.md S5).
             #pragma omp for schedule(dynamic)
             for (int k = 0; k < n; ++k) body(k, S.ffn.data(), S.ffn.data() + D_FF);
         }
