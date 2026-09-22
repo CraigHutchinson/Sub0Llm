@@ -117,6 +117,7 @@
 #include "sub0/transplant.hpp"
 
 #include <array>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -329,9 +330,13 @@ public:
             return false;
         }
 
-        const std::uint64_t table_bytes = h_.n_tensors * sizeof(Desc);
-        if (file_bytes < sizeof(Header) + table_bytes) {
+        if (h_.n_layers <= 0 || h_.n_tensors > (file_bytes - sizeof(Header)) / sizeof(Desc)) {
             err = path + ": truncated descriptor table";
+            return false;
+        }
+        const std::uint64_t table_bytes = h_.n_tensors * sizeof(Desc);
+        if (h_.data_off < sizeof(Header) + table_bytes) {
+            err = path + ": payload overlaps the descriptor table";
             return false;
         }
         descs_.resize(static_cast<std::size_t>(h_.n_tensors));
@@ -355,7 +360,21 @@ public:
                 err = path + ": a descriptor names an unrecognised role";
                 return false;
             }
-            const std::uint64_t key = role_key(static_cast<Role>(d.role), d.layer);
+            const Role role = static_cast<Role>(d.role);
+            if ((role_per_layer(role) && (d.layer < 0 || d.layer >= h_.n_layers)) ||
+                (!role_per_layer(role) && d.layer != -1)) {
+                err = path + ": a descriptor names an invalid layer for its role";
+                return false;
+            }
+            if (d.in_f > static_cast<std::uint32_t>(INT_MAX) ||
+                d.out_f > static_cast<std::uint32_t>(INT_MAX) || d.out_f == 0 ||
+                !bbqd::fusable(d.type_raw, static_cast<int>(d.in_f)) ||
+                bbqd::plane_bytes(d.type_raw, d.in_f) == 0 ||
+                bbqd::plane_bytes(d.type_raw, static_cast<std::uint64_t>(d.in_f) * d.out_f) != d.bytes) {
+                err = path + ": a descriptor has invalid plane geometry";
+                return false;
+            }
+            const std::uint64_t key = role_key(role, d.layer);
             // A duplicate (role, layer) pair would make find() silently prefer one over the other --
             // refused rather than the writer's own bug becoming a loader-side ambiguity.
             if (!index_.emplace(key, i).second) {

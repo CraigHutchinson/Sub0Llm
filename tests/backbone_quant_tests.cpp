@@ -26,6 +26,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -319,4 +320,42 @@ TEST_CASE("bbq: role_key distinguishes model-level (-1) from every real layer", 
     CHECK(k1 != k2);
     CHECK(k1 != k3);
     CHECK(k2 != k3);
+}
+
+TEST_CASE("bbq: Store rejects forged table sizes, overlapping payloads and invalid planes",
+          "[backbonequantsidecar]") {
+    const std::string path = temp_path("sub0_bbq_geometry.bin");
+    bbq::Store store;
+    std::string err;
+    auto patch_header = [&](auto change) {
+        build_sidecar(path, 42);
+        std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+        bbq::Header h;
+        f.read(reinterpret_cast<char*>(&h), sizeof h);
+        change(h);
+        f.seekp(0);
+        f.write(reinterpret_cast<const char*>(&h), sizeof h);
+    };
+    patch_header([](bbq::Header& h) { h.n_tensors = std::numeric_limits<std::uint64_t>::max(); });
+    REQUIRE_FALSE(store.open(path, err));
+    REQUIRE_FALSE(err.empty());
+    patch_header([](bbq::Header& h) { h.data_off = sizeof(bbq::Header); });
+    err.clear();
+    REQUIRE_FALSE(store.open(path, err));
+    REQUIRE_FALSE(err.empty());
+
+    build_sidecar(path, 42);
+    {
+        std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+        bbq::Desc d;
+        f.seekg(sizeof(bbq::Header));
+        f.read(reinterpret_cast<char*>(&d), sizeof d);
+        d.bytes = 1;
+        f.seekp(sizeof(bbq::Header));
+        f.write(reinterpret_cast<const char*>(&d), sizeof d);
+    }
+    err.clear();
+    REQUIRE_FALSE(store.open(path, err));
+    REQUIRE_FALSE(err.empty());
+    REQUIRE(std::filesystem::remove(path));
 }
