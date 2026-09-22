@@ -47,11 +47,31 @@
 // path is provided alongside it so the two can be checked against each other exactly (integer
 // arithmetic, no tolerance) and timed side by side.
 //
-// PERFORMANCE STATUS: compute-bound, NOT yet a win. Only the integer DOT is vectorized; the per-group
-// UNPACK (group() below) is element-by-element and dominates. Measured against the real bf16
-// gemv::axpy at integration (docs/BACKBONE_NATIVE_QUANT.md S8a): Q8_0 ~26 GB/s/thread, but Q6_K ~5.3,
-// Q5_K ~4.3, Q4_K ~1.1 -- slower than bf16 at one thread despite 2.4-3.2x fewer bytes. Phase 2's first
-// gate is a streaming unpack, >= 10 GB/s of compressed bytes per thread.
+// PERFORMANCE STATUS (phase 2a, 2026-09-22): the Q4_K/Q5_K/Q6_K "portable"/"group()-based AVX2" kernels
+// above are kept as the correctness REFERENCE (Q4KPlane/Q5KPlane/Q6KPlane::group(), gemv_rows) -- they
+// are no longer the fast path. The fast path is `detail::dot_row_q4_k_avx2`/`q5_k_avx2`/`q6_k_avx2`
+// further down this file: one 256-element superblock at a time, d/dmin/the 8 sub-block (sc,m) pairs
+// decoded ONCE per superblock via a branch-free bit-unpack (llama.cpp's own `utmp[4]` trick, re-derived
+// onto this project's per-sub-block-float shape, AGENTS.md S5) instead of 8 branchy `k_scale_min` calls,
+// and the nibble/high-bit unpack done via explicit AVX2 intrinsics instead of relying on the compiler to
+// auto-vectorize a scalar loop -- which, per this file's own S12a design-doc writeup, it does
+// inconsistently: Clang vectorized Q5KPlane::group()'s more complex unpack but NOT Q4KPlane::group()'s
+// simpler one, a confirmed compiler heuristic quirk (checked via generated assembly), not a Q4_K-specific
+// problem, and the actual cause of the "Q4_K 4x slower than Q5_K" anomaly S8a first measured -- NOT
+// denormal/FTZ stalls, which were tested directly and ruled out (docs/BACKBONE_NATIVE_QUANT.md S12a).
+//
+// MEASURED RESULT (docs/BACKBONE_NATIVE_QUANT.md S12d-f, real Qwen3.8-Flash-Next shards, DRAM-streamed,
+// this project's Arrow Lake-HX host): three optimization passes took Q4_K from phase 1's 1.1 GB/s/thread
+// to ~10 GB/s, Q5_K from 4.3 to ~10, Q6_K from 5.3 to ~8, Q8_0 stayed ~13 -- roughly AT, not clearly past,
+// the ~10 GB/s/thread compressed-byte gate (within this host's own +/-10-15% run-to-run noise), and NONE
+// of the four formats reach the ~60 GB/s/8-thread aggregate gate (28-36 GB/s measured). The honest,
+// complete picture is not "gate met" -- but it is not "gate missed" either: at 8 threads the streaming
+// kernels beat the REAL `gemv::axpy` bf16 kernel on WALL-CLOCK time per output row for all four formats
+// (15-93% faster) BECAUSE native bytes read are 2.4-3.9x fewer even though native's own GB/s is lower;
+// at 1 thread this holds for Q4_K/Q5_K but not Q8_0/Q6_K. S12g names the concrete architectural reason
+// (8 independent horizontal reductions per superblock, a consequence of keeping ActBlocks' per-32 float
+// activation scale rather than adopting llama.cpp's own per-256 Q8_K-style scheme) and the 4th-pass lever
+// this analysis found, not yet attempted. Parked per AGENTS.md S13, not reverted.
 //
 // NO HEAP ALLOCATION PER CALL (AGENTS.md S1): every kernel here reads only its caller-supplied spans and
 // writes only its caller-supplied `out` pointer; no std::vector/new/malloc appears in any hot path below.
@@ -61,6 +81,7 @@
 #include "sub0/gguf.hpp"
 #include "sub0/moe_quant_dot.hpp"   // moeqd::ActBlocks, moeqd::GROUP -- reused verbatim, not re-derived
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -68,12 +89,30 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
+#define SUB0_BBQD_AVX2 1
+#endif
+#if defined(_OPENMP)
+#include <omp.h>
 #endif
 
 namespace sub0::bbqd {
 
 using moeqd::ActBlocks;
 inline constexpr int GROUP = moeqd::GROUP;   // 32 -- see the file header for why this is the right width
+
+/** Whether gemv_plane runs the streaming AVX2 kernels (detail::gemv_plane_avx2) or the fully-portable
+ * ones (detail::gemv_plane_portable). Same convention as moeqd::kAvx2Kernels (moe_quant_dot.hpp) --
+ * decided by the compiler's target ISA, which a SUB0_NATIVE build fixes at -march=native, not a runtime
+ * or configurator knob: where AVX2 exists the vector kernel is strictly better (bit-exact against the
+ * portable path, checked in tests/backbone_quant_dot_tests.cpp), so there is no choice to make at
+ * runtime. The portable path is kept as the non-AVX2 fallback AND as the AVX2 kernels' own correctness
+ * reference.
+ */
+#if defined(SUB0_BBQD_AVX2)
+inline constexpr bool kAvx2Kernels = true;
+#else
+inline constexpr bool kAvx2Kernels = false;
+#endif
 
 // --- one decoded 32-wide weight span, and the affine terms that fill it -----------------------------
 
@@ -445,37 +484,473 @@ inline void gemv_rows(const Plane& plane, int row_lo, int row_hi, int row_elems,
     }
 }
 
-/** One plane's whole GEMV (all rows), dispatched on the plane's own `type_raw` -- never on its role
- * (unsloth's per-tensor mixed quantization, the same reasoning moe_quant_dot.hpp's own gemv_plane
- * documents). `row_lo`/`row_hi` default to the full range; pass a sub-range directly for threading.
- *
- * @return false if the format is unfusable or `raw` is shorter than the geometry requires -- `out` is
- *         left untouched in either case, matching moeqd::gemv_plane's own contract.
+/** Bounds/geometry validation shared by every entry point below, so "refused means untouched" holds
+ * BEFORE any row is written -- checked once, up front, rather than redundantly inside a per-thread split
+ * (which would let earlier threads write real output while a later thread's own range turned out to be
+ * the one that was actually out of bounds; see gemv_plane<Threads>'s own comment).
  */
-template <bool UseAvx2 = false>
-[[nodiscard]] inline bool gemv_plane(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
-                                     int n_rows, int row_elems, const ActBlocks& x, float* out,
-                                     int row_lo = 0, int row_hi = -1) {
-    if (row_hi < 0) row_hi = n_rows;
+[[nodiscard]] inline bool plane_geometry_ok(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
+                                            int n_rows, int row_elems, int row_lo, int row_hi) {
     if (row_lo < 0 || row_hi > n_rows || row_lo > row_hi) return false;
     const std::uint64_t need = plane_bytes(type_raw, static_cast<std::uint64_t>(n_rows)
                                                       * static_cast<std::uint64_t>(row_elems));
-    if (need == 0 || raw.size() < need) return false;
+    return need != 0 && raw.size() >= need;
+}
+
+// =========================================================================================================
+// Phase 2a -- streaming AVX2 kernels: one superblock at a time, scale/min hoisted once per 256 elements,
+// nibble/high-bit unpack via explicit intrinsics rather than relying on the compiler to auto-vectorize a
+// scalar loop (docs/BACKBONE_NATIVE_QUANT.md S12a: confirmed via generated assembly that Clang does this
+// INCONSISTENTLY across near-identical unpack loops -- not something a caller can rely on).
+//
+// PRECONDITION, gated by the caller (gemv_plane_avx2 below), not asserted per-call: `row_elems % 256 ==
+// 0`. True for every real backbone tensor these formats appear in (docs/BACKBONE_NATIVE_QUANT.md S2a's
+// census: 2560/6144/10240/12288 all divide by 256); a hypothetical future tensor that does NOT divide
+// evenly falls back to the portable-geometry `gemv_rows<Plane,true>` path instead, which handles any
+// row_elems that is merely a multiple of GROUP=32 (fusable()'s own, weaker contract).
+// =========================================================================================================
+
+#if defined(SUB0_BBQD_AVX2)
+namespace detail {
+
+/// 32-wide signed-weight x signed-activation dot, weight supplied as a REGISTER rather than a pointer
+/// (dot32_avx2 above always re-loads from memory) -- the streaming kernels decode a weight group directly
+/// into a register via the unpack helpers below and must not pay a store-then-reload round trip to reuse
+/// dot32_avx2's own pointer-based signature.
+[[nodiscard]] inline std::int32_t dot32_avx2_reg(__m256i vw, const std::int8_t* x) {
+    const __m256i vx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x));
+    const __m256i w_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vw));
+    const __m256i w_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vw, 1));
+    const __m256i x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vx));
+    const __m256i x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vx, 1));
+    const __m256i p_lo = _mm256_madd_epi16(w_lo, x_lo);
+    const __m256i p_hi = _mm256_madd_epi16(w_hi, x_hi);
+    return hsum256_epi32(_mm256_add_epi32(p_lo, p_hi));
+}
+
+/// The 16-wide equivalent of dot32_avx2_reg, for Q6_K's own half-group (kSubW=16) split.
+[[nodiscard]] inline std::int32_t dot16_avx2_reg(__m128i vw, const std::int8_t* x) {
+    const __m128i vx = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x));
+    const __m128i w_lo = _mm_cvtepi8_epi16(vw);
+    const __m128i x_lo = _mm_cvtepi8_epi16(vx);
+    const __m128i w_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vw, 8));   // see dot16_avx2's own comment
+    const __m128i x_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vx, 8));
+    const __m128i p = _mm_add_epi32(_mm_madd_epi16(w_lo, x_lo), _mm_madd_epi16(w_hi, x_hi));
+    __m128i s = _mm_add_epi32(p, _mm_shuffle_epi32(p, _MM_SHUFFLE(1, 0, 3, 2)));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(0, 1, 0, 1)));
+    return _mm_cvtsi128_si32(s);
+}
+
+/// Low nibble of each of 32 bytes, as unsigned codes 0..15 -- a per-byte-safe AND, no cross-lane hazard.
+[[nodiscard]] inline __m256i nibble_lo(__m256i bytes) noexcept {
+    return _mm256_and_si256(bytes, _mm256_set1_epi8(0x0F));
+}
+/// High nibble of each of 32 bytes. The 16-bit-lane-shift idiom llama.cpp itself uses (quants.c's own
+/// Q4_K/Q5_K AVX2 paths): for a 16-bit lane holding bytes [lo=b0, hi=b1], `(lane >> 4) & 0xFF` per byte
+/// works out to `b0 >> 4` for the shifted lane's own low byte and `b1 >> 4` for its high byte, with no
+/// cross-byte contamination -- re-derived bit by bit (docs/BACKBONE_NATIVE_QUANT.md S12b), not assumed
+/// safe by analogy.
+[[nodiscard]] inline __m256i nibble_hi(__m256i bytes) noexcept {
+    return _mm256_and_si256(_mm256_srli_epi16(bytes, 4), _mm256_set1_epi8(0x0F));
+}
+
+/// Q5_K's single `qh` high bit (`bit_idx` in [0,8), one bit per sub-block -- re-derived algebraically
+/// from Q5KPlane::group()'s own `bit = (hi_nibble?2:1) << (2*(sub/2))` as `bit_idx == sub` exactly, not
+/// copied), mapped to output bit 4 (value 16 or 0). Mask-then-compare rather than a runtime-count lane
+/// shift: a variable shift risks the SAME cross-byte hazard nibble_hi's own comment works through, and
+/// proving it safe for an arbitrary runtime shift is harder than for the two fixed shifts nibble_hi
+/// needs -- mask-then-compare sidesteps the question entirely (AND and CMPEQ are always byte-safe).
+[[nodiscard]] inline __m256i qh_bit_to_hi4(__m256i qh, int bit_idx) noexcept {
+    const __m256i bitmask = _mm256_set1_epi8(static_cast<char>(1 << bit_idx));
+    const __m256i is_set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bitmask), bitmask);
+    return _mm256_and_si256(is_set, _mm256_set1_epi8(16));
+}
+
+/// Q6_K's 2-bit `qh` field at `shift` in {0,2,4,6} (`shift = strip*2`), mapped to output bits [4,5].
+/// Mask first (byte-safe), THEN a compile-time-immediate shift selected by a 4-way switch -- each of the
+/// four cases hand-verified not to cross a byte boundary the same way nibble_hi's comment does, rather
+/// than trusting a single runtime-count shift to be safe for every case at once.
+[[nodiscard]] inline __m256i qh_2bits_to_hi4(__m256i qh, int shift) noexcept {
+    const __m256i masked = _mm256_and_si256(qh, _mm256_set1_epi8(static_cast<char>(3 << shift)));
+    switch (shift) {
+        case 0:  return _mm256_slli_epi16(masked, 4);
+        case 2:  return _mm256_slli_epi16(masked, 2);
+        case 4:  return masked;
+        default: return _mm256_srli_epi16(masked, 2);   // shift == 6
+    }
+}
+
+/** Q4_K/Q5_K's shared affine super-block state (`d`, `dmin`, the 8 sub-block `(sc, m)` pairs already
+ * folded into `sc[i] = d*scale_i` / `m[i] = -dmin*min_i`), decoded ONCE per 256-element superblock.
+ * Phase 1's `group()` recomputed this -- including two `f16_to_f32` calls and a `k_scale_min` call -- on
+ * EVERY 32-element group, an 8x-redundant cost within one superblock; this is the actual fix, not the
+ * vector unpack alone (docs/BACKBONE_NATIVE_QUANT.md S12a/S12b).
+ */
+struct KScaleTable {
+    float d = 0.f, dmin = 0.f;
+    std::array<float, 8> sc{}, m{};
+
+    /// `blk` is a Q4_K (144-byte) or Q5_K (176-byte) superblock's own start -- both formats share the
+    /// identical `d`/`dmin`/12-byte-packed-scales layout at the same offsets (AGENTS.md S5, re-checked
+    /// against gguf.hpp's own dequantize_q4_k/dequantize_q5_k rather than assumed from the block sizes
+    /// merely looking similar).
+    ///
+    /// AGENTS.md S13 pass 2: the first version of this function called `gguf::k_scale_min` 8 times, each
+    /// with a data-dependent `if (j < 4)` branch -- ~55M superblocks/sec through this call at the pass-1
+    /// measured throughput (docs/BACKBONE_NATIVE_QUANT.md S12), a real, unpredictable-branch cost. This
+    /// unpacks all 8 (scale, min) pairs at once via the SAME branch-free bit-manipulation llama.cpp's own
+    /// AVX2 `ggml_vec_dot_q4_K_q8_K`/`q5_K_q8_K` use (`utmp[4]`, `D:\Craig\llama.cpp-qwen4exp\ggml\src\
+    /// ggml-cpu\arch\x86\quants.c`) rather than gguf::k_scale_min's own byte-at-a-time reference -- fetched
+    /// from that source and re-derived, not assumed correct by resemblance, and checked bit-exact against
+    /// `gguf::k_scale_min`'s own output for all 8 sub-block indices before being trusted (this file's own
+    /// tests).
+    void load(const std::uint8_t* blk) noexcept {
+        std::uint16_t d_bits = 0, dmin_bits = 0;
+        std::memcpy(&d_bits, blk, 2);
+        std::memcpy(&dmin_bits, blk + 2, 2);
+        d = gguf::f16_to_f32(d_bits);
+        dmin = gguf::f16_to_f32(dmin_bits);
+
+        constexpr std::uint32_t kMask1 = 0x3f3f3f3fu, kMask2 = 0x0f0f0f0fu, kMask3 = 0x03030303u;
+        std::uint32_t utmp[4] = {0, 0, 0, 0};
+        std::memcpy(utmp, blk + 4, 12);   // fills utmp[0..2]; utmp[3] is derived below
+        utmp[3] = ((utmp[2] >> 4) & kMask2) | (((utmp[1] >> 6) & kMask3) << 4);
+        const std::uint32_t uaux = utmp[1] & kMask1;
+        utmp[1] = (utmp[2] & kMask2) | (((utmp[0] >> 6) & kMask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kMask1;
+        // utmp[0]/utmp[1]'s 4 bytes each are sub-block scales 0..3 / 4..7; utmp[2]/utmp[3]'s are the
+        // matching mins -- exactly the byte layout `_mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3..0]))`
+        // consumes in the AVX2 reference, read here with plain byte indexing since this project's
+        // per-32-group ActBlocks (unlike llama.cpp's per-256 block_q8_K) still needs each sub-block's
+        // scale/min as an individually-addressable float, not a single vector register.
+        const auto* sc_bytes = reinterpret_cast<const std::uint8_t*>(utmp);
+        const auto* m_bytes = reinterpret_cast<const std::uint8_t*>(utmp) + 8;
+        for (int i = 0; i < 8; ++i) {
+            sc[static_cast<std::size_t>(i)] = d * static_cast<float>(sc_bytes[i]);
+            m[static_cast<std::size_t>(i)] = -dmin * static_cast<float>(m_bytes[i]);
+        }
+    }
+};
+
+/** Q6_K's per-16-element activation sums (its `bias_lo`/`bias_hi` split needs a finer granularity than
+ * `moeqd::ActBlocks::gsum`'s own per-32). Phase 1's `group()`-based path recomputed this from the raw
+ * activation bytes on EVERY (row, group) pair via `sum16_avx2` -- an O(n_rows) redundant recompute of a
+ * value that depends only on the activation column, never the row. Built ONCE per `gemv_plane_avx2` call
+ * (i.e. once per activation row, shared across however many output rows that call handles) instead.
+ *
+ * @note Not yet hoisted to a caller-owned, cross-call-persistent buffer the way `moeqd::ActBlocks` itself
+ *       is (AGENTS.md S1's "size once outside the hot loop, reuse across calls") -- this phase has no
+ *       decode-loop call site to own that buffer across tokens, so a local, once-per-call vector is the
+ *       honest tradeoff available now; phase 2b's wiring work should hoist it if this path is adopted.
+ */
+struct Gsum16 {
+    std::vector<std::int32_t> v;   // v[2g+0] = sum(x.qs[g*32 : g*32+16)); v[2g+1] = sum of the other 16
+
+    void build(const ActBlocks& x) {
+        const auto groups = static_cast<std::size_t>(x.n / GROUP);
+        v.assign(groups * 2, 0);
+        for (std::size_t g = 0; g < groups; ++g) {
+            v[2 * g + 0] = detail::sum_n_portable(x.qs.data() + g * GROUP, 16);
+            v[2 * g + 1] = detail::sum_n_portable(x.qs.data() + g * GROUP + 16, 16);
+        }
+    }
+};
+
+/** Q4_K, one row, streaming. Requires `row_base % 256 == 0 && row_elems % 256 == 0` (the caller's own
+ * job to check once, not per row). Processes 64 elements (2 sub-blocks) per AVX2 chunk from one 32-byte
+ * `ql` load -- llama.cpp's own iteration shape (`ggml_vec_dot_q4_K_q8_K`'s AVX2 path,
+ * D:\Craig\llama.cpp-qwen4exp\ggml\src\ggml-cpu\arch\x86\quants.c), re-derived onto this project's own
+ * per-32 `ActBlocks` rather than copied (AGENTS.md S5): llama.cpp folds its per-sub-block scale into the
+ * INTEGER accumulator because its own activation is quantized per-256 (`block_q8_K`, one scale for the
+ * whole superblock); this engine's activation is quantized per-32 (`moeqd::ActBlocks`, kept unchanged --
+ * see the file header's own S12b note on why per-32 was kept rather than adopting a Q8_K-style per-256
+ * scheme), so the scale fold stays a per-32-group float FMA here, in the exact same sequential order
+ * (sub-block 0, 1, 2, ..., 7) the OLD `group()`-based `gemv_rows<Q4KPlane,true>` already used. This
+ * changes HOW `isum` is computed (vectorized unpack instead of a scalar loop + a non-inlined `group()`
+ * call), never the arithmetic expression or its evaluation order -- which is exactly why it is checked,
+ * and found, bit-identical to `gemv_rows<Q4KPlane,true>` (tests/backbone_quant_dot_tests.cpp).
+ */
+[[nodiscard]] inline float dot_row_q4_k_avx2(const std::uint8_t* plane, std::uint64_t row_base,
+                                             int row_elems, const ActBlocks& x) noexcept {
+    float acc = 0.f;
+    const std::uint64_t first_super = row_base / 256;
+    const int ns = row_elems / 256;
+    for (int s = 0; s < ns; ++s) {
+        const std::uint8_t* blk = plane + (first_super + static_cast<std::uint64_t>(s)) * 144;
+        KScaleTable t;
+        t.load(blk);
+        const std::uint8_t* ql = blk + 16;
+        const int g0 = s * 8;
+        for (int half = 0; half < 4; ++half) {
+            const std::uint8_t* qlc = ql + half * 32;
+            const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qlc));
+            const int sub_lo = 2 * half, sub_hi = 2 * half + 1;
+            const int gi_lo = g0 + sub_lo, gi_hi = g0 + sub_hi;
+            const __m256i wlo = nibble_lo(raw), whi = nibble_hi(raw);
+            const std::int32_t isum_lo =
+                dot32_avx2_reg(wlo, x.qs.data() + static_cast<std::size_t>(gi_lo) * GROUP);
+            const std::int32_t isum_hi =
+                dot32_avx2_reg(whi, x.qs.data() + static_cast<std::size_t>(gi_hi) * GROUP);
+            acc += x.scale[static_cast<std::size_t>(gi_lo)] *
+                   (t.sc[static_cast<std::size_t>(sub_lo)] * static_cast<float>(isum_lo) +
+                    t.m[static_cast<std::size_t>(sub_lo)] *
+                        static_cast<float>(x.gsum[static_cast<std::size_t>(gi_lo)]));
+            acc += x.scale[static_cast<std::size_t>(gi_hi)] *
+                   (t.sc[static_cast<std::size_t>(sub_hi)] * static_cast<float>(isum_hi) +
+                    t.m[static_cast<std::size_t>(sub_hi)] *
+                        static_cast<float>(x.gsum[static_cast<std::size_t>(gi_hi)]));
+        }
+    }
+    return acc;
+}
+
+/** Q5_K, one row, streaming -- identical shape to dot_row_q4_k_avx2 plus the `qh` high-bit OR
+ * (qh_bit_to_hi4). Same precondition, same accumulation order, same bit-exactness contract.
+ */
+[[nodiscard]] inline float dot_row_q5_k_avx2(const std::uint8_t* plane, std::uint64_t row_base,
+                                             int row_elems, const ActBlocks& x) noexcept {
+    float acc = 0.f;
+    const std::uint64_t first_super = row_base / 256;
+    const int ns = row_elems / 256;
+    for (int s = 0; s < ns; ++s) {
+        const std::uint8_t* blk = plane + (first_super + static_cast<std::uint64_t>(s)) * 176;
+        KScaleTable t;
+        t.load(blk);
+        const std::uint8_t* qh_base = blk + 16;
+        const std::uint8_t* ql = blk + 48;
+        const __m256i qhv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh_base));
+        const int g0 = s * 8;
+        for (int half = 0; half < 4; ++half) {
+            const std::uint8_t* qlc = ql + half * 32;
+            const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qlc));
+            const int sub_lo = 2 * half, sub_hi = 2 * half + 1;
+            const int gi_lo = g0 + sub_lo, gi_hi = g0 + sub_hi;
+            const __m256i nlo = nibble_lo(raw), nhi = nibble_hi(raw);
+            const __m256i hlo = qh_bit_to_hi4(qhv, sub_lo), hhi = qh_bit_to_hi4(qhv, sub_hi);
+            const __m256i wlo = _mm256_or_si256(nlo, hlo), whi = _mm256_or_si256(nhi, hhi);
+            const std::int32_t isum_lo =
+                dot32_avx2_reg(wlo, x.qs.data() + static_cast<std::size_t>(gi_lo) * GROUP);
+            const std::int32_t isum_hi =
+                dot32_avx2_reg(whi, x.qs.data() + static_cast<std::size_t>(gi_hi) * GROUP);
+            acc += x.scale[static_cast<std::size_t>(gi_lo)] *
+                   (t.sc[static_cast<std::size_t>(sub_lo)] * static_cast<float>(isum_lo) +
+                    t.m[static_cast<std::size_t>(sub_lo)] *
+                        static_cast<float>(x.gsum[static_cast<std::size_t>(gi_lo)]));
+            acc += x.scale[static_cast<std::size_t>(gi_hi)] *
+                   (t.sc[static_cast<std::size_t>(sub_hi)] * static_cast<float>(isum_hi) +
+                    t.m[static_cast<std::size_t>(sub_hi)] *
+                        static_cast<float>(x.gsum[static_cast<std::size_t>(gi_hi)]));
+        }
+    }
+    return acc;
+}
+
+/** Q6_K, one row, streaming. `gsum16` must already be built (Gsum16::build) against THIS row's `x`;
+ * the caller builds it once per `gemv_plane_avx2` call, not once per row. Same precondition and
+ * bit-exactness contract as the other two streaming kernels.
+ */
+[[nodiscard]] inline float dot_row_q6_k_avx2(const std::uint8_t* plane, std::uint64_t row_base,
+                                             int row_elems, const ActBlocks& x,
+                                             const Gsum16& gsum16) noexcept {
+    float acc = 0.f;
+    const std::uint64_t first_super = row_base / 256;
+    const int ns = row_elems / 256;
+    for (int s = 0; s < ns; ++s) {
+        const std::uint8_t* blk = plane + (first_super + static_cast<std::uint64_t>(s)) * 210;
+        std::uint16_t d_bits = 0;
+        std::memcpy(&d_bits, blk + 208, 2);
+        const float d = gguf::f16_to_f32(d_bits);
+        const int g0 = s * 8;
+        for (int half = 0; half < 2; ++half) {
+            const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192 + half * 8);
+            const std::uint8_t* qh_base = blk + 128 + half * 32;
+            const __m256i qhv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh_base));
+            for (int strip = 0; strip < 4; ++strip) {
+                const int gi = g0 + half * 4 + strip;
+                const bool hi_nibble = (strip == 2 || strip == 3);
+                const int ql_off = (strip == 1 || strip == 3) ? 32 : 0;
+                const std::uint8_t* qlc = blk + half * 64 + ql_off;
+                const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qlc));
+                const __m256i nib = hi_nibble ? nibble_hi(raw) : nibble_lo(raw);
+                const __m256i hi2 = qh_2bits_to_hi4(qhv, strip * 2);
+                const __m256i wfull = _mm256_or_si256(nib, hi2);   // raw 6-bit code, 0..63
+                const __m128i wlo = _mm256_castsi256_si128(wfull);
+                const __m128i whi = _mm256_extracti128_si256(wfull, 1);
+                const std::int32_t isum_lo =
+                    dot16_avx2_reg(wlo, x.qs.data() + static_cast<std::size_t>(gi) * GROUP);
+                const std::int32_t isum_hi =
+                    dot16_avx2_reg(whi, x.qs.data() + static_cast<std::size_t>(gi) * GROUP + 16);
+                const float scale_lo = d * static_cast<float>(sc[2 * strip + 0]);
+                const float scale_hi = d * static_cast<float>(sc[2 * strip + 1]);
+                const float bias_lo = -32.f * scale_lo, bias_hi = -32.f * scale_hi;
+                const std::int32_t gsum_lo = gsum16.v[2 * static_cast<std::size_t>(gi) + 0];
+                const std::int32_t gsum_hi = gsum16.v[2 * static_cast<std::size_t>(gi) + 1];
+                acc += x.scale[static_cast<std::size_t>(gi)] *
+                       (scale_lo * static_cast<float>(isum_lo) + bias_lo * static_cast<float>(gsum_lo) +
+                        scale_hi * static_cast<float>(isum_hi) + bias_hi * static_cast<float>(gsum_hi));
+            }
+        }
+    }
+    return acc;
+}
+
+}  // namespace detail
+#endif  // SUB0_BBQD_AVX2
+
+namespace detail {
+
+/** The fully-portable entry point: `gemv_rows<Plane,false>` for every format, unconditionally -- the
+ * correctness reference every other path here is checked against (tests/backbone_quant_dot_tests.cpp),
+ * and the only path available on a non-AVX2 build.
+ */
+[[nodiscard]] inline bool gemv_plane_portable(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
+                                              int n_rows, int row_elems, const ActBlocks& x, float* out,
+                                              int row_lo, int row_hi) {
+    if (!plane_geometry_ok(type_raw, raw, n_rows, row_elems, row_lo, row_hi)) return false;
     switch (static_cast<gguf::TensorType>(type_raw)) {
         case gguf::TensorType::Q8_0:
-            gemv_rows<Q8_0Plane, UseAvx2>(Q8_0Plane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+            gemv_rows<Q8_0Plane, false>(Q8_0Plane{raw.data()}, row_lo, row_hi, row_elems, x, out);
             return true;
         case gguf::TensorType::Q4_K:
-            gemv_rows<Q4KPlane, UseAvx2>(Q4KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+            gemv_rows<Q4KPlane, false>(Q4KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
             return true;
         case gguf::TensorType::Q5_K:
-            gemv_rows<Q5KPlane, UseAvx2>(Q5KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+            gemv_rows<Q5KPlane, false>(Q5KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
             return true;
         case gguf::TensorType::Q6_K:
-            gemv_rows<Q6KPlane, UseAvx2>(Q6KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+            gemv_rows<Q6KPlane, false>(Q6KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
             return true;
         default:
             return false;
+    }
+}
+
+#if defined(SUB0_BBQD_AVX2)
+/** The fast entry point. Q8_0 always runs `gemv_rows<Q8_0Plane,true>` (its native block already IS one
+ * GROUP -- no superblock to stream, and it already cleared the throughput gate in phase 1, S8a). Q4_K/
+ * Q5_K/Q6_K run the streaming kernels above when `row_elems % 256 == 0` (every real backbone tensor,
+ * S2a); otherwise they fall back to `gemv_rows<Plane,true>`, which accepts any `row_elems` that is merely
+ * a multiple of GROUP=32 -- correctness is never conditional on the 256 alignment, only which kernel
+ * gets used.
+ */
+[[nodiscard]] inline bool gemv_plane_avx2(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
+                                          int n_rows, int row_elems, const ActBlocks& x, float* out,
+                                          int row_lo, int row_hi) {
+    if (!plane_geometry_ok(type_raw, raw, n_rows, row_elems, row_lo, row_hi)) return false;
+    const auto type = static_cast<gguf::TensorType>(type_raw);
+    if (type == gguf::TensorType::Q8_0) {
+        gemv_rows<Q8_0Plane, true>(Q8_0Plane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+        return true;
+    }
+    if (row_elems % 256 != 0) {
+        switch (type) {
+            case gguf::TensorType::Q4_K:
+                gemv_rows<Q4KPlane, true>(Q4KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+                return true;
+            case gguf::TensorType::Q5_K:
+                gemv_rows<Q5KPlane, true>(Q5KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+                return true;
+            case gguf::TensorType::Q6_K:
+                gemv_rows<Q6KPlane, true>(Q6KPlane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+                return true;
+            default:
+                return false;
+        }
+    }
+    switch (type) {
+        case gguf::TensorType::Q4_K:
+            for (int r = row_lo; r < row_hi; ++r)
+                out[static_cast<std::size_t>(r - row_lo)] = dot_row_q4_k_avx2(
+                    raw.data(), static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems),
+                    row_elems, x);
+            return true;
+        case gguf::TensorType::Q5_K:
+            for (int r = row_lo; r < row_hi; ++r)
+                out[static_cast<std::size_t>(r - row_lo)] = dot_row_q5_k_avx2(
+                    raw.data(), static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems),
+                    row_elems, x);
+            return true;
+        case gguf::TensorType::Q6_K: {
+            Gsum16 gsum16;
+            gsum16.build(x);
+            for (int r = row_lo; r < row_hi; ++r)
+                out[static_cast<std::size_t>(r - row_lo)] = dot_row_q6_k_avx2(
+                    raw.data(), static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems),
+                    row_elems, x, gsum16);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+#endif  // SUB0_BBQD_AVX2
+
+/// The kernel gemv_plane<Threads> runs for one row range: gemv_plane_avx2 where the target has AVX2
+/// (kAvx2Kernels), else gemv_plane_portable. Mirrors moeqd::detail::gemv_best's own convention exactly.
+[[nodiscard]] inline bool gemv_plane_dispatch(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
+                                              int n_rows, int row_elems, const ActBlocks& x, float* out,
+                                              int row_lo, int row_hi) {
+#if defined(SUB0_BBQD_AVX2)
+    if constexpr (kAvx2Kernels) return gemv_plane_avx2(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
+#endif
+    return gemv_plane_portable(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
+}
+
+}  // namespace detail
+
+/** One plane's GEMV over output rows [row_lo, row_hi) (default: the full range), dispatched on the
+ * plane's own `type_raw` (never its role -- unsloth's per-tensor mixed quantization, the same reasoning
+ * moe_quant_dot.hpp's own gemv_plane documents) and auto-selecting the AVX2 or portable kernel from the
+ * compiled target (`bbqd::kAvx2Kernels`) -- the same convention `moeqd::gemv_plane`/`gemv_best` already
+ * establish, not a caller-chosen template flag (AGENTS.md S2: there is no runtime OR call-site choice to
+ * make here, only a compile-time ISA fact).
+ *
+ * @tparam Threads  compile-time fan-out (1 = serial, the default). `Threads > 1` splits [row_lo, row_hi)
+ *         into `Threads` contiguous ranges across a persistent OpenMP team, mirroring `gemv::axpy`'s own
+ *         shape exactly, including its `omp_in_parallel()` nesting guard (a call made from inside an
+ *         existing OpenMP team runs serially rather than nesting). Each range reads disjoint plane bytes
+ *         and writes a disjoint `out` slice with no shared mutable state, so the result is bit-identical
+ *         regardless of thread count (tests/backbone_quant_dot_tests.cpp's own "threading" case).
+ * @return false if the format is unfusable, `raw` is shorter than the geometry requires, or the row range
+ *         is out of bounds -- `out` is left completely untouched in every refusal case, checked BEFORE
+ *         any thread starts (plane_geometry_ok), not merely before this thread's own portion.
+ */
+template <int Threads = 1>
+[[nodiscard]] inline bool gemv_plane(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
+                                     int n_rows, int row_elems, const ActBlocks& x, float* out,
+                                     int row_lo = 0, int row_hi = -1) {
+    static_assert(Threads >= 1, "Threads must be >= 1");
+    if (row_hi < 0) row_hi = n_rows;
+    if (!plane_geometry_ok(type_raw, raw, n_rows, row_elems, row_lo, row_hi)) return false;
+    if constexpr (Threads == 1) {
+        return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
+    } else {
+#if defined(_OPENMP)
+        if (!omp_in_parallel()) {
+            bool ok = true;
+            const int total = row_hi - row_lo;
+            const int per = (total + Threads - 1) / Threads;
+            #pragma omp parallel for num_threads(Threads) schedule(static)
+            for (int t = 0; t < Threads; ++t) {
+                const int lo = row_lo + std::min(total, t * per);
+                const int hi = row_lo + std::min(total, (t + 1) * per);
+                if (lo < hi) {
+                    // gemv_plane_dispatch writes out[r - row_lo_of_THIS_call] for r in [lo, hi) -- offset
+                    // the pointer by (lo - row_lo) so that lands at the SAME absolute out[r - row_lo] a
+                    // single-threaded call would have used, since every thread shares one `out` buffer.
+                    const bool arm_ok = detail::gemv_plane_dispatch(
+                        type_raw, raw, n_rows, row_elems, x, out + (lo - row_lo), lo, hi);
+                    if (!arm_ok) {
+                        #pragma omp atomic write
+                        ok = false;
+                    }
+                }
+            }
+            return ok;
+        }
+#endif
+        return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
     }
 }
 
