@@ -105,5 +105,10 @@ question, defaults that are right, no ritual):
 - **A quick tier for everyday work.** A `--quick` preset (build + suites + G-HASH + one warm decode, no
   sandbox wait) that is cheap enough to run on every engine change, so perf regressions are caught in
   normal development rather than by a dedicated optimization session.
+- **Control thermal noise, or measure around it.** By O3 iteration 2 (decode ~0.21-0.25 s/token), back-to-
+  back real-artifact runs on this laptop-class Arrow Lake-HX part spread 16-30% even at <5% background
+  load, which swamps changes of a few percent. Options: longer interleaved series with outlier-robust
+  statistics, a cool-down between runs, fixed clocks (power-plan max-processor-state < 100% disables
+  turbo), and making the kernel microbenchmarks, not the 37 GiB decode, the evidence for small changes.
 - **Trim the docs to match.** OPTIMIZATION_PROCESS.md has grown by accretion; once the tooling carries
   the rules, the doc should shrink to the WHY and point at the commands.
