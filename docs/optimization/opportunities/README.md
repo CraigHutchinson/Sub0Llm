@@ -54,7 +54,7 @@ re-run it, rather than something noticed months later.
 | B35 | Fused quantized MoE dot products (`--moe-quant-dot`) | implemented (default-off by quality, not perf) | **+2.4x** (3.63 → 1.51 s/token) | 1 |
 | B39 | Compile-time kernel shape | parked-branch | −3.3% after 1 fix (was −8.3%) | 1 of 3 |
 
-**Current profile: [`../profile_post_b35.md`](../profile_post_b35.md)** (measured 2026-09-21 at the fused
+**Current profile: [`../profile_post_o1.md`](../profile_post_o1.md)** (supersedes post-B35; also corrects the DRAM ceiling to ~79 GB/s P-cores / ~91 GB/s all-core).** Previous:  [`../profile_post_b35.md`](../profile_post_b35.md) (measured 2026-09-21 at the fused
 operating point). MoE **68.7%**, mixer GDN/QSA **21.2%**, lm_head 5.4%, gated-residual 4.6%. Lever
 selection must cite this, not the pre-B35 numbers.
 

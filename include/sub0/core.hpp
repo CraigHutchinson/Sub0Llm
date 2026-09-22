@@ -201,6 +201,11 @@ SUB0_API const float* forward_one(int id, int pos);             // logits [VOCAB
 // Training" discussion on why raw-embedding-level fidelity (hrr_unbind) isn't the same question.
 SUB0_API const float* last_hidden_ptr();                        // D_MODEL floats, valid until the next forward_one()/kv_reset()
 
+namespace prof { struct Accumulator; }
+/// The one exclusive-time phase accumulator decode charges under PROFILE_PHASES
+/// (include/sub0/phase_profile.hpp). Exported, not header-static: see that file's header for why.
+[[nodiscard]] SUB0_API prof::Accumulator& phase_accumulator() noexcept;
+
 // --- KV-trace memoization primitives (spike, 2026-07-21) --------------------------------------------
 // See docs/SCRATCH_TOKEN_FRAMING.md's "candidate 1: post-hoc per-layer KV pooling" -- these three
 // functions are the minimal engine surface a caller needs to CAPTURE a word's real per-layer (K,V)

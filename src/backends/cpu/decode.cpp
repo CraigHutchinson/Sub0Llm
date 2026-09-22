@@ -13,6 +13,7 @@
 // so there is exactly one copy of each.
 #include "internal.hpp"
 
+#include "sub0/phase_profile.hpp"      // PROFILE_PHASES: exclusive-time decode phase scopes
 #include "sub0/gated_residual_math.hpp"  // Gated Residual row math (gr::hc_norm/mix/gate/combine/tile)
 
 #include <algorithm>
@@ -249,6 +250,9 @@ struct ParallelExperts {
 
     template <class Body>
     void operator()(int n, float* /*ffn*/, float* /*g*/, Body&& body) const {
+        // PROFILE_PHASES: opened HERE, on the calling thread around the whole team, never inside `body` --
+        // the accumulator is single-threaded, and at MOE_DECODE_THREADS > 1 `body` runs on workers.
+        [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> routed(prof::Phase::MoeRouted);
         #pragma omp parallel num_threads(MOE_DECODE_THREADS)
         {
             const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
@@ -445,6 +449,7 @@ const float* Model::forward_one(int id, int pos) {
     // other index, so there is no read-after-write hazard.
     auto gr_read_row = [&](const float* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w,
                             Node* ln, float* out_a) {
+        [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> phase(prof::Phase::GatedResidual);
         if constexpr (USE_GATED_RESIDUAL) {
             gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, wide, norm_w->pdata, gr_normed);
             gr::mix(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed, gr_mixscr);
@@ -460,6 +465,7 @@ const float* Model::forward_one(int id, int pos) {
         }
     };
     auto gr_write_row = [&](float* wide, const float* mixer_out) {
+        [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> phase(prof::Phase::GatedResidual);
         if constexpr (USE_GATED_RESIDUAL) gr::combine(GR_DIMS, 1, wide, mixer_out, gr_inj, wide);
         else                              for (int j = 0; j < C; ++j) wide[j] += mixer_out[j];
     };
@@ -644,6 +650,8 @@ const float* Model::forward_one(int id, int pos) {
         // GDN_SCHEDULE.full_attn[l] mirrors Model::forward()'s own dispatch exactly (per-LAYER, not
         // per-execution) -- see that function's comment. `if constexpr` keeps a GDN-off build
         // exactly the original single call, no branch at all.
+        {   // PROFILE_PHASES: the mixer sublayer (its gr_write_row nests, charged to GatedResidual)
+        [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> mixer_phase(prof::Phase::Mixer);
         if constexpr (USE_GATED_DELTANET) {
             if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
                 do_full_attn_mixer();
@@ -669,7 +677,10 @@ const float* Model::forward_one(int id, int pos) {
         } else {
             do_full_attn_mixer();
         }
+        }
         gr_read_row(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2, a);
+        {   // PROFILE_PHASES: the FFN sublayer -- MoE (router + routed experts + shared expert) or dense
+        [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> ffn_phase(prof::Phase::Moe);
         if constexpr (USE_MOE) {
             // WP4e: the same moe_resolve() op_moe uses, so the decode path and the batched path
             // resolve experts identically -- which is what keeps forward/forward_one parity (the
@@ -781,6 +792,7 @@ const float* Model::forward_one(int id, int pos) {
             for (int j = 0; j < D_FF; ++j) f1[j] = gelu_row(f1[j]);
             linear_row(f1, L.W2, L.b2, proj, D_FF, C);
         }
+        }
         gr_write_row(h, proj);                                              // residual (write step)
         // Periodic packed-content re-injection spike (Nanbeige-inspired, see core.hpp's
         // set_scratch_reinject doc comment): every `stride` layers, add the SAME layer-0 packed
@@ -808,6 +820,8 @@ const float* Model::forward_one(int id, int pos) {
     // Gated Residual's model-level EXIT collapse (docs/GATED_RESIDUAL.md S1c), mirroring forward()'s
     // own exit-collapse placement: use_combine=False, so just the mix half (no gate/combine) --
     // last_hidden captures the FULLY-COLLAPSED, D_MODEL-wide representation, same as the GR-off path.
+    // PROFILE_PHASES: the model's exit (GR collapse or final norm) and the vocabulary projection.
+    [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> head_phase(prof::Phase::LmHead);
     if constexpr (USE_GATED_RESIDUAL) {
         gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, h, gr_top_norm->pdata, gr_normed);
         gr::mix(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed, gr_mixscr);

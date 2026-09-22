@@ -104,9 +104,20 @@ def system_load_pct(samples: int = 5, interval_s: int = 2) -> float | None:
         return None
 
 
-def run(cmd, cwd=None, timeout=3600) -> str:
+def run(cmd, cwd=None, timeout=3600, check: bool = True) -> str:
+    """Run a command and return its combined output.
+
+    FAILS LOUDLY by default. This used to ignore the exit code, so a failed configure or build left the
+    PREVIOUS binary in place and the suite went on to measure it -- found 2026-09-22 when a compile error
+    produced a "profile" of a pre-O1 binary (1.56 s/token against O1's 0.705) with no warning at all.
+    A measurement of the wrong binary is worse than no measurement: it looks like evidence.
+    """
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    return r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    if check and r.returncode != 0:
+        tail = "\n".join(out.strip().splitlines()[-25:])
+        raise RuntimeError(f"command failed (exit {r.returncode}): {' '.join(map(str, cmd))}\n{tail}")
+    return out
 
 
 def configure(build: pathlib.Path, extra: list[str]) -> None:

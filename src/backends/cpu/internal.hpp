@@ -304,7 +304,13 @@ using MoeDecodeExpertCacheSource = moeq::ExpertCacheSource<MOE_DECODE_SLOTS, MOE
 // thread count tested. Pinned to 1 rather than left as a knob: AGENTS.md S2 prefers a baked compile-time
 // decision over a runtime one once the evidence is in, and nothing here needs to change without a
 // rebuild. Never below 1: EXPERTS_PER_TOK is 0 in a MoE-off build, where nothing ever enters this path.
-inline constexpr int MOE_DECODE_THREADS = 1;
+//
+// NOW A CONFIGURATOR AXIS (`--moe-decode-threads`, default 1 -- every existing build unchanged), because
+// the evidence above has an expiry date: it was measured at ~15-20 MB of DRAM traffic PER EXPERT (the f32
+// dequantize-then-read-back resolve). Since B35 + O1 an expert moves ~1.55 MB of encoded bytes and its
+// kernel is compute-side, so the premise that one thread already saturates the bus no longer holds
+// (docs/OPTIMIZATION_PROCESS.md S5: re-measure combinations after a large win). Re-measured, not assumed.
+inline constexpr int MOE_DECODE_THREADS = MOE_DECODE_THREADS_CFG > 0 ? MOE_DECODE_THREADS_CFG : 1;
 // The sidecar itself: read once by load_model, immutable thereafter (this is a forward-only build by
 // construction -- FORWARD_ONLY below -- so nothing can write a routed expert), hence shared across
 // threads without synchronization. The CACHE is per-Worker, because it is mutable scratch.

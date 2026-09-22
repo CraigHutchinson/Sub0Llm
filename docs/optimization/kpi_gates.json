@@ -3,7 +3,6 @@
   "_format": "Each gate: id, label, stage, metric, op (gte|lte|eq), threshold, severity (hard|soft).",
   "_severity": "hard = must not land on main if it fails -- PARK behind a default-off constexpr toggle (docs/OPTIMIZATION_PROCESS.md S3), never revert. soft = tracked, warning only.",
   "_noise_floor": "Decode s/token on this host reproduces to +-1.5% at zero contention. Any |delta| < 2% is 'no measurable change'. Sub-floor wins are still kept and logged -- they are what compounds (S4).",
-
   "gates": [
     {
       "id": "G-HASH",
@@ -31,7 +30,7 @@
       "stage": "sub0_frontend_tests @ d196check",
       "metric": "assertions",
       "op": "gte",
-      "threshold": 122385,
+      "threshold": 141609,
       "severity": "hard",
       "_note": "Grows as tests are added; must never shrink. 122385/256 as of the B35 merge."
     },

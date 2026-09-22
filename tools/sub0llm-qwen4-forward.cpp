@@ -52,6 +52,7 @@
 #include "sub0/gdn_math.hpp"
 #include "sub0/moe_math.hpp"
 #include "sub0/moe_quant.hpp"
+#include "sub0/phase_profile.hpp" // PROFILE_PHASES: decode phase breakdown
 #include "sub0/hidden_dump.hpp"   // WP4f: the S0HD per-layer hidden-state container
 
 #include <CLI/CLI.hpp>
@@ -114,8 +115,39 @@ double peak_working_set_gib() {
     return 0.0;
 }
 
+// Page faults (hard + soft) this process has taken so far. Decode memory-maps the 37 GiB sidecar, so the
+// FIRST touch of every expert page in a process is a fault even when the page is already in RAM --
+// reported next to the timings so a fault-bound phase is visible rather than inferred.
+std::uint64_t page_faults() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) return pmc.PageFaultCount;
+#endif
+    return 0;
+}
+
 void report_memory(const char* when) {
-    std::println("[mem] {:<28} peak working set {:.2f} GiB", when, peak_working_set_gib());
+    std::println("[mem] {:<28} peak working set {:.2f} GiB, page faults {}", when, peak_working_set_gib(),
+                 page_faults());
+}
+
+// PROFILE_PHASES builds: decode's exclusive-time phase table over the timed forward_one loop. The rows sum
+// to the loop's own wall time by construction; "unattributed" is what no phase scope covered, and is the
+// check that the attribution is complete (docs/OPTIMIZATION_PROCESS.md S5).
+void report_phases(int tokens) {
+    if constexpr (PROFILE_PHASES) {   // generated at global scope, like every sub0_corpus.hpp constant
+        auto& acc = sub0::phase_accumulator();
+        (void)acc.switch_to(sub0::prof::Phase::Other);   // flush the phase still running
+        std::uint64_t total = 0;
+        for (const std::uint64_t v : acc.ns) total += v;
+        std::println("phase profile over {} positions (exclusive time):", tokens);
+        for (std::size_t i = 0; i < acc.ns.size(); ++i)
+            std::println("  {:<34} {:>9.1f} ms/token  {:>5.1f}%", sub0::prof::kPhaseNames[i],
+                         static_cast<double>(acc.ns[i]) / 1e6 / tokens,
+                         total ? 100.0 * static_cast<double>(acc.ns[i]) / static_cast<double>(total) : 0.0);
+    } else {
+        (void)tokens;
+    }
 }
 
 }  // namespace
@@ -237,11 +269,13 @@ int main(int argc, char** argv) {
     report_memory("after graph_reset");
     if (decode_only) {
         kv_reset();   // allocates + clears the KV/GDN/QSA decode caches -- forward_one's precondition
+        sub0::phase_accumulator().reset();
         const auto t0 = std::chrono::steady_clock::now();
         for (int t = 0; t < T; ++t) (void)forward_one(kTokens[t], t);
         const double dec_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         // Same line format as the default path's, so one parser reads both.
         std::println("forward_one over {} positions in {:.2f}s ({:.3f} s/token)", T, dec_s, dec_s / T);
+        report_phases(T);
         report_memory("after forward_one");
         return 0;
     }
@@ -467,6 +501,10 @@ int main(int argc, char** argv) {
     double sq_diff = 0.0, sq_ref = 0.0;
     int argmax_agree = 0;
     std::vector<float> hidden_last(D_MODEL, 0.f);
+    // PROFILE_PHASES: this loop also runs the parity comparison below, which lands in "unattributed". It is
+    // the STEADY-STATE profile (forward() above already faulted in every expert page this loop touches);
+    // --decode-only gives the first-touch profile instead.
+    phase_accumulator().reset();
     const auto t2 = std::chrono::steady_clock::now();
     for (int t = 0; t < T; ++t) {
         const float* one = forward_one(kTokens[t], t);
@@ -488,6 +526,7 @@ int main(int argc, char** argv) {
     const double dec_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
     std::println("forward_one over {} positions in {:.2f}s ({:.3f} s/token)", T, dec_s,
                  dec_s / std::max(1, T));
+    report_phases(T);
     std::println("max |forward - forward_one| = {:.6g}  (at row {}, vocab id {}); max relative = {:.6g}",
                  max_abs, worst_t, worst_v, max_rel);
     std::println("L2-relative logit diff = {:.6g}; argmax agreement {}/{}",

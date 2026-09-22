@@ -681,6 +681,8 @@ int main(int argc, char** argv) {
     // (layout.hpp's own three-way axis rule).
     int d_ff_pin     = 0;
     int ternary      = 0;
+    int profile_phases = 0;     // 1 = exclusive-time decode phase profiler (include/sub0/phase_profile.hpp)
+    int moe_decode_threads = 1; // decode's routed-expert fan-out width (src/backends/cpu/internal.hpp)
     int simd_reduce  = 0;       // B34/B38: multi-accumulator SIMD restructuring of the hot reduction
                                  // loops (moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp).
                                  // 0 = off (default, today's plain scalar reduction, bit-exact). See the
@@ -878,6 +880,18 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::NonNegativeNumber);
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
        ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--profile-phases", profile_phases,
+                   "1 = compile decode's exclusive-time phase profiler in (include/sub0/phase_profile.hpp): "
+                   "mixer / MoE / Gated Residual / lm_head / unattributed, printed by sub0llm-qwen4-forward. "
+                   "The O0/O1 re-profile docs/OPTIMIZATION_PROCESS.md S5 requires after any >20% change, "
+                   "without a hand-written scaffold. 0 = off (default): the scopes compile to nothing.")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--moe-decode-threads", moe_decode_threads,
+                   "threads decode fans a row's routed experts across (internal.hpp MOE_DECODE_THREADS). "
+                   "1 (default) is B29's measured optimum when an expert moved ~15-20 MB of f32 traffic; "
+                   "exposed to re-measure it at the fused-kernel operating point, where an expert moves ~1.55 MB. "
+                   "Scheduling only: the combine order is fixed, so the answer is bit-identical at any value.")
+       ->capture_default_str()->check(CLI::Range(1, 64));
     app.add_option("--simd-reduce", simd_reduce,
                    "1 = multi-accumulator SIMD restructuring (include/sub0/simd_reduce.hpp) of the hot "
                    "reduction loops in moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp -- "
@@ -1837,6 +1851,11 @@ int main(int argc, char** argv) {
     // format -- a checkpoint saved under one setting loads and computes CORRECTLY (to within
     // reassociation-noise tolerance, same as any other compute-precision choice) under the other.
     cos << "constexpr bool USE_SIMD_REDUCE = " << (simd_reduce ? "true" : "false") << ";\n";
+    // Measurement instrumentation only: changes no arithmetic and no checkpoint shape, so it joins
+    // neither ARCH_FINGERPRINT nor PARAM_FLOATS (AGENTS.md S10: deliberately variable between builds).
+    cos << "constexpr bool PROFILE_PHASES = " << (profile_phases ? "true" : "false") << ";\n";
+    // Scheduling only (the combine order is fixed): not an ARCH_FINGERPRINT axis (AGENTS.md S10).
+    cos << "constexpr int  MOE_DECODE_THREADS_CFG = " << moe_decode_threads << ";\n";
     // SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) vs the plain 2-matrix GELU+bias FFN -- see
     // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
     // swiglu_backward_act_kernel in backend_cuda.cu).

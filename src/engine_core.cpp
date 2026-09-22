@@ -15,6 +15,7 @@
 #include "sub0/tokenizer.hpp"
 #include "sub0/layout.hpp"
 #include "sub0/model_file.hpp"
+#include "sub0/phase_profile.hpp" // phase_accumulator()
 #include "sub0/param_store.hpp"   // B24: PARAM_FILE_DTYPE / PARAM_ELEM_BYTES -- the blob's own dtype tag
 
 #include <algorithm>
@@ -297,6 +298,11 @@ bool load_model(const char* path) {
     // the alternative is discovering it inside op_moe, per token. A no-op returning true otherwise.
     if (!load_moe_quant_sidecar(path)) return false;
     return true;
+}
+
+prof::Accumulator& phase_accumulator() noexcept {
+    static prof::Accumulator a;
+    return a;
 }
 
 const char* default_corpus()     { return DEFAULT_CORPUS; }
