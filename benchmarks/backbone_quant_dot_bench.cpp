@@ -6,9 +6,12 @@
 // WHAT "compared against bf16" MEANS HERE, PRECISELY (stated because it is a real simplification, not
 // hidden). The engine's actual resident bf16 backbone path (docs/BACKBONE_PRECISION.md) is an AXPY
 // kernel over a [in,out] layout (`Node::pdata`'s `Bf16CPtr`, one activation scalar broadcast down a
-// contiguous output row) -- a different access pattern from this header's own DOT-over-[out,in] shape,
-// and `include/sub0/gemv.hpp` (the task brief's own name for that kernel) does not exist in this
-// checkout to benchmark directly. What IS measured here is the isolated PER-ELEMENT PROMOTE cost:
+// contiguous output row) -- a different access pattern from this header's own DOT-over-[out,in] shape.
+// KNOWN WEAKNESSES, to fix before this tool gates phase 2 (docs/BACKBONE_NATIVE_QUANT.md S8a): the bf16
+// arm below is a naive scalar loop, NOT the engine's real kernel (include/sub0/gemv.hpp's axpy, which
+// sub0llm-bench-gemv measures); the 1024-row tensors stay cache-resident across reps; and the threaded
+// arms spawn fresh std::threads on every ~250 us call, so they measure spawn cost, not scaling.
+// What IS measured here is the isolated PER-ELEMENT PROMOTE cost:
 // `sub0::bf16_widen` (a branchless 16-bit shift, the exact function `Bf16CPtr::operator[]` calls) run
 // over the SAME row-dot access shape as the native-quant kernels, so the comparison answers "does the
 // native-quant block-decode cost more CPU per element than bf16's promote, at the same row length" --

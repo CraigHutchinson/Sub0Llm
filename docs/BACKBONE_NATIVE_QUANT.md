@@ -7,6 +7,10 @@ describes lives in three new files (`include/sub0/backbone_quant_dot.hpp`,
 (`tools/sub0llm-backbone-census.cpp`); nothing in `src/` or `tools/sub0llm-transplant.cpp` includes any of
 them. A later phase reviews this design and does the actual wiring.
 
+**Integration verdict (2026-09-22, §8a): the kernels are correct but not yet fast.** The unpack is
+compute-bound at 1–5 GB/s per thread for the K-quants, so at one thread they lose to the real bf16
+`gemv::axpy`. The fit win (§7) is real; the throughput win needs phase 2's streaming unpack.
+
 Mirrors `docs/MOE_QUANT_DOT.md`'s own structure and rigour, applied to the BACKBONE instead of the routed
 experts.
 
@@ -257,7 +261,7 @@ per-call path (AGENTS.md S1 — every kernel writes only caller-supplied spans/p
 
 `moe_quant_dot.hpp`'s own B35 finding was that a plain int8 loop already auto-vectorizes under `-O3
 -march=native` (no reassociation barrier the way float addition has), so it deliberately carries no raw
-intrinsics. This header's own task brief asked for an EXPLICIT AVX2 path as well, so one was built:
+intrinsics. An explicit AVX2 path was built alongside it anyway, so the two can be differentially tested:
 `dot32_avx2`/`dot16_avx2`/`sum32_avx2`/`sum16_avx2` use real AVX2/SSE4.1 intrinsics
 (`_mm256_cvtepi8_epi16` + `_mm256_madd_epi16` for the 32-wide primitives, the SSE4.1 128-bit equivalents
 for the 16-wide ones Q6_K needs). Both paths are checked to agree EXACTLY (not merely closely) against
@@ -349,12 +353,52 @@ a naive scalar loop. Flagged as the load-bearing open question for phase 2's own
 resolved here: re-run this comparison against an actually-optimized bf16 kernel (or the real
 `op_linear` AXPY path, once `gemv.hpp` exists) before trusting the magnitude of this result, though the
 DIRECTION (native-quant is not paying a decode-cost tax bf16 avoids) is unlikely to reverse given the
-integer-vectorization argument holds regardless of which bf16 baseline is used.
+integer-vectorization argument holds regardless of which bf16 baseline is used. **§8a re-measured this
+against the real kernel: at one thread the direction DOES reverse for the K-quants.**
 
 **A second honest limitation**: Q4_K's numbers are measured at a 1024-row cap of a 248,320-row tensor —
 representative of the PER-ROW cost, but not of the tensor's own full-row aggregate time (which would be
 ~242x larger). Q4_K's own real per-token cost (the full `output.weight` GEMV, every decode token) is
 therefore NOT directly read off this table without that scaling, named here rather than left implicit.
+
+### 8a. Re-measured at integration against the real bf16 kernel (2026-09-22)
+
+This phase's branch was cut from `2df23b0`, before O2 merged `include/sub0/gemv.hpp`; that is why the
+kernel "did not exist in this checkout". On `main` it does, so the comparison §8 deferred was run at merge
+time, on the same host, both tools built in `d196check` (another track's build was running; ~13% total
+CPU load, so treat single digits as noise). The shape is directly comparable: Q6_K `blk.2.attn_qkv` is
+2560 → 10240, exactly `sub0llm-bench-gemv`'s `gdn in_qkv` row.
+
+| kernel, 2560 → 10240 | bytes | 1 thread | 8 threads |
+|---|---:|---:|---:|
+| bf16 `gemv::axpy` (DRAM-streamed, persistent OpenMP team) | 52.4 MB | **2623 µs** (20.0 GB/s) | **1048 µs** (50.0 GB/s) |
+| Q6_K `bbqd` AVX2 (1024 rows × 10, cache-resident) | 16.4 MB | ~4060 µs (5.3 GB/s) | ~2880 µs (spawn-bound, see below) |
+
+Per-thread throughput of the phase-1 kernels (compressed bytes, cache-resident, AVX2, 1 thread):
+**Q8_0 ~26 GB/s, Q6_K ~5.3, Q5_K ~4.3, Q4_K ~1.1.** The reading:
+
+1. **The K-quant kernels are compute-bound, not bandwidth-bound**, at a quarter or less of one core's
+   ~20 GB/s bf16 streaming rate, and Q4_K at a twentieth. The integer dot vectorizes. The per-group
+   UNPACK does not: `group()` rebuilds a `WeightGroup` element by element (nibble select, high-bit OR)
+   and recomputes `k_scale_min` and two `f16_to_f32` for every 32 elements. §8's integer-vectorization
+   argument covered the dot, which was never the cost.
+2. **At one thread they lose to bf16 despite reading 3.2x fewer bytes.** The cache-resident setup
+   flatters them, so this is an upper bound on their speed.
+3. **The 8-thread arms here do not measure scaling.** The bench spawns fresh `std::thread`s on every
+   ~250 µs call. If the kernels scaled linearly on a persistent team, Q6_K/Q5_K would reach ~42/34 GB/s:
+   roughly 2.5x faster than bf16 at this shape, still ~2x from the ~79 GB/s P-core roof. Q4_K would still
+   lose to bf16 (~8.8 GB/s: lm_head ~40 ms against bf16's ~24 ms).
+4. **Q4_K is anomalous.** It is the simplest K-quant format, yet it runs 4x slower than Q5_K through the
+   same row walk. That must be explained before it is optimised.
+
+**Consequence for phase 2:** the lever is real (the bytes are 2.4–3.2x fewer, and the memory fit follows
+from §7), but it is only realised with an unpack that streams. The gate is **≥ 10 GB/s of compressed bytes
+per thread, streamed from DRAM**, so that 8 P-cores saturate the roof. That means a superblock-at-a-time
+AVX2 unpack with scales hoisted per 256 elements, `maddubs`-shaped since the weights are unsigned and the
+activations signed (this host also has AVX-VNNI and AVX-VNNI-INT8, confirmed from clang's
+`-march=native` macros), plus a load-time repack if the GGUF block order fights
+it. Before any of that, the bench must be fixed to compare against `gemv::axpy` with a DRAM-sized tensor
+pool and a persistent team, the way `sub0llm-bench-gemv` does.
 
 ---
 

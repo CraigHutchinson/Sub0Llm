@@ -42,13 +42,16 @@
 // `gemv_rows`'s own [row_lo, row_hi) parameters are exactly that split, ready for a caller to hand
 // non-overlapping row ranges to independent worker threads with no shared mutable state between them.
 //
-// NO RAW INTRINSICS IN THE PORTABLE PATH, deliberately, following moe_quant_dot.hpp's own measured
-// precedent (integer addition has no float-style reassociation barrier, so a plain loop already
-// vectorizes under -O3 -march=native). AN EXPLICIT AVX2 PATH IS ALSO PROVIDED HERE, unlike
-// moe_quant_dot.hpp, because this header's own task brief asks for one directly comparable against the
-// portable path (a real differential test and a real microbenchmark arm), not because auto-vectorization
-// was found lacking -- see dot32_avx2/dot16_avx2's own comments for the actual instruction shape and why
-// it is a real, additional check on top of (not a replacement for) the portable form's correctness.
+// NO RAW INTRINSICS IN THE PORTABLE PATH, deliberately: integer addition has no float-style
+// reassociation barrier, so a plain loop already vectorizes under -O3 -march=native. An explicit AVX2
+// path is provided alongside it so the two can be checked against each other exactly (integer
+// arithmetic, no tolerance) and timed side by side.
+//
+// PERFORMANCE STATUS: compute-bound, NOT yet a win. Only the integer DOT is vectorized; the per-group
+// UNPACK (group() below) is element-by-element and dominates. Measured against the real bf16
+// gemv::axpy at integration (docs/BACKBONE_NATIVE_QUANT.md S8a): Q8_0 ~26 GB/s/thread, but Q6_K ~5.3,
+// Q5_K ~4.3, Q4_K ~1.1 -- slower than bf16 at one thread despite 2.4-3.2x fewer bytes. Phase 2's first
+// gate is a streaming unpack, >= 10 GB/s of compressed bytes per thread.
 //
 // NO HEAP ALLOCATION PER CALL (AGENTS.md S1): every kernel here reads only its caller-supplied spans and
 // writes only its caller-supplied `out` pointer; no std::vector/new/malloc appears in any hot path below.
