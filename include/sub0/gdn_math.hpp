@@ -95,6 +95,37 @@ namespace detail {
 inline float silu(float x) { return x / (1.f + std::exp(-x)); }
 inline float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 inline float softplus(float x) { return std::log1p(std::exp(-std::fabs(x))) + std::max(x, 0.f); }
+
+/** Run `f(i)` for i in [0,n) across `Threads` threads, or serially at Threads<=1 (O4 lever 1).
+ *
+ * The one dispatch every head/channel-parallel region in forward() below shares: the conv1d+SiLU+
+ * history-roll sweep (independent per CHANNEL), the delta-rule recurrence + its L2-norm prelude
+ * (independent per physical k-head, each owning its own `rep` v-heads' disjoint state/output slots),
+ * and the RMSNormGated gate (independent per v-head). None of these combine results across `i` -- each
+ * iteration reads only its own inputs and writes only its own output slice -- so splitting the range
+ * across threads changes nothing about any single iteration's arithmetic, only which thread executes
+ * it (AGENTS.md S1: no heap allocation; each thread's own stack locals are per-invocation, not shared).
+ *
+ * Mirrors gemv::axpy's own dispatch shape (include/sub0/gemv.hpp): `if constexpr` elides the OpenMP
+ * pragma entirely at Threads<=1 (byte-identical codegen to the pre-O4 serial loop, so every non-decode
+ * caller -- forward()'s batched/training callers all pass Threads=1 -- is unaffected), and a call made
+ * from inside an existing team (omp_in_parallel()) runs serially rather than nesting.
+ */
+template <int Threads, class F>
+inline void parallel_for(int n, F&& f) {
+    if constexpr (Threads <= 1) {
+        for (int i = 0; i < n; ++i) f(i);
+    } else {
+#if defined(_OPENMP)
+        if (!omp_in_parallel()) {
+            #pragma omp parallel for num_threads(Threads) schedule(static)
+            for (int i = 0; i < n; ++i) f(i);
+            return;
+        }
+#endif
+        for (int i = 0; i < n; ++i) f(i);
+    }
+}
 }  // namespace detail
 
 // One (t, v-head) step of the sequential delta-rule recurrence -- S1b's exact formula, quoted/verified
@@ -192,29 +223,47 @@ inline void forward(const Dims& d, int T,
     float* gated    = scratch;                                    /* scratch += value_dim, unused after */
 
     // in_proj_qkv, in_proj_z, in_proj_b, in_proj_a -- this project's [in,out] weight convention.
+    // O4 lever 1: in_proj_b/in_proj_a used to be a hand-written output-major dot-product loop (`for hh:
+    // for i: bs += ...`), scalar and unthreaded. Routed through gemv::axpy instead: for a fixed output
+    // hh, axpy's own accumulation is `for i: y[hh] += x[i]*w[i*Hv+hh]` -- the SAME i-ascending order the
+    // hand loop used (gemv.hpp's own "bit-exact by construction" argument applies verbatim), so this is
+    // a pure reordering of the SAME sum into a vectorized, threaded primitive, not a numeric change.
+    // beta/gg's own rows are the destination for the raw projection (no extra scratch needed): each row
+    // is written once by axpy, then transformed in place by the elementwise sigmoid/softplus below --
+    // safe because every read of a given hh happens before that hh's own (only) write.
     for (int t = 0; t < T; ++t) {
         const float* xt = x + static_cast<std::size_t>(t) * hs;
         float* qkvr = qkv_pre + static_cast<std::size_t>(t) * conv_dim;
         float* zr = zb + static_cast<std::size_t>(t) * value_dim;
+        float* br = beta + static_cast<std::size_t>(t) * Hv;
+        float* gr = gg   + static_cast<std::size_t>(t) * Hv;
         gemv::axpy<Threads>(xt, w_qkv, hs, conv_dim, qkvr);   // O2: include/sub0/gemv.hpp
         gemv::axpy<Threads>(xt, w_z, hs, value_dim, zr);
+        gemv::axpy<Threads>(xt, w_b, hs, Hv, br);             // O4: raw b_logit, transformed below
+        gemv::axpy<Threads>(xt, w_a, hs, Hv, gr);             // O4: raw a_logit, transformed below
         for (int hh = 0; hh < Hv; ++hh) {
-            float bs = 0.f, as_ = 0.f;
-            for (int i = 0; i < hs; ++i) {
-                bs  += xt[i] * w_b[static_cast<std::size_t>(i) * Hv + hh];
-                as_ += xt[i] * w_a[static_cast<std::size_t>(i) * Hv + hh];
-            }
-            beta[static_cast<std::size_t>(t) * Hv + hh] = detail::sigmoid(bs);
-            gg[static_cast<std::size_t>(t) * Hv + hh] =
-                -std::exp(a_log[hh]) * detail::softplus(as_ + dt_bias[hh]);
+            br[hh] = detail::sigmoid(br[hh]);
+            gr[hh] = -std::exp(a_log[hh]) * detail::softplus(gr[hh] + dt_bias[hh]);
         }
     }
 
     // Causal depthwise conv1d + SiLU. Virtual sequence = concat(conv_hist[0..K-2], qkv_pre[0..T-1]);
     // out[t] = sum_k w[k] * virtual[t+k] -- exactly causal_conv1d_fn's F.conv1d(padding=K-1)[:, :, :T]
     // when conv_hist is all-zero (a fresh training-scratch call), and exactly causal_conv1d_update's
-    // cat([conv_state, hidden_states]) when conv_hist carries real decode history.
-    for (int c = 0; c < conv_dim; ++c) {
+    // cat([conv_state, hidden_states]) when conv_hist carries real decode history. Then roll the history
+    // forward: new_hist[j] = virtual[T+j] for j in [0,K-2] (buffered in `tmp` first, since some new_hist
+    // entries alias OLD conv_hist entries this same channel is about to overwrite).
+    //
+    // O4 lever 1: these were two separate `for c: for ...` sweeps (silu-conv, then history-roll). Every
+    // channel is independent of every other (conv_w/conv_hist/qkv_pre/qkv_post are all indexed by THIS
+    // c alone, nothing here reduces across c), so the two sweeps are fused into one per-channel body --
+    // one full pass over the T*conv_dim/K*conv_dim data instead of two -- and threaded over c. Per
+    // channel the read-before-write ordering (silu reads OLD conv_hist, then the roll reads the SAME OLD
+    // conv_hist into `tmp` before finally overwriting it) is identical to the original two-sweep version;
+    // only the relative order BETWEEN channels changes, which cannot matter since no channel reads
+    // another's data. `tmp` is a per-iteration stack local, so this is thread-safe with no extra scratch.
+    constexpr int MAX_K = 32;   // generous bound on conv_kernel; GDN_CONV_KERNEL is 4 in this project
+    detail::parallel_for<Threads>(conv_dim, [&](int c) {
         for (int t = 0; t < T; ++t) {
             float s = 0.f;
             for (int k = 0; k < K; ++k) {
@@ -225,32 +274,32 @@ inline void forward(const Dims& d, int T,
             }
             qkv_post[static_cast<std::size_t>(t) * conv_dim + c] = detail::silu(s);
         }
-    }
-    // Roll the history forward: new_hist[j] = virtual[T+j] for j in [0,K-2]. Buffer first (tmp) since
-    // this overwrites conv_hist in place and some new_hist entries alias OLD conv_hist entries.
-    {
-        constexpr int MAX_K = 32;   // generous bound on conv_kernel; GDN_CONV_KERNEL is 4 in this project
         float tmp[MAX_K - 1];
-        for (int c = 0; c < conv_dim; ++c) {
-            for (int j = 0; j < K - 1; ++j) {
-                const int v = T + j;
-                tmp[j] = (v < K - 1) ? conv_hist[static_cast<std::size_t>(v) * conv_dim + c]
-                                     : qkv_pre[static_cast<std::size_t>(v - (K - 1)) * conv_dim + c];
-            }
-            for (int j = 0; j < K - 1; ++j) conv_hist[static_cast<std::size_t>(j) * conv_dim + c] = tmp[j];
+        for (int j = 0; j < K - 1; ++j) {
+            const int v = T + j;
+            tmp[j] = (v < K - 1) ? conv_hist[static_cast<std::size_t>(v) * conv_dim + c]
+                                 : qkv_pre[static_cast<std::size_t>(v - (K - 1)) * conv_dim + c];
         }
-    }
+        for (int j = 0; j < K - 1; ++j) conv_hist[static_cast<std::size_t>(j) * conv_dim + c] = tmp[j];
+    });
 
     // Split into Q/K/V column ranges of qkv_post: Q [0,key_dim), K [key_dim,2*key_dim), V [2*key_dim,conv_dim).
     const int q_off = 0, k_off = key_dim, v_off = 2 * key_dim;
 
     // Sequential delta-rule recurrence, per S1b's exact form (verified against the real installed
     // reference, see this file's header comment for the one real correction found doing so).
+    //
+    // O4 lever 1: the `hk` loop threaded over physical k-heads. Every physical k-head owns a disjoint
+    // range of `rep` v-heads (hv = hk*rep + r), and every v-head's state slot (state + hv*dk*dv) and
+    // output slot (qkv_post's V column range at hv*dv) is written by exactly one hk -- no two threads
+    // ever touch the same element, so this is bit-exact by construction (AGENTS.md S1: qn/kn stay
+    // per-iteration stack locals, no shared scratch to size). Nothing REDUCES across hk (no cross-head
+    // sum), so only the order in which independent heads are computed changes, never a value.
     for (int t = 0; t < T; ++t) {
         const float* row = qkv_post + static_cast<std::size_t>(t) * conv_dim;
         float* orow = out + static_cast<std::size_t>(t) * hs;   // written at the very end via out_proj instead;
         (void)orow;
-        for (int hk = 0; hk < Hk; ++hk) {
+        detail::parallel_for<Threads>(Hk, [&](int hk) {
             // L2-normalize this physical (t, k-head)'s Q and K once; every one of its `rep` virtual
             // v-heads reads the SAME normalized vector (repeat_interleave duplicates the value, so
             // normalizing before or after duplication is identical -- see this project's own note).
@@ -279,15 +328,19 @@ inline void forward(const Dims& d, int T,
                 float* core = qkv_post + static_cast<std::size_t>(t) * conv_dim + v_off + hv * dv;
                 recurrence_step(dk, dv, g_t, beta_t, kn, qn, vraw, S, core);
             }
-        }
+        });
     }
 
     // RMSNormGated, per head_v_dim group (norm_w is [head_v_dim], shared across heads -- S1c), gated
     // by sigmoid(z) (this real config's output_gate_type), then out_proj back to hidden_size.
+    // O4 lever 1: the `hh` loop threaded over v-heads -- each hh reads only its own core/z slice and
+    // writes only its own disjoint `gated[hh*dv, (hh+1)*dv)` slice, so this is the same "no cross-head
+    // reduction" argument as the recurrence loop above. Sequenced (not fused) with the out_proj axpy
+    // call: `gated` must be fully written before axpy reads it, same dependency the serial form had.
     for (int t = 0; t < T; ++t) {
         const float* core_row = qkv_post + static_cast<std::size_t>(t) * conv_dim + v_off;
         const float* z_row = zb + static_cast<std::size_t>(t) * value_dim;
-        for (int hh = 0; hh < Hv; ++hh) {
+        detail::parallel_for<Threads>(Hv, [&](int hh) {
             const float* cv = core_row + hh * dv;
             const float* zv = z_row + hh * dv;
             // B34/B38: contiguous self-dot -- was a scalar reduction, see simd_reduce.hpp.
@@ -296,7 +349,7 @@ inline void forward(const Dims& d, int T,
             const float rinv = 1.f / std::sqrt(ms + RMS_EPS);
             for (int j = 0; j < dv; ++j)
                 gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
-        }
+        });
         float* ot = out + static_cast<std::size_t>(t) * hs;
         gemv::axpy<Threads>(gated, w_out, value_dim, hs, ot);
     }
