@@ -29,9 +29,19 @@ A number that does not follow this protocol is not evidence, and must not be quo
 - **`sub0llm-qwen4-forward`'s `forward_one` timing can never be cold-cache.** The tool runs `forward()`
   first on the same tokens, and identical tokens route to identical experts — so `forward()` pre-warms
   exactly the sidecar pages `forward_one` then reads. A "cold" `forward_one` number is really warm.
-  Measuring genuine cold-cache decode (the only case `--moe-io-mode pipelined` exists for) needs a
-  forward_one-only mode, or a flushed standby list plus distinct tokens. **Not yet built** — noted here
-  so nobody quotes a cold number from the existing tool.
+  Measuring genuine cold-cache decode (the only case `--moe-io-mode pipelined` exists for) uses
+  `run_perf_suite.py --cold`. Before **every** run it evicts the artifact and its sidecar from the page
+  cache, **unelevated, per file** (`scripts/page_cache.py`: a `FILE_FLAG_NO_BUFFERING` open and close
+  makes Windows purge that file's pages, including pages cached through a memory map once nothing maps
+  the file). It then **verifies** with a timing probe (≥95% of sampled pages must come from disk, or it
+  refuses) and times decode alone with `sub0llm-qwen4-forward --decode-only`. Measured: a cached sample
+  took 2.6 µs per page and the same sample after eviction took 110 µs, all of it from disk (a control
+  without eviction stayed at ~2.5 µs). The purge is **undocumented** file-system-driver behaviour, not a
+  documented API, which is why every run re-verifies it. The fallback, if it ever stops working, is an
+  elevated system-wide standby purge or a reboot; see `scripts/page_cache.py`. Cold and
+  warm are **different quantities**: the history row carries `"cache": "cold"|"warm"`, and they are
+  never compared with each other. Eviction does not reset the NVMe drive's own cache, file-system
+  metadata or SysMain prefetch; a reboot remains the reference if any of those is suspected.
 - **Interleave arms, never batch them.** A/B/A/B, not AAA then BBB — thermal drift is real on this part
   (`[[thermal-confounds-ab-wallclock-testing]]`).
 - **Minimum 3 runs per arm**, and report every one, not just the mean. A mean hiding 1.44/1.49/1.67 is

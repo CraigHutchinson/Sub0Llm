@@ -117,8 +117,16 @@ def build_target(build: pathlib.Path, target: str) -> str:
     return run(["cmake", "--build", str(build), "--target", target, "-j"])
 
 
-def decode_s_per_token(build: pathlib.Path, tokens: int = 3) -> float | None:
-    out = run([str(build / "sub0llm-qwen4-forward.exe"), "--model", ARTIFACT, "--tokens", str(tokens)])
+def decode_s_per_token(build: pathlib.Path, tokens: int = 3, cold: bool = False) -> float | None:
+    """Decode s/token. `cold`: evict the artifact AND its sidecar from the page cache first (verified --
+    page_cache.evict_verified raises rather than return a warm "cold"), and run --decode-only, because the
+    default run's forward() pre-warms exactly the expert pages forward_one then reads."""
+    extra = []
+    if cold:
+        import page_cache
+        page_cache.evict_verified([ARTIFACT, ARTIFACT + ".moeq"])
+        extra = ["--decode-only"]
+    out = run([str(build / "sub0llm-qwen4-forward.exe"), "--model", ARTIFACT, "--tokens", str(tokens), *extra])
     m = re.search(r"forward_one over \d+ positions in [\d.]+s \(([\d.]+) s/token\)", out)
     return float(m.group(1)) if m else None
 
@@ -129,7 +137,8 @@ def parity(build: pathlib.Path, tokens: int = 6) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def stage_perf(build: pathlib.Path, arms: list[tuple[str, list[str]]], runs: int, tokens: int) -> dict:
+def stage_perf(build: pathlib.Path, arms: list[tuple[str, list[str]]], runs: int, tokens: int,
+               cold: bool = False) -> dict:
     """Interleaved A/B/A/B across arms -- never batched, per OPTIMIZATION_PROCESS.md S1.
 
     Reconfigures + rebuilds between arms in ONE build dir rather than using N sibling dirs, because a
@@ -140,7 +149,7 @@ def stage_perf(build: pathlib.Path, arms: list[tuple[str, list[str]]], runs: int
         for name, flags in arms:
             configure(build, flags)
             build_target(build, "sub0llm-qwen4-forward")
-            v = decode_s_per_token(build, tokens)
+            v = decode_s_per_token(build, tokens, cold)
             if v is not None:
                 samples[name].append(v)
             print(f"  [{i+1}/{runs}] {name}: {v} s/token", flush=True)
@@ -266,6 +275,10 @@ def main() -> int:
     ap.add_argument("--arm", action="append", default=[],
                     help='"name:flags", e.g. "fused:--moe-quant-dot 1". First arm is the baseline.')
     ap.add_argument("--build", default="out/build/wp5c_full48", help="build dir for real-artifact stages")
+    ap.add_argument("--cold", action="store_true",
+                    help="evict the artifact + sidecar from the page cache before EVERY run (verified) and time "
+                         "decode alone (--decode-only). Cold and warm numbers are different quantities: "
+                         "label and compare them separately")
     ap.add_argument("--runs", type=int, default=3, help="runs per arm (minimum 3 by policy)")
     ap.add_argument("--tokens", type=int, default=3)
     ap.add_argument("--label", default="", help="opportunity ID, tags the history row (e.g. B35)")
@@ -324,7 +337,8 @@ def run_suite(args, sb) -> int:
     if "perf" in stages:
         if args.runs < 3:
             print("warning: policy minimum is 3 runs per arm", file=sys.stderr)
-        results["perf"] = stage_perf(build, arms, args.runs, args.tokens)
+        results["perf"] = stage_perf(build, arms, args.runs, args.tokens, args.cold)
+        results["cache"] = "cold" if args.cold else "warm"
 
     if "vtune" in stages:
         # Profiles the LAST arm -- normally the one under investigation, since profiling the baseline

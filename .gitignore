@@ -56,3 +56,6 @@ tokenizer.stamp
 state.json
 train.log
 *.ckpt
+
+# Python bytecode from scripts/ imports
+__pycache__/

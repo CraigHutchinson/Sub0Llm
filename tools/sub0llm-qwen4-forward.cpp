@@ -146,6 +146,15 @@ int main(int argc, char** argv) {
     app.add_option("--dump-hidden", hidden_path,
                    "write every per-layer named hidden state of one forward pass to this path "
                    "(S0HD container -- WP4f's llama.cpp comparison input)");
+    // Cold-cache decode timing (docs/OPTIMIZATION_PROCESS.md S1). The default run calls forward() FIRST
+    // on the same tokens, and identical tokens route to identical experts -- so forward() pre-warms
+    // exactly the sidecar pages forward_one then reads, and a "cold" forward_one number is really warm.
+    // This skips forward() and everything that compares against it, and times forward_one alone. It only
+    // measures cold decode if the harness evicted the artifact's pages first (scripts/run_perf_suite.py
+    // --cold does, and verifies it); on a warm cache it times ordinary warm decode.
+    bool decode_only = false;
+    app.add_flag("--decode-only", decode_only,
+                 "skip forward() and the parity checks; time forward_one alone (cold-cache decode)");
     CLI11_PARSE(app, argc, argv);
     // Unbuffered: this run is minutes long and holds 43 GiB resident, so if it dies the partial output
     // IS the finding. A buffered stdout redirected to a file loses all of it.
@@ -226,6 +235,16 @@ int main(int argc, char** argv) {
     }());
     graph_reset();          // lays out this thread's parameter nodes + allocates its Worker
     report_memory("after graph_reset");
+    if (decode_only) {
+        kv_reset();   // allocates + clears the KV/GDN/QSA decode caches -- forward_one's precondition
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < T; ++t) (void)forward_one(kTokens[t], t);
+        const double dec_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        // Same line format as the default path's, so one parser reads both.
+        std::println("forward_one over {} positions in {:.2f}s ({:.3f} s/token)", T, dec_s, dec_s / T);
+        report_memory("after forward_one");
+        return 0;
+    }
     // WP4f: with --dump-hidden this runs forward_capture INSTEAD of forward (not in addition to it) --
     // it returns the same logits node, so the whole rest of this harness, including WP4e's bitwise
     // logits gate below, is comparing exactly what a plain forward() produced. Doing a second pass to
