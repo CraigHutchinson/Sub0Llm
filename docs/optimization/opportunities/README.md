@@ -83,6 +83,16 @@ default-off.
 | ID | Item | Status |
 |---|---|---|
 | P1 | **Make the codified optimization workflow lean enough to be part of the DEFAULT development workflow** — do after the O2 work lands | backlog |
+| P2 | **Rename the `sub0_tests` target to `sub0llm_tests`**, matching the `sub0llm-*` tool naming | backlog |
+
+**P2 — rename `sub0_tests` → `sub0llm_tests`.** Do it in one commit, on a quiet tree, with no delegated
+track mid-flight: every agent brief, gate and script names the target. The build-affecting consumers are
+`tests/CMakeLists.txt` (the target itself), `scripts/run_perf_suite.py`, `docs/optimization/kpi_gates.json`
+(G-HASH and G-SUITE-ENGINE name the stage) and `.vscode/settings.json`. About 27 more docs mention it by
+name: update the living ones (AGENTS.md, OPTIMIZATION_PROCESS.md, the briefs) and leave dated historical
+records as written. Verify with `git grep sub0_tests`, which should then show only historical records.
+Open question for the user: rename `sub0_frontend_tests` → `sub0llm_frontend_tests` at the same time
+(22 files), so the two suites stay consistent?
 
 **P1 — what to fold in, from what the O1/O2 session actually needed** (keep it lean: one command per
 question, defaults that are right, no ritual):
