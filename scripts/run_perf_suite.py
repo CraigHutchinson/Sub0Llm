@@ -65,12 +65,42 @@ CONTENTION_RE = re.compile(r"sub0llm|clang|ninja|cmake", re.I)
 
 
 def contention_count() -> int:
-    """Processes that would poison a timing run. OPTIMIZATION_PROCESS.md S1: this must be 0."""
+    """Named processes that would poison a timing run (sibling agents' builds/benchmarks).
+
+    NECESSARY BUT NOT SUFFICIENT -- see system_load_pct(). This alone reported "0 contention" on a
+    freshly rebooted host whose total CPU load was sampling 6-19% sustained (a VS Code updater,
+    browser, desktop apps, GPU container settling after boot) -- enough to make a ~7-10% decode
+    delta unattributable, against a noise floor of +-1.5%.
+    """
     try:
         out = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=60).stdout
     except Exception:
         return -1  # unknown -- caller decides; never silently treat as "clear"
     return sum(1 for line in out.splitlines() if CONTENTION_RE.search(line))
+
+
+# Threshold for background load on an otherwise-idle host. 5% is deliberately strict: the decode
+# noise floor is +-1.5%, and background load is not uniform -- a burst landing on the cores decode
+# is using costs far more than its time-averaged share suggests.
+MAX_BACKGROUND_LOAD_PCT = 5.0
+
+
+def system_load_pct(samples: int = 5, interval_s: int = 2) -> float | None:
+    """Average total CPU load over a short window -- catches contention nothing else names.
+
+    Samples the performance counter rather than trusting one instantaneous reading: a single read of
+    Win32_Processor.LoadPercentage returned 48% where the sustained figure was 6-19%. Returns None if
+    the counter is unavailable, which callers must treat as UNKNOWN, never as idle.
+    """
+    ps = ("$s = Get-Counter '\\Processor(_Total)\\% Processor Time' "
+          f"-SampleInterval {interval_s} -MaxSamples {samples}; "
+          "($s.CounterSamples | Measure-Object CookedValue -Average).Average")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=samples * interval_s + 60).stdout
+        return float(out.strip().splitlines()[-1])
+    except Exception:
+        return None
 
 
 def run(cmd, cwd=None, timeout=3600) -> str:
@@ -213,15 +243,26 @@ def main() -> int:
     stages = args.stage or ["perf"]
     gates = json.loads(GATES.read_text(encoding="utf-8"))
 
-    if "perf" in stages or "quality" in stages:
+    results_load = None
+    if "perf" in stages or "quality" in stages or "vtune" in stages:
         n = contention_count()
-        if n != 0 and not args.allow_contention:
-            print(f"REFUSING TO MEASURE: {n} competing process(es) detected.\n"
-                  "This host has produced 2x run-to-run variance under load; a contended measurement\n"
-                  "is not a slow measurement, it is a meaningless one (OPTIMIZATION_PROCESS.md S1).\n"
-                  "Wait, or pass --allow-contention and do not quote the number as evidence.",
-                  file=sys.stderr)
+        load = system_load_pct()
+        results_load = {"named_processes": n, "background_load_pct": load}
+        problems = []
+        if n != 0:
+            problems.append(f"{n} named competing process(es) (sibling builds/benchmarks)")
+        if load is None:
+            problems.append("background load UNKNOWN (counter unavailable) -- not treated as idle")
+        elif load > MAX_BACKGROUND_LOAD_PCT:
+            problems.append(f"background CPU load {load:.1f}% > {MAX_BACKGROUND_LOAD_PCT:.0f}% "
+                            "(post-boot updaters, browsers, indexing all count)")
+        if problems and not args.allow_contention:
+            print("REFUSING TO MEASURE:\n  - " + "\n  - ".join(problems) + "\n"
+                  "A contended measurement is not a slow measurement, it is a meaningless one\n"
+                  "(OPTIMIZATION_PROCESS.md S1). Wait, or pass --allow-contention and do not quote\n"
+                  "the number as evidence.", file=sys.stderr)
             return 2
+        print(f"contention check: {n} named, {load:.1f}% background -- clear", file=sys.stderr)
 
     arms = []
     for spec in args.arm:
@@ -232,6 +273,9 @@ def main() -> int:
 
     build = ROOT / args.build
     results: dict = {"label": args.label, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    # Every history row carries the conditions it was measured under -- a number without its
+    # contention context cannot be compared against a later one.
+    results["contention"] = results_load
 
     if "perf" in stages:
         if args.runs < 3:

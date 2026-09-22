@@ -17,9 +17,21 @@ saturating the same host.
 
 A number that does not follow this protocol is not evidence, and must not be quoted in a commit message.
 
-- **Check for contention first.** `tasklist | grep -icE "sub0llm|clang|ninja|cmake"` must be 0. This
-  host produced **2x run-to-run variance** under sibling-agent load (observed repeatedly during
-  B36/B37). A contended measurement is not a slow measurement, it is a meaningless one.
+- **Check for contention first — BOTH named processes AND total system load.** Named sibling tools
+  (`sub0llm|clang|ninja|cmake`) must be 0, *and* sustained total CPU load must be under **5%**
+  (performance counter, averaged over ~10 s — never one instantaneous read, which reported 48% where
+  the sustained figure was 6-19%). This host produced **2x run-to-run variance** under sibling-agent
+  load (B36/B37). The named-process check alone is **not sufficient**: after a reboot it reported "0
+  contention" while a VS Code updater, browser, desktop apps and a GPU container held total load at
+  6-19% — enough to make a ~7-10% decode delta unattributable against a ±1.5% noise floor.
+  `scripts/run_perf_suite.py` enforces both and refuses to measure otherwise. A contended measurement
+  is not a slow measurement, it is a meaningless one.
+- **`sub0llm-qwen4-forward`'s `forward_one` timing can never be cold-cache.** The tool runs `forward()`
+  first on the same tokens, and identical tokens route to identical experts — so `forward()` pre-warms
+  exactly the sidecar pages `forward_one` then reads. A "cold" `forward_one` number is really warm.
+  Measuring genuine cold-cache decode (the only case `--moe-io-mode pipelined` exists for) needs a
+  forward_one-only mode, or a flushed standby list plus distinct tokens. **Not yet built** — noted here
+  so nobody quotes a cold number from the existing tool.
 - **Interleave arms, never batch them.** A/B/A/B, not AAA then BBB — thermal drift is real on this part
   (`[[thermal-confounds-ab-wallclock-testing]]`).
 - **Minimum 3 runs per arm**, and report every one, not just the mean. A mean hiding 1.44/1.49/1.67 is
