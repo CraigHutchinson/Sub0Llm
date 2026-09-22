@@ -118,6 +118,14 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #                              the whole correctness gate for phase 1. Validates against real GGUF bytes
 #                              when SUB0_QWEN4_GGUF_DIR (or the hardcoded default) is present; skips
 #                              gracefully (WARN, not fail) otherwise, like qwen_tokenizer_tests.cpp.
+#   backbone_quant_tests.cpp — O5 phase 2b-1: sub0::bbq, the S0B1 native-quant BACKBONE sidecar format
+#                              and its mmap loader (docs/BACKBONE_NATIVE_QUANT.md S9/S10). Storage/loader
+#                              only -- nothing in src/ or tools/ includes backbone_quant.hpp yet. Covers
+#                              the on-disk struct sizes, the role table's derivation from
+#                              transplant::recipe_for (single source, AGENTS.md S5), the sparse
+#                              (role, layer) index (unlike moeq's dense grid, a per-layer role may be
+#                              absent at some layers), and every documented refusal (truncated/foreign/
+#                              version-mismatched/paired-wrong file).
 #   hidden_dump_tests.cpp    — WP4f: the S0HD hidden-state container the llama.cpp comparison exchanges.
 #                              Its byte layout is asserted offset-by-offset against a hand-written
 #                              expectation (not by writing and reading back with the same code), because
@@ -139,7 +147,7 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #                              the three errors no shape or statistical check can see (an alpha/beta
 #                              identity swap, a down-the-middle q|gate split, a swapped indexer concat).
 #                              Skips gracefully if the fixtures are absent.
-add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ngram_qwen4_fixture_tests.cpp gdn_qwen4_fixture_tests.cpp gated_residual_qwen4_fixture_tests.cpp moe_qwen4_fixture_tests.cpp qsa_qwen4_fixture_tests.cpp transplant_tests.cpp transplant_fixture_tests.cpp moe_quant_tests.cpp backbone_quant_dot_tests.cpp hidden_dump_tests.cpp qwen_tokenizer_tests.cpp fp8_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
+add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ngram_qwen4_fixture_tests.cpp gdn_qwen4_fixture_tests.cpp gated_residual_qwen4_fixture_tests.cpp moe_qwen4_fixture_tests.cpp qsa_qwen4_fixture_tests.cpp transplant_tests.cpp transplant_fixture_tests.cpp moe_quant_tests.cpp backbone_quant_dot_tests.cpp backbone_quant_tests.cpp hidden_dump_tests.cpp qwen_tokenizer_tests.cpp fp8_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
 target_include_directories(sub0_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)

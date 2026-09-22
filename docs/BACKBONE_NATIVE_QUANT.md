@@ -20,6 +20,17 @@ at 8 threads for every format (the metric that answers "is a real token faster")
 read are 1.9–3.6x fewer even though the native kernel's own GB/s is lower. Parked at this state per
 AGENTS.md §13 (a genuine 3-pass mechanism, not reverted); the concrete next lever is named in §12f.
 
+**Phase 2b-1 status (2026-09-22): DONE — the `S0B1` resident-format sidecar and its loader, resolving §9's
+own fork.** See §13 for the full write-up: `include/sub0/backbone_quant.hpp` (new), the writer wired into
+`tools/sub0llm-transplant.cpp` behind an opt-in `--backbone-quant` flag (default off, byte-identical
+existing output confirmed), `tests/backbone_quant_tests.cpp` (new). Storage/loader only — still nothing in
+`src/` reads this sidecar; phase 2b-2 (the parallel, separate work package finishing
+`backbone_quant_dot.hpp`'s kernel wiring) is what will eventually consume it. A real finding from actually
+running this against the file (AGENTS.md §9): the backbone is not uniformly one format per role the way
+§2a's aggregate table suggests — layer 2 is a genuine per-layer outlier (its `ffn_gate_shexp`/
+`ffn_up_shexp` are Q6_K, every other layer's are Q5_K), the same phenomenon §3a-bis already documented for
+the routed experts.
+
 Mirrors `docs/MOE_QUANT_DOT.md`'s own structure and rigour, applied to the BACKBONE instead of the routed
 experts.
 
@@ -756,3 +767,162 @@ precisely because this class of thing merges quietly and is not found until a pr
 decode throughput number and no logit-quality number. The per-row win above is a kernel measurement;
 whether it survives contact with the real decode depends on phase 2b's layout reconciliation (§3d), which
 is unsolved.
+
+---
+
+## 13. Phase 2b-1 — the `S0B1` resident-format sidecar and its loader (2026-09-22)
+
+Resolves §9's own fork: **(a)** — a sibling sidecar to `moeq`'s own `S0Q1`, tagged `S0B1`, not folded into
+the existing `S0L5`/`S0Q1` formats. Storage and a read-only loader only, per this phase's own brief:
+`include/sub0/backbone_quant.hpp` (new, engine-free), a writer wired into
+`tools/sub0llm-transplant.cpp` behind an opt-in `--backbone-quant <path>` flag (default off), and
+`tests/backbone_quant_tests.cpp` (new). Nothing in `src/` reads this sidecar yet — that is phase 2b-2's
+job, a separate, parallel work package finishing `backbone_quant_dot.hpp`'s own kernel wiring, whose three
+files (`include/sub0/backbone_quant_dot.hpp`, its tests, its bench) this phase deliberately did not touch.
+
+### 13a. Format
+
+`Header` (48 bytes: magic `S0B1`, version, `n_layers`, `n_tensors`, `data_off`/`data_bytes`,
+`model_param_floats`) + a `Desc` table (40 bytes each: `role`, `layer`, `type_raw`, `in_f`/`out_f` =
+GGUF's own `ne[0]`/`ne[1]`, `off`, `bytes`) + the payload, mmapped by `Store` exactly the way `moeq::Store`
+already maps `S0Q1` (`FileMap`, RAII, never eagerly read). Both struct sizes are `static_assert`-pinned.
+
+**Identity is `(Role, layer)`, not a GGUF name.** `Role` is a 15-member `enum class` — one member per
+`transplant::Dest` this sidecar carries (`TokEmb`, `LmHead`, `GrAttnDown/Up`, `GrFfnDown/Up`,
+`GrExitDown/Up`, `MoeSharedGate/Up/Down`, `QsaQGateProj`, `QsaKProj/VProj/OProj`) — mirroring `moeq::Which`'s
+`(layer, expert, which)` precedent with a flat per-role enum instead (no expert axis here). `role_pattern()`
+reads each role's own GGUF source-name pattern from `transplant::recipe_for()` directly (AGENTS.md §5's
+single-source discipline) rather than a second hand-copied table.
+
+**Sparse, not dense.** Unlike `moeq`'s dense `(layer, expert, which)` grid (every cell always present by
+construction — a routed layer always has all 512 experts), a per-layer role here may genuinely be absent
+at some layers (a QSA role on a GDN layer, and vice versa). `Store` builds a small
+`std::unordered_map<role_key, index>` once at `open()` and `find(role, layer)` returns `nullptr` for a real
+gap — checked directly (`tests/backbone_quant_tests.cpp`'s own deliberate-gap fixture) rather than assumed
+safe by a dense-grid analogy.
+
+**Byte order: GGUF's own, verbatim, untransposed** — the opposite of the `.bin` blob, and the reason this
+is a genuinely separate format rather than a fourth `ParamDtype`. A GGUF tensor is `[out][in]`, the natural
+DOT shape `backbone_quant_dot.hpp`'s kernels consume directly; the existing blob instead transposes every
+2-D weight to this project's own `[in, out]` AXPY convention. `dequantize_expert`'s `transpose_out_in` step
+is deliberately NOT applied anywhere in this sidecar's write or read path.
+
+### 13b. Per-role pre-transform decisions (the real work of this phase)
+
+Every `transplant::Dest` this sidecar could plausibly carry was checked against `transplant.hpp`'s own
+`fold_for()` and `vperm_for()` tables — the project's single source for which destinations need a value
+transform — not assumed safe by inspection:
+
+- **`fold_for()` (RMSNorm `1+w`, `ssm_a`'s `-exp(A_log)`): never fires for any role in the sidecar.** Every
+  `Dest` `fold_for` returns non-`None` for is a norm, a bias, or an F32 per-head-scalar GDN gate — already
+  excluded on format grounds (§13c point 1) before the fold question is even reached. Checked mechanically
+  by `tests/backbone_quant_tests.cpp`'s own "no role's transplant Dest carries a Fold" case, not left as a
+  prose claim.
+- **`vperm_for()` (GDN's grouped→tiled value-head reorder): fires for three otherwise-native-quant
+  candidates, and this phase had to actually resolve it, not just note it.** `GdnInProjQkv`/`GdnInProjZ`
+  (Q5_K) and `GdnOutProj` (Q6_K) all carry a real value-order permutation. Worked through by axis, not
+  assumed uniform:
+    - `GdnInProjQkv`/`GdnInProjZ` reorder the DESTINATION's column axis, which — because both are
+      `Op::Transpose` — is the RAW GGUF tensor's own ROW axis. Reordering whole rows of an independently
+      block-quantized tensor is, in principle, just a permuted row COPY: no re-quantization needed.
+    - `GdnOutProj` reorders the destination's ROW axis, which is the raw GGUF tensor's own COLUMN axis —
+      i.e. it reorders elements WITHIN each row, across the very axis K-quant super-blocks are computed
+      over. That does NOT commute with raw quantized bytes: reassembling a validly-quantized permuted row
+      would need real re-blocking, not a copy.
+  Rather than build two different mechanisms (a row-copy path for two roles, a re-blocking path for the
+  third) with no live kernel consumer yet to validate either against, this phase made ONE conservative
+  decision for all three: **exclude every VPerm-affected role from the sidecar.** They stay in the existing
+  bf16 blob. The row-copy option for the two `Cols`-axis roles is named as a scoped future increment, not
+  attempted here.
+- **Roles excluded on format grounds** (no `Fold`/`VPerm` question even reached): F32 tensors (norms, the
+  dense router, biases, small per-head-scalar GDN gates — no smaller native form exists) and the QSA
+  indexer (`indexer.q_proj`/`k_proj`, BF16 — already the resident target format).
+- **Roles excluded because they already have their own sidecar**: the 512 routed experts per layer
+  (`moe_quant.hpp`'s own `S0Q1`) — this design's role table does not duplicate them.
+- **`QsaQGateProj`, a genuinely different kind of decision.** `attn_q.weight` supplies BOTH
+  `Dest::QsaQProj` and `Dest::QsaGateProj` via `transplant::Op::PerHeadHalf` — a non-contiguous per-head row
+  selection, not a slice or a transpose. Rather than pre-split the tensor at sidecar-write time (real risk
+  of an off-by-one in the per-head row arithmetic with no kernel consumer yet to catch it against), the
+  sidecar stores the WHOLE source tensor verbatim under one role; a future consumer applies
+  `per_head_half_transpose`'s own row-selection formula (`h*2*head_dim + half*head_dim`) directly against
+  this role's raw bytes. No pre-split, no permutation, no re-blocking risk.
+
+### 13c. Real file, end to end (AGENTS.md §9) — the measured size, and the honest discrepancy
+
+Ran `sub0llm-transplant-q48 --gguf D:\ModelWeights\Qwen3.8-Flash-Next-GGUF\UD-IQ1_S --param-dtype 1 --out
+<...>.bin --backbone-quant <...>.bin.bbq` end to end (157.2s for the whole run, produced all three real
+artifacts: 9.83 GB `.bin`, 39.85 GB `.moeq`, 1.99 GB `.bbq`; `D:` had 263 GiB free against a ~50 GB need).
+Real measured sidecar:
+
+| | Value |
+|---|---:|
+| Tensors considered | 388 |
+| Tensors included | 388 (100% of considered — every candidate that passed the format filter was block-aligned) |
+| **Native encoded bytes** | **1,993,630,720 (1.857 GiB)** |
+| Same tensors' bf16 cost | 5,481,431,040 (5.105 GiB) — **2.75x** smaller |
+| Q8_0 tensors | 242 (100% of the file's Q8_0 — no exclusions apply to this format) |
+| Q4_K tensors | 2 (100% — `TokEmb` + `LmHead`) |
+| Q5_K tensors | 142 (94 `MoeSharedGate`/`Up`, 48 QSA `K`/`V`/`O`/`QGateProj`) |
+| Q6_K tensors | 2 (the layer-2 outlier's `MoeSharedGate`/`Up` — see §13d) |
+
+**Discrepancy from §2a's 3.59 GiB prediction, stated plainly rather than rounded away: the measured
+sidecar is 1.857 GiB, about 52% of that figure — and the right comparison is actually against §2a's own
+Q8_0+Q4_K+Q5_K+Q6_K subtotal (3,339.55 MiB / 3.262 GiB, the "4-format" figure that table itself reports),
+against which the measured result is 58.3%.** The gap is real and almost entirely explained by §13b's
+VPerm exclusion, not a measurement error: §2a's own totals put Q6_K at 478.34 MiB and this sidecar carries
+only ~2.6 MiB of it (the layer-2 outlier), and Q5_K at 1,455.35 MiB against this sidecar's ~493 MiB (GDN
+in-proj — `GdnInProjQkv`/`GdnInProjZ` across the file's ~35 non-outlier GDN layers — accounts for
+essentially the whole difference). Q8_0 and Q4_K, which have no VPerm-affected role, land at their full
+predicted totals exactly (242/2 tensors, matching §2a's own per-format counts). **Net: the conservative
+VPerm decision gives up roughly 1.4 GiB of the format's theoretical native-quant byte reduction** — real,
+quantified, and the direct, traceable consequence of §13b's own reasoning, not a surprise.
+
+Put against the whole backbone's current bf16 residency (9.15 GiB, §7): this sidecar's included tensors are
+55.8% of that footprint by bf16 bytes, and shrinking them 2.75x saves **3.248 GiB** of the model's total
+resident size if wired in — about 58% of §7's full four-format potential (5.56 GiB), the same fraction
+§13b's exclusion gives up.
+
+### 13d. Correctness gates — real numbers
+
+- **Round-trip against the real shard (AGENTS.md §9), every included tensor, not a sample** (388 is small
+  enough that a full sweep costs nothing next to the transplant's own ~157s): decode the sidecar's own
+  bytes via `gguf::to_f32`, independently re-read and decode the SAME bytes straight from the GGUF shard via
+  the tool's own `read_range`, compare bit for bit. **388/388, 0 mismatches.**
+- **Cross-check against the `.bin` blob's own value, to bf16 rounding, one real tensor per format** — the
+  gate the round-trip alone cannot give, since it would pass even if every role were paired with the wrong
+  GGUF name, as long as the pairing were self-consistent. Uses a SEPARATE decode path (`PARAM_LAYOUT` offset
+  arithmetic into the blob + the blob's own bf16 decode, not the sidecar's own code): `GrAttnDown` layer 0
+  (Q8_0), `TokEmb` (Q4_K), `MoeSharedGate` layer 0 (Q5_K) — and, found only by actually running this against
+  the real file (not assumed from §2a's aggregate table), `MoeSharedGate` layer 2 (Q6_K, the real per-layer
+  outlier §13b's own comment names). **36 sample values (3 rows × 3 columns × 4 tensors), 0 mismatches** —
+  so, unlike an earlier draft of this section assumed, Q6_K DOES get a real cross-check after all, because
+  the writer discovers each tensor's actual `type_raw` by lookup rather than assuming a role's format from
+  its name, and correctly picked up the layer-2 anomaly with no special case.
+- **Refusals**, each with its own test in `tests/backbone_quant_tests.cpp`: a file that is not `S0B1` at
+  all, a truncated header, a truncated descriptor table, a truncated payload, a version bump, a
+  `model_param_floats` mismatch (an optional caller-supplied check — this header has no compile-time
+  `PARAM_FLOATS` of its own, being engine-free, so the expected value is a parameter; 0 means "skip"), an
+  out-of-range role, and a duplicate `(role, layer)` descriptor. All refuse cleanly with a non-empty `err`
+  rather than reading garbage.
+- **AGENTS.md §4 — zero effect on existing output when the flag is omitted.** Ran the real 4-layer
+  transplant twice, identical arguments except one run added `--backbone-quant`: the resulting `.bin` and
+  `.moeq` files are byte-for-byte identical (`cmp` confirmed) between the two runs.
+- **Suites** (`out/build/o5p2b`, this host, `sub0_core.dll` beside the test binaries): `sub0_tests`
+  **28,969,623 / 147**, exactly unchanged from `main` (this package touches nothing `sub0_tests` depends
+  on — no engine, no `src/` file). `sub0_frontend_tests` **145,636 / 275**, i.e. `main`'s 145,500/267 plus
+  exactly this package's own 136 assertions / 8 test cases in `[backbonequantsidecar]`, nothing else moved.
+
+### 13e. What phase 2b-2 (kernel wiring) inherits, named rather than re-derived
+
+- The `Store`/`Desc`/`Role` surface (§13a) is the seam a real `op_linear`/decode consumer would read
+  from: `find(role, layer)` → `nullptr` or a `Desc`; `raw(desc)` → the exact byte span
+  `bbqd::gemv_plane(type_raw, raw, n_rows, row_elems, ...)` wants, with `Desc::in_f`/`out_f` already named
+  `row_elems`/`n_rows` in that kernel's own vocabulary.
+- **The VPerm-excluded roles (§13b) are NOT in this sidecar at any layer.** A wiring pass must fall back to
+  the existing bf16/f32 blob for `GdnInProjQkv`, `GdnInProjZ`, and `GdnOutProj` unconditionally — `find()`
+  returning `nullptr` for those roles is the correct, permanent outcome, not a bug to chase.
+- **`QsaQGateProj` needs the per-head-half row-selection arithmetic applied by the CONSUMER**, not
+  pre-applied here (§13b) — `transplant::per_head_half_transpose`'s own row math
+  (`h*2*head_dim + half*head_dim`) is the reference to port.
+- The AXPY-vs-DOT reconciliation §3d already named as unresolved is unchanged by this phase — this phase
+  only produces bytes and an identity lookup, it does not touch any engine call site's loop shape.

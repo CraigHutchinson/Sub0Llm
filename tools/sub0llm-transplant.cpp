@@ -34,6 +34,7 @@
 // layer 1, and the MTP and vision blocks, are NOT transplanted. They are reported by name in the
 // unmatched-source list rather than silently skipped.
 
+#include "sub0/backbone_quant.hpp"
 #include "sub0/bf16.hpp"
 #include "sub0/fp8.hpp"
 #include "sub0/gguf.hpp"
@@ -409,6 +410,118 @@ bool write_moe_sidecar(const std::string& path, std::map<std::string, Source>& b
     return static_cast<bool>(os);
 }
 
+// --- O5 phase 2b-1: the native-quant backbone sidecar (`<out>.bbq`, include/sub0/backbone_quant.hpp) ---
+//
+// Writes a SUBSET of the backbone's own 2-D weight tensors, verbatim in their source GGUF encoding
+// (Q8_0/Q4_K/Q5_K/Q6_K only) and GGUF's own [out][in] byte order (no transpose -- see backbone_quant.hpp's
+// own header comment for why, and the DOT-vs-AXPY reasoning it cites). Additive: every tensor this sidecar
+// carries is ALSO still in the ordinary .bin blob, at whatever --param-dtype this run used -- nothing about
+// the existing output changes when this flag is used, and nothing changes AT ALL when it is not (the
+// caller must pass a non-empty path to get here).
+//
+// Which (role, layer) pairs actually land in the sidecar is discovered by lookup against `by_name`, not
+// predicted: a per-layer role like QsaKProj simply has no source tensor on a GDN layer, and that is a
+// normal outcome (skip), not a failure -- unlike write_moe_sidecar's own dense per-expert grid, where a
+// missing source IS an error (every expert exists at every routed layer by construction).
+struct BackboneQuantTotals {
+    std::uint64_t tensors_considered = 0;   // every (role, layer) whose GGUF source tensor was found
+    std::uint64_t tensors_included = 0;     // ... and was one of Q8_0/Q4_K/Q5_K/Q6_K, block-aligned
+    std::uint64_t bytes = 0;
+    std::uint64_t bf16_bytes_avoided = 0;   // the same tensors' cost in the .bin blob's own bf16 form
+    std::map<std::uint32_t, std::uint64_t> by_type;
+};
+
+bool write_backbone_quant_sidecar(const std::string& path, std::map<std::string, Source>& by_name,
+                                  std::map<const Shard*, std::ifstream>& handles,
+                                  BackboneQuantTotals& tot, bool dry_run) {
+    struct Entry { bbq::Role role; int layer; const gguf::TensorInfo* info; const Shard* shard; };
+    std::vector<Entry> entries;
+
+    for (int r = 0; r < bbq::kRoleCount; ++r) {
+        const auto role = static_cast<bbq::Role>(r);
+        const char* pattern = bbq::role_pattern(role);
+        std::vector<int> layers;
+        if (bbq::role_per_layer(role)) { for (int l = 0; l < N_LAYERS; ++l) layers.push_back(l); }
+        else                            { layers.push_back(-1); }
+
+        for (int layer : layers) {
+            const std::string name = gguf_name(pattern, layer < 0 ? 0 : layer);
+            auto it = by_name.find(name);
+            if (it == by_name.end()) continue;   // not present at this layer -- a normal mixer-branch gap
+            const gguf::TensorInfo& t = it->second.info;
+            if (t.dims.empty()) continue;
+            ++tot.tensors_considered;
+            const int in_f = static_cast<int>(t.dims[0]);
+            const std::uint64_t out_f = t.dims.size() < 2 ? 1 : t.dims[1];
+            // fusable(): the ONE format-validity table (Q8_0/Q4_K/Q5_K/Q6_K, row_elems % 32 == 0),
+            // reused from backbone_quant_dot.hpp rather than re-listing the formats here (AGENTS.md S3).
+            // A role whose real tensor turns out to be F32/BF16 (norms, the indexer -- see this file's
+            // own header comment on why those are excluded) is discovered here, not hardcoded.
+            if (!bbqd::fusable(t.type_raw, in_f)) continue;
+            entries.push_back({role, layer, &t, it->second.shard});
+        }
+    }
+
+    std::vector<bbq::Desc> descs(entries.size());
+    std::uint64_t cursor = 0;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const Entry& e = entries[i];
+        const std::uint64_t elems = static_cast<std::uint64_t>(e.info->dims[0]) *
+                                    (e.info->dims.size() < 2 ? 1 : e.info->dims[1]);
+        const std::uint64_t bytes = bbqd::plane_bytes(e.info->type_raw, elems);
+        if (bytes == 0) {
+            std::println(stderr, "error: '{}' ({} elements, type {}) is not a whole number of blocks -- "
+                                 "fusable() should have already excluded this", e.info->name, elems,
+                         e.info->type_raw);
+            return false;
+        }
+        descs[i] = bbq::Desc{static_cast<std::int32_t>(e.role), e.layer, e.info->type_raw,
+                             static_cast<std::uint32_t>(e.info->dims[0]),
+                             static_cast<std::uint32_t>(e.info->dims.size() < 2 ? 1 : e.info->dims[1]),
+                             0, cursor, bytes};
+        cursor += bytes;
+        ++tot.tensors_included;
+        tot.bytes += bytes;
+        tot.bf16_bytes_avoided += elems * 2;
+        ++tot.by_type[e.info->type_raw];
+    }
+
+    bbq::Header h;
+    h.n_layers = N_LAYERS;
+    h.n_tensors = descs.size();
+    h.data_off = sizeof(bbq::Header) + descs.size() * sizeof(bbq::Desc);
+    h.data_bytes = cursor;
+    h.model_param_floats = PARAM_FLOATS;
+    if (dry_run) return true;
+
+    std::ofstream os(path, std::ios::binary | std::ios::trunc);
+    if (!os) { std::println(stderr, "error: cannot create {}", path); return false; }
+    os.write(reinterpret_cast<const char*>(&h), sizeof h);
+    os.write(reinterpret_cast<const char*>(descs.data()),
+             static_cast<std::streamsize>(descs.size() * sizeof(bbq::Desc)));
+
+    std::vector<std::uint8_t> buf;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const Entry& e = entries[i];
+        const bbq::Desc& d = descs[i];
+        const std::uint64_t off = e.shard->data_offset + e.info->offset;   // the WHOLE tensor, no slice
+        buf.assign(static_cast<std::size_t>(d.bytes), 0);
+        std::ifstream& f = handles[e.shard];
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(off));
+        f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(d.bytes));
+        if (static_cast<std::uint64_t>(f.gcount()) != d.bytes) {
+            std::println(stderr, "error: short read for backbone-quant tensor {} ({} of {} bytes at {})",
+                         i, static_cast<std::uint64_t>(f.gcount()), d.bytes, off);
+            return false;
+        }
+        os.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(d.bytes));
+        if (!os) { std::println(stderr, "error: backbone-quant write failed at tensor {}", i); return false; }
+    }
+    os.flush();
+    return static_cast<bool>(os);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -438,6 +551,16 @@ int main(int argc, char** argv) {
     // "bit-for-bit" means against the SAME bf16 rounding this run would itself produce (dst rounded
     // through f32_narrow on both sides of the comparison), not against the pre-rounding float.
     app.add_option("--verify", verify_path, "compare an existing artifact against a fresh transplant");
+    // O5 phase 2b-1 (docs/BACKBONE_NATIVE_QUANT.md S9/S10): an opt-in, ADDITIVE second sidecar holding a
+    // subset of the backbone's own weights in native GGUF quantization (see backbone_quant.hpp's own
+    // header comment for exactly which tensors and why). Default empty -- this run's other outputs are
+    // byte-for-byte unchanged unless this is set (AGENTS.md S4). A plain runtime flag rather than a
+    // constexpr toggle is correct here for the SAME reason --verify already is one: it produces an
+    // additional output artifact, it does not change what PARAM_LAYOUT/the .bin blob computes or contains.
+    std::string backbone_quant_path;
+    app.add_option("--backbone-quant", backbone_quant_path,
+                   "also write a native-quant backbone sidecar (Q8_0/Q4_K/Q5_K/Q6_K, verbatim GGUF "
+                   "bytes) to this path. Default: not written.");
     CLI11_PARSE(app, argc, argv);
     if (!dry_run && out_path.empty() && verify_path.empty()) {
         std::println(stderr, "error: one of --out, --dry-run or --verify is required");
@@ -797,6 +920,176 @@ int main(int argc, char** argv) {
             std::println("mismatches                                  : {}", mismatched);
             if (mismatched != 0) return 13;
         }
+    }
+
+    // --- O5 phase 2b-1: the native-quant backbone sidecar (`--backbone-quant`) ---------------------
+    BackboneQuantTotals bbq_tot;
+    if (!backbone_quant_path.empty()) {
+        if (!write_backbone_quant_sidecar(backbone_quant_path, by_name, handles, bbq_tot, dry_run))
+            return 15;
+
+        if (!dry_run) {
+            // Round-trip against the REAL shard bytes (AGENTS.md S9), for EVERY included tensor -- there
+            // are hundreds of backbone tensors, not the tens of thousands of routed-expert planes, so a
+            // full sweep is cheap and there is no reason to sample. This proves the write+reopen pipeline
+            // itself, on top of the "verbatim copy" claim the format's own comment makes.
+            bbq::Store store;
+            std::string err;
+            if (!store.open(backbone_quant_path, err, PARAM_FLOATS)) {
+                std::println(stderr, "error: cannot re-open the backbone-quant sidecar just written: {}",
+                             err);
+                return 15;
+            }
+            if (store.resident_bytes() != bbq_tot.bytes) {
+                std::println(stderr, "error: reopened sidecar's own payload size ({}) does not match "
+                                     "what the writer computed ({})", store.resident_bytes(),
+                             bbq_tot.bytes);
+                return 15;
+            }
+            std::uint64_t checked = 0, mismatched = 0;
+            std::vector<float> from_sidecar, from_shard;
+            std::vector<std::uint8_t> raw_bytes;
+            for (int r = 0; r < bbq::kRoleCount; ++r) {
+                const auto role = static_cast<bbq::Role>(r);
+                std::vector<int> layers;
+                if (bbq::role_per_layer(role)) { for (int l = 0; l < N_LAYERS; ++l) layers.push_back(l); }
+                else                            { layers.push_back(-1); }
+                for (int layer : layers) {
+                    const bbq::Desc* d = store.find(role, layer);
+                    if (!d) continue;
+                    if (!bbq::dequantize_role_to_f32(*d, store.raw(*d), from_sidecar)) {
+                        std::println(stderr, "error: backbone-quant decode failed at role {} layer {}",
+                                     bbq::role_name(role), layer);
+                        return 15;
+                    }
+                    const std::string name = gguf_name(bbq::role_pattern(role), layer < 0 ? 0 : layer);
+                    const Source& s = by_name.find(name)->second;
+                    const std::uint64_t n = static_cast<std::uint64_t>(d->in_f) * d->out_f;
+                    if (!read_range(handles[s.shard], *s.shard, s.info, 0, n, raw_bytes, from_shard))
+                        return 15;
+                    ++checked;
+                    if (from_sidecar.size() != from_shard.size() ||
+                        std::memcmp(from_sidecar.data(), from_shard.data(),
+                                    from_sidecar.size() * sizeof(float)) != 0) {
+                        ++mismatched;
+                        if (mismatched <= 5)
+                            std::println(stderr, "BACKBONE-QUANT MISMATCH role {} layer {}",
+                                         bbq::role_name(role), layer);
+                    }
+                }
+            }
+            std::println("");
+            std::println("--- O5 phase 2b-1: backbone-quant round-trip vs the real shard -------------");
+            std::println("tensors compared    : {}", checked);
+            std::println("mismatches           : {}", mismatched);
+            if (mismatched != 0) return 15;
+
+            // Cross-check against the .bin BLOB's own value (a SEPARATE decode path: PARAM_LAYOUT offset
+            // arithmetic + the blob's own dtype decode, not the sidecar's), to bf16 rounding -- what
+            // proves this sidecar carries the RIGHT tensor under the RIGHT identity, which the round-trip
+            // above alone cannot (it would pass identically even if every role were paired with the wrong
+            // GGUF name, as long as the pairing were self-consistent). One real tensor per format:
+            // Q8_0 (GrAttnDown layer 0), Q4_K (TokEmb), Q5_K (MoeSharedGate layer 0). Q6_K's ONLY intended
+            // consumer (GdnOutProj) is excluded via VPerm -- but the real file's per-layer mixed
+            // quantization (discovered at run time, not assumed: this census found layer 2's
+            // ffn_gate_shexp/ffn_up_shexp are Q6_K where every other layer is Q5_K, an outlier layer the
+            // design doc's earlier aggregate table did not surface) means MoeSharedGate at layer 2 IS a
+            // real, included Q6_K tensor -- so all four formats get a real cross-check after all.
+            struct CrossCheck { bbq::Role role; int layer; Dest dest; bool transpose; const char* fmt; };
+            const CrossCheck checks[] = {
+                {bbq::Role::GrAttnDown,    0, Dest::GrAttnDown,    true,  "Q8_0"},
+                {bbq::Role::TokEmb,       -1, Dest::TokEmb,        false, "Q4_K"},
+                {bbq::Role::MoeSharedGate, 0, Dest::MoeSharedGate, true,  "Q5_K"},
+                {bbq::Role::MoeSharedGate, 2, Dest::MoeSharedGate, true,  "Q6_K (layer-2 outlier)"},
+            };
+            std::ifstream bin(out_path, std::ios::binary);
+            std::uint64_t cc_checked = 0, cc_mismatched = 0;
+            bool any_cc_missing = false;
+            for (const CrossCheck& cc : checks) {
+                const bbq::Desc* d = store.find(cc.role, cc.layer);
+                if (!d) {
+                    std::println(stderr, "backbone-quant cross-check: role {} layer {} not in the "
+                                         "sidecar (excluded, or absent at this layer)",
+                                 bbq::role_name(cc.role), cc.layer);
+                    any_cc_missing = true;
+                    continue;
+                }
+                std::size_t idx = plan.size();
+                for (std::size_t i = 0; i < plan.size(); ++i)
+                    if (plan[i].dest == cc.dest && plan[i].layer == cc.layer) { idx = i; break; }
+                if (idx == plan.size()) {
+                    std::println(stderr, "backbone-quant cross-check: no PARAM_LAYOUT slot for role {} "
+                                         "layer {}", bbq::role_name(cc.role), cc.layer);
+                    return 15;
+                }
+                const ParamDesc& p = PARAM_LAYOUT[idx];
+                if (!bbq::dequantize_role_to_f32(*d, store.raw(*d), from_sidecar)) return 15;
+                const int rows_r[] = {0, static_cast<int>(d->out_f) / 2,
+                                      static_cast<int>(d->out_f) - 1};
+                const int cols_r[] = {0, static_cast<int>(d->in_f) / 2, static_cast<int>(d->in_f) - 1};
+                for (int o : rows_r) {
+                    if (o < 0 || o >= static_cast<int>(d->out_f)) continue;
+                    for (int i : cols_r) {
+                        if (i < 0 || i >= static_cast<int>(d->in_f)) continue;
+                        const std::uint64_t flat = cc.transpose
+                            ? p.off + static_cast<std::uint64_t>(i) * p.cols + static_cast<std::uint64_t>(o)
+                            : p.off + static_cast<std::uint64_t>(o) * p.cols + static_cast<std::uint64_t>(i);
+                        bin.clear();
+                        bin.seekg(static_cast<std::streamoff>(sizeof(ModelHeader) + flat * elem_bytes));
+                        float blob_val = 0.f;
+                        if (out_dtype == ParamDtype::BF16) {
+                            bf16 v{};
+                            bin.read(reinterpret_cast<char*>(&v), sizeof v);
+                            blob_val = to_f32(v);
+                        } else if (out_dtype == ParamDtype::FP8) {
+                            fp8 v{};
+                            bin.read(reinterpret_cast<char*>(&v), sizeof v);
+                            blob_val = to_f32(v);
+                        } else {
+                            bin.read(reinterpret_cast<char*>(&blob_val), sizeof blob_val);
+                        }
+                        const float sidecar_val =
+                            from_sidecar[static_cast<std::size_t>(o) * d->in_f + static_cast<std::size_t>(i)];
+                        ++cc_checked;
+                        // "to bf16 rounding": round BOTH sides through bf16 before comparing, so the
+                        // check is fair regardless of which --param-dtype this run actually used.
+                        if (bf16_round(sidecar_val) != bf16_round(blob_val)) {
+                            ++cc_mismatched;
+                            std::println(stderr, "  cross-check mismatch {} role {} layer {} row {} col "
+                                                 "{}: sidecar {:.6g} vs blob {:.6g}", cc.fmt,
+                                         bbq::role_name(cc.role), cc.layer, o, i, sidecar_val, blob_val);
+                        }
+                    }
+                }
+            }
+            std::println("--- O5 phase 2b-1: backbone-quant cross-check vs the .bin blob (bf16 "
+                         "rounding) ---");
+            std::println("sample values compared: {}", cc_checked);
+            std::println("mismatches             : {}", cc_mismatched);
+            // A listed cross-check tensor is expected to exist at every real N_LAYERS this tool builds
+            // (layers 0 and 2 always exist) -- if one is missing, that is a real defect in the writer or
+            // the role table, not a benign gap, so it fails loudly rather than degrading to a note.
+            if (any_cc_missing) {
+                std::println(stderr, "error: a listed backbone-quant cross-check tensor was missing (see "
+                                     "the messages above) -- this should never happen at N_LAYERS >= 3");
+                return 15;
+            }
+            if (cc_mismatched != 0) return 15;
+        }
+        std::println("");
+        std::println("--- O5 phase 2b-1: backbone-quant sidecar --------------------------------");
+        std::println("sidecar                  : {}", backbone_quant_path);
+        std::println("tensors considered       : {}", bbq_tot.tensors_considered);
+        std::println("tensors included         : {}", bbq_tot.tensors_included);
+        std::println("native encoded bytes     : {} ({:.3f} GiB)", bbq_tot.bytes,
+                     static_cast<double>(bbq_tot.bytes) / (1024.0 * 1024.0 * 1024.0));
+        std::println("the same tensors as bf16 : {} ({:.3f} GiB) -- ratio {:.2f}x",
+                     bbq_tot.bf16_bytes_avoided,
+                     static_cast<double>(bbq_tot.bf16_bytes_avoided) / (1024.0 * 1024.0 * 1024.0),
+                     static_cast<double>(bbq_tot.bf16_bytes_avoided) /
+                         static_cast<double>(bbq_tot.bytes ? bbq_tot.bytes : 1));
+        for (const auto& [type, n] : bbq_tot.by_type)
+            std::println("  GGML type {:>2} : {:>4} tensors", type, n);
     }
 
     // --- LEVEL 1: reconciliation --------------------------------------------------------------------
