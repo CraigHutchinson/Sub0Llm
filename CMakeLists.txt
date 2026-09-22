@@ -215,6 +215,13 @@ add_executable(sub0llm-tokenizer tools/sub0llm-tokenizer.cpp)
 target_include_directories(sub0llm-tokenizer PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0_frontend)
 
+# O5 phase 1 (docs/BACKBONE_NATIVE_QUANT.md): header/tensor-table-only census of the backbone's real
+# non-expert, non-PLE GGUF tensors -- name, type, shape, bytes, consumer. Engine-free (gguf.hpp only,
+# no CLI11 dependency -- it takes one plain --gguf <dir> argument), same "reads only what a design pass
+# needs, never a bulk payload load" reasoning as sub0llm-tokenizer above.
+add_executable(sub0llm-backbone-census tools/sub0llm-backbone-census.cpp)
+target_include_directories(sub0llm-backbone-census PRIVATE "${CMAKE_SOURCE_DIR}/include")
+
 # WP4c: the offline weight transplant (docs/WP4_SCOPE.md S4). Unusual in exactly one way, and the
 # reason is worth stating at the target rather than only in the source: it is compiled against
 # tests/qwen4_real_axes/sub0_config.hpp -- Qwen3.8-Flash-Next's REAL RunConfig axes, with N_LAYERS
