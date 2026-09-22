@@ -465,6 +465,13 @@ if(WIN32)
 endif()
 set_target_properties(sub0llm-qwen4-forward PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 
+# --- kernel microbenchmark for the fused MoE GEMV (B35 / O1) ---------------
+# Header-only against include/sub0/moe_quant_dot.hpp, no engine and no generated config, so it builds in
+# any configuration in seconds. It is the fast inner loop for kernel iteration
+# (docs/OPTIMIZATION_PROCESS.md S4); the real-artifact decode stays the final gate.
+add_executable(sub0llm-bench-moeqd tools/sub0llm-bench-moeqd.cpp)
+target_include_directories(sub0llm-bench-moeqd PRIVATE "${CMAKE_SOURCE_DIR}/include")
+
 # --- WP5c: the real-axes GENERATION harness ---------------------------------
 # Same shape and the same reasoning as sub0llm-qwen4-forward directly above -- it links the engine, so
 # it is compiled against ${GEN_DIR}'s generated config and only does anything useful in a build that

@@ -759,6 +759,74 @@ TEST_CASE("moeq (B35): the int8 activation is the only new error source, and thi
     }
 }
 
+TEST_CASE("moeq (O1): the AVX2 kernel computes what the portable kernel does, at the real plane shapes",
+          "[moequant]") {
+    // gemv_plane runs detail::gemv_avx2 wherever the target has AVX2 (moeqd::kAvx2Kernels); the portable
+    // detail::gemv is kept as its reference. The two share each format's bit-field parse, so what this
+    // pins is everything they do NOT share: the vector materialisation of each format (IQ1_S's grid
+    // qwords, IQ2_XXS's magnitude/sign split, IQ4_NL's vpshufb nibble decode), the vpsignb/vpmaddubsw
+    // MAC, F16C's scale conversion and the per-lane accumulation.
+    //
+    // Real shapes, not a toy block: gate/up are 640 rows of 2560, down is 2560 rows of 640 -- the odd
+    // rows of the latter begin half-way into an IQ1_S/IQ2_XXS super-block, which a 256-wide case never
+    // reaches. 1.6M random elements per plane also cover every grid index and all 128 IQ2_XXS sign
+    // patterns many times over.
+    //
+    // Tolerance: the kernels differ only in float summation order, so the right yardstick is the sum of
+    // the MAGNITUDES of the per-group terms (the quantity reassociation error scales with), not the
+    // possibly-cancelling row result. Any decode or sign error is O(1) against that, not O(1e-6).
+    INFO("AVX2 kernels compiled in: " << moeqd::kAvx2Kernels);
+    struct Shape { int rows, cols; };
+    for (const Shape sh : {Shape{640, 2560}, Shape{2560, 640}}) {
+        std::vector<float> x(static_cast<std::size_t>(sh.cols));
+        std::mt19937 rng(31337u + static_cast<std::uint32_t>(sh.cols));
+        std::normal_distribution<float> normal(0.f, 1.f);
+        for (float& v : x) v = normal(rng);
+        moeqd::ActBlocks xq;
+        xq.quantize(x.data(), sh.cols);
+
+        for (const gguf::TensorType type : kFusedFormats) {
+            INFO("format " << format_name(type) << ", " << sh.rows << " x " << sh.cols);
+            const auto raw_t = static_cast<std::uint32_t>(type);
+            const std::vector<std::uint8_t> raw = make_iq_blocks(
+                type, static_cast<std::uint64_t>(sh.rows) * static_cast<std::uint64_t>(sh.cols), 4040u + raw_t);
+
+            std::vector<float> best(static_cast<std::size_t>(sh.rows));
+            std::vector<float> portable(static_cast<std::size_t>(sh.rows));
+            std::vector<double> magnitude(static_cast<std::size_t>(sh.rows), 0.0);
+            REQUIRE(moeqd::gemv_plane(raw_t, std::span<const std::uint8_t>(raw), sh.rows, sh.cols, xq, best.data()));
+
+            const auto reference = [&](const auto& plane) {
+                moeqd::detail::gemv(plane, sh.rows, sh.cols, xq, portable.data());
+                for (int r = 0; r < sh.rows; ++r)
+                    for (int g = 0; g < sh.cols / moeqd::GROUP; ++g) {
+                        const auto gi = static_cast<std::size_t>(g);
+                        const moeqd::WeightGroup wg = plane.group(
+                            static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(sh.cols) + gi * moeqd::GROUP);
+                        double term = moeqd::detail::dot_group(wg.q.data(), xq.qs.data() + gi * moeqd::GROUP);
+                        term += static_cast<double>(wg.delta) * xq.gsum[gi];
+                        magnitude[static_cast<std::size_t>(r)] += std::fabs(
+                            static_cast<double>(xq.scale[gi]) * wg.scale * term);
+                    }
+            };
+            switch (type) {
+                case gguf::TensorType::IQ1_S:   reference(moeqd::Iq1SPlane{raw.data()}); break;
+                case gguf::TensorType::IQ2_XXS: reference(moeqd::Iq2XxsPlane{raw.data()}); break;
+                default:                        reference(moeqd::Iq4NlPlane{raw.data()}); break;
+            }
+
+            double worst = 0.0;
+            for (std::size_t r = 0; r < best.size(); ++r) {
+                REQUIRE(std::isfinite(best[r]));
+                REQUIRE(magnitude[r] > 0.0);
+                worst = std::max(worst, std::fabs(static_cast<double>(best[r]) - portable[r]) / magnitude[r]);
+            }
+            INFO("worst |avx2 - portable| / sum|group terms| = " << worst);
+            REQUIRE(worst < 2e-5);
+        }
+    }
+}
+
 TEST_CASE("moeq (B35): expert_ffn_row_quant computes the same expert the dequantize path does",
           "[moequant]") {
     // The whole fused FFN against the whole existing one, on the SAME encoded bytes: gate, up, SiLU,
