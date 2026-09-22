@@ -250,6 +250,7 @@ Both are **automated**, so neither is a manual ritual anyone has to remember:
 |---|---|
 | `python scripts/analyze_kernel.py --probe <header>` | static: vectorization, instruction mix, port pressure, aliasing, alignment |
 | `python scripts/run_perf_suite.py --stage vtune --arm "x:<flags>"` | dynamic: Top-Down split (Retiring / Front-End / Bad-Spec / Back-End, and Memory Bound vs Core Bound) |
+| `sub0llm-bench-moeqd [--hot\|--stream]` | the fused MoE GEMV kernel alone, at the real plane shapes: µs/plane, GB/s and GMAC/s as % of both roofs, hot (compute) vs stream (memory). Seconds per data point instead of a 37 GiB decode; its old-kernel IQ2_XXS time (~1300 µs/plane) matched the real profile's 1227, so it is a faithful proxy. The inner loop for kernel iteration; the real decode stays the final gate |
 
 `analyze_kernel.py` carries a registry of independent analyzers; **adding one is a single decorated
 function**, and the set is expected to grow as we learn what else informs a decision. The current five

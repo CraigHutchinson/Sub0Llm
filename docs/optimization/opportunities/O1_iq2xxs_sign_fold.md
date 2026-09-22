@@ -1,6 +1,6 @@
 # O1 — fold IQ2_XXS's sign application into the dot product
 
-**Status:** pending
+**Status:** merged 2026-09-22 — implemented as a WIDER change than §4 chose; see §10
 **Expected gain:** up to ~18% of total decode (see §2 arithmetic); realistically less
 **Risk:** medium — touches the fused kernel's numerics path
 **Complexity:** S/M
@@ -124,3 +124,51 @@ the grid-lookup encoding, in which case closing half of it is a good result.
 - The mixer (GDN/QSA) at 21.2% of total is entirely untouched and needs its own O1 split before any
   lever is chosen there.
 - Whatever lands here, **re-profile if it exceeds ~20%** (`OPTIMIZATION_PROCESS.md` §5).
+
+## 10. What was actually built, and why it differs from §4
+
+§4 chose a local fix (SWAR sign negate inside `Iq2XxsPlane::group()`). Before implementing it, the
+post-B35 roofline (`../roofline_post_b35.md`) reframed the problem: the fused path sat at **2.2% of the
+AVX2 int8 ceiling for every format**, not only IQ2_XXS. The sign pass was one symptom; the shape of the
+loop was the cause — every 32-element group ended in a horizontal reduction, an int→float convert and
+a serial scalar accumulate, and `group()` returned a 36-byte struct by value. A local fix to one
+unpacker could not move the other two formats (61% of MoE time).
+
+So O1 became `detail::gemv_avx2` (`include/sub0/moe_quant_dot.hpp`):
+- the accumulator stays in a float vector for the whole row; one horizontal sum per ROW;
+- the MAC is the `vpsignb` + `vpmaddubsw` + `vpmaddwd` shape llama.cpp's AVX2 IQ kernels use;
+- IQ2_XXS hands its native magnitude/sign split straight to the kernel — **no sign pass at all**
+  (§4's goal, met more completely than option 2 would have);
+- IQ4_NL decodes both nibble halves with one `vpshufb`; the f16 scale uses F16C;
+- each format's bit-field parse lives in one `fields()` shared by the portable and AVX2 paths, so
+  the layout knowledge is not duplicated. The portable kernel stays as the non-AVX2 fallback and the
+  AVX2 kernel's test reference (compile-time `kAvx2Kernels`, no runtime knob).
+
+### Results
+
+Kernel microbenchmark (`sub0llm-bench-moeqd`, per plane, old → new): IQ1_S ~375 → ~100-118 µs (~3.5x),
+IQ2_XXS ~1300 → ~97-118 µs (~12x), IQ4_NL ~760 → ~108 µs stream (~7x). IQ4_NL is now memory-side
+(hot 59 vs stream 108 µs, ~8.5 GB/s single-core); IQ1_S/IQ2_XXS remain compute-side at ~13-15% of AVX2.
+
+End-to-end, real 48-layer artifact, fused config, warm, sandboxed, interleaved, 3 runs each
+(2026-09-22, post-reboot, background 4.3%):
+
+| arm | median s/token | runs | L2 (6 tok) | argmax |
+|---|---:|---|---:|---:|
+| main (portable kernel) | 1.508 | 1.573, 1.444, 1.508 | 0.293822 | 4/6 |
+| O1 (AVX2 kernel) | **0.705** | 0.756, 0.671, 0.705 | **0.23252** | 4/6 |
+
+**2.14x decode.** Quality IMPROVED: the per-lane accumulation is a shallower rounding chain than a long
+sequential float sum. The main arm reproduced B35's recorded 0.293822 exactly, which validates the setup.
+
+Gates: G-SUITE-ENGINE 28,969,623 / 147 exact; G-SUITE-FRONTEND 122,385 / 256 exact excluding the new O1
+case (+19,224 assertions / 1 case); G-QUALITY 0.2325 ≤ 0.43; G-PERF −53%. Mutation checks: swapping two
+IQ2_XXS sign qwords, and swapping IQ4_NL's nibble halves, each fail multiple `[moequant]` cases.
+
+### Next constraint (re-profile before choosing)
+
+MoE is no longer 68.7% of decode — re-profile at the O1 operating point before briefing anything.
+Known candidates from the microbench: IQ1_S/IQ2_XXS grid lookups (4 table loads + `set_epi64x` per
+group, compute-side at ~15% of AVX2), IQ4_NL memory-side (prefetch / multi-row interleave now worth
+re-trying — B28's prefetch was measured when the kernel was compute-bound, which it no longer is for
+IQ4_NL), and the mixer (21.2% before O1, now a far larger share).

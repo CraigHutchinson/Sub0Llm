@@ -24,14 +24,17 @@
 // cross-read against gguf.hpp's OWN dequantize_iq1_s/dequantize_iq2_xxs/dequantize_iq4_nl AND against
 // ggml-quants.c's dequantize_row_* scalar references. All three formats' layouts agreed exactly.
 //
-// NO RAW INTRINSICS, DELIBERATELY -- and this is a measurement, not a preference. B34/B38 found that a
-// float reduction does not auto-vectorize because Clang will not reassociate floating-point addition.
-// INTEGER addition has no such barrier, so the portable form of the inner loop below vectorizes on its
-// own: compiled at `-O3 -march=native`, the 32-element int8 dot emits `vpmovsxbw`/`vpmaddwd` (the same
-// shape the hand-written AVX2 reference builds out of `_mm256_maddubs_epi16`) for two of the three
-// unpackers and `vpmovsxbd`/`vpmulld`/`vphaddd` for the third -- vector code either way, with no scalar
-// fallback to rescue. Raw intrinsics would buy at most the narrower multiply on one format, and would
-// cost a second, unshared copy of the kernel per format. See detail::dot_group's own comment.
+// TWO KERNELS: PORTABLE, AND AVX2 INTRINSICS (O1). B35 shipped portable-only, on the measured grounds
+// that the integer inner dot auto-vectorizes (`vpmovsxbw`/`vpmaddwd` for two formats,
+// `vpmovsxbd`/`vpmulld`/`vphaddd` for the third) -- see detail::dot_group. That was true and
+// answered the wrong question: "does the dot vectorize" is not "is the loop the right shape". The
+// post-B35 roofline (docs/optimization/roofline_post_b35.md) put the fused path at 2.2% of the AVX2 int8
+// ceiling, because every 32-element group still ends in a horizontal reduction, a convert and a serial
+// scalar accumulate. detail::gemv_avx2 keeps the accumulator in a vector for the whole row, which a
+// portable loop cannot express without the float reassociation Clang refuses (B34/B38). The layout
+// knowledge is NOT duplicated: each unpacker's bit fields are read in one `fields()` function that both
+// materialisations share; only the final register form differs. The portable kernel stays as the
+// non-AVX2 fallback and as the AVX2 kernel's test reference (docs/optimization/opportunities/O1_*.md).
 //
 // NOT BIT-EXACT, BY CONSTRUCTION -- one genuinely new error source, with no precedent in this codebase.
 // The WEIGHT side adds none: the integer path is algebraically the same expression gguf::to_f32
@@ -68,7 +71,25 @@
 #include <span>
 #include <vector>
 
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#include <immintrin.h>
+#define SUB0_MOEQD_AVX2 1
+#endif
+
 namespace sub0::moeqd {
+
+/** Whether gemv_plane runs the AVX2 kernels (detail::gemv_avx2) or the portable ones (detail::gemv).
+ *
+ * Decided by the compiler's target ISA, which a SUB0_NATIVE build fixes at `-march=native`. There is no
+ * runtime or configurator knob because there is no choice to make: where AVX2 exists the vector kernel
+ * is the one to run. The portable kernel is kept, not deleted -- it is the fallback for non-AVX2
+ * targets AND the reference the AVX2 kernel is tested against (tests/moe_quant_tests.cpp, "O1").
+ */
+#if defined(SUB0_MOEQD_AVX2)
+inline constexpr bool kAvx2Kernels = true;
+#else
+inline constexpr bool kAvx2Kernels = false;
+#endif
 
 /// The one granularity at which this engine's real row shapes (hidden_size 2560, d_ff 640) and all
 /// three sidecar formats' internal sub-block structure simultaneously align -- see the file header.
@@ -165,6 +186,23 @@ struct WeightGroup {
     float delta = 0.f;   ///< IQ1_S's per-group additive offset; unused (and never read) elsewhere
 };
 
+#if defined(SUB0_MOEQD_AVX2)
+/** The AVX2 form of one decoded group: 32 weights as UNSIGNED magnitudes plus a separate sign source.
+ *
+ * Split this way because it is the operand shape `vpmaddubsw` wants (unsigned x signed): the kernel
+ * moves each weight's sign onto the activation with `vpsignb` and multiplies magnitudes. IQ2_XXS stores
+ * exactly this split natively (grid magnitudes + a sign table), so it hands both over as-is -- no negate
+ * pass at all, which is the sign-fold the O1 brief asked for. IQ1_S and IQ4_NL decode to signed weights
+ * and pass `mag = |w|`, `sgn = w`.
+ */
+struct WeightGroupV {
+    __m256i mag;           ///< 32 x uint8 |w|
+    __m256i sgn;           ///< 32 x int8 carrying w's sign in its own sign; value otherwise unused
+    float   scale = 0.f;
+    float   delta = 0.f;   ///< IQ1_S only, as WeightGroup::delta
+};
+#endif
+
 /** Unpacks one GROUP of IQ1_S: 256 elements per 50-byte block = f16 d, 32 grid-index low bytes, then
  * eight u16 `qh` each packing three high grid-index bits per 8-element sub-group at [3l+2:3l], a 3-bit
  * scale at [14:12], and the delta's sign at bit 15. The grid is a ternary codebook, so `q` is already
@@ -174,23 +212,53 @@ struct Iq1SPlane {
     static constexpr bool kHasDelta = true;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
-    [[nodiscard]] WeightGroup group(std::uint64_t p) const {
+    /// The group's bit fields: the ONE place this format's layout is read. group() and group_v() differ
+    /// only in how they materialise the result.
+    struct Fields {
+        std::uint16_t       d_bits = 0;
+        std::uint16_t       qh     = 0;
+        const std::uint8_t* qs     = nullptr;   // non-owning; into `plane`
+    };
+    [[nodiscard]] Fields fields(std::uint64_t p) const noexcept {
         const std::uint8_t* blk = plane + (p / 256) * 50;
         const int ib = static_cast<int>((p % 256) / 32);
-        std::uint16_t d_bits = 0, qh = 0;
-        std::memcpy(&d_bits, blk, sizeof d_bits);
-        std::memcpy(&qh, blk + 34 + 2 * ib, sizeof qh);
-        const std::uint8_t* qs = blk + 2 + 4 * ib;
+        Fields f;
+        f.qs = blk + 2 + 4 * ib;
+        std::memcpy(&f.d_bits, blk, sizeof f.d_bits);
+        std::memcpy(&f.qh, blk + 34 + 2 * ib, sizeof f.qh);
+        return f;
+    }
+    /// Eight int8 weights, little-endian.
+    [[nodiscard]] static std::uint64_t grid(const Fields& f, int l) noexcept {
+        return gguf::IQ1S_GRID[f.qs[l] | (((f.qh >> (3 * l)) & 7) << 8)];
+    }
+    [[nodiscard]] static float scale(const Fields& f, float d) noexcept {
+        return d * static_cast<float>(2 * ((f.qh >> 12) & 7) + 1);
+    }
+    [[nodiscard]] static float delta(const Fields& f) noexcept {
+        return (f.qh & 0x8000) ? -gguf::IQ1S_DELTA : gguf::IQ1S_DELTA;
+    }
 
+    [[nodiscard]] WeightGroup group(std::uint64_t p) const {
+        const Fields f = fields(p);
         WeightGroup wg;
-        wg.scale = gguf::f16_to_f32(d_bits) * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
-        wg.delta = (qh & 0x8000) ? -gguf::IQ1S_DELTA : gguf::IQ1S_DELTA;
+        wg.scale = scale(f, gguf::f16_to_f32(f.d_bits));
+        wg.delta = delta(f);
         for (int l = 0; l < 4; ++l) {
-            const std::uint64_t grid = gguf::IQ1S_GRID[qs[l] | (((qh >> (3 * l)) & 7) << 8)];
-            std::memcpy(wg.q.data() + 8 * l, &grid, sizeof grid);   // eight int8, little-endian
+            const std::uint64_t g = grid(f, l);
+            std::memcpy(wg.q.data() + 8 * l, &g, sizeof g);
         }
         return wg;
     }
+
+#if defined(SUB0_MOEQD_AVX2)
+    [[nodiscard]] WeightGroupV group_v(std::uint64_t p) const noexcept {
+        const Fields f = fields(p);
+        const auto ll = [](std::uint64_t v) { return static_cast<long long>(v); };
+        const __m256i w = _mm256_set_epi64x(ll(grid(f, 3)), ll(grid(f, 2)), ll(grid(f, 1)), ll(grid(f, 0)));
+        return {_mm256_sign_epi8(w, w), w, scale(f, _cvtsh_ss(f.d_bits)), delta(f)};
+    }
+#endif
 };
 
 /** Unpacks one GROUP of IQ2_XXS: 256 elements per 66-byte block = f16 d, then eight groups of two u32.
@@ -202,27 +270,55 @@ struct Iq2XxsPlane {
     static constexpr bool kHasDelta = false;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
-    [[nodiscard]] WeightGroup group(std::uint64_t p) const {
+    /// The group's bit fields: the ONE place this format's layout is read (see Iq1SPlane::Fields).
+    struct Fields {
+        std::uint16_t d_bits = 0;
+        std::uint32_t aux[2] = {0, 0};   ///< [0]: four grid-index bytes; [1]: scale nibble + 4 x 7-bit signs
+    };
+    [[nodiscard]] Fields fields(std::uint64_t p) const noexcept {
         const std::uint8_t* blk = plane + (p / 256) * 66;
         const int ib32 = static_cast<int>((p % 256) / 32);
-        std::uint16_t d_bits = 0;
-        std::memcpy(&d_bits, blk, sizeof d_bits);
-        std::uint32_t aux[2] = {0, 0};
-        std::memcpy(aux, blk + 2 + 8 * ib32, sizeof aux);
-        const auto* aux8 = reinterpret_cast<const std::uint8_t*>(aux);
+        Fields f;
+        std::memcpy(&f.d_bits, blk, sizeof f.d_bits);
+        std::memcpy(f.aux, blk + 2 + 8 * ib32, sizeof f.aux);
+        return f;
+    }
+    /// Eight unsigned magnitudes, little-endian.
+    [[nodiscard]] static std::uint64_t grid(const Fields& f, int l) noexcept {
+        return gguf::IQ2XXS_GRID[(f.aux[0] >> (8 * l)) & 0xFFu];
+    }
+    /// Eight +1/-1 bytes, little-endian.
+    [[nodiscard]] static std::uint64_t signs(const Fields& f, int l) noexcept {
+        return SIGNS64[(f.aux[1] >> (7 * l)) & 127u];
+    }
+    [[nodiscard]] static float scale(const Fields& f, float d) noexcept {
+        return d * (0.5f + static_cast<float>(f.aux[1] >> 28)) * 0.25f;
+    }
 
+    [[nodiscard]] WeightGroup group(std::uint64_t p) const {
+        const Fields f = fields(p);
         WeightGroup wg;
-        wg.scale = gguf::f16_to_f32(d_bits) * (0.5f + static_cast<float>(aux[1] >> 28)) * 0.25f;
+        wg.scale = scale(f, gguf::f16_to_f32(f.d_bits));
         std::array<std::int8_t, GROUP> sign{};
         for (int l = 0; l < 4; ++l) {
-            const std::uint64_t grid  = gguf::IQ2XXS_GRID[aux8[l]];
-            const std::uint64_t signs = SIGNS64[(aux[1] >> (7 * l)) & 127];
-            std::memcpy(wg.q.data() + 8 * l, &grid, sizeof grid);
-            std::memcpy(sign.data() + 8 * l, &signs, sizeof signs);
+            const std::uint64_t g = grid(f, l), s = signs(f, l);
+            std::memcpy(wg.q.data() + 8 * l, &g, sizeof g);
+            std::memcpy(sign.data() + 8 * l, &s, sizeof s);
         }
         for (int j = 0; j < GROUP; ++j) wg.q[j] = static_cast<std::int8_t>(wg.q[j] * sign[j]);
         return wg;
     }
+
+#if defined(SUB0_MOEQD_AVX2)
+    /// The format's own magnitude/sign split, handed straight to the kernel: no negate pass.
+    [[nodiscard]] WeightGroupV group_v(std::uint64_t p) const noexcept {
+        const Fields f = fields(p);
+        const auto ll = [](std::uint64_t v) { return static_cast<long long>(v); };
+        return {_mm256_set_epi64x(ll(grid(f, 3)), ll(grid(f, 2)), ll(grid(f, 1)), ll(grid(f, 0))),
+                _mm256_set_epi64x(ll(signs(f, 3)), ll(signs(f, 2)), ll(signs(f, 1)), ll(signs(f, 0))),
+                scale(f, _cvtsh_ss(f.d_bits)), 0.f};
+    }
+#endif
 };
 
 /** Unpacks one GROUP of IQ4_NL, whose blocks ARE 32 elements: f16 d plus 16 packed nibble pairs. Byte
@@ -233,20 +329,46 @@ struct Iq4NlPlane {
     static constexpr bool kHasDelta = false;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
-    [[nodiscard]] WeightGroup group(std::uint64_t p) const {
+    /// The group's fields: the ONE place this format's layout is read (see Iq1SPlane::Fields).
+    struct Fields {
+        std::uint16_t       d_bits = 0;
+        const std::uint8_t* qn     = nullptr;   ///< non-owning; the block's 16 packed nibble-pair bytes
+    };
+    [[nodiscard]] Fields fields(std::uint64_t p) const noexcept {
         const std::uint8_t* blk = plane + (p / 32) * 18;
-        std::uint16_t d_bits = 0;
-        std::memcpy(&d_bits, blk, sizeof d_bits);
-        const std::uint8_t* qn = blk + 2;
+        Fields f;
+        f.qn = blk + 2;
+        std::memcpy(&f.d_bits, blk, sizeof f.d_bits);
+        return f;
+    }
+
+    [[nodiscard]] WeightGroup group(std::uint64_t p) const {
+        const Fields f = fields(p);
+        const std::uint8_t* qn = f.qn;
 
         WeightGroup wg;
-        wg.scale = gguf::f16_to_f32(d_bits);
+        wg.scale = gguf::f16_to_f32(f.d_bits);
         for (int j = 0; j < 16; ++j) {
             wg.q[static_cast<std::size_t>(j)]      = gguf::KVALUES_IQ4NL[qn[j] & 0xF];
             wg.q[static_cast<std::size_t>(j) + 16] = gguf::KVALUES_IQ4NL[qn[j] >> 4];
         }
         return wg;
     }
+
+#if defined(SUB0_MOEQD_AVX2)
+    /// Both nibble halves decoded by ONE `vpshufb` against the 16-entry codebook broadcast to both
+    /// 128-bit lanes: low nibbles land in bytes 0-15 (elements 0-15), high nibbles in 16-31.
+    [[nodiscard]] WeightGroupV group_v(std::uint64_t p) const noexcept {
+        const Fields f = fields(p);
+        const __m128i raw  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(f.qn));
+        const __m128i m4   = _mm_set1_epi8(0x0F);
+        const __m256i idx  = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(raw, 4), m4), _mm_and_si128(raw, m4));
+        const __m256i book = _mm256_broadcastsi128_si256(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(gguf::KVALUES_IQ4NL)));
+        const __m256i w = _mm256_shuffle_epi8(book, idx);
+        return {_mm256_sign_epi8(w, w), w, _cvtsh_ss(f.d_bits), 0.f};
+    }
+#endif
 };
 
 // --- the shared seam: one GEMV body, one integer MAC, three unpackers ------------------------------
@@ -296,6 +418,65 @@ void gemv(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, flo
     }
 }
 
+#if defined(SUB0_MOEQD_AVX2)
+/// Horizontal sum of eight floats.
+[[nodiscard]] inline float hsum(__m256 v) noexcept {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+/** gemv()'s computation with the accumulator held in a vector register for the whole row.
+ *
+ * WHY, when the portable dot already vectorizes: every 32-element group there ends in a horizontal
+ * reduction to one int, an int->float convert and a serial scalar accumulate -- per-group overhead on
+ * the order of the 32 MACs themselves, which is how the fused path sat at 2.2% of the AVX2 int8 ceiling
+ * (docs/optimization/roofline_post_b35.md). Here a group's partial sums stay as eight int32 lanes, are
+ * scaled as a vector and fold into a float vector accumulator; the horizontal reduction happens once
+ * per ROW.
+ *
+ * The MAC is the vpmaddubsw shape llama.cpp's AVX2 IQ kernels use: each weight's sign moves onto the
+ * activation (`vpsignb`), then unsigned magnitude x signed activation. In range for the reason
+ * ActBlocks::quantize documents -- |w|, |q| <= 127, so a pair sum is <= 32258 and the saturating int16
+ * add never saturates. Every int32 lane is exact and converts to float exactly (< 2^24).
+ *
+ * NOT bit-identical to gemv(): per-group float products are summed per lane and then across lanes,
+ * not group-sequentially. The difference is float reassociation only; test "O1" bounds it.
+ */
+template <class Plane>
+void gemv_avx2(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, float* out) noexcept {
+    const int ng = row_elems / GROUP;
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int r = 0; r < n_rows; ++r) {
+        const std::uint64_t base = static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems);
+        __m256 acc  = _mm256_setzero_ps();
+        float  dacc = 0.f;
+        for (int g = 0; g < ng; ++g) {
+            const std::size_t gi = static_cast<std::size_t>(g);
+            const WeightGroupV wg = plane.group_v(base + static_cast<std::uint64_t>(g) * GROUP);
+            const __m256i q   = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.qs.data() + gi * GROUP));
+            const __m256i p16 = _mm256_maddubs_epi16(wg.mag, _mm256_sign_epi8(q, wg.sgn));
+            const __m256i p32 = _mm256_madd_epi16(p16, ones);
+            const float   s   = x.scale[gi] * wg.scale;
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(s), acc);
+            if constexpr (Plane::kHasDelta) dacc += s * wg.delta * static_cast<float>(x.gsum[gi]);
+        }
+        out[r] = hsum(acc) + dacc;
+    }
+}
+#endif
+
+/// The kernel gemv_plane runs: gemv_avx2 where the target has it (kAvx2Kernels), else gemv.
+template <class Plane>
+void gemv_best(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, float* out) {
+#if defined(SUB0_MOEQD_AVX2)
+    gemv_avx2(plane, n_rows, row_elems, x, out);
+#else
+    gemv(plane, n_rows, row_elems, x, out);
+#endif
+}
+
 }  // namespace detail
 
 /** Can this plane be fused at all?
@@ -343,13 +524,13 @@ void gemv(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, flo
     if (need == 0 || raw.size() < need) return false;
     switch (static_cast<gguf::TensorType>(type_raw)) {
         case gguf::TensorType::IQ1_S:
-            detail::gemv(Iq1SPlane{raw.data()}, n_rows, row_elems, x, out);
+            detail::gemv_best(Iq1SPlane{raw.data()}, n_rows, row_elems, x, out);
             return true;
         case gguf::TensorType::IQ2_XXS:
-            detail::gemv(Iq2XxsPlane{raw.data()}, n_rows, row_elems, x, out);
+            detail::gemv_best(Iq2XxsPlane{raw.data()}, n_rows, row_elems, x, out);
             return true;
         case gguf::TensorType::IQ4_NL:
-            detail::gemv(Iq4NlPlane{raw.data()}, n_rows, row_elems, x, out);
+            detail::gemv_best(Iq4NlPlane{raw.data()}, n_rows, row_elems, x, out);
             return true;
         default:
             return false;
