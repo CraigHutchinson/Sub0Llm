@@ -11,6 +11,13 @@ them. A later phase reviews this design and does the actual wiring.
 compute-bound at 1–5 GB/s per thread for the K-quants, so at one thread they lose to the real bf16
 `gemv::axpy`. The fit win (§7) is real; the throughput win needs phase 2's streaming unpack.
 
+**Phase 2a status (2026-09-22): PAUSED mid-implementation, design verified but not yet ported into the
+real header.** See §12 below for the checkpoint — the Q4_K anomaly is explained (disassembly, not
+denormals), a streaming/vectorized-unpack design is built and checked bit-exact in a scratch harness
+(not yet in `include/sub0/backbone_quant_dot.hpp`), and a first throughput number is in hand for Q4_K
+only. Tasks 0 (bench fix), 4 (OpenMP threading), 5 (tests), 6 (suite gate), and the doc/header write-up
+are NOT done yet.
+
 Mirrors `docs/MOE_QUANT_DOT.md`'s own structure and rigour, applied to the BACKBONE instead of the routed
 experts.
 
@@ -468,3 +475,123 @@ underestimate the change's real shape by analogy by to BF16/FP8's much smaller s
 - Add Q4_K support to anything outside this header — it was added here BEYOND the task's named three
   formats (Q5_K/Q6_K/Q8_0) because the census (S2a) found it real and substantial (682.03 MiB, 17.7% of
   native bytes, the two largest single tensors in the whole backbone).
+
+---
+
+## 12. Phase 2a — checkpoint (2026-09-22, PAUSED mid-implementation)
+
+Work stopped here on a pause request before the streaming kernels were ported into the real header, the
+bench was fixed, or the tests were updated. This section records what is verified so the next session
+resumes from evidence, not from scratch (AGENTS.md's own "a parked toggle is a finding banked" spirit,
+applied to an in-flight task rather than a finished one).
+
+### 12a. The Q4_K anomaly (§8a point 4), explained — NOT denormals
+
+Hypothesis tested first, because this project has a real precedent at almost the same magnitude
+(`docs/host-cpu-arrow-lake-hx` memory note: FTZ/DAZ fixed a measured 4.4x slowdown, close to Q4_K's own
+"4x slower than Q5_K"): **REJECTED**. A standalone scan of every superblock's `d`/`dmin`/`d*sc`/`dmin*m`
+term across 10,240 real `output.weight` superblocks found zero subnormal values, and forcing
+`_MM_SET_FLUSH_ZERO_MODE`/`_MM_SET_DENORMALS_ZERO_MODE` ON changed the measured time by <1% (1239.5 vs
+1246.2 µs/call). Also ruled out: the anomaly is NOT data-dependent — real `output.weight` bytes and
+freshly-random synthetic bytes of the identical shape (1024×2560, Q4_K) time within 0.5% of each other
+(1404.5 vs 1398.3 µs/call), and the cost scales linearly with row count (128 rows: ~205 µs, 1024 rows:
+~1400 µs), ruling out a paging/allocation artifact tied to the specific 248,320-row tensor.
+
+**Actual cause, found by reading the generated assembly (`clang++ -O3 -march=native -S`) for
+`gemv_rows<Q4KPlane,true>` and `gemv_rows<Q5KPlane,true>` side by side**: Clang auto-vectorized
+`Q5KPlane::group()`'s 32-element unpack loop (which does MORE work — nibble extract AND a qh high-bit OR)
+into ~15 AVX2 instructions including `vgf2p8affineqb`, but did NOT vectorize `Q4KPlane::group()`'s
+simpler nibble-only unpack loop at all — it compiled to 64 sequential scalar `movzx`/`and`/`mov`
+instructions (32 for the low-nibble branch, 32 for the high-nibble branch, selected by a hoisted
+loop-invariant branch). Same compiler, same flags, same `-O3 -march=native`, functionally similar
+loops — LLVM's vectorizer / idiom-matcher simply did not fire for the simpler case. This is an
+empirically confirmed compiler-heuristic quirk, not a property of the Q4_K format itself, and it
+independently justifies this phase's plan (don't rely on autovectorization for the unpack — write
+explicit AVX2 intrinsics), rather than needing a Q4_K-specific workaround.
+
+**A second, smaller finding from the same assembly read, affecting all four formats equally**: none of
+`Q8_0Plane::group()`/`Q4KPlane::group()`/`Q5KPlane::group()` were inlined into `gemv_rows` — the
+generated code has a real `call` instruction (plus a `vzeroupper` state-transition before it) on every
+group, paying full calling-convention overhead (stack frame, register spill/fill) on top of whatever the
+callee itself costs. The streaming design below eliminates this by writing one self-contained per-row
+function per format instead of calling a struct-returning `group()` once per 32 elements.
+
+### 12b. Streaming design, verified bit-exact in a scratch harness — NOT yet ported into the real header
+
+Design (matches the task brief's own shape): one 256-element superblock at a time, `d`/`dmin`/the 8
+sub-block `(sc, m)` pairs decoded ONCE per superblock (`KScaleTable`, was: once per 32-element group, an
+8x-redundant `f16_to_f32` + `k_scale_min` + pointer-arithmetic cost), and the nibble/high-bit unpack done
+via explicit AVX2 intrinsics instead of relying on the compiler:
+
+- `nibble_lo(bytes) = bytes & 0x0F` (byte-safe AND, trivial).
+- `nibble_hi(bytes) = (bytes >> 4 as 16-bit lanes) & 0x0F` — llama.cpp's own idiom; re-derived and
+  confirmed safe by hand (a 16-bit lane right-shift of 4 moves each byte's own high nibble into that
+  same byte's position in the shifted lane without leaking bits from the neighbour byte, worked through
+  bit-by-bit rather than assumed).
+- Q5_K's single `qh` bit (`(qh[l] >> bit_idx) & 1`, `bit_idx == sub` exactly — re-derived algebraically
+  from the scalar reference's `bit = (hi_nibble?2:1) << (2*(sub/2))`, not copied) is extracted via
+  mask-then-compare (`and` with `1<<bit_idx`, `cmpeq` against the same constant, `and` with a 16-broadcast)
+  rather than a runtime-count lane shift, specifically to avoid the cross-byte-contamination hazard a
+  16-bit lane shift by a runtime count can have when the masked value isn't provably confined to one
+  byte's own bit range — branch-free and byte-safe by construction, verified against the scalar reference
+  rather than trusted by inspection.
+- Q6_K's 2-bit `qh` field (`(qh[l] >> shift) & 3`, `shift = strip*2 ∈ {0,2,4,6}`) is extracted via
+  mask-then-compile-time-immediate-shift, selected by a 4-way `switch` on `shift` so every shift the
+  compiler emits is a known-safe immediate (each case hand-verified not to cross a byte boundary, the
+  same way `nibble_hi` was).
+- Q6_K also needs a per-16 (not per-32) activation sum for its `bias_lo`/`bias_hi` split that
+  `moeqd::ActBlocks::gsum` (per-32) doesn't carry. Phase 1's `group()`-based path recomputed this from
+  scratch on EVERY (row, group) pair via `sum16_avx2` — an O(n_rows) redundant recompute of a value that
+  only depends on the activation column, not the row. Designed (not yet perf-measured with caching): a
+  small `Gsum16` helper built ONCE per `gemv_plane` call (per activation row, shared across all output
+  rows), mirroring `ActBlocks`' own "resize only when the width changes" allocation-free-in-steady-state
+  contract rather than touching `moe_quant_dot.hpp` (out of scope for this phase).
+
+**Verification method**: a standalone scratch program (`clang++ -O3 -march=native`, not part of the
+build) implements the four pieces above and compares the result against
+`bbqd::gemv_plane<true>(...)` (today's `group()`-based AVX2 path, unchanged) row by row, requiring EXACT
+equality (`==`, not a tolerance) — the same discipline this file's own §6b used for the two defects phase
+1 caught. Result: **Q4_K, Q5_K, and Q6_K all bit-exact** against the existing AVX2 reference, both on
+multi-superblock synthetic bytes (4 rows × 2560 elements, 10 superblocks/row) and on 32 real rows of the
+real `output.weight` (Q4_K) tensor (0/32 mismatches). One real bug was caught and fixed during this
+verification: Q6_K's scale table (`sc`) must be offset by `half*8` within its 16-entry array — re-derived
+from `gguf.hpp`'s `dequantize_q6_k`, which advances `sc += 8` at the end of each outer `half` iteration
+(easy to miss since it is a plain pointer increment at the bottom of a loop, not inline with the indexing
+that uses it); the first draft of the scratch kernel omitted it and every row mismatched until fixed.
+
+**First throughput number** (scratch prototype, cache-resident real `output.weight` bytes, single
+thread, NOT yet run through the fixed DRAM-streamed bench from task 0): **Q4_K went from phase 1's 1.1
+GB/s to ~9.4–10.5 GB/s** — roughly 9x, at or just under the phase-2 gate of ≥10 GB/s/thread compressed
+bytes. Q5_K and Q6_K were queued for the same measurement when the pause request arrived; no number for
+them yet.
+
+### 12c. Explicit next step to resume from
+
+1. Port the four verified scratch functions (in this session's scratchpad,
+   `streaming_verify.cpp` — `dot_row_q4_k`, `dot_row_q5_k`, `dot_row_q6_k`, plus the `KScaleTable`/
+   `Gsum16`/`nibble_lo`/`nibble_hi`/`qh_bit_to_hi4`/`qh_2bits_to_hi4`/`dot32_avx2_reg`/`dot16_avx2_reg`
+   helpers they use) into `include/sub0/backbone_quant_dot.hpp` under `detail::`, gated on
+   `row_elems % 256 == 0` (true for every real backbone tensor per the census, §2a) with a fallback to
+   the existing `gemv_rows<Plane,true>` for the general case.
+2. Restructure the public entry point to auto-dispatch (moeqd's own `kAvx2Kernels`/`gemv_best`
+   convention, not a caller-chosen `UseAvx2` template bool — the task brief's own explicit instruction),
+   keeping `detail::gemv_plane_portable`/`detail::gemv_plane_avx2` as the two differential-test targets
+   (mirroring `tests/moe_quant_tests.cpp`'s own "O1" test shape).
+3. Add a `Threads`-templated OpenMP entry point mirroring `gemv::axpy<Threads>` exactly, including its
+   `omp_in_parallel()` nesting guard.
+4. Fix `benchmarks/backbone_quant_dot_bench.cpp` per task item 0: real `gemv::axpy` baseline (link
+   OpenMP the way `sub0llm-bench-gemv` does in root `CMakeLists.txt`), a pool of distinct real tensors
+   exceeding 3x L3 so every call streams from DRAM, persistent OpenMP team (no per-call `std::thread`
+   spawn), 1/2/4/8/16 threads.
+5. Update `tests/backbone_quant_dot_tests.cpp`: replace every `gemv_plane<false>`/`gemv_plane<true>`
+   call site with `detail::gemv_plane_portable`/`detail::gemv_plane_avx2` (or the new auto-dispatching
+   `gemv_plane`, per what each case is actually checking), add a streaming-vs-portable exact-agreement
+   case, a `Gsum16` correctness case, and a threading bit-exactness case for the new `Threads`-templated
+   entry point.
+6. Re-run the diagnostic scripts already in this session's scratchpad
+   (`denormal_diag.cpp` — FTZ/DAZ hypothesis, rejected; `anomaly_diag2.cpp` — data-vs-algorithm
+   isolation) are NOT needed again; their findings are recorded in §12a above and don't need
+   re-verification, only the streaming kernels themselves need porting and re-testing in-tree.
+7. Only after 1–5: run `sub0_frontend_tests` (must stay 141,609/257 outside `[backbonequant]`), the
+   `[backbonequant]` tag alone, the fixed bench at real shapes, write up final numbers in this section
+   (replacing "not yet measured"), and run `cpp-review` over the diff before calling phase 2a done.
