@@ -745,9 +745,19 @@ not worth touching yet.
 
 ---
 
-**2026-09-22 Claude Code — post-reboot / PSU-swap re-baseline (CPU-heavy, active).** Host rebooted and
+**2026-09-22 Claude Code — post-reboot / PSU-swap re-baseline — CLOSED (superseded).** The first attempt was invalid (perf_sandbox self-confinement bug, fixed `83e48f1`); the thread then moved on to O1-O3, whose own interleaved A/Bs are the current baselines (`docs/optimization/opportunities/O1..O3`). The DRAM ceiling was re-measured: 30 GB/s is ONE core, 79 GB/s P-cores, 91 GB/s all-core (`profile_post_o1.md`). Host rebooted and
 PSU swapped to correct wattage. Every baseline in `docs/optimization/kpi_gates.json` and the ~30 GB/s
 DRAM ceiling the roofline rests on may have been measured power-limited, so they need re-deriving.
 First post-boot runs were contaminated by 6-19% background load (fixed the contention check to catch
 this, `423659d`). Now waiting for sustained load < 5%, then `run_perf_suite.py` default vs fused arms,
 3 runs each, label `post-psu-baseline`. **Do not run CPU-heavy work on this host until this completes.**
+
+---
+
+**2026-09-22 — two delegated Sonnet 5 tracks (Claude Code primary reviews and merges both).**
+
+| Started | Agent | Work package | Branch | Files/areas | Status | Notes |
+|---|---|---|---|---|---|---|
+| 2026-09-22 | Sonnet 5 subagent A (isolated worktree) | O4: remaining bit-exact decode levers — GDN recurrence threaded over heads, routed-expert plane rows spread across threads, GDN out-proj efficiency | agent worktree | `include/sub0/gdn_math.hpp`, `include/sub0/moe_quant_dot.hpp`, `src/backends/cpu/decode.cpp`, `include/sub0/gemv.hpp` | active | **Owns real-artifact decode measurements on this host.** Expect its perf-suite contention gate to wait while track B compiles. |
+| 2026-09-22 | Sonnet 5 subagent B (isolated worktree) | O5 phase 1: native-quant backbone (keep the unsloth GGUF's Q5_K/Q6_K/Q8_0 backbone bytes resident; fused int8-activation dot) — census, design doc, isolated kernels + tests + microbench | agent worktree | NEW header + NEW tests + NEW bench tool + `docs/`; does NOT touch engine wiring, `moe_quant_dot.hpp`, `decode.cpp` or the transplant in phase 1 | active | No real-artifact decode runs; microbench runs kept short. |
+
