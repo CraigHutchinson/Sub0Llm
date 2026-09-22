@@ -472,6 +472,15 @@ set_target_properties(sub0llm-qwen4-forward PROPERTIES BUILD_RPATH "$ORIGIN" INS
 add_executable(sub0llm-bench-moeqd tools/sub0llm-bench-moeqd.cpp)
 target_include_directories(sub0llm-bench-moeqd PRIVATE "${CMAKE_SOURCE_DIR}/include")
 
+# --- kernel microbenchmark for the shared GEMV primitive (O2) --------------
+# Header-only against include/sub0/gemv.hpp; links OpenMP because the primitive's threaded path is what it
+# measures. Same role as sub0llm-bench-moeqd: the seconds-long inner loop, not the gate.
+add_executable(sub0llm-bench-gemv tools/sub0llm-bench-gemv.cpp)
+target_include_directories(sub0llm-bench-gemv PRIVATE "${CMAKE_SOURCE_DIR}/include")
+if(SUB0_OPENMP_TARGET)
+  target_link_libraries(sub0llm-bench-gemv PRIVATE ${SUB0_OPENMP_TARGET})
+endif()
+
 # --- WP5c: the real-axes GENERATION harness ---------------------------------
 # Same shape and the same reasoning as sub0llm-qwen4-forward directly above -- it links the engine, so
 # it is compiled against ${GEN_DIR}'s generated config and only does anything useful in a build that

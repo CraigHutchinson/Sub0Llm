@@ -63,6 +63,7 @@ selection must cite this, not the pre-B35 numbers.
 | ID | Opportunity | Status | Evidence |
 |---|---|---|---|
 | [O1](O1_iq2xxs_sign_fold.md) | AVX2 fused MoE GEMV: vector accumulator per row (widened from "fold IQ2_XXS signs") | **merged** | **+2.14x decode** (1.508 → 0.705 s/token); L2 0.2938 → 0.2325 | 1 |
+| [O2](O2_backbone_gemv.md) | One GEMV primitive for the bf16 backbone: vectorized + threaded; B40 pin fix | **merged** | **+2.42x decode** (0.757 → 0.313 s/token), bit-identical | 2 |
 
 **Retracted**: *IQ1_S narrowing*, previously named by B35 as the next lever on the grounds that its dot
 uses the 8-lane `vpmulld` shape. The per-format profile refutes it — IQ1_S is the **cheapest** format
@@ -75,3 +76,33 @@ its own O1 split (48 GDN layers vs 12 QSA) before any lever is picked there; a
 branchless/lookup-table `fp8_widen` (the named fix for B33's regression); reducing B35's
 activation-quantization error, which is the whole of its quality cost and the only reason it ships
 default-off.
+
+## Process backlog
+
+| ID | Item | Status |
+|---|---|---|
+| P1 | **Make the codified optimization workflow lean enough to be part of the DEFAULT development workflow** — do after the O2 work lands | backlog |
+
+**P1 — what to fold in, from what the O1/O2 session actually needed** (keep it lean: one command per
+question, defaults that are right, no ritual):
+
+- **One command, sensible defaults.** `run_perf_suite.py` should default to what is almost always wanted:
+  sandbox on, `--wait-stable` on, stable-then-measure, the steady-state (default-path) number AND the
+  phase table in one run. Today each of those is a separate flag a session has to rediscover.
+- **Fail loudly everywhere, by construction.** The harness silently measured a stale binary after a
+  failed build until 2026-09-22. Every stage must refuse rather than degrade (already true of `run()`,
+  the contention gate and `page_cache.evict_verified`; audit the rest once).
+- **Built-in instruments, not scaffolds.** `--profile-phases` replaced a hand-written, reverted
+  scaffold. Apply the same to anything else re-typed per session (per-format MoE timing, page-fault
+  counts, bandwidth/roofline numbers — `bw.cpp` lives in a scratchpad and should be a tool).
+- **Inner loop vs gate.** Kernel microbenchmarks (`sub0llm-bench-moeqd`, a GEMV equivalent) are the
+  seconds-long inner loop; the real-artifact decode is the gate. Make that split explicit and cheap to
+  follow, so the 37 GiB decode is run a few times per change, not per iteration.
+- **Roofline inputs measured, not remembered.** The ~30 GB/s "ceiling" was a single-core number used as
+  the machine ceiling for weeks. A `--stage roofline` should measure 1-core and all-core bandwidth and
+  the ISA-width MAC ceiling on the current host and write them where every report reads them.
+- **A quick tier for everyday work.** A `--quick` preset (build + suites + G-HASH + one warm decode, no
+  sandbox wait) that is cheap enough to run on every engine change, so perf regressions are caught in
+  normal development rather than by a dedicated optimization session.
+- **Trim the docs to match.** OPTIMIZATION_PROCESS.md has grown by accretion; once the tooling carries
+  the rules, the doc should shrink to the WHY and point at the commands.

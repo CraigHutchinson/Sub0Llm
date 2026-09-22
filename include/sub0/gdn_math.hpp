@@ -46,6 +46,7 @@
 #include <cstddef>
 #include <utility>
 
+#include "sub0/gemv.hpp"
 #include "sub0/simd_reduce.hpp"  // B34/B38: sumsq_choice<UseSimd>() for this file's real contiguous
                                   // self-dot hot loops in forward()/backward()
                                   // (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
@@ -158,7 +159,7 @@ inline void recurrence_step(int dk, int dv, float g_t, float beta_t,
 // reduction strategy for qss/kss/ms below -- explicit template argument at the call site
 // (src/backends/cpu/{backend,decode}.cpp), not a global read, matching this file's own "explicit Dims"
 // convention. src/backends/cuda/backend.cu's CPU-reference call takes the default (false), unaffected.
-template <bool UseSimd = false, class WP>
+template <bool UseSimd = false, int Threads = 1, class WP>
 inline void forward(const Dims& d, int T,
                      const float* x,
                      WP w_qkv, WP w_z, WP w_b, WP w_a,
@@ -194,16 +195,9 @@ inline void forward(const Dims& d, int T,
     for (int t = 0; t < T; ++t) {
         const float* xt = x + static_cast<std::size_t>(t) * hs;
         float* qkvr = qkv_pre + static_cast<std::size_t>(t) * conv_dim;
-        std::fill(qkvr, qkvr + conv_dim, 0.f);
         float* zr = zb + static_cast<std::size_t>(t) * value_dim;
-        std::fill(zr, zr + value_dim, 0.f);
-        for (int i = 0; i < hs; ++i) {
-            const float xi = xt[i];
-            const auto Wq = w_qkv + static_cast<std::size_t>(i) * conv_dim;
-            for (int o = 0; o < conv_dim; ++o) qkvr[o] += xi * Wq[o];
-            const auto Wz = w_z + static_cast<std::size_t>(i) * value_dim;
-            for (int o = 0; o < value_dim; ++o) zr[o] += xi * Wz[o];
-        }
+        gemv::axpy<Threads>(xt, w_qkv, hs, conv_dim, qkvr);   // O2: include/sub0/gemv.hpp
+        gemv::axpy<Threads>(xt, w_z, hs, value_dim, zr);
         for (int hh = 0; hh < Hv; ++hh) {
             float bs = 0.f, as_ = 0.f;
             for (int i = 0; i < hs; ++i) {
@@ -304,12 +298,7 @@ inline void forward(const Dims& d, int T,
                 gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
         }
         float* ot = out + static_cast<std::size_t>(t) * hs;
-        std::fill(ot, ot + hs, 0.f);
-        for (int i = 0; i < value_dim; ++i) {
-            const float gi = gated[i];
-            const auto Wo = w_out + static_cast<std::size_t>(i) * hs;
-            for (int o = 0; o < hs; ++o) ot[o] += gi * Wo[o];
-        }
+        gemv::axpy<Threads>(gated, w_out, value_dim, hs, ot);
     }
 }
 

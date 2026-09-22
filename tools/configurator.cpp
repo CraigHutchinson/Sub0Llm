@@ -683,6 +683,7 @@ int main(int argc, char** argv) {
     int ternary      = 0;
     int profile_phases = 0;     // 1 = exclusive-time decode phase profiler (include/sub0/phase_profile.hpp)
     int moe_decode_threads = 1; // decode's routed-expert fan-out width (src/backends/cpu/internal.hpp)
+    int decode_gemv_threads = 1; // O2: decode's backbone GEMV fan-out (include/sub0/gemv.hpp)
     int simd_reduce  = 0;       // B34/B38: multi-accumulator SIMD restructuring of the hot reduction
                                  // loops (moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp).
                                  // 0 = off (default, today's plain scalar reduction, bit-exact). See the
@@ -886,10 +887,15 @@ int main(int argc, char** argv) {
                    "The O0/O1 re-profile docs/OPTIMIZATION_PROCESS.md S5 requires after any >20% change, "
                    "without a hand-written scaffold. 0 = off (default): the scopes compile to nothing.")
        ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--decode-gemv-threads", decode_gemv_threads,
+                   "O2: threads decode splits each backbone GEMV across, by output column (include/sub0/gemv.hpp) "
+                   "-- mixer projections, shared expert, router, lm_head. 1 (default) = serial. Bit-exact at "
+                   "every value: each output keeps its own sequential sum; threads split only across outputs.")
+       ->capture_default_str()->check(CLI::Range(1, 64));
     app.add_option("--moe-decode-threads", moe_decode_threads,
                    "threads decode fans a row's routed experts across (internal.hpp MOE_DECODE_THREADS). "
-                   "1 (default) is B29's measured optimum when an expert moved ~15-20 MB of f32 traffic; "
-                   "exposed to re-measure it at the fused-kernel operating point, where an expert moves ~1.55 MB. "
+                   "Default 1. B29's '1 is fastest' was an artefact of every decode team being confined to one "
+                   "core (B40, fixed); measured since: 10 threads cut the routed-expert phase 185 -> 39 ms. "
                    "Scheduling only: the combine order is fixed, so the answer is bit-identical at any value.")
        ->capture_default_str()->check(CLI::Range(1, 64));
     app.add_option("--simd-reduce", simd_reduce,
@@ -1856,6 +1862,7 @@ int main(int argc, char** argv) {
     cos << "constexpr bool PROFILE_PHASES = " << (profile_phases ? "true" : "false") << ";\n";
     // Scheduling only (the combine order is fixed): not an ARCH_FINGERPRINT axis (AGENTS.md S10).
     cos << "constexpr int  MOE_DECODE_THREADS_CFG = " << moe_decode_threads << ";\n";
+    cos << "constexpr int  DECODE_GEMV_THREADS = " << decode_gemv_threads << ";\n";
     // SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) vs the plain 2-matrix GELU+bias FFN -- see
     // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
     // swiglu_backward_act_kernel in backend_cuda.cu).

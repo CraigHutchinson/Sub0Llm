@@ -13,6 +13,7 @@
 // so there is exactly one copy of each.
 #include "internal.hpp"
 
+#include "sub0/gemv.hpp"              // O2: the shared GEMV primitive
 #include "sub0/phase_profile.hpp"      // PROFILE_PHASES: exclusive-time decode phase scopes
 #include "sub0/gated_residual_math.hpp"  // Gated Residual row math (gr::hc_norm/mix/gate/combine/tile)
 
@@ -286,14 +287,7 @@ struct ParallelExperts {
 // promising about (weights never alias `y`) is still true by construction.
 static inline void linear_row(const float* __restrict x, const Node* W, const Node* bias,
                               float* __restrict y, int in, int out) {
-    for (int o = 0; o < out; ++o) y[o] = 0.f;
-    const ParamCPtr Wf = W->pdata;
-    for (int p = 0; p < in; ++p) {
-        const float xp = x[p];
-        if (xp == 0.f) continue;
-        const auto Wr = Wf + static_cast<size_t>(p) * out;
-        for (int o = 0; o < out; ++o) y[o] += xp * Wr[o];
-    }
+    gemv::axpy<DECODE_GEMV_THREADS>(x, W->pdata, in, out, y);   // O2: include/sub0/gemv.hpp
     if (bias) for (int o = 0; o < out; ++o) y[o] += bias->pdata[o];
 }
 // Tied-embedding head, single-row (generation) form: y[v] = dot(x[:], table[v,:]), no bias -- see
@@ -622,7 +616,7 @@ const float* Model::forward_one(int id, int pos) {
                                       L.qsa_idx_qnorm->pdata, cos_pos, sin_pos, qsa::RMS_EPS,
                                       qsa_idx_q,
                                       raw_k_base + static_cast<size_t>(pos) * QSA_INDEXER_HEAD_DIM);
-            qsa::attn_project_row<USE_SIMD_REDUCE>(QSA_DIMS, a, L.qsa_q->pdata, L.qsa_gate->pdata,
+            qsa::attn_project_row<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(QSA_DIMS, a, L.qsa_q->pdata, L.qsa_gate->pdata,
                                    L.qsa_k->pdata, L.qsa_v->pdata,
                                    L.qsa_qnorm->pdata, L.qsa_knorm->pdata,
                                    cos_pos, sin_pos, qsa::RMS_EPS,
@@ -635,7 +629,7 @@ const float* Model::forward_one(int id, int pos) {
                                      g_qsa_rope.sin.data(), qsa::RMS_EPS,
                                      g_qsa_cache.block_base(e), g_qsa_cache.n_cached_of(e),
                                      qsa_mask, qsa_sel_scr);
-            qsa::attn_row<USE_SIMD_REDUCE>(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
+            qsa::attn_row<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
                            qsa_mask, L.qsa_o->pdata, proj, qsa_att_scr);
             gr_write_row(h, proj);                                           // residual (write step)
         };
@@ -665,7 +659,7 @@ const float* Model::forward_one(int id, int pos) {
                 // Same dt_bias/a_log ARGUMENT-ORDER fix as op_gdn's batched forward (backend.cpp) (this
                 // decode path had the identical swap, independently) -- see that call site's comment.
                 float gdn_scratch[GDN_SCRATCH1];
-                gdn::forward<USE_SIMD_REDUCE>(GDN_DIMS, 1, a,
+                gdn::forward<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(GDN_DIMS, 1, a,
                              L.gdn_in_qkv->pdata, L.gdn_in_z->pdata,
                              L.gdn_in_b->pdata, L.gdn_in_a->pdata,
                              L.gdn_conv->pdata, L.gdn_dt_bias->pdata,
@@ -715,7 +709,7 @@ const float* Model::forward_one(int id, int pos) {
             // O(hidden_size * d_ff * experts_per_tok) of dot work, but only if it is genuinely hoisted
             // out of the per-expert lambda, which is the point of doing it at this line).
             if constexpr (USE_MOE_QUANT && MOE_QUANT_DOT) g_moe_act_q.quantize(a, MOE_DIMS.hidden_size);
-            moe::forward_row_via_run_ex<USE_SIMD_REDUCE>(
+            moe::forward_row_via_run_ex<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(
                 MOE_DIMS, a, L.moe_router->pdata,
                 [&](int k, int e, float* out_ptr, float* ffn, float* g) {
                     const int t = omp_get_thread_num() % MOE_DECODE_THREADS;

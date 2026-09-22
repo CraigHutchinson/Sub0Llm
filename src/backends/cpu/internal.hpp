@@ -305,6 +305,15 @@ using MoeDecodeExpertCacheSource = moeq::ExpertCacheSource<MOE_DECODE_SLOTS, MOE
 // decision over a runtime one once the evidence is in, and nothing here needs to change without a
 // rebuild. Never below 1: EXPERTS_PER_TOK is 0 in a MoE-off build, where nothing ever enters this path.
 //
+// CORRECTION, 2026-09-22 -- the B29 evidence above was a MEASUREMENT ARTEFACT. ensure_thread_built()
+// pinned the main thread to ONE logical CPU before any OpenMP region, and libomp places every team inside
+// its master's affinity mask, so all 10 "parallel" expert threads ran time-sliced on a single core. That
+// is exactly the "each expert starts as the previous one ends" serialization B29 observed (and B21 before
+// it), and exactly why adding threads cost ~9% instead of helping. Fixed in backend.cpp (the initial
+// thread now takes the P-core SET, cpu_affinity.hpp's pin_current_thread_p_set). Re-measured with the fix
+// at the O1+O2 operating point: routed experts 185 ms (1 thread) -> 94 (2) -> 49 (5) -> 39 ms (10),
+// decode 0.474 -> 0.314 s/token, L2 bit-identical. The DRAM-contention explanation did not survive.
+//
 // NOW A CONFIGURATOR AXIS (`--moe-decode-threads`, default 1 -- every existing build unchanged), because
 // the evidence above has an expiry date: it was measured at ~15-20 MB of DRAM traffic PER EXPERT (the f32
 // dequantize-then-read-back resolve). Since B35 + O1 an expert moves ~1.55 MB of encoded bytes and its

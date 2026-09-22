@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstddef>
 
+#include "sub0/gemv.hpp"
 #include "sub0/simd_reduce.hpp"  // B34/B38: dot_choice<UseSimd>() for this file's real scalar-reduction
                                   // hot loop (the shared-expert gate logit in forward_row_via_run_ex) --
                                   // see that header for why a plain scalar `s += a[i]*b[i]` never
@@ -104,26 +105,14 @@ inline float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 // expert's come straight out of `g_param_data`, whose element type is PARAM_DTYPE. Templating is what
 // lets both keep calling the one function -- which is the property docs/MOE.md already relies on for
 // WP4e's bit-identical gate. `const float*` deduces exactly as before in every F32 build.
-template <class WP>
+template <int Threads = 1, class WP>
 inline void expert_ffn_row(const Dims& d, const float* x, WP gate_w, WP up_w,
                             WP down_w, float* out, float* pre_scratch, float* g_scratch) {
-    for (int o = 0; o < d.d_ff; ++o) { pre_scratch[o] = 0.f; g_scratch[o] = 0.f; }
-    for (int i = 0; i < d.hidden_size; ++i) {
-        const float xi = x[i];
-        if (xi == 0.f) continue;
-        const auto gr = gate_w + static_cast<std::size_t>(i) * d.d_ff;
-        const auto ur = up_w   + static_cast<std::size_t>(i) * d.d_ff;
-        for (int o = 0; o < d.d_ff; ++o) { g_scratch[o] += xi * gr[o]; pre_scratch[o] += xi * ur[o]; }
-    }
+    // O2: all three GEMVs through the one primitive (include/sub0/gemv.hpp), same per-output order.
+    gemv::axpy<Threads>(x, gate_w, d.hidden_size, d.d_ff, g_scratch);
+    gemv::axpy<Threads>(x, up_w, d.hidden_size, d.d_ff, pre_scratch);
     for (int o = 0; o < d.d_ff; ++o) pre_scratch[o] = detail::silu(g_scratch[o]) * pre_scratch[o];
-
-    for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
-    for (int o = 0; o < d.d_ff; ++o) {
-        const float po = pre_scratch[o];
-        if (po == 0.f) continue;
-        const auto dr = down_w + static_cast<std::size_t>(o) * d.hidden_size;
-        for (int j = 0; j < d.hidden_size; ++j) out[j] += po * dr[j];
-    }
+    gemv::axpy<Threads>(pre_scratch, down_w, d.d_ff, d.hidden_size, out);
 }
 
 // --- fused, no-transpose variant of expert_ffn_row (B31, docs/INDEPENDENT_REVIEW_BACKLOG.md) -------
@@ -223,7 +212,7 @@ inline void expert_ffn_row_source(const Dims& d, const float* x, WP gate_src, WP
 // num_experts]. `probs_scratch`: >= num_experts floats, destroyed (used as working storage for the
 // selection scan below, S4b -- this row's own softmax values are not needed again after this call).
 // `out_weight`/`out_idx`: caller buffers of length >= experts_per_tok (TOPK_MAX-capped internally).
-template <class WP>
+template <int Threads = 1, class WP>
 inline void router_topk_row(const Dims& d, const float* x, WP router_w, float* probs_scratch,
                              float* out_weight, int* out_idx, bool norm_topk_prob) {
     // INPUT-major/contiguous (this project's own linear_row convention, matching router_w's own
@@ -233,13 +222,7 @@ inline void router_topk_row(const Dims& d, const float* x, WP router_w, float* p
     // output-major form (outer e, inner i striding router_w by num_experts floats per step) survived
     // the earlier code-reading-only perf review that fixed gr::mix()/expert_ffn_row() but never looked
     // at this function. Pure summation reorder, same tolerance argument as that fix.
-    for (int e = 0; e < d.num_experts; ++e) probs_scratch[e] = 0.f;
-    for (int i = 0; i < d.hidden_size; ++i) {
-        const float xi = x[i];
-        if (xi == 0.f) continue;
-        const auto wr = router_w + static_cast<std::size_t>(i) * d.num_experts;
-        for (int e = 0; e < d.num_experts; ++e) probs_scratch[e] += xi * wr[e];
-    }
+    gemv::axpy<Threads>(x, router_w, d.hidden_size, d.num_experts, probs_scratch);   // O2
     float mx = probs_scratch[0];
     for (int e = 1; e < d.num_experts; ++e) mx = std::max(mx, probs_scratch[e]);
     float sum = 0.f;
@@ -340,7 +323,7 @@ struct SerialExperts {
 // B34/B38: `UseSimd` selects the shared-expert gate-logit reduction strategy (simd::dot_choice<UseSimd>
 // below), defaulted false so every existing untouched call site keeps today's exact scalar behavior --
 // callers that want USE_SIMD_REDUCE pass it as an explicit template argument (src/backends/cpu/decode.cpp).
-template <bool UseSimd = false, class WP, class ComputeExpert, class RunExperts>
+template <bool UseSimd = false, int Threads = 1, class WP, class ComputeExpert, class RunExperts>
 inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
                                     ComputeExpert&& compute_expert, RunExperts&& run_experts,
                                     WP shared_gate_w, WP shared_up_w,
@@ -353,7 +336,7 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
     float* routed_out = expert_out + d.hidden_size;  // [experts_per_tok][hidden_size]
     float topk_w[TOPK_MAX];
     int   topk_idx[TOPK_MAX];
-    router_topk_row(d, x, router_w, probs, topk_w, topk_idx, norm_topk_prob);
+    router_topk_row<Threads>(d, x, router_w, probs, topk_w, topk_idx, norm_topk_prob);
 
     // B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): if the runner offers a prefetch hook, give it
     // the selected expert ids BEFORE any resolve/compute starts, so it can issue their bytes' reads as
@@ -383,7 +366,7 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
     // `F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output`. Always
     // f32-resident: it runs for EVERY token, so there is nothing for a quantized-resident form to save
     // (see include/sub0/moe_quant.hpp's own header comment).
-    expert_ffn_row(d, x, shared_gate_w, shared_up_w, shared_down_w, expert_out, ffn_scratch, g_scratch);
+    expert_ffn_row<Threads>(d, x, shared_gate_w, shared_up_w, shared_down_w, expert_out, ffn_scratch, g_scratch);
     // B34/B38: was a scalar `for(i) gate_logit += x[i]*w[i];` reduction -- see simd_reduce.hpp. Gated on
     // USE_SIMD_REDUCE via the `UseSimd` template parameter above; UseSimd=false reproduces the exact
     // original scalar accumulation order.

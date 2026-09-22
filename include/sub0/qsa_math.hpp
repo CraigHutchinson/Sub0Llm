@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <limits>
 
+#include "sub0/gemv.hpp"
 #include "sub0/simd_reduce.hpp"  // B34/B38: dot_choice/sumsq_choice/sum_choice<UseSimd>() for this
                                   // file's real scalar-reduction hot loops (docs/INDEPENDENT_REVIEW_
                                   // BACKLOG.md B38).
@@ -176,15 +177,10 @@ inline void rope_apply_row(float* x, const float* cos, const float* sin, int rot
 
 // out[o] = sum_i x[i] * w[i*out_n + o]  -- this project's [rows=in, cols=out] convention, no bias
 // (attention_bias=false everywhere in the real config).
-template <class WP>
+// O2: the one shared primitive (include/sub0/gemv.hpp) -- vectorized, and threaded when a caller asks.
+template <int Threads = 1, class WP>
 inline void linear_row(const float* x, WP w, int in_n, int out_n, float* out) {
-    for (int o = 0; o < out_n; ++o) out[o] = 0.f;
-    for (int i = 0; i < in_n; ++i) {
-        const float xi = x[i];
-        if (xi == 0.f) continue;
-        const auto wr = w + static_cast<std::size_t>(i) * out_n;
-        for (int o = 0; o < out_n; ++o) out[o] += xi * wr[o];
-    }
+    gemv::axpy<Threads>(x, w, in_n, out_n, out);
 }
 
 // --- the indexer --------------------------------------------------------------------------------
@@ -331,15 +327,15 @@ inline int indexer_select_row(const Dims& d, const float* q, const float* raw_ke
 // arithmetic (a chunk of a bias-free Linear's output axis is a partition of its weight rows) -- see
 // docs/QSA.md S2b.4 for why, and for the per-head chunk order a future weight transplant must respect.
 // q_norm_w/k_norm_w: [head_dim], applied PER HEAD, BEFORE RoPE. v is neither normed nor rotated.
-template <bool UseSimd = false, class WP>
+template <bool UseSimd = false, int Threads = 1, class WP>
 inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
                               WP k_w, WP v_w, WP q_norm_w,
                               WP k_norm_w, const float* cos_pos, const float* sin_pos,
                               float eps, float* out_q, float* out_gate, float* out_k, float* out_v) {
-    linear_row(x, q_w,    d.hidden_size, d.q_width(),  out_q);
-    linear_row(x, gate_w, d.hidden_size, d.q_width(),  out_gate);
-    linear_row(x, k_w,    d.hidden_size, d.kv_width(), out_k);
-    linear_row(x, v_w,    d.hidden_size, d.kv_width(), out_v);
+    linear_row<Threads>(x, q_w,    d.hidden_size, d.q_width(),  out_q);
+    linear_row<Threads>(x, gate_w, d.hidden_size, d.q_width(),  out_gate);
+    linear_row<Threads>(x, k_w,    d.hidden_size, d.kv_width(), out_k);
+    linear_row<Threads>(x, v_w,    d.hidden_size, d.kv_width(), out_v);
     for (int h = 0; h < d.n_heads; ++h) {
         float* qh = out_q + static_cast<std::size_t>(h) * d.head_dim;
         rms_norm_row<UseSimd>(qh, q_norm_w, d.head_dim, eps, qh);
@@ -358,7 +354,7 @@ inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
 // cannot happen here because indexer_select_row always keeps at least the query's own tail position.
 // k_cache/v_cache: [kv_len, kv_width()]. o_proj_w: [q_width(), hidden_size].
 // `scratch`: >= attn_scratch_floats(d, kv_len).
-template <bool UseSimd = false, class WP>
+template <bool UseSimd = false, int Threads = 1, class WP>
 inline void attn_row(const Dims& d, const float* q, const float* gate, const float* k_cache,
                       const float* v_cache, int kv_len, const float* mask, WP o_proj_w,
                       float* out, float* scratch) {
@@ -397,7 +393,7 @@ inline void attn_row(const Dims& d, const float* q, const float* gate, const flo
     }
     // attn_output = attn_output * sigmoid(gate), elementwise over the flat [n_heads*head_dim] row.
     for (int o = 0; o < d.q_width(); ++o) ao[o] *= detail::sigmoid(gate[o]);
-    linear_row(ao, o_proj_w, d.q_width(), d.hidden_size, out);
+    linear_row<Threads>(ao, o_proj_w, d.q_width(), d.hidden_size, out);
 }
 
 // The whole QSA mixer sublayer for a T-row prefill (positions 0..T-1, causal). A thin loop over the row

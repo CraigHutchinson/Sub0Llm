@@ -75,6 +75,7 @@
 static inline int omp_get_thread_num()  { return 0; }
 static inline int omp_get_num_threads() { return 1; }
 static inline int omp_get_max_threads() { return 1; }
+static inline int omp_in_parallel()     { return 0; }
 #endif
 
 // (The x86 FTZ/DAZ control-register helper this file used to define locally now lives in internal.hpp:
@@ -1864,8 +1865,13 @@ void ensure_thread_built() {
     ensure_shared_params();                               // heap-alloc the shared weight/grad/moment arenas once
     set_flush_denormals();                                // FTZ/DAZ for this thread's MXCSR
     const int tid = omp_get_thread_num() % MAX_WORKERS;   // clamp; train_batch caps the width
-    sub0::pin_current_thread_p_first(tid);                // P-cores first (see cpu_affinity.hpp); a hint,
-                                                            // never required -- silently no-ops if it fails
+    // P-cores first (see cpu_affinity.hpp); a hint, never required -- silently no-ops if it fails. A worker
+    // INSIDE a team takes its own rank. The INITIAL thread takes the whole P-core set instead: it masters
+    // every later team, and libomp places a team inside its master's mask -- pinning it to one CPU (as
+    // this did until 2026-09-22) confined every decode team to a single core. Training never showed it
+    // because train_batch's workers re-pin themselves here; decode's GEMV and MoE teams never call this.
+    if (omp_in_parallel()) sub0::pin_current_thread_p_first(tid);
+    else                   sub0::pin_current_thread_p_set();
     // Each thread owns its slot (unique tid within the team), so this lazy alloc needs no lock.
     if (!g_workers[tid]) g_workers[tid] = std::make_unique<Worker>();
     W = g_workers[tid].get();                             // grad spans now reference this slot

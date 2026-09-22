@@ -89,4 +89,19 @@ inline bool pin_current_thread_p_first(int rank) {
     return SetThreadAffinityMask(GetCurrentThread(), mask) != 0;
 }
 
+// Pin the CALLING thread to the whole P-core SET (every logical processor of the top EfficiencyClass),
+// not to one of them. This is the right pin for a thread that will MASTER OpenMP teams: LLVM's libomp (the
+// runtime this toolchain links) places a team inside its master's affinity mask, so a master pinned to ONE
+// logical CPU confines its entire team to that CPU. Measured 2026-09-22 on the shared GEMV primitive at 8
+// threads: master pinned to one CPU 15.7 GB/s (slower than 1 thread's 19.6), master pinned to the P-core
+// set 51-62 GB/s. Same no-op-on-failure contract as pin_current_thread_p_first.
+inline bool pin_current_thread_p_set() {
+    const CoreOrder& o = detect_core_order();
+    if (!o.valid || o.p_core_count <= 0) return false;
+    DWORD_PTR mask = 0;
+    for (int i = 0; i < o.p_core_count; ++i)
+        mask |= static_cast<DWORD_PTR>(1) << o.logical_ids[static_cast<std::size_t>(i)];
+    return SetThreadAffinityMask(GetCurrentThread(), mask) != 0;
+}
+
 }  // namespace sub0
