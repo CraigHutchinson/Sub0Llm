@@ -33,8 +33,10 @@ A number that does not follow this protocol is not evidence, and must not be quo
   `run_perf_suite.py --cold`. Before **every** run it evicts the artifact and its sidecar from the page
   cache, **unelevated, per file** (`scripts/page_cache.py`: a `FILE_FLAG_NO_BUFFERING` open and close
   makes Windows purge that file's pages, including pages cached through a memory map once nothing maps
-  the file). It then **verifies** with a timing probe (≥95% of sampled pages must come from disk, or it
-  refuses) and times decode alone with `sub0llm-qwen4-forward --decode-only`. Measured: a cached sample
+  the file). It then **verifies** with a canary: a fixed page sample is cached first, the file is evicted,
+  and ≥95% of that same sample must then come from disk, or it refuses. A random sample could not fail,
+  because decode never touches most of the 37 GiB. The negative control (a mapping held open) is
+  refused as it should be. and times decode alone with `sub0llm-qwen4-forward --decode-only`. Measured: a cached sample
   took 2.6 µs per page and the same sample after eviction took 110 µs, all of it from disk (a control
   without eviction stayed at ~2.5 µs). The purge is **undocumented** file-system-driver behaviour, not a
   documented API, which is why every run re-verifies it. The fallback, if it ever stops working, is an
@@ -70,11 +72,15 @@ Waiting for a quiet host does not scale: after a reboot this machine sat at 8-17
 `run_perf_suite.py --sandbox` (implemented in `scripts/perf_sandbox.py`) reserves most of the CPU for
 the run instead, for a bounded time, and puts everything back afterwards.
 
-**Windows (implemented, best-effort).** "Reverse affinity": every other process the user can open is
-confined to 2 housekeeping E-cores at BELOW_NORMAL priority. The benchmark keeps the other 22 logical
-CPUs, all 8 P-cores included. The OS reports the core map (`GetSystemCpuSetInformation`), because on
-this part the P-cores are logical `[0,1,10,11,12,13,22,23]`, interleaved with the E-cores. The run also
-switches to the High Performance power plan. New processes are re-swept every 10 s, a watchdog restores
+**Windows (implemented, best-effort).** Default mode is **priority**: every other process the user can
+open drops to BELOW_NORMAL, and the benchmark's whole process tree keeps NORMAL priority on **all 24**
+logical CPUs, so it wins every contended core. The first version confined other processes to 2
+housekeeping E-cores ("affinity" mode, now **parked**) and failed twice over. It excluded only its own
+PID, so the re-sweep confined the decode process it had spawned. And withholding 2 CPUs oversubscribes
+decode's 24-thread OpenMP team, because `cpu_affinity.hpp` pins thread *i* to CPU rank *i*. The one
+result it produced is marked invalid in `perf_history.jsonl`. The OS reports the core map
+(`GetSystemCpuSetInformation`), because on this part the P-cores are logical `[0,1,10,11,12,13,22,23]`,
+interleaved with the E-cores. The run also switches to the High Performance power plan. New processes are re-swept every 10 s, a watchdog restores
 everything after the time limit, and the original state is saved to disk *before* any change, so
 `python scripts/perf_sandbox.py --restore` undoes a sandbox whose owner crashed.
 
