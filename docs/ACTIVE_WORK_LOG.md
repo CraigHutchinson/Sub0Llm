@@ -758,7 +758,44 @@ this, `423659d`). Now waiting for sustained load < 5%, then `run_perf_suite.py` 
 
 | Started | Agent | Work package | Branch | Files/areas | Status | Notes |
 |---|---|---|---|---|---|---|
-| 2026-09-22 | Sonnet 5 subagent A (isolated worktree) | O4: remaining bit-exact decode levers — GDN recurrence threaded over heads, routed-expert plane rows spread across threads, GDN out-proj efficiency | agent worktree | `include/sub0/gdn_math.hpp`, `include/sub0/moe_quant_dot.hpp`, `src/backends/cpu/decode.cpp`, `include/sub0/gemv.hpp` | active | **Owns real-artifact decode measurements on this host.** Expect its perf-suite contention gate to wait while track B compiles. |
+| 2026-09-22 | Sonnet 5 subagent A (isolated worktree) | O4: remaining bit-exact decode levers — GDN recurrence threaded over heads, routed-expert plane rows spread across threads, GDN out-proj efficiency | agent worktree | `include/sub0/gdn_math.hpp`, `include/sub0/moe_quant_dot.hpp`, `src/backends/cpu/decode.cpp`, `include/sub0/gemv.hpp` | paused: agent done, NOT merged | Branch `worktree-agent-ac92618df53668765` @ `42f82a0` (touches only `gdn_math.hpp` + `decode.cpp`). See the 2026-09-22 pause note below for the review and what is left before merge. |
 | 2026-09-22 | Sonnet 5 subagent B (isolated worktree) | O5 phase 1: native-quant backbone (keep the unsloth GGUF's Q5_K/Q6_K/Q8_0 backbone bytes resident; fused int8-activation dot) — census, design doc, isolated kernels + tests + microbench | agent worktree | NEW header + NEW tests + NEW bench tool + `docs/`; does NOT touch engine wiring, `moe_quant_dot.hpp`, `decode.cpp` or the transplant in phase 1 | done | Merged 2026-09-22 after independent re-verification: frontend 144,457/263 (= 141,609/257 unchanged + `[backbonequant]` 2,848/6), real-byte case ran, census reproduced (1,073 tensors, 3.59 vs 9.15 GiB). Kernels are CORRECT but compute-bound (K-quants 1-5 GB/s/thread); at one thread they lose to the real bf16 `gemv::axpy`. See `docs/BACKBONE_NATIVE_QUANT.md` S8a. Phase 2 (streaming unpack, then wiring) not started. |
-| 2026-09-22 | Sonnet 5 subagent C (isolated worktree) | O5 phase 2a: streaming native-quant unpack kernels (Q8_0/Q4_K/Q5_K/Q6_K), gated at >= 10 GB/s of compressed bytes per thread; bench fixed to compare against the real `gemv::axpy` | agent worktree | `include/sub0/backbone_quant_dot.hpp`, `tests/backbone_quant_dot_tests.cpp`, `benchmarks/backbone_quant_dot_bench.cpp`, `docs/BACKBONE_NATIVE_QUANT.md`. NO engine wiring (phase 2b waits for O4, since it touches `decode.cpp`) | active | Short microbench runs only, and none while a real-artifact decode (O4) is running. |
+| 2026-09-22 | Sonnet 5 subagent C (isolated worktree) | O5 phase 2a: streaming native-quant unpack kernels (Q8_0/Q4_K/Q5_K/Q6_K), gated at >= 10 GB/s of compressed bytes per thread; bench fixed to compare against the real `gemv::axpy` | agent worktree | `include/sub0/backbone_quant_dot.hpp`, `tests/backbone_quant_dot_tests.cpp`, `benchmarks/backbone_quant_dot_bench.cpp`, `docs/BACKBONE_NATIVE_QUANT.md`. NO engine wiring (phase 2b waits for O4, since it touches `decode.cpp`) | paused | Asked to commit WIP on its worktree branch and stop; see the pause note below. |
+
+---
+
+**2026-09-22 Claude Code — PAUSED at the user's request. Resume from here.** Session `/goal` is still
+open: decode is ~0.21 s/token, about 2x from the bf16 bandwidth floor. Main is `0cb276d`+ locally, 20+
+commits ahead of `origin/main`, **not pushed**.
+
+- **O4 (agent done, not merged): `worktree-agent-ac92618df53668765` @ `42f82a0`.**
+  - Lever 1 threads GDN's conv1d+roll (per channel), recurrence (per k-head) and RMSNormGated (per
+    v-head), and routes `in_proj_b/a` through `gemv::axpy`. Agent measured the GDN phase at 85.2 → 72.3
+    ms/token.
+  - Lever 2: `ParallelExperts` `schedule(static)` → `schedule(dynamic)`. Agent measured routed experts
+    at 38.3 → 35.2 ms/token.
+  - The agent reported unchanged gates: 28,969,623/147, 141,609/257, all three fingerprints, and L2
+    0.23252 at GEMV threads 1 and 8.
+  - **Diff reviewed by the primary agent: the bit-exactness arguments hold.** No threaded loop reduces
+    across its split axis; the b/a axpy keeps the i-ascending order; the phase-2 MoE sum stays in fixed
+    k order.
+  - **Left before merge:**
+    1. merge `--no-ff` onto current main (no file overlap with O5);
+    2. rebuild `d196check` and run both suites. Frontend is now **144,457/263** on main, not 141,609;
+    3. run the fingerprints, and the real-artifact L2 at the recommended flags;
+    4. an interleaved A/B at low contention;
+    5. write `docs/optimization/opportunities/O4_*.md`, add its README index row and a perf_history row.
+  - **Process gap to record in that doc:** lever 3 (a GDN out-proj prefetch in `gemv.hpp`) got only 1 of
+    3 passes. It was inconclusive and was REVERTED rather than parked behind a toggle, contrary to
+    AGENTS.md §13. Untried candidates: an 8-row unroll, and forcing the private tile for narrow per-thread
+    slices.
+- **O5 phase 2a (paused): Sonnet agent in its own worktree**, asked to commit WIP and stop. Its hand-off
+  message names the branch, commit and next step.
+  - Target: a streaming unpack at >= 10 GB/s of compressed bytes per thread (see
+    `docs/BACKBONE_NATIVE_QUANT.md` §8a).
+  - Phase 2b (engine wiring) waits on O4's merge.
+- **Backlog, unchanged:**
+  - P1: a lean default-workflow version of `OPTIMIZATION_PROCESS.md`.
+  - P2: rename `sub0_tests` → `sub0llm_tests`, on a quiet tree. Open question: rename
+    `sub0_frontend_tests` too?
 
