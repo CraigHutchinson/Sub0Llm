@@ -227,6 +227,38 @@ def stage_vtune(build: pathlib.Path, flags: list[str], tokens: int, outdir: path
     }
 
 
+def contention_check(sb) -> tuple[dict, list[str]]:
+    """One pass of the S1 gate. Returns (record for the history row, problems -- empty if clear).
+
+    On failure it also ATTRIBUTES the load (perf_sandbox.load_attribution): a gate that only says
+    "8.6%, wait" gives no way to tell a telemetry task that will finish in ten minutes from a stuck
+    process that never will. Known transient Windows tasks are labelled as such.
+    """
+    import perf_sandbox
+    n = contention_count()
+    if sb is not None:
+        time.sleep(5)   # let confined processes' in-flight quanta drain off the reserved cores
+        load = perf_sandbox.bench_core_load(sb.bench_cpus)
+    else:
+        load = system_load_pct()
+    problems = []
+    if n != 0:
+        problems.append(f"{n} named competing process(es) (sibling builds/benchmarks)")
+    if load is None:
+        problems.append("background load UNKNOWN (counter unavailable) -- not treated as idle")
+    elif load > MAX_BACKGROUND_LOAD_PCT:
+        where = ("on the sandbox's RESERVED cores (what it cannot confine unelevated: SYSTEM services, "
+                 "kernel threads, DPCs -- OPTIMIZATION_PROCESS.md S1a)" if sb is not None
+                 else "(post-boot updaters, browsers, indexing all count; try --sandbox)")
+        problems.append(f"background CPU load {load:.1f}% > {MAX_BACKGROUND_LOAD_PCT:.0f}% {where}")
+    top = perf_sandbox.load_attribution() if problems else []
+    if top:
+        problems.append("top consumers (% of one core): " + ", ".join(
+            f"{name} {pct}" + (f" [known transient: {why}]" if why else "") for name, pct, why in top[:6]))
+    return ({"named_processes": n, "background_load_pct": load, "top_consumers": top,
+             "sandbox": sb.report() if sb is not None else None}, problems)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", action="append", choices=["suites", "quality", "perf", "compete", "vtune"],
@@ -242,6 +274,8 @@ def main() -> int:
     ap.add_argument("--sandbox", action="store_true",
                     help="confine other processes to 2 housekeeping E-cores for the run (perf_sandbox.py); "
                          "the load gate then checks the RESERVED cores, not the whole box")
+    ap.add_argument("--wait-stable", type=float, default=0, metavar="MIN",
+                    help="re-check the contention gate every 60 s for up to MIN minutes before refusing")
     args = ap.parse_args()
     with contextlib.ExitStack() as stack:
         sb = None
@@ -249,41 +283,30 @@ def main() -> int:
             import perf_sandbox
             sb = stack.enter_context(perf_sandbox.Sandbox(max_seconds=4 * 3600))
             print(f"sandbox: {json.dumps(sb.report())}", file=sys.stderr)
-        return run(args, sb)
+        return run_suite(args, sb)
 
 
-def run(args, sb) -> int:
-
+def run_suite(args, sb) -> int:
     stages = args.stage or ["perf"]
     gates = json.loads(GATES.read_text(encoding="utf-8"))
 
     results_load = None
     if "perf" in stages or "quality" in stages or "vtune" in stages:
-        n = contention_count()
-        if sb is not None:
-            import perf_sandbox
-            time.sleep(5)   # let confined processes' in-flight quanta drain off the reserved cores
-            load = perf_sandbox.bench_core_load(sb.bench_cpus)
-        else:
-            load = system_load_pct()
-        results_load = {"named_processes": n, "background_load_pct": load,
-                        "sandbox": sb.report() if sb is not None else None}
-        problems = []
-        if n != 0:
-            problems.append(f"{n} named competing process(es) (sibling builds/benchmarks)")
-        if load is None:
-            problems.append("background load UNKNOWN (counter unavailable) -- not treated as idle")
-        elif load > MAX_BACKGROUND_LOAD_PCT:
-            where = ("on the sandbox's RESERVED cores -- i.e. from what it cannot confine unelevated: "
-                     "SYSTEM services, kernel threads, DPCs (OPTIMIZATION_PROCESS.md S1a)") if sb is not None                 else "(post-boot updaters, browsers, indexing all count; try --sandbox)"
-            problems.append(f"background CPU load {load:.1f}% > {MAX_BACKGROUND_LOAD_PCT:.0f}% {where}")
+        deadline = time.monotonic() + args.wait_stable * 60
+        while True:
+            results_load, problems = contention_check(sb)
+            if not problems or args.allow_contention or time.monotonic() > deadline:
+                break
+            print("waiting to stabilise: " + "; ".join(problems), file=sys.stderr)
+            time.sleep(60)
         if problems and not args.allow_contention:
             print("REFUSING TO MEASURE:\n  - " + "\n  - ".join(problems) + "\n"
                   "A contended measurement is not a slow measurement, it is a meaningless one\n"
-                  "(OPTIMIZATION_PROCESS.md S1). Wait, or pass --allow-contention and do not quote\n"
-                  "the number as evidence.", file=sys.stderr)
+                  "(OPTIMIZATION_PROCESS.md S1). Wait (--wait-stable N), or pass --allow-contention\n"
+                  "and do not quote the number as evidence.", file=sys.stderr)
             return 2
-        print(f"contention check: {n} named, {load:.1f}% background -- clear", file=sys.stderr)
+        print(f"contention check: {results_load['named_processes']} named, "
+              f"{results_load['background_load_pct']:.1f}% background -- clear", file=sys.stderr)
 
     arms = []
     for spec in args.arm:
