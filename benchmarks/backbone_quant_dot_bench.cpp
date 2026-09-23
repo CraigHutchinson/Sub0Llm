@@ -36,7 +36,7 @@
 // ENGINE-FREE: gguf.hpp + backbone_quant_dot.hpp + bf16.hpp + gemv.hpp only. No sub0_config.hpp, no
 // layout.hpp.
 //
-// PASS 4 ADDITION (docs/BACKBONE_NATIVE_QUANT.md S13): every Q4_K/Q5_K/Q6_K format entry now ALSO times
+// PASS 4 ADDITION (docs/BACKBONE_NATIVE_QUANT.md S14): every Q4_K/Q5_K/Q6_K format entry now ALSO times
 // `gemv_plane_super<Threads>` (the per-256 ActSuper activation) through `time_native_super_pool`, over
 // the SAME real pool and at the SAME thread counts as the existing `gemv_plane<Threads>` (per-32
 // ActBlocks) arm -- printed as two extra columns so the two schemes' throughput is directly comparable
@@ -221,7 +221,7 @@ double time_native_pool(const Pool& pool, std::uint32_t type_raw, const bbqd::Ac
     return el / total_bytes_read;   // seconds per byte -- caller turns this into GB/s and us/row-call
 }
 
-/// Pass 4 (docs/BACKBONE_NATIVE_QUANT.md S13): the SAME pool, timed through `gemv_plane_super<Threads>`
+/// Pass 4 (docs/BACKBONE_NATIVE_QUANT.md S14): the SAME pool, timed through `gemv_plane_super<Threads>`
 /// (the per-256 ActSuper activation, Q4_K/Q5_K/Q6_K only) instead of `gemv_plane<Threads>` -- identical
 /// harness shape to time_native_pool, so the two numbers are directly comparable at the same thread
 /// count on the same real bytes.
@@ -249,7 +249,7 @@ double time_native_super_pool(const Pool& pool, std::uint32_t type_raw, const bb
 /// Pass 4, single-thread ONLY: isolates whether AVX-VNNI (`dot_row_q{4,5,6}_k_super_vnni`) actually beats
 /// plain AVX2 (`dot_row_q{4,5,6}_k_super_avx2`, `maddubs_epi16`+`madd_epi16`) by calling the internal
 /// `detail::gemv_plane_super_avx2`/`_vnni` entry points DIRECTLY -- `gemv_plane_super<Threads>` itself
-/// does NOT dispatch to VNNI (docs/BACKBONE_NATIVE_QUANT.md S13: measured slightly slower here, so the
+/// does NOT dispatch to VNNI (docs/BACKBONE_NATIVE_QUANT.md S14: measured slightly slower here, so the
 /// live default stays plain AVX2), so this is the only place in the tree that still exercises the VNNI
 /// kernels, kept for a future re-measurement (the task's own "measure it, do not assume it wins").
 #if defined(SUB0_BBQD_VNNI)
@@ -338,7 +338,7 @@ int main(int argc, char** argv) {
         xq.quantize(x.data(), pool.row_elems);
         std::vector<float> native_out(static_cast<std::size_t>(kMaxRowsPerEntry));
 
-        // Pass 4 (docs/BACKBONE_NATIVE_QUANT.md S13): the per-256 ActSuper activation, Q4_K/Q5_K/Q6_K
+        // Pass 4 (docs/BACKBONE_NATIVE_QUANT.md S14): the per-256 ActSuper activation, Q4_K/Q5_K/Q6_K
         // only -- `bbqd::super_fusable` refuses Q8_0 by design (ActSuper's own header comment), so that
         // arm is simply skipped below rather than measured and discarded.
         const bool has_super = bbqd::super_fusable(static_cast<std::uint32_t>(type), pool.row_elems);

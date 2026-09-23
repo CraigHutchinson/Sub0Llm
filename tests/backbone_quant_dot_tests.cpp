@@ -570,7 +570,7 @@ TEST_CASE("bbqd (AGENTS.md S9): validated against REAL bytes from the Qwen3.8-Fl
     }
 }
 
-// --- pass 4 (AGENTS.md S13, docs/BACKBONE_NATIVE_QUANT.md S13): the per-256 ActSuper activation --------
+// --- pass 4 (AGENTS.md S13, docs/BACKBONE_NATIVE_QUANT.md S14): the per-256 ActSuper activation --------
 // --- scheme and its Q4_K/Q5_K/Q6_K portable/AVX2/AVX-VNNI streaming kernels -----------------------------
 //
 // Mirrors the structure of the ActBlocks cases above exactly (lossless-decode isolates weight-layout bugs
@@ -682,9 +682,9 @@ TEST_CASE("bbqd (pass 4): the AVX2 super path agrees EXACTLY with the portable s
 TEST_CASE("bbqd (pass 4): the AVX-VNNI super path agrees EXACTLY with the portable and AVX2 super paths",
           "[backbonequant]") {
     // Only compiled/run when this TU was built with AVX-VNNI (this project's own SUB0_NATIVE=ON host --
-    // docs/BACKBONE_NATIVE_QUANT.md S13's own -march=native macro dump confirms it here). Distributivity
+    // docs/BACKBONE_NATIVE_QUANT.md S14's own -march=native macro dump confirms it here). Distributivity
     // of integer multiplication over addition is what makes dpbusd+mullo bit-exact with maddubs+madd
-    // (this header's own S13 comment) -- checked here, not assumed from the algebra alone.
+    // (this header's own S14 comment) -- checked here, not assumed from the algebra alone.
     constexpr int kN = 2560, kRows = 5;
     std::mt19937 rng(3131);
     std::normal_distribution<float> normal(0.f, 2.f);

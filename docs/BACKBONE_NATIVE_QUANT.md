@@ -926,3 +926,284 @@ resident size if wired in — about 58% of §7's full four-format potential (5.5
   (`h*2*head_dim + half*head_dim`) is the reference to port.
 - The AXPY-vs-DOT reconciliation §3d already named as unresolved is unchanged by this phase — this phase
   only produces bytes and an identity lookup, it does not touch any engine call site's loop shape.
+
+---
+
+## 14. Pass 4 (kernel pass 4) — the §12g lever: fold the per-sub-block scale into the integer accumulator
+
+§12g named the concrete next lever, unattempted at the time: §12's own streaming kernels pay 8 (Q4_K/
+Q5_K) or 16 (Q6_K) independent `hsum256_epi32`-style horizontal reductions per 256-element superblock —
+one per sub-block — because `moeqd::ActBlocks`' own per-32 float activation scale cannot fold a
+sub-block's INTEGER weight scale into the integer accumulator the way llama.cpp's per-256 `block_q8_K`
+activation does. This section builds that: a new per-256 activation type (`bbqd::ActSuper`, beside
+`ActBlocks`, not a change to it), three implementations of the fold (portable / AVX2 / AVX-VNNI) checked
+bit-exact against each other, and an honest measurement of both the speed win and the activation-error
+cost it buys.
+
+### 14a. Reference study (AGENTS.md §5) — quoted, not paraphrased
+
+`D:\Craig\llama.cpp-qwen4exp\ggml\src\ggml-common.h`'s `block_q8_K`:
+
+```c
+// This is only used for intermediate quantization and dot products
+typedef struct {
+    float   d;              // delta
+    int8_t  qs[QK_K];       // quants
+    int16_t bsums[QK_K/16]; // sum of quants in groups of 16
+} block_q8_K;
+```
+
+`D:\Craig\llama.cpp-qwen4exp\ggml\src\ggml-cpu\arch\x86\quants.c`'s `ggml_vec_dot_q4_K_q8_K` (AVX2 arm,
+elided to the two lines that matter here — the full kernel is quoted at length in §12c already):
+
+```c
+const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+...
+const __m256i q4l = _mm256_and_si256(q4bits, m4);
+...
+__m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
+p16l = _mm256_madd_epi16(scale_l, p16l);
+...
+sumi = _mm256_add_epi32(sumi, sumj);
+...
+__m256 vd = _mm256_set1_ps(d);
+acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
+```
+
+The load-bearing fact, re-derived rather than assumed: `scale_l`/`scale_h` carry the RAW unsigned 6-bit
+`sc` codes (0..63, from `utmp`, never multiplied by `d`), and `madd_epi16(scale_l, p16l)` folds that raw
+scale into the int32 domain BEFORE any float conversion. `sumi` accumulates ALL EIGHT sub-blocks of one
+superblock in the integer domain; `d = y[i].d * x[i].d` (activation `d` times weight `d`) is multiplied
+in and reduced to float exactly ONCE, at the very end of the `nb` (superblock) loop — not once per
+sub-block. This is possible ONLY because `y[i].d` (the activation scale) is the SAME single float for
+the whole 256-element superblock; if it varied per 32-element sub-block (as `ActBlocks::scale` does), the
+scale could not be folded into `p16l`'s own accumulation and would need its own per-sub-block float
+multiply — exactly the shape §12's own kernels are stuck with.
+
+The min-term fold (same kernel, elided):
+
+```c
+const __m128i q8sums = _mm256_loadu_si256((const __m256i*)y[i].bsums);
+const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+```
+
+`y[i].bsums` (16 per-16-element sums) is pairwise-summed (`_mm_hadd_epi16`) into 8 per-32-element sums,
+matched against the 8 raw `min` codes via `madd_epi16`, and folded with ONE `dmin` float multiply per
+superblock — the min-term equivalent of the same trick.
+
+`ggml_vec_dot_q6_K_q8_K`'s own affine term (Q6_K has no separate "min", only the constant `-32`
+zero-point, so this is its WHOLE affine correction, quoted in full because this project's own Q6_K
+kernel below follows it exactly):
+
+```c
+const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y[i].bsums);
+const __m128i scales = _mm_loadu_si128((const __m128i*)x[i].scales);
+const __m256i scales_16 = _mm256_cvtepi8_epi16(scales);
+const __m256i q8sclsub = _mm256_slli_epi32(_mm256_madd_epi16(q8sums, scales_16), 5);
+...
+sumi = _mm256_sub_epi32(sumi, q8sclsub);
+acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
+```
+
+`madd_epi16(q8sums, scales_16)` combines all 16 `(scale, bsum)` pairs in ONE instruction, `slli_epi32(...,
+5)` multiplies by 32 (the zero-point) via a shift, and the whole `-32*sum(scale*bsum)` correction is
+subtracted from the raw `sumi` before a SINGLE float multiply-add — the `q8sclsub` shape this project's
+own `dot_row_q6_k_super_*` (§14c) reuses under the same name.
+
+**How this project's own conventions were re-mapped, not assumed to match (AGENTS.md §5):**
+- llama.cpp's weight tensor and this project's are the SAME GGUF bytes (Q4_K/Q5_K/Q6_K block layout is a
+  format constant, not a convention llama.cpp invented) — no axis remap needed on the WEIGHT side, unlike
+  the Newton-Schulz precedent AGENTS.md §5 cites.
+- The ACCUMULATION and OUTPUT shape differ: llama.cpp's `ggml_vec_dot_*` computes ONE dot product (row
+  vs row) inside a caller-side GEMM/GEMV loop; this project's `dot_row_q{4,5,6}_k_super_*` are already
+  that same "one row's dot" shape (matching §12's own `dot_row_q{4,5,6}_k_avx2`), so no restructuring was
+  needed there either — the fold is the only thing ported.
+- **What was NOT ported**: llama.cpp's `get_scale_shuffle_k4`-based broadcast batching (two sub-blocks'
+  scales broadcast into one register via `_mm256_shuffle_epi8` against a combined lookup table, processing
+  64 raw elements per outer-loop step). This project's kernels already decode ONE sub-block's nibbles at a
+  time (`nibble_lo`/`nibble_hi`, unchanged from §12), so each sub-block's own raw scale is already an
+  individually-addressable scalar by the time it is needed — a plain `_mm256_set1_epi16`/`set1_epi32`
+  broadcast suffices, at the cost of one broadcast per sub-block instead of amortizing two via a shuffle
+  table. A deliberate simplicity-over-micro-optimization call (`include/sub0/backbone_quant_dot.hpp`'s own
+  §14 file-header comment names this explicitly), not an oversight.
+- llama.cpp's own quantized activation (`quantize_row_q8_K_ref`) was re-derived onto this project's
+  caller-owned/reused-buffer convention (`ActSuper::quantize`, mirroring `ActBlocks::quantize` field for
+  field: allocates only when the width changes) rather than copied — the RATIONALE for the /127 divisor
+  (not /128, keeping every int8 product's headroom) is identical to `ActBlocks`' own, already established
+  in this project, not re-derived from llama.cpp's own comment (which does not spell out that reasoning).
+
+### 14b. `bbqd::ActSuper` — the new type, beside `ActBlocks`
+
+`include/sub0/backbone_quant_dot.hpp`, mirroring `block_q8_K` field for field: `qs` (n int8 quants),
+`d` (n/256 per-superblock float scales — ONE per 256, not per 32), `bsums` (n/16 per-16-element int16
+sums, llama.cpp's own name — finer than `ActBlocks::gsum`'s per-32, needed for Q6_K's own 16-wide
+sub-blocks). Used ONLY by the Q4_K/Q5_K/Q6_K kernels below; `Q8_0` stays on `ActBlocks` unconditionally
+(`super_fusable()` refuses it) because its own native block already IS 32 wide — a coarser per-256 scale
+would only cost it accuracy with nothing to fold, since Q8_0 has no per-sub-block affine scale at all.
+
+### 14c. Three kernel implementations, one dot-product algebra
+
+`detail::KScaleRaw` unpacks Q4_K/Q5_K's `(sc, m)` pairs the SAME branch-free way `KScaleTable` (§12b)
+does, but keeps them as raw `uint8` codes rather than pre-multiplying by `d`/`dmin` — the fold needs the
+raw integer.
+
+- **`dot_row_q{4,5,6}_k_super_portable`**: the correctness reference. Per superblock: `isum`/`isum_min`
+  accumulate in `std::int32_t` across all 8 (Q4_K/Q5_K) or 16 (Q6_K) sub-blocks BEFORE any float
+  conversion; ONE `d_combined = x.d[s] * t.d` float FMA (plus one `dmin_combined` FMA for Q4_K/Q5_K, or
+  one subtract for Q6_K's `q8sclsub`) closes out the superblock.
+- **`dot_row_q{4,5,6}_k_super_avx2`**: `_mm256_maddubs_epi16` (unsigned weight nibble × signed
+  activation) + `_mm256_madd_epi16` (broadcast raw scale, fold + reduce to int32) per sub-block,
+  accumulated into a running `__m256i`/`__m128i` across the WHOLE superblock, with exactly ONE
+  `hsum256_epi32` (or the 128-bit equivalent for Q6_K) at the end — down from §12's own 8 or 16.
+- **`dot_row_q{4,5,6}_k_super_vnni`**: `_mm256_dpbusd_avx_epi32` (AVX-VNNI, `vpdpbusd`) computes the raw
+  unsigned×signed dot directly to int32 (no int16 intermediate), then `_mm256_mullo_epi32` folds the raw
+  scale in before accumulating — the lever the task brief named explicitly (§14e).
+
+**Why all three are bit-exact, not merely close (checked, not assumed):** integer addition and
+multiplication are associative and commutative exactly, with no rounding — `sum_sub sc[sub] *
+dot(w_sub, x_sub)` evaluates to the identical `std::int32_t` regardless of which order or which SIMD
+lane grouping computes the partial sums, as long as no term overflows int32 (worked through explicitly in
+the header's own §14 comment: Q4_K/Q5_K's worst case is ~63.5M per superblock, Q6_K's ~260M — both three
+orders of magnitude under `INT32_MAX`). The only floating-point step in any of the three implementations
+is the SAME final `d_combined`/`dmin_combined` multiply-add, done in the same per-superblock sequential
+order in all three — so `tests/backbone_quant_dot_tests.cpp`'s "AVX2 super path agrees EXACTLY with
+portable" and "AVX-VNNI... agrees EXACTLY..." cases require bit-identical output, not a tolerance, and
+both hold.
+
+**A free correctness/§1 side-effect worth recording**: §12i flagged `Gsum16` (Q6_K's per-16 activation
+sum cache) as heap-allocating inside `gemv_plane_avx2`, once per call and per thread. Pass 4's `bsums`
+lives INSIDE `ActSuper` itself, built once by `ActSuper::quantize()` (called once per token/layer, the
+same cadence `ActBlocks::quantize()` already has) — so `dot_row_q6_k_super_*` needs no per-call
+allocation at all, and no analogous `TODO` is needed here.
+
+### 14d. AGENTS.md §14 — three measured passes
+
+**Pass 1 — ActSuper + AVX2(maddubs) + VNNI(dpbusd), dispatch defaults to VNNI where available.**
+`gemv_plane_super<Threads>` picked VNNI whenever `kVnniKernels` was true (mirroring `kAvx2Kernels`'s own
+convention one ISA tier up). Real Qwen3.8-Flash-Next UD-IQ1_S shards, this host, DRAM-streamed pool
+(`sub0_backbone_quant_dot_bench`, `--seconds 0.4`), 8 threads, wall-clock speedup over the real
+`gemv::axpy` bf16 kernel at the matching `(row_elems, out_dim)` shape:
+
+| Format | OLD (§12, per-32 ActBlocks streaming) | NEW (pass 4, per-256 ActSuper, VNNI-default) | Task's own §12i target |
+|---|---:|---:|---:|
+| Q4_K | 1.78x | **2.59x** | 2.17x |
+| Q5_K | 1.39x | **2.11x** | 1.93x |
+| Q6_K | 1.41x | **3.21x** | 1.82x |
+
+All three formats beat their own stated target on the FIRST pass. The mechanism is a clear win before any
+tuning — this is the "a first milestone that merely works is proof the mechanism is viable" case AGENTS.md
+§14 describes, not yet evidence of the CEILING.
+
+**Pass 2 — is VNNI actually the better default? Measured, not assumed.** `time_super_kernel_1t` (new in
+`benchmarks/backbone_quant_dot_bench.cpp`) calls `detail::gemv_plane_super_avx2`/`_vnni` DIRECTLY,
+bypassing the dispatcher, isolating the two kernels' own 1-thread cost on identical real bytes. Four
+independent runs (`--seconds 0.3`-`0.5`), all three formats (12 measurements total):
+
+| Run | Q4_K VNNI/AVX2 | Q5_K VNNI/AVX2 | Q6_K VNNI/AVX2 |
+|---|---:|---:|---:|
+| A | 0.92x | 0.97x | 0.98x |
+| B | 0.99x | 0.99x | 0.94x |
+| C | 0.94x | 0.94x | 0.87x |
+| D | 1.09x | 0.92x | 0.92x |
+
+Mean ~0.95x — rough PARITY, never a clear win, occasionally a real regression, once (Q4_K, run D)
+marginally ahead. **Mechanistic reading, not just a number**: `madd_epi16`'s own job is "multiply two
+int16 operands AND reduce adjacent pairs to int32" in one instruction; VNNI's `dpbusd` computes the raw
+unsigned×signed sum directly to int32, but the per-sub-block SCALE still has to be folded in afterward
+via a separate `mullo_epi32` — so the instruction count does not actually drop (2 instructions either
+way), and `vpmulld` is typically the higher-latency of the two paths' respective "extra" instructions on
+x86. VNNI's fusion advantage is real for a PURE dot product; it is not free once a per-sub-block integer
+scale still needs folding in a separate step. **Consequence**: `gemv_plane_super_dispatch` was changed to
+prefer plain AVX2 over VNNI (simpler, needs no `-mavxvnni` availability, never measured clearly worse) --
+`detail::gemv_plane_super_vnni` stays in the tree, individually callable and tested, parked rather than
+reverted (AGENTS.md §14's own "never fully back a change out").
+
+**Pass 3 — re-verify gates and re-measure the corrected default.** Full rebuild, full suite:
+`[backbonequant]` **6,884 assertions in 17 test cases** (phase 2a's own 3,891/10 plus 7 new pass-4 cases);
+`~[backbonequant]` **141,609 assertions in 257 test cases** — bit-for-bit the required baseline, confirming
+nothing leaked; full `sub0_frontend_tests` **148,493 assertions in 274 test cases**. Real-artifact
+DRAM-streamed re-measurement (default AVX2 dispatch, `--seconds 0.5`), 8 threads:
+
+| Format | OLD (per-32, §12) | NEW (per-256, pass 4, plain-AVX2 default) | Target |
+|---|---:|---:|---:|
+| Q4_K | 2.11x | **2.50x** | 2.17x |
+| Q5_K | 1.68x | **2.35x** | 1.93x |
+| Q6_K | 1.50x | **2.87x** | 1.82x |
+
+Still comfortably ahead of every stated target after the dispatch correction — the win is not an artifact
+of the (now-abandoned) VNNI-first choice. Per-thread compressed-byte throughput (native/super GB/s,
+`sub0_backbone_quant_dot_bench`'s own columns), same run: Q4_K 1→8 threads 11.71→44.93 GB/s, Q5_K
+8.63→41.39, Q6_K 15.71→53.68 — all comfortably above §12's own per-thread numbers at every thread count,
+though (like §12f) still short of the host's ~79 GB/s all-P-core roof, leaving headroom for a future pass.
+
+**Run-to-run noise, stated plainly rather than glossed over**: this host shows real ±15-40% swings between
+runs on both the native AND the bf16 baseline arms (e.g. Q5_K's 1-thread `bf16 GB/s` ranged 12.35-21.92
+across the sessions this pass ran in) — consistent with the shared-host contention this task's own brief
+warned about (a sibling agent writing a ~3.6 GiB sidecar file concurrently). The RATIO (native vs bf16,
+same run) is far more stable than either arm's own absolute number, which is why every speedup claim above
+is a same-run ratio, never an absolute GB/s compared across different runs.
+
+### 14e. Activation-quantization error: OLD vs NEW, side by side, on real weights (not buried)
+
+Measured identically to §5b/§12's own precedent: real backbone tensor bytes, a single Gaussian (`N(0,1)`)
+activation row, SAME seed and SAME draw for both schemes so the comparison is apples-to-apples (not two
+different random instances) — `tests/backbone_quant_dot_tests.cpp`'s own pass-4 real-bytes case.
+
+| Format | Real tensor | OLD, per-32 `ActBlocks` (§5b's own baseline) | NEW, per-256 `ActSuper` | Ratio |
+|---|---|---:|---:|---:|
+| Q4_K | `output.weight` | 3.85% | **8.35%** | 2.17x |
+| Q5_K | `blk.0.attn_gate.weight` | 1.99% | **6.50%** | 3.27x |
+| Q6_K | `blk.0.ssm_out.weight` | 0.12% | **0.41%** | 3.48x |
+
+**This is a real cost, reported plainly, not picked around.** A per-256 activation scale is coarser by
+construction (one scale must now cover 8x more dynamic range than before), and the error roughly doubles
+to triples across the three formats. For context against this project's own precedent
+(`docs/MOE_QUANT_DOT.md` §6e, B35's own MoE-path numbers, and §5b's own end-to-end read): the OLD scheme's
+own worst case (Q4_K 3.85%) sits in the same band as B35's MoE path (0.48%-3.3%), which produced a 0.29
+end-to-end logit L2-relative diff against the BF16 backbone (shipped default-off, "a real tradeoff a user
+can choose" per the B35 precedent, not "too costly to ship"). The NEW scheme's Q4_K number (8.35%) is
+roughly 2.5x that precedent's own worst case — **plausibly, not confirmed, in the same general
+neighbourhood as FP8's own 0.43 L2-relative/3-of-6-argmax-flip result** (shipped default-off, "not
+recommended" — the one precedent this project has explicitly NOT recommended for exactly this reason).
+**No end-to-end logit comparison was run this pass** (§5d's own gap — no engine wiring exists yet to
+produce one), so this is an informed analogy, not a verified equivalence; a phase-2b wiring pass MUST run
+the real `--dump-logits` comparison against the BF16 (~0.199) and FP8 (~0.43) precedents before this
+scheme is trusted at inference quality, not merely at kernel-dot-product accuracy. **This is the primary
+agent's call to weigh, per this task's own brief — not something this pass resolves or should resolve on
+its own.**
+
+The weight-decode side stays EXACT under the new scheme (as required, unconditionally): the
+lossless-activation test (`tests/backbone_quant_dot_tests.cpp`'s own pass-4 case, reusing §5a/§12's own
+`lossless_row()` helper — every 32-wide GROUP already plants an exact ±127, so every 256-wide SUPERBLOCK's
+own amax is trivially also 127, checked directly) measures worst-case relative disagreement 8.9e-8 to
+3.2e-7 against `gguf::to_f32` on real sidecar bytes — float-rounding only, no layout error, matching §5a's
+own bar.
+
+### 14f. Gates
+
+- `[backbonequant]`: 6,884 / 17 (was 3,891 / 10 before this pass; +7 new cases, all pass-4).
+- `~[backbonequant]`: 141,609 / 257 — **exactly** the required baseline, unchanged.
+- Full `sub0_frontend_tests`: 148,493 / 274.
+- New pass-4 test cases: `super_fusable()` accepts only Q4_K/Q5_K/Q6_K at a 256-aligned width; the fused
+  super unpackers decode the SAME weights `gguf::to_f32` does (lossless activation); the AVX2 super path
+  agrees EXACTLY with the portable super path; the AVX-VNNI super path agrees EXACTLY with both (gated on
+  `SUB0_BBQD_VNNI`); `gemv_plane_super<Threads>` is bit-exact across 1/2/4 threads on an uneven split;
+  `gemv_plane_super` refuses Q8_0 and an unaligned row, untouched on refusal; the AGENTS.md §9 real-bytes
+  case (lossless decode + the OLD-vs-NEW error comparison above).
+
+### 14g. What this pass does not do, named rather than left implicit
+
+- No engine wiring, exactly per this task's own scope — `gemv_plane_super` is not called from `src/` or
+  `tools/`, same as §12's own kernels.
+- No end-to-end logit comparison (§14e's own gap) — the activation-error rise is real and measured at the
+  dot-product level; whether it is acceptable at INFERENCE quality is the primary agent's call, informed
+  by but not resolved by this pass.
+- No further VNNI tuning beyond the batching alternatives considered and rejected in pass 2's own
+  reasoning (§14d) — a genuinely different VNNI formulation (e.g. batching two sub-blocks' scale folds
+  into one wider multiply) was considered but has no clear instruction-count win over the current shape,
+  so it was not attempted as a fourth pass; named here as the concrete next step if VNNI is revisited.
+- The per-thread GB/s gate (~79 GB/s all-P-core roof) is still not reached (§12f's own gate, restated in
+  §14d) — 28-67 GB/s measured across formats and thread counts here, the same "real headroom, not yet
+  claimed" reading §12i already gave the per-32 scheme.

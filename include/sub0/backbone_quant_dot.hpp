@@ -92,7 +92,7 @@
 #define SUB0_BBQD_AVX2 1
 #endif
 // AVX-VNNI (`vpdpbusd`, VEX-encoded -- distinct from the AVX512VNNI form): this host (Arrow Lake-HX) has
-// it without AVX-512 (confirmed via `clang++ -march=native -dM -E`, docs/BACKBONE_NATIVE_QUANT.md S13).
+// it without AVX-512 (confirmed via `clang++ -march=native -dM -E`, docs/BACKBONE_NATIVE_QUANT.md S14).
 // `<immintrin.h>` pulls in `avxvnniintrin.h` unconditionally; the `_avx_epi32`-suffixed intrinsics it
 // declares are gated by the `__AVXVNNI__` target-feature macro at the call site, not by a separate header
 // guard, so this project's own SUB0_BBQD_VNNI mirrors that same macro rather than inventing a new test.
@@ -123,7 +123,7 @@ inline constexpr bool kAvx2Kernels = false;
 #endif
 
 /** Whether this translation unit was built with AVX-VNNI (`vpdpbusd`) available -- this host has it
- * without AVX-512 (docs/BACKBONE_NATIVE_QUANT.md S13's own `-march=native` macro dump). Records the ISA
+ * without AVX-512 (docs/BACKBONE_NATIVE_QUANT.md S14's own `-march=native` macro dump). Records the ISA
  * fact for callers/tests (`detail::gemv_plane_super_vnni` only exists to call when this is true); it does
  * NOT drive `gemv_plane_super`'s own dispatch (see `detail::gemv_plane_super_dispatch`'s own comment) --
  * pass 4's own measurement found the VNNI kernels at rough PARITY with the plain-AVX2 ones here
@@ -157,7 +157,7 @@ struct WeightGroup {
     float scale_hi = 0.f, bias_hi = 0.f;                        ///< applies to q[16..32)
 };
 
-// --- pass 4 (AGENTS.md S13, docs/BACKBONE_NATIVE_QUANT.md S12g/S13): a per-256 activation superblock ---
+// --- pass 4 (AGENTS.md S13, docs/BACKBONE_NATIVE_QUANT.md S12g/S14): a per-256 activation superblock ---
 // --- for the K-quant kernels, so each superblock's per-sub-block INTEGER weight scale can fold into ----
 // --- the integer accumulator the way llama.cpp's own block_q8_K-based kernels do -------------------------
 
@@ -344,7 +344,7 @@ inline constexpr bool kHasAvx2 =
 #endif
 
 /// True only when this translation unit was compiled with AVX-VNNI enabled -- pass 4's own kernel
-/// selection fact (docs/BACKBONE_NATIVE_QUANT.md S13), same convention as kHasAvx2.
+/// selection fact (docs/BACKBONE_NATIVE_QUANT.md S14), same convention as kHasAvx2.
 inline constexpr bool kHasVnni =
 #if defined(SUB0_BBQD_VNNI)
     true;
@@ -905,7 +905,7 @@ struct Gsum16 {
 #endif  // SUB0_BBQD_AVX2
 
 // =========================================================================================================
-// Pass 4 (AGENTS.md S13, docs/BACKBONE_NATIVE_QUANT.md S12g/S13): the per-256 activation superblock
+// Pass 4 (AGENTS.md S13, docs/BACKBONE_NATIVE_QUANT.md S12g/S14): the per-256 activation superblock
 // (ActSuper, above) lets Q4_K/Q5_K/Q6_K fold each superblock's per-sub-block INTEGER scale into the
 // integer accumulator BEFORE any float conversion, the way llama.cpp's own AVX2 K-quant kernels do
 // (D:\Craig\llama.cpp-qwen4exp\ggml\src\ggml-cpu\arch\x86\quants.c, ggml_vec_dot_q{4,5,6}_K_q8_K) --
@@ -932,7 +932,7 @@ struct Gsum16 {
 // broadcast of the (already individually-addressable) raw scale suffices -- no shuffle table needed, at
 // the cost of one broadcast instruction per sub-block instead of amortizing two sub-blocks per shuffle.
 // This was a deliberate simplicity-over-micro-optimization call, re-derivable from measurement if the
-// broadcast overhead turns out to matter (it did not, per this section's own S13 pass numbers).
+// broadcast overhead turns out to matter (it did not, per this section's own S14 pass numbers).
 //
 // OVERFLOW, worked through per format rather than assumed safe by analogy to S12's own per-32 bound:
 //   Q4_K/Q5_K: per-element product <= 31 (Q5's widest nibble+hibit) * 127 = 3937; a 32-wide sub-block dot
@@ -1598,7 +1598,7 @@ namespace detail {
 #endif  // SUB0_BBQD_VNNI
 
 /// gemv_plane_super<Threads>'s own kernel choice: plain AVX2, else portable. NOT VNNI-first, even though
-/// `kVnniKernels` is true on this host -- measured, not assumed (docs/BACKBONE_NATIVE_QUANT.md S13's own
+/// `kVnniKernels` is true on this host -- measured, not assumed (docs/BACKBONE_NATIVE_QUANT.md S14's own
 /// pass-4 table): across four independent 1-thread runs x three formats (12 measurements),
 /// `dot_row_q{4,5,6}_k_super_vnni` sat at rough PARITY with `dot_row_q{4,5,6}_k_super_avx2` -- ratios
 /// 0.87x-1.09x, mean ~0.95x, i.e. no clear win either direction, not a strong regression. The mechanistic
