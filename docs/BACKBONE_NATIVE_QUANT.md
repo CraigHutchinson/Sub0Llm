@@ -1207,3 +1207,41 @@ own bar.
 - The per-thread GB/s gate (~79 GB/s all-P-core roof) is still not reached (§12f's own gate, restated in
   §14d) — 28-67 GB/s measured across formats and thread counts here, the same "real headroom, not yet
   claimed" reading §12i already gave the per-32 scheme.
+
+---
+
+## 15. Phase 2b-2a — first opt-in decode consumers (2026-09-23)
+
+`--backbone-quant-dot 1` now requires the paired `<model>.bbq` sidecar and its `.bbq.pair` identity
+record at model load. The transplant writer hashes the complete model and sidecar into that record; the
+loader verifies both before decode, so equal-shaped files from different checkpoints cannot be mixed
+silently. Existing sidecars need a pairing record before opt-in use. The first decode consumers are the
+token-embedding gather and the untied Q4_K language-model head. Tied embeddings are rejected by the
+configurator until the native gather and tied head can share one table. The gather decodes one
+GGUF-order row into the caller's existing output buffer. The head quantizes its activation per 32
+elements and calls `bbqd::gemv_plane`; its scratch vectors reserve capacity at `kv_reset()`, before any
+token is decoded. A missing or unsupported role falls back to the existing blob path. The flag defaults
+off, and all other backbone roles still use the blob. The per-256 `ActSuper` kernel from §14 remains an
+isolated experiment because its increased activation error has no end-to-end quality measurement.
+
+This is **two of the real sidecar's 388 roles**, a correctness and integration increment rather than a
+whole-backbone performance claim. The original bf16 blob remains loaded, so this increment does not yet
+realize §13's potential resident-memory reduction. Nor do two uncontrolled end-to-end runs establish a
+decode-throughput gain.
+
+Checks on this host:
+
+- The engine-free sidecar/kernel cases passed: 7,313 assertions in 28 cases. The row-gather case
+  compared a Q4_K row with independent `gguf::to_f32` decoding; the pairing case rejected same-size
+  model and sidecar mutations.
+- The default-off d196 L11 H7 neutral engine suite passed **29,510,661 assertions in 147 cases**, exactly
+  the recorded pre-change count. On the real 48-layer artifact, default-off `forward_one` and batched
+  `forward` logits agreed exactly over six tokens: L2-relative 0, argmax 6/6.
+- With the opt-in flag and the paired real S0B1 sidecar, the same six-token comparison completed with
+  finite logits, **L2-relative 0.162039 and argmax 5/6**. This is a real quality cost of reading native
+  Q4_K weights and quantizing the head activation. It is below the earlier FP8 (~0.43) comparison but is
+  not evidence that the entire native-backbone path is acceptable; other roles remain unwired.
+
+Raw run logs are retained under `out/o5-native-head/` (`default.log`, `optin-paired.log`). The next integration
+increment must name each additional role explicitly, keep the default-off gate exact, and compare logits
+before treating its isolated kernel throughput as a decode win.

@@ -20,6 +20,7 @@
 #pragma once
 
 #include "sub0/core.hpp"
+#include "sub0/backbone_quant.hpp" // O5: mapped native backbone planes for decode
 #include "sub0/gdn_math.hpp"        // Gated DeltaNet dims/scratch sizing (calc_act_cap)
 #include "sub0/moe_io.hpp"          // B36: explicit overlapped I/O for decode's resolve path
 #include "sub0/moe_math.hpp"        // moe::ExpertWeights (moe_resolve) + scratch sizing
@@ -324,6 +325,8 @@ inline constexpr int MOE_DECODE_THREADS = MOE_DECODE_THREADS_CFG > 0 ? MOE_DECOD
 // construction -- FORWARD_ONLY below -- so nothing can write a routed expert), hence shared across
 // threads without synchronization. The CACHE is per-Worker, because it is mutable scratch.
 extern moeq::Store g_moe_quant;
+// Opened once during model load; decode reads the validated mapping without owning it.
+extern bbq::Store g_backbone_quant;
 
 // B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): decode's explicit-overlapped-I/O reader for the
 // sidecar's payload, opened only when MOE_IO_PIPELINED -- a SEPARATE open handle from g_moe_quant's own

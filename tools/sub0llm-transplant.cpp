@@ -859,6 +859,8 @@ int main(int argc, char** argv) {
         os.write(reinterpret_cast<const char*>(&arch2), sizeof arch2);
         os.flush();
         if (!os) { std::println(stderr, "error: trailer write failed"); return 4; }
+        os.close();
+        if (!os) { std::println(stderr, "error: model close failed"); return 4; }
     }
 
     // --- WP4e: the routed-expert sidecar ------------------------------------------------------------
@@ -1071,6 +1073,11 @@ int main(int argc, char** argv) {
             std::println("candidate roles skipped: {}", cc_skipped);
             std::println("mismatches             : {}", cc_mismatched);
             if (cc_mismatched != 0) return 15;
+            std::string pair_err;
+            if (!bbq::write_pair_identity(out_path, backbone_quant_path, pair_err)) {
+                std::println(stderr, "error: cannot bind backbone sidecar to the model: {}", pair_err);
+                return 15;
+            }
         }
         std::println("");
         std::println("--- O5 phase 2b-1: backbone-quant sidecar --------------------------------");

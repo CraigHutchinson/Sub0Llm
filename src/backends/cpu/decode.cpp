@@ -207,6 +207,9 @@ std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
 // forward_one is single-threaded at the call level, and MOE_DECODE_THREADS is 1 (B29), so the fan-out
 // below only ever READS this. Empty and untouched in every build but MOE_QUANT_DOT.
 moeqd::ActBlocks g_moe_act_q{};
+// Sized at kv_reset(), before the first token. The first native backbone role wired here is the Q4_K
+// language-model head, whose activation width is D_MODEL on every token.
+thread_local bbqd::ActBlocks g_backbone_head_act_q{};
 
 // Runs one decode row's selected experts across MOE_DECODE_THREADS threads. Passed to
 // moe::forward_row_via_run, which computes each expert into its OWN output buffer and does the weighted
@@ -493,8 +496,22 @@ const float* Model::forward_one(int id, int pos) {
         encode_slot(tok_emb->pdata, C, persistent_fragments(g_persistent_binds, id), enc, h,
                     g_persistent_binds ? g_persistent_binds->enc_w : nullptr);
     } else {
-        const auto emb = tok_emb->pdata + static_cast<size_t>(id) * C;
-        for (int j = 0; j < C; ++j) h[j] = emb[j];
+        bool native_embed = false;
+        if constexpr (BACKBONE_QUANT_DOT && !USE_TIED_EMBEDDINGS) {
+            const bbq::Desc* d = g_backbone_quant.find(bbq::Role::TokEmb);
+            if (d && d->in_f == C && d->out_f == VOCAB) {
+                if (!bbq::dequantize_row(*d, g_backbone_quant.raw(*d), static_cast<std::uint32_t>(id),
+                                         std::span<float>(h, C))) {
+                    std::println(stderr, "fatal: the native token embedding has invalid row geometry");
+                    std::abort();
+                }
+                native_embed = true;
+            }
+        }
+        if (!native_embed) {
+            const auto emb = tok_emb->pdata + static_cast<size_t>(id) * C;
+            for (int j = 0; j < C; ++j) h[j] = emb[j];
+        }
     }
     if constexpr (POS_ENCODING == PosEncoding::Absolute) {
         const auto pe = pos_emb->pdata + static_cast<size_t>(pos) * C;
@@ -834,8 +851,26 @@ const float* Model::forward_one(int id, int pos) {
         for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = h[j];   // diagnostic capture
         rmsnorm_row(h, ln_f, a, C);
     }
-    if constexpr (USE_TIED_EMBEDDINGS) tied_head_row(a, tok_emb, logits.data(), C, VOCAB);
-    else                               linear_row(a, lm_head, lm_bias, logits.data(), C, VOCAB);
+    if constexpr (USE_TIED_EMBEDDINGS) {
+        tied_head_row(a, tok_emb, logits.data(), C, VOCAB);
+    } else {
+        bool native_head = false;
+        if constexpr (BACKBONE_QUANT_DOT) {
+            const bbq::Desc* d = g_backbone_quant.find(bbq::Role::LmHead);
+            if (d && d->type_raw == static_cast<std::uint32_t>(gguf::TensorType::Q4_K) &&
+                d->in_f == C && d->out_f == VOCAB) {
+                g_backbone_head_act_q.quantize(a, C);
+                if (!bbqd::gemv_plane<DECODE_GEMV_THREADS>(d->type_raw, g_backbone_quant.raw(*d),
+                                                           VOCAB, C, g_backbone_head_act_q, logits.data())) {
+                    std::println(stderr, "fatal: the native Q4_K language-model head has invalid geometry");
+                    std::abort();
+                }
+                native_head = true;
+            }
+        }
+        if (!native_head) linear_row(a, lm_head, lm_bias, logits.data(), C, VOCAB);
+        else if (lm_bias) for (int v = 0; v < VOCAB; ++v) logits[static_cast<std::size_t>(v)] += lm_bias->pdata[v];
+    }
     return logits.data();
 }
 
@@ -857,6 +892,14 @@ void kv_reset() {
     if constexpr (DECODE_OMP_SPIN) kmp_set_blocktime(std::numeric_limits<int>::max());
 #endif
     g_kv.reset();
+    if constexpr (BACKBONE_QUANT_DOT && !USE_TIED_EMBEDDINGS) {
+        if (const bbq::Desc* d = g_backbone_quant.find(bbq::Role::LmHead);
+            d && d->type_raw == static_cast<std::uint32_t>(gguf::TensorType::Q4_K) && d->in_f == D_MODEL) {
+            g_backbone_head_act_q.qs.reserve(D_MODEL);
+            g_backbone_head_act_q.scale.reserve(D_MODEL / moeqd::GROUP);
+            g_backbone_head_act_q.gsum.reserve(D_MODEL / moeqd::GROUP);
+        }
+    }
     if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset();
     if constexpr (USE_QSA) g_qsa_cache.reset();   // the indexer's own raw-key store -- docs/QSA.md S6
 }

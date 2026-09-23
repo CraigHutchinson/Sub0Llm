@@ -120,12 +120,86 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace sub0::bbq {
+
+// An S0B1 sidecar is usable only with the exact blob written alongside it. This separate record
+// preserves the existing S0B1 byte layout while binding both complete files, including their headers.
+// FNV-1a is an accidental-mismatch guard, not an authentication mechanism.
+struct PairIdentity {
+    char          magic[4] = {'S', '0', 'B', 'I'};
+    std::uint32_t version = 1;
+    std::uint64_t model_bytes = 0, model_hash = 0;
+    std::uint64_t sidecar_bytes = 0, sidecar_hash = 0;
+};
+static_assert(sizeof(PairIdentity) == 40);
+
+[[nodiscard]] inline bool file_identity(const std::string& path, std::uint64_t& bytes,
+                                        std::uint64_t& hash, std::string& err) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { err = "cannot open " + path + " for identity check"; return false; }
+    std::vector<char> block(1 << 20);
+    bytes = 0;
+    hash = 14695981039346656037ull;
+    while (file) {
+        file.read(block.data(), block.size());
+        const auto n = file.gcount();
+        for (std::streamsize i = 0; i < n; ++i) {
+            hash ^= static_cast<std::uint8_t>(block[static_cast<std::size_t>(i)]);
+            hash *= 1099511628211ull;
+        }
+        bytes += static_cast<std::uint64_t>(n);
+    }
+    if (!file.eof()) { err = "cannot read " + path + " for identity check"; return false; }
+    return true;
+}
+
+[[nodiscard]] inline bool write_pair_identity(const std::string& model_path,
+                                              const std::string& sidecar_path, std::string& err) {
+    PairIdentity id;
+    if (!file_identity(model_path, id.model_bytes, id.model_hash, err) ||
+        !file_identity(sidecar_path, id.sidecar_bytes, id.sidecar_hash, err)) return false;
+    std::ofstream out(sidecar_path + ".pair", std::ios::binary | std::ios::trunc);
+    if (!out) { err = "cannot create " + sidecar_path + ".pair"; return false; }
+    out.write(reinterpret_cast<const char*>(&id), sizeof id);
+    out.close();
+    if (!out) { err = "cannot write " + sidecar_path + ".pair"; return false; }
+    return true;
+}
+
+[[nodiscard]] inline bool verify_pair_identity(const std::string& model_path,
+                                               const std::string& sidecar_path, std::string& err) {
+    const std::string pair_path = sidecar_path + ".pair";
+    std::ifstream in(pair_path, std::ios::binary | std::ios::ate);
+    if (!in || in.tellg() != static_cast<std::streamoff>(sizeof(PairIdentity))) {
+        err = pair_path + ": missing or invalid pair identity";
+        return false;
+    }
+    in.seekg(0);
+    PairIdentity id;
+    in.read(reinterpret_cast<char*>(&id), sizeof id);
+    if (!in || std::memcmp(id.magic, "S0BI", 4) != 0 || id.version != 1) {
+        err = pair_path + ": invalid pair identity header";
+        return false;
+    }
+    std::uint64_t bytes = 0, hash = 0;
+    if (!file_identity(model_path, bytes, hash, err)) return false;
+    if (bytes != id.model_bytes || hash != id.model_hash) {
+        err = pair_path + ": model content does not match the sidecar pair";
+        return false;
+    }
+    if (!file_identity(sidecar_path, bytes, hash, err)) return false;
+    if (bytes != id.sidecar_bytes || hash != id.sidecar_hash) {
+        err = pair_path + ": sidecar content does not match the model pair";
+        return false;
+    }
+    return true;
+}
 
 // --- roles: the stable, engine-facing tensor identity ----------------------------------------------
 //
@@ -288,6 +362,33 @@ static_assert(alignof(Desc) == 8);
     t.type_raw = d.type_raw;
     t.dims = {static_cast<std::uint64_t>(d.in_f) * d.out_f};
     return gguf::to_f32(t, raw, out);
+}
+
+// Decode one GGUF-order row into caller-owned storage. Token embedding is a gather, so decoding the
+// whole tensor (or allocating a temporary vector) on each token would defeat native residency.
+[[nodiscard]] inline bool dequantize_row(const Desc& d, std::span<const std::uint8_t> raw,
+                                         std::uint32_t row, std::span<float> out) {
+    if (row >= d.out_f || out.size() != d.in_f || d.in_f > static_cast<std::uint32_t>(INT_MAX) ||
+        !bbqd::fusable(d.type_raw, static_cast<int>(d.in_f)) ||
+        bbqd::plane_bytes(d.type_raw, d.in_f) == 0 ||
+        bbqd::plane_bytes(d.type_raw, static_cast<std::uint64_t>(d.in_f) * d.out_f) > raw.size())
+        return false;
+    for (std::uint32_t col = 0; col < d.in_f; col += bbqd::GROUP) {
+        const std::uint64_t p = static_cast<std::uint64_t>(row) * d.in_f + col;
+        bbqd::WeightGroup group;
+        switch (static_cast<gguf::TensorType>(d.type_raw)) {
+            case gguf::TensorType::Q8_0: group = bbqd::Q8_0Plane{raw.data()}.group(p); break;
+            case gguf::TensorType::Q4_K: group = bbqd::Q4KPlane{raw.data()}.group(p); break;
+            case gguf::TensorType::Q5_K: group = bbqd::Q5KPlane{raw.data()}.group(p); break;
+            case gguf::TensorType::Q6_K: group = bbqd::Q6KPlane{raw.data()}.group(p); break;
+            default: return false;
+        }
+        for (int j = 0; j < bbqd::GROUP / 2; ++j)
+            out[col + static_cast<std::uint32_t>(j)] = group.scale_lo * group.q[static_cast<std::size_t>(j)] + group.bias_lo;
+        for (int j = bbqd::GROUP / 2; j < bbqd::GROUP; ++j)
+            out[col + static_cast<std::uint32_t>(j)] = group.scale_hi * group.q[static_cast<std::size_t>(j)] + group.bias_hi;
+    }
+    return true;
 }
 
 // --- reader ------------------------------------------------------------------------------------------

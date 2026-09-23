@@ -22,7 +22,9 @@
 #include "sub0/backbone_quant.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -189,6 +191,11 @@ TEST_CASE("bbq: a written sidecar reads back, decodes bit-identically, and Store
         REQUIRE(gguf::to_f32(t, std::span<const std::uint8_t>(bytes), reference));
         REQUIRE(decoded.size() == reference.size());
         REQUIRE(std::memcmp(decoded.data(), reference.data(), decoded.size() * sizeof(float)) == 0);
+        std::array<float, kIn> gathered{};
+        REQUIRE(bbq::dequantize_row(*d, raw, 2, gathered));
+        REQUIRE(std::memcmp(gathered.data(), reference.data() + 2 * kIn,
+                            gathered.size() * sizeof(float)) == 0);
+        REQUIRE_FALSE(bbq::dequantize_row(*d, raw, kOut, gathered));
     }
 
     // The deliberate gap: GrAttnUp exists at layer 0 but NOT layer 1 in this fixture.
@@ -320,6 +327,56 @@ TEST_CASE("bbq: role_key distinguishes model-level (-1) from every real layer", 
     CHECK(k1 != k2);
     CHECK(k1 != k3);
     CHECK(k2 != k3);
+}
+
+TEST_CASE("bbq: Q4_K row gather matches independent GGUF dequantization", "[backbonequantsidecar]") {
+    constexpr std::uint32_t width = 256, rows = 2;
+    std::vector<std::uint8_t> raw(rows * 144);
+    std::mt19937 rng(91);
+    for (auto& byte : raw) byte = static_cast<std::uint8_t>(rng());
+    for (std::uint32_t row = 0; row < rows; ++row) {
+        const std::uint16_t one = 0x3c00;
+        std::memcpy(raw.data() + row * 144, &one, sizeof one);
+        std::memcpy(raw.data() + row * 144 + 2, &one, sizeof one);
+    }
+    const bbq::Desc d{static_cast<std::int32_t>(bbq::Role::TokEmb), -1,
+                      static_cast<std::uint32_t>(gguf::TensorType::Q4_K), width, rows,
+                      0, 0, raw.size()};
+    gguf::TensorInfo t;
+    t.type_raw = d.type_raw;
+    t.dims = {static_cast<std::uint64_t>(width) * rows};
+    std::vector<float> reference;
+    REQUIRE(gguf::to_f32(t, raw, reference));
+    std::array<float, width> gathered{};
+    REQUIRE(bbq::dequantize_row(d, raw, 1, gathered));
+    for (std::uint32_t col = 0; col < width; ++col)
+        CHECK(gathered[col] == Catch::Approx(reference[width + col]).epsilon(1e-6));
+}
+
+TEST_CASE("bbq: exact model and sidecar contents are bound together", "[backbonequantsidecar]") {
+    const std::string model = temp_path("sub0_bbq_pair_model.bin");
+    const std::string sidecar = temp_path("sub0_bbq_pair_sidecar.bbq");
+    auto put = [](const std::string& path, const char* data) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(data, 4);
+    };
+    put(model, "abcd");
+    put(sidecar, "1234");
+    std::string err;
+    REQUIRE_FALSE(bbq::verify_pair_identity(model, sidecar, err));
+    REQUIRE(bbq::write_pair_identity(model, sidecar, err));
+    REQUIRE(bbq::verify_pair_identity(model, sidecar, err));
+
+    put(model, "abce");   // same size and layout, different weights
+    REQUIRE_FALSE(bbq::verify_pair_identity(model, sidecar, err));
+    put(model, "abcd");
+    REQUIRE(bbq::verify_pair_identity(model, sidecar, err));
+    put(sidecar, "1235");
+    REQUIRE_FALSE(bbq::verify_pair_identity(model, sidecar, err));
+
+    REQUIRE(std::filesystem::remove(model));
+    REQUIRE(std::filesystem::remove(sidecar));
+    REQUIRE(std::filesystem::remove(sidecar + ".pair"));
 }
 
 TEST_CASE("bbq: Store rejects forged table sizes, overlapping payloads and invalid planes",

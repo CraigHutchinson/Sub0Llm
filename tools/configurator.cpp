@@ -654,6 +654,8 @@ int main(int argc, char** argv) {
     // expert to f32 first. 0 = off (default, today's dequantize-then-f32-dot path, bit-exact). See the
     // --moe-quant-dot CLI option below for the measured accuracy and throughput tradeoff.
     int moe_quant_dot     = 0;
+    // O5: selected decode roles can use native backbone bytes from the S0B1 sidecar.
+    int backbone_quant_dot = 0;
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
     // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
@@ -836,6 +838,12 @@ int main(int argc, char** argv) {
                    "measured end-to-end logit diff against the existing path. Requires "
                    "--moe-quant-experts 1. 0 = off (default, today's exact behavior, bit-exact decode "
                    "hash).")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--backbone-quant-dot", backbone_quant_dot,
+                   "Experimental native-quant decode for selected backbone roles (starting with LM "
+                   "head dot and token-embedding gather); roles without supported sidecar planes use "
+                   "the existing bf16 path. Requires a valid <model_path>.bbq S0B1 sidecar when 1. "
+                   "0 = off (default, existing decode behavior).")
        ->capture_default_str()->check(CLI::Range(0, 1));
     // Qwen Sparse Attention (docs/QSA.md): Stage 0 -- every axis hard-clamped to 0. All five must be
     // set together; a half-configured QSA build is refused both here and by layout.hpp's static_assert.
@@ -1022,6 +1030,10 @@ int main(int argc, char** argv) {
     if (compute != 0 && !has_cuda) {
         std::println(stderr, "configure warning: --compute={} requested but no CUDA backend is built; using CPU", compute);
         compute = 0;
+    }
+    if (backbone_quant_dot && tie_embeddings) {
+        std::println(stderr, "configure error: --backbone-quant-dot currently requires --tie-embeddings 0");
+        return 1;
     }
     // Tied embeddings: GPU support landed (launch_tied_head/launch_tied_head_bwd in backend_cuda.cu,
     // gated purely by `if constexpr (USE_TIED_EMBEDDINGS)` at each forward/backward call site -- no
@@ -1829,6 +1841,9 @@ int main(int argc, char** argv) {
     // own winning case), so the two paths genuinely compute different arithmetic. That is expected and
     // gated as a tolerance rather than an equality; see docs/MOE_QUANT_DOT.md S5.
     cos << "constexpr bool MOE_QUANT_DOT = " << (moe_quant_dot ? "true" : "false") << ";\n";
+    // Inference arithmetic only: no model shape or checkpoint identity changes. The sidecar's own
+    // PARAM_FLOATS and layer checks guard pairing when this is enabled.
+    cos << "constexpr bool BACKBONE_QUANT_DOT = " << (backbone_quant_dot ? "true" : "false") << ";\n";
     // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
     cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
     cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";

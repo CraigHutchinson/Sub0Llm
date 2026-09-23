@@ -118,6 +118,11 @@ SUB0_API void build_model();                       // allocate param layout + ra
 // backend's TU, the same reason print_host_memplan is declared here and defined there. A no-op
 // returning true in every build where MOE_QUANT_EXPERTS is off, i.e. every build that exists today.
 [[nodiscard]] SUB0_API bool load_moe_quant_sidecar(const char* model_path);
+/** Loads the S0B1 backbone sidecar paired with a validated model blob.
+ * Returns false if the required sidecar is missing or incompatible in a BACKBONE_QUANT_DOT build;
+ * otherwise leaves the existing load path unchanged.
+ */
+[[nodiscard]] SUB0_API bool load_backbone_quant_sidecar(const char* model_path);
 SUB0_API void print_config();                      // human-readable config + memory line
 // Host-side memory plan (shared params + one Worker per compute thread), for `sub0llm memplan`. Defined in
 // the CPU backend because the per-thread cost is sizeof(Worker), a type private to that TU.

@@ -151,6 +151,7 @@ static void ensure_shared_params() {
 }
 
 moeq::Store g_moe_quant;
+bbq::Store g_backbone_quant;
 MoeIoStage g_moe_io_stage;                              // B36 -- sized once, beside the open below
 moeio::PlaneIo<MOE_IO_MAX_INFLIGHT> g_moe_decode_io;   // B36 -- opened alongside g_moe_quant below, only
                                                         // under MOE_IO_PIPELINED
@@ -2055,6 +2056,31 @@ bool load_moe_quant_sidecar(const char* model_path) {
                              err);
                 return false;
             }
+        }
+        return true;
+    }
+}
+
+bool load_backbone_quant_sidecar(const char* model_path) {
+    if constexpr (!BACKBONE_QUANT_DOT) {
+        (void)model_path;
+        return true;
+    } else {
+        const std::string path = std::string(model_path) + ".bbq";
+        std::string err;
+        if (!g_backbone_quant.open(path, err, PARAM_FLOATS)) {
+            std::println(stderr, "error: BACKBONE_QUANT_DOT requires an S0B1 sidecar beside the model: {}",
+                         err);
+            return false;
+        }
+        if (g_backbone_quant.header().n_layers != N_LAYERS) {
+            std::println(stderr, "error: {} does not belong to this model: sidecar has {} layers; "
+                                 "this build has {}", path, g_backbone_quant.header().n_layers, N_LAYERS);
+            return false;
+        }
+        if (!bbq::verify_pair_identity(model_path, path, err)) {
+            std::println(stderr, "error: BACKBONE_QUANT_DOT model/sidecar pairing failed: {}", err);
+            return false;
         }
         return true;
     }

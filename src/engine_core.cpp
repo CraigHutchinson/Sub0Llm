@@ -297,6 +297,8 @@ bool load_model(const char* path) {
     // at the same seam that already refuses a config mismatch, is the "lowest callable seam" rule --
     // the alternative is discovering it inside op_moe, per token. A no-op returning true otherwise.
     if (!load_moe_quant_sidecar(path)) return false;
+    // The S0B1 sidecar is mandatory only for the opt-in native backbone decode build.
+    if (!load_backbone_quant_sidecar(path)) return false;
     return true;
 }
 
