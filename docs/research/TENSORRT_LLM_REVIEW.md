@@ -213,6 +213,46 @@ TensorRT-LLM ships confirmed Qwen4-Exp (hyper-connections + PLE) support.
 
 ---
 
+## Primary-agent review (2026-09-23)
+
+**Platform claims spot-checked against the primary sources. The verdict stands, with one correction.**
+
+- *"TensorRT-LLM requires Linux x86_64 or Linux aarch64"* is real, but it comes from a **stale** page:
+  `support-matrix.html` is marked "Last updated on September 15, 2025" (commit `0c9430e`), and its
+  source file now returns 404 on `main`. The page that replaced it, `supported-hardware.html` (updated
+  2026-09-21, commit `fca831e`), makes no OS statement at all. It lists **Blackwell B200, GB200, B300,
+  GB300 and DGX Spark only — no RTX 50 and no sm_120**. The old page's own rule still describes what
+  that means: an architecture not listed gets "community support" only. So this host's GPU is not a
+  tested target, which is a stronger reason to decline than the OS alone.
+- *"Windows platform support is deprecated as of v0.18.0"* is confirmed word for word, in the 0.18.0
+  release notes. Release 1.2 also removed the TensorRT backend ("PyTorch is now the sole execution
+  backend"). The notes do record sm_120 fixes (FP8 for SM120 in 0.19, MoE fixes in 1.0), so consumer
+  Blackwell is not ignored, just not a tier-one target.
+
+**Recommendation 1 (speculative decoding) is the right one to take forward, but it is less of a free
+lunch on this model than the section above implies.** Three things set its real ceiling:
+
+1. **The MoE does not amortize the way the backbone does.** Verifying K drafted tokens reads the backbone
+   stream once. It does not read the experts once: each token picks its own top-10 of 512 per layer, so
+   up to 10K distinct experts per layer get touched. Routed experts are ~46 ms of the ~211 ms per token
+   today, and that share grows roughly with K rather than staying fixed.
+2. **The verify pass is the batched `forward()`, which the O-series never optimized.** Every decode
+   optimization so far (O1–O4, and O5's native backbone) lives in `forward_one`. A K-token verify runs
+   the prefill-shaped path. That path needs its own threading and native-quant wiring before speculation
+   can pay, and GDN's recurrence stays sequential across the K positions inside it.
+3. **Acceptance rate depends on the text.** Prompt-lookup drafting wins on repetitive or copy-heavy
+   output (code, quoting, structured data) and wins little on open prose. The correctness gate the
+   section names (accepted-token distribution identical to plain decode) is non-negotiable, and it is
+   cheap to state exactly: under greedy decoding, speculative output must be token-for-token identical
+   to plain decode.
+
+The practical ordering is therefore: finish O5's native backbone in `forward_one`, bring the batched
+path up to the same kernels, then prototype prompt-lookup verification behind a configurator flag with
+the token-identity gate. Measure acceptance on a mixed prompt set, not on one friendly prompt.
+
+**Recommendations 2 and 3 accepted as written.** The Qwen3-Next FLA/GDN kernels are useful as a second,
+independent reading of the delta-rule recurrence when the CUDA backend is revived.
+
 ## Sources
 
 - `https://github.com/NVIDIA/TensorRT-LLM` (README, `main`)
