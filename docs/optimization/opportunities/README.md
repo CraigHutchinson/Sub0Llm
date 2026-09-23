@@ -68,6 +68,14 @@ selection must cite this, not the pre-B35 numbers.
 | [O4](O4_gdn_threads_and_moe_schedule.md) | Thread GDN across heads/channels; `schedule(dynamic)` for routed experts | **merged** | **0.236 → 0.211 s/token**; GDN phase −18.5%, bit-exact. MoE lever did NOT reproduce (−2.4%, in noise) | 1 |
 | [O5](../../BACKBONE_NATIVE_QUANT.md) | Native-quant backbone: keep the unsloth GGUF's Q8_0/Q4_K/Q5_K/Q6_K bytes resident, fused int8-activation dot | phase 1 + 2a **merged**, kernels isolated; phase 2b (engine wiring) NOT started | Kernel-level: **1.2–2.2x faster per row than `gemv::axpy` at 8 threads**, 1.9–3.6x fewer bytes; resident 3.59 vs 9.15 GiB. No end-to-end number yet | 3 |
 
+**Candidate, not yet briefed — O6: speculative (prompt-lookup) decoding.** The only lever on the table
+that raises tokens/s beyond the per-token bandwidth floor: verifying K drafted tokens in one batched pass
+reads the backbone once for K tokens. Its ceiling on this model is set by three things
+(`../../research/TENSORRT_LLM_REVIEW.md`, primary-agent review): routed experts do not amortize across
+drafted tokens; the verify pass is the batched `forward()`, which O1–O5 never optimized; and acceptance
+is text-dependent. Prerequisites: O5's native backbone finished in `forward_one`, then the batched path
+brought up to the same kernels. Gate: under greedy decoding, output token-identical to plain decode.
+
 **Retracted**: *IQ1_S narrowing*, previously named by B35 as the next lever on the grounds that its dot
 uses the 8-lane `vpmulld` shape. The per-format profile refutes it — IQ1_S is the **cheapest** format
 per plane (326 µs vs IQ4_NL 757 and IQ2_XXS 1227). Lane width is not the binding constraint. Do not
