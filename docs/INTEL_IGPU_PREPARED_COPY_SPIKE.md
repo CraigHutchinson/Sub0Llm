@@ -1,6 +1,7 @@
 # Prepared explicit-copy staging spike
 
-Date: 2026-09-08; compile and bounded runtime gate executed 2026-09-09. All three modes passed
+Date: 2026-09-08; compile and bounded runtime gate executed 2026-09-09. Selected-arm process mode
+added and smoke-checked 2026-09-23. All three modes passed
 element-wise correctness at both sizes. The fixed-order single-process samples are exploratory and do
 not select a production memory path. See [the R0 checkpoint](INTEL_IGPU_R0_CHECKPOINT.md).
 
@@ -40,10 +41,14 @@ Intel `8086:7D67` Level Zero execution and missing USM aspects fail rather than 
 break-even must be calculated from both ranges' observed setup and release costs and the per-copy
 distributions after a reserved run; the source assumes no reuse count.
 
-The three modes currently run in a fixed order within one process and the seven warm observations are
-not independent process trials. These samples establish correctness and expose gross mechanism costs;
-they do not support a winner claim. Any comparative result must use the reserved-run process
-alternation and independent-trial controls referenced below.
+The inventory invocation still runs all three modes in fixed order. `--arm ordinary|prepared|host_usm_staging`
+instead runs one selected arm per process, and I21's runner alternates process order across pairs. The
+2026-09-23 synthetic contract validator passed, the source compiled with DPC++ 2025.3.3, the 257-element
+inventory run passed all modes, and an independent `--arm prepared` process returned eight checked
+samples with `status=pass`. Raw smoke evidence is under `out/intel-review/prepared-copy/20260923-190235-228/`.
+The full I21 runner also completed a one-pair, two-process integration smoke with both process records
+passing its result contract (`out/intel-review/i21-prepared-copy/20260923-190630-669/result.json`).
+One pair is not a controlled comparison and does not support a winner claim; a reserved run is still required.
 
 ## Compile and runtime evidence
 

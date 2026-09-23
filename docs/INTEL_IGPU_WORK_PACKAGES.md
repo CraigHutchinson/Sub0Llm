@@ -75,7 +75,7 @@ approved project estimate.
 | I18 | ISA/code-generation and quantization proof | I00, I01 for real planes | M |
 | I19 | Memory access, residency and bounded staging | I00; WP5b findings as available | M |
 | I20 | Equivalent-kernel Level Zero/SYCL submission comparison | I00, executable I18 kernel; coordinate I19 | M |
-| I21 | v1 schema/parser/orchestrator groundwork validated; comparison remains ineligible until a consumer selects one arm per process | I00/I01 schemas; grow with runnable consumers | M remaining |
+| I21 | v1 schema/parser/orchestrator validated; prepared-copy now selects one arm per process, with controlled comparison still pending | I00/I01 schemas; grow with runnable consumers | M remaining |
 | I22 | Measured native optimization campaign | I21 + correct component; integrated acceptance after I15 | L, bounded per hypothesis |
 | I23 | Runtime/deployment qualification and release decision | I07b/I11 smoke; prefix after I15/I22; full after I17b | M |
 
@@ -113,8 +113,8 @@ boundary. I01's machine-readable [artifact admission card](../tests/fixtures/int
 and [tracked-fixture checksums](../tests/fixtures/intel/qwen-reference-fixtures.sha256) admit the checked
 small fixtures while explicitly blocking the dense, four-layer and useful full-artifact gates on their
 remaining identities/capabilities. I21's v1 schema and synthetic validator are present under its owned
-directories; they produce no performance conclusion until the prepared-copy consumer supports one
-selected arm per process.
+directories. The prepared-copy consumer now supports one selected arm per process and passed a bounded
+correctness smoke; performance remains inconclusive until an uncontended alternating-process run.
 
 These refine S0/I05, keeping the six top-level spike IDs. **Terra owns this batch by explicit user
 request**, overriding the default Sol implementation assignment. Preparation is parallel-safe in

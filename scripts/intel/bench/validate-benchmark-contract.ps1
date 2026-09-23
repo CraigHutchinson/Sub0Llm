@@ -14,22 +14,27 @@ if (@($schedule | ForEach-Object { $_.arm } | Group-Object | Where-Object Count 
 }
 
 function New-SyntheticPreparedCopyLog {
-    param([switch]$PreparedUnsupported)
+    param(
+        [ValidateSet('ordinary', 'prepared', 'host_usm_staging')][string]$SelectedMode,
+        [switch]$PreparedUnsupported
+    )
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add('schema=sub0.intel.prepared-copy.v1')
     $lines.Add('backend=level_zero')
     $lines.Add('cold_columns=phase,mode,bytes,setup_first_ms,setup_changed_ms,staging_ms,transfer_ms,kernel_ms,readback_ms,validation_ms,validation_inclusive_ms')
     $lines.Add('warm_columns=phase,mode,bytes,trial,staging_ms,transfer_ms,kernel_ms,readback_ms,validation_ms,validation_inclusive_ms')
     $lines.Add('release_columns=phase,mode,bytes,release_first_ms,release_changed_ms')
+    $lines.Add('execution_scope=selected')
+    $lines.Add("selected_arm=$SelectedMode")
     if ($PreparedUnsupported) {
         $lines.Add('copy_optimize_macro=unavailable')
         $lines.Add('prepared_status=unsupported')
         $lines.Add('prepared_reason=synthetic unsupported path')
-        $modes = @('ordinary', 'host_usm_staging')
+        $modes = @()
     } else {
         $lines.Add('copy_optimize_macro=1')
         $lines.Add('prepared_status=supported')
-        $modes = @('ordinary', 'prepared', 'host_usm_staging')
+        $modes = @($SelectedMode)
     }
     foreach ($mode in $modes) {
         $lines.Add("cold,$mode,1028,0,0,0,0.1,0.2,0.1,0.01,0.41")
@@ -43,10 +48,11 @@ function New-SyntheticPreparedCopyLog {
     return @($lines)
 }
 
-$supportedLines = @(New-SyntheticPreparedCopyLog)
-$ordinary = ConvertFrom-IntelPreparedCopyOutput -Lines $supportedLines -ExitCode 0 `
+$ordinaryLines = @(New-SyntheticPreparedCopyLog -SelectedMode ordinary)
+$ordinary = ConvertFrom-IntelPreparedCopyOutput -Lines $ordinaryLines -ExitCode 0 `
     -TargetArm ordinary -ProcessSequence 0 -PairIndex 0
-$prepared = ConvertFrom-IntelPreparedCopyOutput -Lines $supportedLines -ExitCode 0 `
+$preparedLines = @(New-SyntheticPreparedCopyLog -SelectedMode prepared)
+$prepared = ConvertFrom-IntelPreparedCopyOutput -Lines $preparedLines -ExitCode 0 `
     -TargetArm prepared -ProcessSequence 1 -PairIndex 0
 if ($ordinary.outcome -ne 'pass' -or $prepared.outcome -ne 'pass') {
     throw 'Supported synthetic output did not parse as pass'
@@ -54,8 +60,20 @@ if ($ordinary.outcome -ne 'pass' -or $prepared.outcome -ne 'pass') {
 if (@($ordinary.samples | Where-Object selected_for_comparison).Count -ne 9) {
     throw 'Raw target-arm sample retention shape is wrong'
 }
+$strayLines = [System.Collections.Generic.List[string]]::new()
+$strayLines.AddRange([string[]]$ordinaryLines)
+$strayLines.Add('cold,prepared,1028,0,0,0,0.1,0.2,0.1,0.01,0.41')
+$stray = ConvertFrom-IntelPreparedCopyOutput -Lines @($strayLines) -ExitCode 0 `
+    -TargetArm ordinary -ProcessSequence 0 -PairIndex 0
+if ($stray.outcome -ne 'fail') { throw 'Selected-arm output accepted a stray non-target sample' }
+$allModeLines = @($ordinaryLines | ForEach-Object {
+    if ($_ -eq 'execution_scope=selected') { 'execution_scope=all' } else { $_ }
+})
+$allMode = ConvertFrom-IntelPreparedCopyOutput -Lines $allModeLines -ExitCode 0 `
+    -TargetArm ordinary -ProcessSequence 0 -PairIndex 0
+if ($allMode.outcome -ne 'fail') { throw 'Selected-arm output accepted an all-mode process' }
 
-$unsupportedLines = @(New-SyntheticPreparedCopyLog -PreparedUnsupported)
+$unsupportedLines = @(New-SyntheticPreparedCopyLog -SelectedMode prepared -PreparedUnsupported)
 $unsupported = ConvertFrom-IntelPreparedCopyOutput -Lines $unsupportedLines -ExitCode 0 `
     -TargetArm prepared -ProcessSequence 0 -PairIndex 0
 if ($unsupported.outcome -ne 'unsupported') { throw 'Unsupported output was not classified explicitly' }
@@ -127,8 +145,8 @@ $result = [ordered]@{
         schedule = @(New-IntelBenchmarkSchedule -Arms @('ordinary', 'prepared') -Pairs 1)
         process_isolation = $true
         raw_sample_retention = $true
-        consumer_process_protocol = 'synthetic validation'
-        comparison_eligible = $false
+        consumer_process_protocol = 'synthetic selected-arm validation'
+        comparison_eligible = $true
     }
     timing_provenance = [ordered]@{
         host_clock = 'std::chrono::steady_clock'

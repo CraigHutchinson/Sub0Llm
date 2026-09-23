@@ -13,6 +13,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -100,6 +101,13 @@ private:
     case Mode::host_staging: return "host_usm_staging";
     }
     throw std::runtime_error("Invalid mode");
+}
+
+[[nodiscard]] std::optional<Mode> parse_mode(std::string_view name) {
+    if (name == "ordinary") return Mode::ordinary;
+    if (name == "prepared") return Mode::prepared;
+    if (name == "host_usm_staging") return Mode::host_staging;
+    return std::nullopt;
 }
 
 void verify(const float* actual, const float* expected, std::size_t count) {
@@ -215,9 +223,16 @@ void measure(Mode mode, sycl::queue& queue, const Mapping& first, const Mapping&
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 4) throw std::runtime_error("Usage: prepared_copy.exe <fixture-a> <fixture-b> <elements>");
+        if (argc != 4 && argc != 6)
+            throw std::runtime_error(
+                "Usage: prepared_copy.exe <fixture-a> <fixture-b> <elements> "
+                "[--arm <ordinary|prepared|host_usm_staging>]");
         const std::size_t count = std::stoull(argv[3]);
         if (count == 0 || count > 1024 * 1024) throw std::runtime_error("Elements must be in [1,1048576]");
+        if (argc == 6 && std::string_view(argv[4]) != "--arm")
+            throw std::runtime_error("Expected --arm before the selected prepared-copy mode");
+        const std::optional<Mode> selected_mode = argc == 6 ? parse_mode(argv[5]) : std::nullopt;
+        if (argc == 6 && !selected_mode) throw std::runtime_error("Unknown prepared-copy arm");
         const std::size_t bytes = count * sizeof(float);
         const auto first = open_read_only(argv[1], bytes);
         const auto changed = open_read_only(argv[2], bytes);
@@ -231,17 +246,20 @@ int main(int argc, char** argv) {
         std::cout << "schema=sub0.intel.prepared-copy.v1\nbackend=level_zero\n"
                   << "cold_columns=phase,mode,bytes,setup_first_ms,setup_changed_ms,staging_ms,transfer_ms,kernel_ms,readback_ms,validation_ms,validation_inclusive_ms\n"
                   << "warm_columns=phase,mode,bytes,trial,staging_ms,transfer_ms,kernel_ms,readback_ms,validation_ms,validation_inclusive_ms\n"
-                  << "release_columns=phase,mode,bytes,release_first_ms,release_changed_ms\n";
+                  << "release_columns=phase,mode,bytes,release_first_ms,release_changed_ms\n"
+                  << "execution_scope=" << (selected_mode ? "selected" : "all") << '\n'
+                  << "selected_arm=" << (selected_mode ? mode_name(*selected_mode) : "all") << '\n';
+        const auto run_mode = [&](Mode mode) {
+            if (!selected_mode || *selected_mode == mode) measure(mode, queue, first, changed, count);
+        };
 #if defined(SYCL_EXT_ONEAPI_COPY_OPTIMIZE) && SYCL_EXT_ONEAPI_COPY_OPTIMIZE >= 1
         std::cout << "copy_optimize_macro=" << SYCL_EXT_ONEAPI_COPY_OPTIMIZE
                   << "\nprepared_status=supported\n";
-        for (const auto mode : {Mode::ordinary, Mode::prepared, Mode::host_staging})
-            measure(mode, queue, first, changed, count);
+        for (const auto mode : {Mode::ordinary, Mode::prepared, Mode::host_staging}) run_mode(mode);
 #else
         std::cout << "copy_optimize_macro=unavailable\nprepared_status=unsupported\n"
                   << "prepared_reason=SYCL_EXT_ONEAPI_COPY_OPTIMIZE >= 1 is required\n";
-        for (const auto mode : {Mode::ordinary, Mode::host_staging})
-            measure(mode, queue, first, changed, count);
+        for (const auto mode : {Mode::ordinary, Mode::host_staging}) run_mode(mode);
 #endif
         std::cout << "verified_elements_per_run=" << count << "\nstatus=pass\n";
         return 0;

@@ -141,8 +141,8 @@ $result = [ordered]@{
         schedule = $schedule
         process_isolation = $true
         raw_sample_retention = $true
-        consumer_process_protocol = 'Each schedule entry starts a new prepared_copy.exe process. The target arm labels the retained comparison samples; the current executable also runs every available mode internally in fixed ordinary/prepared/host_usm_staging order.'
-        comparison_eligible = $false
+        consumer_process_protocol = 'Each schedule entry starts a new prepared_copy.exe process with one selected arm. Across pairs, the first arm alternates so each arm occupies each pair position equally.'
+        comparison_eligible = $true
     }
     timing_provenance = [ordered]@{
         host_clock = 'std::chrono::steady_clock'
@@ -164,8 +164,7 @@ $result = [ordered]@{
     }
     processes = @()
     limits = @(
-        'The prepared-copy consumer executes all available modes internally in fixed order; process scheduling alternates target-arm retention but cannot reverse that internal order.',
-        'A pass means the requested checked samples were collected. comparison_eligible remains false until a consumer can execute one selected arm per process or vary internal order.',
+        'Each native process executes exactly one selected arm; process startup and teardown remain outside the component timing columns and inside elapsed_ms.',
         'The supplied environment manifest is hashed and embedded; it must be captured for the same executable and hardware window.',
         'No aggregation, outlier exclusion, noise threshold or promotion decision is performed by this groundwork runner.'
     )
@@ -181,7 +180,7 @@ try {
     foreach ($entry in $schedule) {
         $logName = 'pair-{0:D3}-position-{1}-{2}.log' -f $entry.pair_index, $entry.position_in_pair, $entry.arm
         $logPath = Join-Path $output $logName
-        [string[]]$arguments = @($fixtureAPath, $fixtureBPath, "$Elements")
+        [string[]]$arguments = @($fixtureAPath, $fixtureBPath, "$Elements", '--arm', $entry.arm)
         $startedUtc = [DateTime]::UtcNow.ToString('o')
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
         [string[]]$lines = @(& $exePath @arguments 2>&1 | ForEach-Object { "$_" })

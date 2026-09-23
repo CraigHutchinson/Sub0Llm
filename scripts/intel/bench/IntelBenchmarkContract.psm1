@@ -169,6 +169,15 @@ function ConvertFrom-IntelPreparedCopyOutput {
         if (-not $metadata.Contains('status') -or $metadata.status -ne 'pass') {
             throw 'Prepared-copy process did not report status=pass'
         }
+        if (-not $metadata.Contains('execution_scope') -or $metadata.execution_scope -ne 'selected') {
+            throw 'Prepared-copy process did not execute one selected arm'
+        }
+        if (-not $metadata.Contains('selected_arm') -or $metadata.selected_arm -ne $TargetArm) {
+            throw "Prepared-copy process selected '$($metadata.selected_arm)' instead of '$TargetArm'"
+        }
+        if (@($samples | Where-Object mode -ne $TargetArm).Count -ne 0) {
+            throw "Selected-arm process emitted samples outside '$TargetArm'"
+        }
         if ($TargetArm -eq 'prepared' -and $metadata.prepared_status -eq 'unsupported') {
             $reason = if ($metadata.Contains('prepared_reason')) { $metadata.prepared_reason } else { 'prepared mode unsupported' }
             return [ordered]@{ outcome = 'unsupported'; outcome_reason = $reason; metadata = $metadata; samples = @($samples) }
