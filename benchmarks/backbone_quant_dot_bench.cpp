@@ -36,6 +36,13 @@
 // ENGINE-FREE: gguf.hpp + backbone_quant_dot.hpp + bf16.hpp + gemv.hpp only. No sub0_config.hpp, no
 // layout.hpp.
 //
+// PASS 4 ADDITION (docs/BACKBONE_NATIVE_QUANT.md S13): every Q4_K/Q5_K/Q6_K format entry now ALSO times
+// `gemv_plane_super<Threads>` (the per-256 ActSuper activation) through `time_native_super_pool`, over
+// the SAME real pool and at the SAME thread counts as the existing `gemv_plane<Threads>` (per-32
+// ActBlocks) arm -- printed as two extra columns so the two schemes' throughput is directly comparable
+// on identical bytes. Q8_0 has no super arm (`bbqd::super_fusable` refuses it by design) and prints
+// "n/a" in those columns.
+//
 // Usage: sub0_backbone_quant_dot_bench --gguf <dir> [--seconds N]
 
 #include "sub0/backbone_quant_dot.hpp"
@@ -214,6 +221,60 @@ double time_native_pool(const Pool& pool, std::uint32_t type_raw, const bbqd::Ac
     return el / total_bytes_read;   // seconds per byte -- caller turns this into GB/s and us/row-call
 }
 
+/// Pass 4 (docs/BACKBONE_NATIVE_QUANT.md S13): the SAME pool, timed through `gemv_plane_super<Threads>`
+/// (the per-256 ActSuper activation, Q4_K/Q5_K/Q6_K only) instead of `gemv_plane<Threads>` -- identical
+/// harness shape to time_native_pool, so the two numbers are directly comparable at the same thread
+/// count on the same real bytes.
+template <int Threads>
+double time_native_super_pool(const Pool& pool, std::uint32_t type_raw, const bbqd::ActSuper& x,
+                              std::vector<float>& out, double min_seconds) {
+    double total_bytes_read = 0.0;
+    const auto t0 = Clock::now();
+    double el = 0.0;
+    do {
+        for (const auto& entry : pool.entries) {
+            const bool ok = bbqd::gemv_plane_super<Threads>(type_raw, entry.bytes, entry.n_rows,
+                                                             pool.row_elems, x, out.data());
+            if (!ok) {
+                std::fprintf(stderr, "error: gemv_plane_super refused a real pool entry\n");
+                std::exit(5);
+            }
+            total_bytes_read += static_cast<double>(entry.bytes.size());
+        }
+        el = secs(t0, Clock::now());
+    } while (el < min_seconds);
+    return el / total_bytes_read;   // seconds per byte -- caller turns this into GB/s and us/row-call
+}
+
+/// Pass 4, single-thread ONLY: isolates whether AVX-VNNI (`dot_row_q{4,5,6}_k_super_vnni`) actually beats
+/// plain AVX2 (`dot_row_q{4,5,6}_k_super_avx2`, `maddubs_epi16`+`madd_epi16`) by calling the internal
+/// `detail::gemv_plane_super_avx2`/`_vnni` entry points DIRECTLY -- `gemv_plane_super<Threads>` itself
+/// does NOT dispatch to VNNI (docs/BACKBONE_NATIVE_QUANT.md S13: measured slightly slower here, so the
+/// live default stays plain AVX2), so this is the only place in the tree that still exercises the VNNI
+/// kernels, kept for a future re-measurement (the task's own "measure it, do not assume it wins").
+#if defined(SUB0_BBQD_VNNI)
+double time_super_kernel_1t(bool use_vnni, const Pool& pool, std::uint32_t type_raw, const bbqd::ActSuper& x,
+                            std::vector<float>& out, double min_seconds) {
+    double total_bytes_read = 0.0;
+    const auto t0 = Clock::now();
+    double el = 0.0;
+    do {
+        for (const auto& entry : pool.entries) {
+            const bool ok =
+                use_vnni ? bbqd::detail::gemv_plane_super_vnni(type_raw, entry.bytes, entry.n_rows,
+                                                               pool.row_elems, x, out.data(), 0, entry.n_rows)
+                         :
+                           bbqd::detail::gemv_plane_super_avx2(type_raw, entry.bytes, entry.n_rows,
+                                                               pool.row_elems, x, out.data(), 0, entry.n_rows);
+            if (!ok) { std::fprintf(stderr, "error: gemv_plane_super_{avx2,vnni} refused a pool entry\n"); std::exit(5); }
+            total_bytes_read += static_cast<double>(entry.bytes.size());
+        }
+        el = secs(t0, Clock::now());
+    } while (el < min_seconds);
+    return el / total_bytes_read;
+}
+#endif
+
 /// bf16 baseline: `gemv::axpy<Threads>` over a pool of distinct [row_elems, out_dim] bf16 matrices sized
 /// the same way (identical technique to sub0llm-bench-gemv's own time_shape), at the SAME logical (in,
 /// out) shape as the native-quant pool's own (row_elems, out_dim) -- see this file's own header comment
@@ -277,6 +338,14 @@ int main(int argc, char** argv) {
         xq.quantize(x.data(), pool.row_elems);
         std::vector<float> native_out(static_cast<std::size_t>(kMaxRowsPerEntry));
 
+        // Pass 4 (docs/BACKBONE_NATIVE_QUANT.md S13): the per-256 ActSuper activation, Q4_K/Q5_K/Q6_K
+        // only -- `bbqd::super_fusable` refuses Q8_0 by design (ActSuper's own header comment), so that
+        // arm is simply skipped below rather than measured and discarded.
+        const bool has_super = bbqd::super_fusable(static_cast<std::uint32_t>(type), pool.row_elems);
+        bbqd::ActSuper xqs;
+        if (has_super) xqs.quantize(x.data(), pool.row_elems);
+        std::vector<float> super_out(static_cast<std::size_t>(kMaxRowsPerEntry));
+
         // Distinct bf16 matrices for the axpy baseline, sized to the SAME DRAM target.
         const std::size_t bf16_bytes_per = static_cast<std::size_t>(pool.row_elems) * out_dim * sizeof(bf16);
         const std::size_t bf16_pool_n =
@@ -289,7 +358,8 @@ int main(int argc, char** argv) {
             for (auto& v : m) v.bits = static_cast<std::uint16_t>(bits(rng));
         std::vector<float> bf16_y(static_cast<std::size_t>(out_dim));
 
-        std::printf("%-8s %14s %14s %10s\n", "threads", "native us/row", "native GB/s", "bf16 GB/s");
+        std::printf("%-8s %14s %14s %10s %14s %14s\n", "threads", "native us/row", "native GB/s",
+                    "bf16 GB/s", "super us/row", "super GB/s");
         for (int threads : kThreadCounts) {
             double sec_per_byte = 0.0;
             switch (threads) {
@@ -316,8 +386,41 @@ int main(int argc, char** argv) {
             }
             const double axpy_gbs = 1.0 / axpy_sec_per_byte / 1e9;
 
-            std::printf("%-8d %14.3f %14.2f %10.2f\n", threads, native_us_row, native_gbs, axpy_gbs);
+            double super_us_row = 0.0, super_gbs = 0.0;
+            if (has_super) {
+                double super_sec_per_byte = 0.0;
+                switch (threads) {
+                    case 1:  super_sec_per_byte = time_native_super_pool<1>(pool, static_cast<std::uint32_t>(type), xqs, super_out, min_seconds); break;
+                    case 2:  super_sec_per_byte = time_native_super_pool<2>(pool, static_cast<std::uint32_t>(type), xqs, super_out, min_seconds); break;
+                    case 4:  super_sec_per_byte = time_native_super_pool<4>(pool, static_cast<std::uint32_t>(type), xqs, super_out, min_seconds); break;
+                    case 8:  super_sec_per_byte = time_native_super_pool<8>(pool, static_cast<std::uint32_t>(type), xqs, super_out, min_seconds); break;
+                    case 16: super_sec_per_byte = time_native_super_pool<16>(pool, static_cast<std::uint32_t>(type), xqs, super_out, min_seconds); break;
+                    default: break;
+                }
+                super_gbs = 1.0 / super_sec_per_byte / 1e9;
+                super_us_row = super_sec_per_byte * bytes_per_row * 1e6;
+            }
+
+            if (has_super)
+                std::printf("%-8d %14.3f %14.2f %10.2f %14.3f %14.2f\n", threads, native_us_row, native_gbs,
+                            axpy_gbs, super_us_row, super_gbs);
+            else
+                std::printf("%-8d %14.3f %14.2f %10.2f %14s %14s\n", threads, native_us_row, native_gbs,
+                            axpy_gbs, "n/a", "n/a");
         }
+
+#if defined(SUB0_BBQD_VNNI)
+        if (has_super) {
+            const double bytes_per_row = pool.total_bytes / std::accumulate(pool.entries.begin(), pool.entries.end(), 0.0,
+                                                                             [](double s, const PoolEntry& e) { return s + e.n_rows; });
+            const double avx2_spb = time_super_kernel_1t(false, pool, static_cast<std::uint32_t>(type), xqs, super_out, min_seconds);
+            const double vnni_spb = time_super_kernel_1t(true, pool, static_cast<std::uint32_t>(type), xqs, super_out, min_seconds);
+            std::printf("1-thread kernel isolation: plain-AVX2 %.3f us/row (%.2f GB/s)  AVX-VNNI %.3f us/row (%.2f GB/s)  VNNI/AVX2 = %.2fx\n",
+                        avx2_spb * bytes_per_row * 1e6, 1.0 / avx2_spb / 1e9,
+                        vnni_spb * bytes_per_row * 1e6, 1.0 / vnni_spb / 1e9,
+                        avx2_spb / vnni_spb);
+        }
+#endif
     }
     return 0;
 }

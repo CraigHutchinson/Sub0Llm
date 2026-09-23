@@ -570,6 +570,287 @@ TEST_CASE("bbqd (AGENTS.md S9): validated against REAL bytes from the Qwen3.8-Fl
     }
 }
 
+// --- pass 4 (AGENTS.md S13, docs/BACKBONE_NATIVE_QUANT.md S13): the per-256 ActSuper activation --------
+// --- scheme and its Q4_K/Q5_K/Q6_K portable/AVX2/AVX-VNNI streaming kernels -----------------------------
+//
+// Mirrors the structure of the ActBlocks cases above exactly (lossless-decode isolates weight-layout bugs
+// from activation-quantization error; exact-agreement checks integer arithmetic, which has no
+// reassociation tolerance to hide behind; real-byte validation per AGENTS.md S9), applied to the NEW
+// per-256 activation type instead of moeqd::ActBlocks. Q8_0 is intentionally absent from every case here
+// -- super_fusable() refuses it by design (ActSuper's own header comment: Q8_0 has no per-sub-block scale
+// to fold, so a coarser activation would only cost it accuracy for nothing).
+
+namespace {
+constexpr gguf::TensorType kSuperFormats[3] = {gguf::TensorType::Q4_K, gguf::TensorType::Q5_K,
+                                                gguf::TensorType::Q6_K};
+}  // namespace
+
+TEST_CASE("bbqd (pass 4): super_fusable() accepts only Q4_K/Q5_K/Q6_K at a 256-aligned row width",
+          "[backbonequant]") {
+    REQUIRE(bbqd::super_fusable(static_cast<std::uint32_t>(gguf::TensorType::Q4_K), 2560));
+    REQUIRE(bbqd::super_fusable(static_cast<std::uint32_t>(gguf::TensorType::Q5_K), 2560));
+    REQUIRE(bbqd::super_fusable(static_cast<std::uint32_t>(gguf::TensorType::Q6_K), 6144));
+    // Q8_0 is excluded by design (ActSuper's own header comment), even at a 256-aligned width.
+    REQUIRE_FALSE(bbqd::super_fusable(static_cast<std::uint32_t>(gguf::TensorType::Q8_0), 2560));
+    // A row width that is a multiple of GROUP=32 but NOT of 256 is fusable() territory, not this path's.
+    REQUIRE_FALSE(bbqd::super_fusable(static_cast<std::uint32_t>(gguf::TensorType::Q4_K), 96));
+    REQUIRE_FALSE(bbqd::super_fusable(static_cast<std::uint32_t>(gguf::TensorType::IQ1_S), 2560));
+    REQUIRE_FALSE(bbqd::super_fusable(static_cast<std::uint32_t>(gguf::TensorType::Q4_K), 0));
+}
+
+TEST_CASE("bbqd (pass 4): the fused super unpackers decode the SAME weights gguf::to_f32 does "
+          "(lossless activation)",
+          "[backbonequant]") {
+    // lossless_row() plants an exact +/-127 in every 32-wide GROUP, so every 256-wide SUPERBLOCK's own
+    // amax is also exactly 127 (the max of eight already-127-magnitude sub-maxima) -- the same lossless
+    // premise the ActBlocks case above relies on, one granularity up. Checked directly below rather than
+    // assumed from that reasoning alone.
+    constexpr int kN = 2560, kRows = 3;
+    const std::vector<float> x = lossless_row(kN, 9191);
+    bbqd::ActSuper xq;
+    xq.quantize(x.data(), kN);
+    for (int s = 0; s < kN / 256; ++s) REQUIRE(xq.d[static_cast<std::size_t>(s)] == 1.0f);
+    for (int i = 0; i < kN; ++i)
+        REQUIRE(static_cast<float>(xq.qs[static_cast<std::size_t>(i)]) == x[static_cast<std::size_t>(i)]);
+
+    for (const gguf::TensorType type : kSuperFormats) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        const gguf::BlockSpec spec = gguf::block_spec(raw_t);
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
+                                                           1717u + raw_t);
+
+        std::vector<float> portable(kRows, 0.f);
+        REQUIRE(bbqd::detail::gemv_plane_super_portable(raw_t, std::span<const std::uint8_t>(raw), kRows,
+                                                        kN, xq, portable.data(), 0, kRows));
+        std::vector<float> avx2(kRows, 0.f);
+        REQUIRE(bbqd::detail::gemv_plane_super_avx2(raw_t, std::span<const std::uint8_t>(raw), kRows, kN,
+                                                     xq, avx2.data(), 0, kRows));
+
+        double worst_rel = 0.0;
+        for (int row = 0; row < kRows; ++row) {
+            const auto byte_off = static_cast<std::size_t>(
+                (static_cast<std::uint64_t>(row) * kN / spec.elems) * spec.bytes);
+            const double ref = reference_dot(
+                type, std::span<const std::uint8_t>(raw).subspan(
+                          byte_off, static_cast<std::size_t>(kN / spec.elems * spec.bytes)),
+                kN, x);
+            REQUIRE(std::isfinite(portable[static_cast<std::size_t>(row)]));
+            REQUIRE(std::isfinite(avx2[static_cast<std::size_t>(row)]));
+            REQUIRE(std::fabs(ref) > 0.0);
+            worst_rel = std::max(
+                worst_rel, std::fabs(portable[static_cast<std::size_t>(row)] - ref) / std::fabs(ref));
+            worst_rel =
+                std::max(worst_rel, std::fabs(avx2[static_cast<std::size_t>(row)] - ref) / std::fabs(ref));
+        }
+        INFO("worst relative disagreement vs gguf::to_f32 = " << worst_rel);
+        REQUIRE(worst_rel < 1e-5);
+    }
+}
+
+TEST_CASE("bbqd (pass 4): the AVX2 super path agrees EXACTLY with the portable super path",
+          "[backbonequant]") {
+    // Integer arithmetic, no tolerance -- same discipline as the ActBlocks case above. This is the check
+    // that would have caught a scale-fold algebra mistake (e.g. a lane-count/mullo width bug) the way the
+    // ActBlocks-era tests caught the double-subtracted Q6_K zero-point and the 16-lane AVX2 bug.
+    constexpr int kN = 2560, kRows = 5;
+    std::mt19937 rng(919);
+    std::normal_distribution<float> normal(0.f, 2.f);
+    std::vector<float> x(kN);
+    for (float& v : x) v = normal(rng);
+    bbqd::ActSuper xq;
+    xq.quantize(x.data(), kN);
+
+    for (const gguf::TensorType type : kSuperFormats) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
+                                                           2323u + raw_t);
+        std::vector<float> portable(kRows, -1.f), avx2(kRows, -2.f);
+        REQUIRE(bbqd::detail::gemv_plane_super_portable(raw_t, std::span<const std::uint8_t>(raw), kRows,
+                                                        kN, xq, portable.data(), 0, kRows));
+        REQUIRE(bbqd::detail::gemv_plane_super_avx2(raw_t, std::span<const std::uint8_t>(raw), kRows, kN,
+                                                     xq, avx2.data(), 0, kRows));
+        for (int r = 0; r < kRows; ++r) {
+            INFO("row " << r);
+            REQUIRE(portable[static_cast<std::size_t>(r)] == avx2[static_cast<std::size_t>(r)]);
+        }
+    }
+}
+
+#if defined(SUB0_BBQD_VNNI)
+TEST_CASE("bbqd (pass 4): the AVX-VNNI super path agrees EXACTLY with the portable and AVX2 super paths",
+          "[backbonequant]") {
+    // Only compiled/run when this TU was built with AVX-VNNI (this project's own SUB0_NATIVE=ON host --
+    // docs/BACKBONE_NATIVE_QUANT.md S13's own -march=native macro dump confirms it here). Distributivity
+    // of integer multiplication over addition is what makes dpbusd+mullo bit-exact with maddubs+madd
+    // (this header's own S13 comment) -- checked here, not assumed from the algebra alone.
+    constexpr int kN = 2560, kRows = 5;
+    std::mt19937 rng(3131);
+    std::normal_distribution<float> normal(0.f, 2.f);
+    std::vector<float> x(kN);
+    for (float& v : x) v = normal(rng);
+    bbqd::ActSuper xq;
+    xq.quantize(x.data(), kN);
+
+    for (const gguf::TensorType type : kSuperFormats) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
+                                                           4141u + raw_t);
+        std::vector<float> portable(kRows, -1.f), avx2(kRows, -2.f), vnni(kRows, -3.f);
+        REQUIRE(bbqd::detail::gemv_plane_super_portable(raw_t, std::span<const std::uint8_t>(raw), kRows,
+                                                        kN, xq, portable.data(), 0, kRows));
+        REQUIRE(bbqd::detail::gemv_plane_super_avx2(raw_t, std::span<const std::uint8_t>(raw), kRows, kN,
+                                                     xq, avx2.data(), 0, kRows));
+        REQUIRE(bbqd::detail::gemv_plane_super_vnni(raw_t, std::span<const std::uint8_t>(raw), kRows, kN,
+                                                     xq, vnni.data(), 0, kRows));
+        for (int r = 0; r < kRows; ++r) {
+            INFO("row " << r);
+            REQUIRE(portable[static_cast<std::size_t>(r)] == avx2[static_cast<std::size_t>(r)]);
+            REQUIRE(portable[static_cast<std::size_t>(r)] == vnni[static_cast<std::size_t>(r)]);
+        }
+    }
+}
+#endif  // SUB0_BBQD_VNNI
+
+TEST_CASE("bbqd (pass 4): gemv_plane_super<Threads> is bit-exact across 1/2/4 threads on an uneven split",
+          "[backbonequant]") {
+    constexpr int kN = 2560, kRows = 37;   // 37 is not evenly divisible by 2 or 4
+    std::mt19937 rng(5151);
+    std::normal_distribution<float> normal(0.f, 1.5f);
+    std::vector<float> x(kN);
+    for (float& v : x) v = normal(rng);
+    bbqd::ActSuper xq;
+    xq.quantize(x.data(), kN);
+
+    for (const gguf::TensorType type : kSuperFormats) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
+                                                           6161u + raw_t);
+        std::vector<float> t1(kRows, -1.f), t2(kRows, -2.f), t4(kRows, -3.f);
+        REQUIRE(bbqd::gemv_plane_super<1>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, t1.data()));
+        REQUIRE(bbqd::gemv_plane_super<2>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, t2.data()));
+        REQUIRE(bbqd::gemv_plane_super<4>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq, t4.data()));
+        for (int r = 0; r < kRows; ++r) {
+            INFO("row " << r);
+            REQUIRE(t1[static_cast<std::size_t>(r)] == t2[static_cast<std::size_t>(r)]);
+            REQUIRE(t1[static_cast<std::size_t>(r)] == t4[static_cast<std::size_t>(r)]);
+        }
+    }
+}
+
+TEST_CASE("bbqd (pass 4): gemv_plane_super refuses Q8_0 and an unaligned row, untouched on refusal",
+          "[backbonequant]") {
+    const std::vector<std::uint8_t> q4 = make_blocks(gguf::TensorType::Q4_K, 256, 15u);
+    std::vector<float> x(256, 0.5f);
+    bbqd::ActSuper xq;
+    xq.quantize(x.data(), 256);
+    float out = 4321.f;
+
+    REQUIRE_FALSE(bbqd::gemv_plane_super(static_cast<std::uint32_t>(gguf::TensorType::Q8_0),
+                                         std::span<const std::uint8_t>(q4), 1, 256, xq, &out));
+    REQUIRE(out == 4321.f);
+
+    const std::vector<std::uint8_t> q4_96 = make_blocks(gguf::TensorType::Q4_K, 96 * 8, 16u);
+    bbqd::ActSuper xq96;   // never quantized to 96 -- the refusal must happen before x is even touched
+    REQUIRE_FALSE(bbqd::gemv_plane_super(static_cast<std::uint32_t>(gguf::TensorType::Q4_K),
+                                         std::span<const std::uint8_t>(q4_96), 8, 96, xq96, &out));
+    REQUIRE(out == 4321.f);
+
+    bbqd::ActSuper empty;
+    REQUIRE_FALSE(bbqd::gemv_plane_super<2>(static_cast<std::uint32_t>(gguf::TensorType::Q4_K),
+                                            std::span<const std::uint8_t>(q4), 1, 256, empty, &out));
+    REQUIRE(out == 4321.f);
+    REQUIRE_FALSE(bbqd::detail::gemv_plane_super_portable(
+        static_cast<std::uint32_t>(gguf::TensorType::Q4_K), std::span<const std::uint8_t>(q4),
+        1, 256, empty, &out, 0, 1));
+    REQUIRE(out == 4321.f);
+}
+
+TEST_CASE("bbqd (pass 4, AGENTS.md S9): validated against REAL bytes, activation error reported "
+          "side by side with the ActBlocks (per-32) scheme",
+          "[backbonequant]") {
+    const auto picks = find_real_picks();
+    if (picks.size() < 4) {
+        WARN("the real Qwen3.8-Flash-Next UD-IQ1_S GGUF shards were not found -- skipping");
+        return;
+    }
+
+    for (const RealPick& pk : picks) {
+        const auto type = static_cast<gguf::TensorType>(pk.info.type_raw);
+        if (type == gguf::TensorType::Q8_0) continue;   // ActSuper does not cover Q8_0 by design
+        INFO("tensor " << pk.info.name << " format " << format_name(type));
+        const int row_elems = static_cast<int>(pk.info.dims[0]);
+        REQUIRE(row_elems % 256 == 0);   // the real census guarantees this; checked, not assumed
+        const std::vector<std::uint8_t> raw = read_tensor_bytes(pk);
+        REQUIRE_FALSE(raw.empty());
+
+        // (a) lossless-activation decode -- the weight side must stay exact under the new scheme too.
+        const std::vector<float> x = lossless_row(row_elems, 8181u + pk.info.type_raw);
+        bbqd::ActSuper xq;
+        xq.quantize(x.data(), row_elems);
+        float fused = 0.f;
+        REQUIRE(bbqd::detail::gemv_plane_super_portable(pk.info.type_raw, std::span<const std::uint8_t>(raw),
+                                                         1, row_elems, xq, &fused, 0, 1));
+        const double ref = reference_dot(type, raw, row_elems, x);
+        REQUIRE(std::isfinite(fused));
+        REQUIRE(std::fabs(ref) > 0.0);
+        const double rel = std::fabs(static_cast<double>(fused) - ref) / std::fabs(ref);
+        INFO("relative disagreement on real bytes (super, portable) = " << rel);
+        REQUIRE(rel < 1e-5);
+
+        float fused_avx2 = 0.f;
+        REQUIRE(bbqd::detail::gemv_plane_super_avx2(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
+                                                     row_elems, xq, &fused_avx2, 0, 1));
+        REQUIRE(fused == fused_avx2);
+#if defined(SUB0_BBQD_VNNI)
+        float fused_vnni = 0.f;
+        REQUIRE(bbqd::detail::gemv_plane_super_vnni(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
+                                                     row_elems, xq, &fused_vnni, 0, 1));
+        REQUIRE(fused == fused_vnni);
+#endif
+
+        // (b) activation-quantization error on the model's OWN real weight statistics, computed for BOTH
+        // schemes on the IDENTICAL Gaussian row so the comparison is apples-to-apples -- the deliverable
+        // this pass explicitly asks not to bury: does the coarser per-256 scale cost real accuracy?
+        // SAME seed as the ActBlocks-only real-byte case above (20260921) -- so `rel_g_old` here
+        // reproduces that case's own already-documented baseline (docs/BACKBONE_NATIVE_QUANT.md S5b:
+        // Q8_0 0.20%, Q4_K 3.85%, Q5_K 1.99%, Q6_K 0.12%) exactly, and `rel_g_new` is a true apples-to-
+        // apples comparison on the IDENTICAL activation draw, not a different random instance.
+        std::vector<float> xg(static_cast<std::size_t>(row_elems));
+        std::mt19937 rng(20260921);
+        std::normal_distribution<float> normal(0.f, 1.f);
+        for (float& v : xg) v = normal(rng);
+        const double ref_g = reference_dot(type, raw, row_elems, xg);
+        REQUIRE(std::fabs(ref_g) > 0.0);
+
+        bbqd::ActBlocks xqg_old;
+        xqg_old.quantize(xg.data(), row_elems);
+        float fused_g_old = 0.f;
+        REQUIRE(bbqd::detail::gemv_plane_portable(pk.info.type_raw, std::span<const std::uint8_t>(raw), 1,
+                                                   row_elems, xqg_old, &fused_g_old, 0, 1));
+        const double rel_g_old = std::fabs(static_cast<double>(fused_g_old) - ref_g) / std::fabs(ref_g);
+
+        bbqd::ActSuper xqg_new;
+        xqg_new.quantize(xg.data(), row_elems);
+        float fused_g_new = 0.f;
+        REQUIRE(bbqd::detail::gemv_plane_super_portable(pk.info.type_raw, std::span<const std::uint8_t>(raw),
+                                                         1, row_elems, xqg_new, &fused_g_new, 0, 1));
+        const double rel_g_new = std::fabs(static_cast<double>(fused_g_new) - ref_g) / std::fabs(ref_g);
+
+        INFO("activation-quantization relative error, OLD per-32 ActBlocks = " << rel_g_old
+             << ", NEW per-256 ActSuper = " << rel_g_new);
+        // Generous margin (not a target picked to pass): the design doc's own measured range for the
+        // per-32 scheme tops out at ~3.9% (Q4_K); a per-256 scale is strictly coarser so some rise is
+        // expected, but it must still stay well clear of anything that would visibly move end-to-end
+        // logits (the FP8/B35 precedent's own ~0.2-0.4 L2-relative band, docs/BACKBONE_NATIVE_QUANT.md
+        // S5b/S12g).
+        REQUIRE(rel_g_new < 0.25);
+    }
+}
+
 // --- mutation check (documented here rather than left as a committed always-on case; see this file's ---
 // --- own header comment, and AGENTS.md's "regression test on a reproducible bug") ----------------------
 //
