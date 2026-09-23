@@ -351,7 +351,7 @@ the pipeline (74,899 tensors) and the one most likely to be right for 74,898 of 
   decoder layer 0's output, before the injection point.** This is a real methodological constraint the
   original plan did not spell out; §6's WP4d builds around (b), which needs no llama.cpp modification.
 - **The interface seam it must NOT block on**: `docs/NGRAM_EMBEDDING.md` §7's `ngram_tab[e]` "thin client
-  issuing `resolve_into` calls instead of a raw parameter pointer", against `docs/SUB0FIRN_SPEC.md` §3's
+  issuing `resolve_into` calls instead of a raw parameter pointer", against `docs/SUB0TIEREDCACHE_SPEC.md` §3's
   `resolve_into(table_handle, row_indices[], dest_buffer)` contract. **Nothing in WP4a-e should introduce
   a design that assumes the table is absent** — it is *not present in this build*, which is a different
   claim from *cannot be present*. Concretely: keep the PLE injection point as a real, named,

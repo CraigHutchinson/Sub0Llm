@@ -33,7 +33,7 @@ those measurements come in — bump the revision log below each time.
 **Read first, not re-derived here**: `docs/QWEN4_PREVIEW_REFERENCE.md` (architecture facts),
 `docs/GATED_DELTANET.md` (GDN math + this project's own arena/checkpoint design for it),
 `docs/QWEN4_DEPLOYMENT_FEASIBILITY.md` (real GGUF quant-tier byte totals + MoE-offload prior art —
-cited, not re-derived, throughout §1-§3), `docs/SUB0FIRN_SPEC.md` + `docs/NGRAM_TABLE_TIERED_STORAGE.md`
+cited, not re-derived, throughout §1-§3), `docs/SUB0TIEREDCACHE_SPEC.md` + `docs/NGRAM_TABLE_TIERED_STORAGE.md`
 (the n-gram table's own tiered-storage design — cited for the seam in §3, out of scope for budgeting per
 explicit user instruction), `include/sub0/memplan.hpp` (the existing `Dims`/`persistent_bytes`/
 `train_scratch_bytes`/`fwd_dids_bytes` accounting this doc extends rather than parallels),
@@ -627,9 +627,9 @@ Per explicit user instruction, this table is **omitted entirely from the initial
 budget** — legitimate, not a correctness compromise, because it is one additive signal injected at a
 single decoder layer (`ple_layer_ids=[2]`, i.e. 0-indexed layer 1), so a first test validating the OTHER
 mechanisms (GDN, QSA, Gated Residual, MoE routing) does not need it present to be a meaningful test of
-those mechanisms. **The seam for a future Sub0Firn-backed tier is exactly the one
+those mechanisms. **The seam for a future Sub0TieredCache-backed tier is exactly the one
 `docs/NGRAM_EMBEDDING.md` §7's deferred section already names**: `ngram_tab[e]` would become "a thin
-client issuing `resolve_into` calls instead of a raw parameter pointer" (`docs/SUB0FIRN_SPEC.md` §3's
+client issuing `resolve_into` calls instead of a raw parameter pointer" (`docs/SUB0TIEREDCACHE_SPEC.md` §3's
 `resolve_into(table_handle, row_indices[], dest_buffer)` contract) rather than the fully-resident
 `PARAM_LAYOUT` leaf it is for this engine's own small, from-scratch-trained tables today. Nothing about
 this document's own placement decisions for backbone/MoE/runtime-state depends on this table existing —
@@ -716,7 +716,7 @@ Per `AGENTS.md` §1 (no runtime-variable-latency branch in a hot path), classify
 | GDN recurrent + conv state | **Inline access, safe** | Not a cross-tier fetch at all — a local, arena-resident buffer read/written in place by the same compute (CPU or GPU, whichever this build placed that layer on) that owns it; no I/O, no latency variance, exactly `docs/GATED_DELTANET.md` §2's existing `GdnCache` design. |
 | QSA KV cache + indexer pooled-key cache | **Inline access, safe** | Same reasoning as GDN state — compute-local, append-in-place per step, no external table lookup. |
 | N-gram/PLE table | **Out of scope this pass**; when built, mandatory explicit resolve pass — already fully designed in `docs/NGRAM_TABLE_TIERED_STORAGE.md` §2a/§2c, cited not re-derived here. |
-| A hypothetical fully-local, already-downloaded, page-cache-warm backbone/expert file | **Judgment call, not resolved by this document** | `docs/SUB0FIRN_SPEC.md` §3c's own hedge applies unchanged: an mmap page-fault against an already-local, already-warm file has bounded, NVMe-class (tens of µs) latency, which *might* be defensible to access inline without a separate resolve pass — but this is explicitly **not** the same case as a remote/cold fetch, which always requires the explicit resolve pass, and this document does not adjudicate the judgment call any more firmly than the source doc already declined to. |
+| A hypothetical fully-local, already-downloaded, page-cache-warm backbone/expert file | **Judgment call, not resolved by this document** | `docs/SUB0TIEREDCACHE_SPEC.md` §3c's own hedge applies unchanged: an mmap page-fault against an already-local, already-warm file has bounded, NVMe-class (tens of µs) latency, which *might* be defensible to access inline without a separate resolve pass — but this is explicitly **not** the same case as a remote/cold fetch, which always requires the explicit resolve pass, and this document does not adjudicate the judgment call any more firmly than the source doc already declined to. |
 
 ---
 
@@ -841,7 +841,7 @@ facts. §6c items 1-4 and 6 are what would make them residency facts.
 > unlocked by having CPU forward implementations**, which is all that landed since v1. No number for any
 > of them appears anywhere in this revision, and none should be invented from the shape facts §6a
 > promoted — a shape is not a bandwidth. Items 1, 2 and 4 are on `docs/WP4_SCOPE.md`'s critical path;
-> item 6 is explicitly downstream of a first working run; item 3 remains a Sub0Firn prerequisite,
+> item 6 is explicitly downstream of a first working run; item 3 remains a Sub0TieredCache prerequisite,
 > unscheduled. **Item 7 is NEW in v2.**
 
 1. **A real `sub0_cuda_train_footprint`-style measured-vs-predicted check, extended to an inference-only
@@ -852,7 +852,7 @@ facts. §6c items 1-4 and 6 are what would make them residency facts.
    claim about MoE-expert-fetch latency becomes load-bearing for a design decision — §1a's PCIe
    bandwidth numbers are spec arithmetic, not a measurement.
 3. **A real sequential/random-read benchmark against this machine's actual NVMe drives**, before any
-   disk-tier latency number in a future Sub0Firn integration is trusted — §1c's NVMe figures are
+   disk-tier latency number in a future Sub0TieredCache integration is trusted — §1c's NVMe figures are
    class-level, not device-specific.
 4. **A real wall-clock-timed HTTP-range extraction** (even a modest one — e.g. resolving a few hundred
    rows/tensors and timing it), to finally put a throughput number on this project's own already-proven

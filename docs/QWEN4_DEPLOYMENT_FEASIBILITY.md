@@ -16,10 +16,10 @@ already built.**
 **This machine**: 63GB RAM, one RTX 5070 Laptop (~8GB VRAM, sm_120), 589GB free on `D:`, 179GB free on
 `C:` (`[[host-cpu-arrow-lake-hx]]`).
 
-**Companion docs, not duplicated here**: `docs/SUB0FIRN_SPEC.md` (the real, spec'd tiered-cache
+**Companion docs, not duplicated here**: `docs/SUB0TIEREDCACHE_SPEC.md` (the real, spec'd tiered-cache
 project for the n-gram table — do not re-litigate its design; §3 below only asks whether a much
 smaller, throwaway alternative also has a place) and `docs/NGRAM_TABLE_TIERED_STORAGE.md` (the prior
-art and staged plan Sub0Firn implements — §2 below adds llama.cpp-specific and MoE-specific prior art
+art and staged plan Sub0TieredCache implements — §2 below adds llama.cpp-specific and MoE-specific prior art
 that doc did not need, since it was scoped to embedding-table serving, not expert-weight serving).
 
 ---
@@ -257,9 +257,9 @@ command-line flag against the exact files §1 already found.
 
 ### 3a. Restating the scope boundary from the task brief
 
-This section is **not** Sub0Firn. Sub0Firn (`docs/SUB0FIRN_SPEC.md`, `docs/NGRAM_TABLE_TIERED_STORAGE.md`,
+This section is **not** Sub0TieredCache. Sub0TieredCache (`docs/SUB0TIEREDCACHE_SPEC.md`, `docs/NGRAM_TABLE_TIERED_STORAGE.md`,
 now a real spun-off repository at
-[github.com/CraigHutchinson/Sub0Firn](https://github.com/CraigHutchinson/Sub0Firn)) is the real,
+[github.com/CraigHutchinson/Sub0TieredCache](https://github.com/CraigHutchinson/Sub0TieredCache)) is the real,
 staged, multi-tier design for this exact problem. This section asks a narrower question: is there a
 *simpler-than-that*, throwaway, zero-new-caching-logic option — plain `mmap` + let the OS page cache do
 whatever it does — and does it fit `docs/NGRAM_EMBEDDING.md`'s own already-identified integration seam
@@ -329,11 +329,11 @@ task benefits from directly: **`op_embed` itself needs zero changes to read from
 The naive mmap idea is real and worth keeping (§3b's `std::span<float>` finding is a genuine, positive
 discovery worth remembering), but it applies cleanly to a case (Sub0Llm's own future table) that does
 not exist yet, and does not apply cleanly to the case that actually matters today (the external Qwen
-table) without first doing dtype-decode and leaf-construction work that is squarely `Sub0Firn`/Stage-3
+table) without first doing dtype-decode and leaf-construction work that is squarely `Sub0TieredCache`/Stage-3
 territory, not a PoC-sized shortcut around it. **This is not a reason to abandon a lightweight option
 in principle** — it is a reason to build the *decode* step (§1d's `gguf.hpp` gap: `BF16`/`IQ4_NL`/K-quant
 byte-size + dequantization support) as the actual next concrete unit of work, since that is the one
-piece every path through this problem — Sub0Firn's real design, and any future "naive" shortcut alike —
+piece every path through this problem — Sub0TieredCache's real design, and any future "naive" shortcut alike —
 needs regardless of which cache architecture eventually sits on top of it.
 
 ---
@@ -394,9 +394,9 @@ header reads worked identically across every tier probed).
    strongly, by showing concretely how far out of reach *actually running* the real model is on this
    hardware at every quant level.
 2. **If an external-table consumption use case becomes real** (§3's case 1), the correct venue is
-   **Sub0Firn**, not a bespoke shortcut in this repo — it is already spec'd through Stage 2 (standalone,
+   **Sub0TieredCache**, not a bespoke shortcut in this repo — it is already spec'd through Stage 2 (standalone,
    zero Sub0Llm dependency) and Stage 3-5 (Sub0Llm integration), and §3d's finding (the `gguf.hpp`
-   dtype-decode gap) is squarely useful prerequisite work for *either* Sub0Firn's real design or any
+   dtype-decode gap) is squarely useful prerequisite work for *either* Sub0TieredCache's real design or any
    future naive shortcut, so it is worth doing regardless of which one comes first. This document does
    not schedule that work — only names it as the concrete, scoped, connects-to-what-exists next
    candidate, per §1d/§3d.

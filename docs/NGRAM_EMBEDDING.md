@@ -283,7 +283,7 @@ diagnostic/directory-naming identity, not the checkpoint-format gate (`ARCH_FING
   for the small, from-scratch-trained tables this stage targets. Growing this to a huge, externally
   sourced, effectively-frozen table (too big for RAM/VRAM) is a distinct backing-store problem, not a
   variant of Stage 1/2 — see `docs/NGRAM_TABLE_TIERED_STORAGE.md` for the design and
-  [github.com/CraigHutchinson/Sub0Firn](https://github.com/CraigHutchinson/Sub0Firn) (spec + prior art +
+  [github.com/CraigHutchinson/Sub0TieredCache](https://github.com/CraigHutchinson/Sub0TieredCache) (spec + prior art +
   a concrete, code-grounded trace of exactly what this file's `forward()`/`forward_one()` would need from
   such a backing store — its README §7) for where the actual implementation is scoped to land. Nothing
   in `Model`'s current structure needs to change to make room for this later: `ngram_tab[e]` would become

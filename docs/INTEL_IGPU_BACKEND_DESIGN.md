@@ -39,7 +39,7 @@ order and regression gates. The [whole-plan review](INTEL_IGPU_PLAN_REVIEW.md) r
 Six bounded preliminary spikes feed five review checkpoints; evidence can narrow or stop later work.
 This document adds an Intel execution option to [BACKENDS.md](BACKENDS.md) and
 [Qwen memory orchestration](QWEN4_MEMORY_ORCHESTRATION.md); it does not replace the latter's
-cross-tier storage design or [Sub0Firn](SUB0FIRN_SPEC.md).
+cross-tier storage design or [Sub0TieredCache](SUB0TIEREDCACHE_SPEC.md).
 
 ## 1. Hardware and workload boundary
 

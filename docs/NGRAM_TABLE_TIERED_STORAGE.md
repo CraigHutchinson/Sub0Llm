@@ -6,19 +6,19 @@ staged plan with checkable exit conditions, an explicit "novel vs reuses an exis
 sources cited with a confidence tag) but this doc's own "Stage 0" has no landed code — the staging
 below is the deliverable, not a record of what shipped.
 
-**Companion doc**: [SUB0FIRN_SPEC.md](SUB0FIRN_SPEC.md) — the spec/requirements/README for **Sub0Firn**,
+**Companion doc**: [SUB0TIEREDCACHE_SPEC.md](SUB0TIEREDCACHE_SPEC.md) — the spec/requirements/README for **Sub0TieredCache**,
 the standalone sideline project this design spins the tiered-storage engine out into (see §7). This doc
 covers the problem, the prior art, and how Sub0Llm's own engine reconciles with it; that doc covers what
-Sub0Firn itself promises as an independent, engine-agnostic library.
+Sub0TieredCache itself promises as an independent, engine-agnostic library.
 
-**2026-09-01: the Sub0Firn repository now exists**, and has since grown past its initial seed —
-[github.com/CraigHutchinson/Sub0Firn](https://github.com/CraigHutchinson/Sub0Firn) now has its own
+**2026-09-01: the Sub0TieredCache repository now exists**, and has since grown past its initial seed —
+[github.com/CraigHutchinson/Sub0TieredCache](https://github.com/CraigHutchinson/Sub0TieredCache) now has its own
 `REQUIREMENTS.md` (a normative R1–R10 contract), `AGENTS.md`, `STYLE_GUIDE.md`, a `docs/` split into
 `prior-art.md`/`tiered-storage-design.md`/`reference-consumer-sub0llm.md`, and a buildable
 (header-only-skeleton) `CMakeLists.txt` — brought up to the same requirements rigor as the sibling
 `Sub0Log` project. This doc (originally seeded there as `DESIGN_RATIONALE.md`, now
 `docs/tiered-storage-design.md` in that repo) stays here as Sub0Llm's own historical record of how/why
-the spin-off happened, not kept in lockstep with every subsequent edit there; the Sub0Firn repo is now
+the spin-off happened, not kept in lockstep with every subsequent edit there; the Sub0TieredCache repo is now
 where any actual implementation work on the tiered-cache engine itself belongs, not here. No code has
 landed in
 either repo yet — both documents are still design-only.
@@ -122,7 +122,7 @@ every row those ids address into a flat, pre-sized arena buffer, THEN run the ex
 `op_embed`/`op_linear`/`op_add` pipeline reading from that buffer instead of from a resident
 `PARAM_LAYOUT` tensor. `op_embed` itself does not need to change — only what it's an embedding lookup
 *into* changes, from "the resident table" to "this call's already-resolved working-set buffer," which
-is exactly the kind of substitution the thin-client interface (§7, `SUB0FIRN_SPEC.md`) exists to make
+is exactly the kind of substitution the thin-client interface (§7, `SUB0TIEREDCACHE_SPEC.md`) exists to make
 clean.
 
 **How the resolve pass gets its row-ids differs sharply between training and decode — the brief is right
@@ -270,7 +270,7 @@ really the same knob at all, for case 1**:
   checkpoint-format decision gated behind `AGENTS.md` §3's process, not a `constexpr`-vs-runtime
   argument at all — a different section of the checklist applies, not this one.
 
-### 2f. On-disk location conventions — which convention is Sub0Llm's, which is Sub0Firn's
+### 2f. On-disk location conventions — which convention is Sub0Llm's, which is Sub0TieredCache's
 
 Sub0Llm already has two real, load-bearing on-disk conventions: per-build-directory generated artifacts
 (`out/build/<name>/generated/`, e.g. `tokenizer.stamp`) and per-corpus sidecars living next to the corpus
@@ -278,13 +278,13 @@ file itself (`corpus.tok`, `<corpus>.words`). A Sub0Llm-side disk cache tier sho
 family — most naturally a sibling of `corpus.tok` (keyed by the SAME corpus identity `corpus-tok-reuse-stamp`
 already tracks, since case-2's working set is a function of the corpus) for the training-time
 precomputed-working-set case, or a `generated/`-relative cache directory for anything build-config-scoped
-rather than corpus-scoped. **This convention is Sub0Llm's own and must not leak into Sub0Firn** — per the
-brief's own instruction and `SUB0FIRN_SPEC.md`'s explicit non-goal, Sub0Firn (a spun-off, portable
+rather than corpus-scoped. **This convention is Sub0Llm's own and must not leak into Sub0TieredCache** — per the
+brief's own instruction and `SUB0TIEREDCACHE_SPEC.md`'s explicit non-goal, Sub0TieredCache (a spun-off, portable
 library) instead defaults to a platform-appropriate user/system cache directory (`XDG_CACHE_HOME` on
 Linux, `%LOCALAPPDATA%` on Windows, `~/Library/Caches` on macOS — the same three-way split most portable
-cache libraries already use), configurable, with Sub0Llm's own build simply pointing its Sub0Firn client
+cache libraries already use), configurable, with Sub0Llm's own build simply pointing its Sub0TieredCache client
 at a Sub0Llm-chosen path (most naturally under `out/build/<name>/generated/` or a corpus-adjacent
-directory) rather than Sub0Firn inventing or assuming that structure itself.
+directory) rather than Sub0TieredCache inventing or assuming that structure itself.
 
 ## 3. Concrete ladder proposal
 
@@ -329,29 +329,29 @@ network leg, not glossed over.
 
 ## 5. Staged implementation plan (design only)
 
-Each stage names whether it is buildable as **Sub0Firn standalone, zero Sub0Llm dependency** or requires
+Each stage names whether it is buildable as **Sub0TieredCache standalone, zero Sub0Llm dependency** or requires
 **Sub0Llm integration**, per the brief's spin-off framing.
 
-- **Stage 0 — Sub0Firn: the engine-agnostic interface + an in-memory reference implementation.**
-  `resolve`/`resolve_many`/`prefetch`/`try_get` (exact signatures in `SUB0FIRN_SPEC.md`) implemented
+- **Stage 0 — Sub0TieredCache: the engine-agnostic interface + an in-memory reference implementation.**
+  `resolve`/`resolve_many`/`prefetch`/`try_get` (exact signatures in `SUB0TIEREDCACHE_SPEC.md`) implemented
   against a plain in-process hash map with no tiering at all — i.e. "the contract, proven with the
   simplest possible backend." Exit condition: a unit test registers a small synthetic table, resolves a
   batch of rows, and gets back exactly what was registered — no I/O, no async, no tiers yet. **Buildable
   standalone.**
-- **Stage 1 — Sub0Firn: local-file tiers (RAM cache + local disk mirror), no network.** Implements the
+- **Stage 1 — Sub0TieredCache: local-file tiers (RAM cache + local disk mirror), no network.** Implements the
   RAM working-set cache and a local-disk case-(a)-shaped tier (§2d) against a synthetic or
   hand-constructed flat table file. Exit condition: a working set that exceeds the RAM budget correctly
   falls through to the disk tier and returns identical values to Stage 0's reference; a working set that
   fits the RAM budget never touches disk after warm-up (§2b's headline claim, made checkable against a
   synthetic corpus of known working-set size). **Buildable standalone.**
-- **Stage 2 — Sub0Firn: remote tier (HTTP Range) + disk-tier-as-cache-in-front (case (b)).** Generalizes
+- **Stage 2 — Sub0TieredCache: remote tier (HTTP Range) + disk-tier-as-cache-in-front (case (b)).** Generalizes
   `docs/QWEN4_PREVIEW_REFERENCE.md`'s proven Stage 1 extraction script (§2d) into the reusable remote leg.
   Exit condition: resolving the real 96 rows in `tests/fixtures/qwen4_preview/ngram_embedding_*` via live
   HTTP Range requests against the real Qwen checkpoint reproduces the fixture's `ngram_embedding_per_head.bin`
   bit-for-bit — the same "real-weight fixture as correctness gate" discipline `docs/GATED_DELTANET.md`
   §5 step 2 already established, applied to a serving-infra correctness question instead of a math one.
   **Buildable standalone** (needs network access and the public Hugging Face repo, nothing Sub0Llm-side).
-- **Stage 3 — Sub0Llm integration: thin-client op + resolve-pass wiring.** Sub0Llm vendors the Sub0Firn
+- **Stage 3 — Sub0Llm integration: thin-client op + resolve-pass wiring.** Sub0Llm vendors the Sub0TieredCache
   client (§7's "how Sub0Llm consumes it"), and `Model::forward`'s existing n-gram block (§2a) gets an
   explicit resolve call inserted before its `op_embed`/`op_linear`/`op_add` composition, reading from the
   resolved buffer instead of a resident tensor — for an EXTERNAL table only; Sub0Llm's own trained table
