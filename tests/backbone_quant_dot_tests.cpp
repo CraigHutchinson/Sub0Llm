@@ -384,6 +384,56 @@ TEST_CASE("bbqd (O5 phase 2a): gemv_plane<Threads> is bit-exact across 1/2/4 thr
     }
 }
 
+TEST_CASE("bbqd (O5 phase 2b-2b): gemv_plane's caller-owned gsum16 scratch reproduces the default "
+          "(no-hint) result exactly, at 1 and 4 threads, and survives being REUSED across a changed "
+          "activation width",
+          "[backbonequant]") {
+    // Closes docs/BACKBONE_NATIVE_QUANT.md S12i's own TODO(phase 2b): Gsum16 must no longer be built
+    // fresh inside gemv_plane on every call when a caller hands one in. This checks three things a
+    // caller-owned-scratch API can get wrong that a pure "does it compile" check would miss:
+    //   1. Passing a caller-owned Gsum16* must not change the ANSWER (same bytes, gsum16 hint or not).
+    //   2. The SAME instance, reused at Threads>1, must still agree (built once, read by every thread --
+    //      the concurrency argument the header comment makes, checked here rather than just asserted).
+    //   3. Reusing the SAME Gsum16 object across TWO DIFFERENT activation widths must not leak stale
+    //      per-16 sums from the first call into the second's shorter row range -- build()'s own
+    //      `v.assign(groups*2, 0)` must re-derive the right group count every call.
+    constexpr auto type = gguf::TensorType::Q6_K;   // the one format this scratch actually feeds
+    const auto raw_t = static_cast<std::uint32_t>(type);
+    constexpr int kRows = 21;   // not evenly divisible by 4 -- exercises the same uneven-split path
+
+    bbqd::Gsum16 shared_gsum16;   // ONE object, reused across every call below -- both thread counts AND
+                                  // both activation widths -- so its own `.v` buffer is genuinely
+                                  // exercised across a real resize, not just re-passed unchanged.
+    auto run_one = [&](int n_elems, std::uint32_t seed) {
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> normal(0.f, 1.5f);
+        std::vector<float> x(static_cast<std::size_t>(n_elems));
+        for (float& v : x) v = normal(rng);
+        bbqd::ActBlocks xq;
+        xq.quantize(x.data(), n_elems);
+        const std::vector<std::uint8_t> raw =
+            make_blocks(type, static_cast<std::uint64_t>(kRows) * n_elems, seed);
+
+        std::vector<float> no_hint(kRows, -1.f), hinted_1t(kRows, -2.f), hinted_4t(kRows, -3.f);
+        REQUIRE(bbqd::gemv_plane<1>(raw_t, std::span<const std::uint8_t>(raw), kRows, n_elems, xq,
+                                    no_hint.data()));
+        REQUIRE(bbqd::gemv_plane<1>(raw_t, std::span<const std::uint8_t>(raw), kRows, n_elems, xq,
+                                    hinted_1t.data(), 0, -1, &shared_gsum16));
+        REQUIRE(bbqd::gemv_plane<4>(raw_t, std::span<const std::uint8_t>(raw), kRows, n_elems, xq,
+                                    hinted_4t.data(), 0, -1, &shared_gsum16));
+        for (int r = 0; r < kRows; ++r) {
+            INFO("n_elems " << n_elems << " row " << r);
+            REQUIRE(no_hint[static_cast<std::size_t>(r)] == hinted_1t[static_cast<std::size_t>(r)]);
+            REQUIRE(no_hint[static_cast<std::size_t>(r)] == hinted_4t[static_cast<std::size_t>(r)]);
+        }
+    };
+
+    run_one(2560, 909u);   // real backbone width -- shared_gsum16 sized here for the first time
+    run_one(6144, 909u);   // a LARGER width, same shared_gsum16 object -- must re-derive its own group
+                           // count rather than reading stale entries left over from the 2560 call above
+    run_one(2560, 909u);   // back down to the smaller width -- must not read past a now-shorter v either
+}
+
 TEST_CASE("bbqd (O5 phase 2a): KScaleTable's branch-free bit-unpack agrees EXACTLY with gguf::k_scale_min "
           "for all 8 sub-block indices",
           "[backbonequant]") {
@@ -426,7 +476,9 @@ TEST_CASE("bbqd (O5 phase 2a): Gsum16 matches a direct per-16-element sum of the
     bbqd::ActBlocks xq;
     xq.quantize(x.data(), kN);
 
-    bbqd::detail::Gsum16 g16;
+    // O5 phase 2b-2b: Gsum16 moved to public bbqd scope (from bbqd::detail) so it is nameable as
+    // caller-owned scratch -- see backbone_quant_dot.hpp's own comment on the type.
+    bbqd::Gsum16 g16;
     g16.build(xq);
     REQUIRE(g16.v.size() == static_cast<std::size_t>(kN / bbqd::GROUP) * 2);
 
