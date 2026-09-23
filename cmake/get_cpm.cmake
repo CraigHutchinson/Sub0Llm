@@ -31,6 +31,7 @@ if(NOT EXISTS "${CPM_DOWNLOAD_LOCATION}")
   endif()
 else()
   file(SHA256 "${CPM_DOWNLOAD_LOCATION}" CPM_CACHED_SHA256)
+  string(TOUPPER "${CPM_CACHED_SHA256}" CPM_CACHED_SHA256)
   if(NOT CPM_CACHED_SHA256 STREQUAL CPM_DOWNLOAD_SHA256)
     message(WARNING
       "Cached CPM.cmake v${CPM_DOWNLOAD_VERSION} has an unexpected SHA-256; removing it and retrying.")
