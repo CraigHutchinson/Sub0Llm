@@ -616,6 +616,37 @@ inline void gemv_rows(const Plane& plane, int row_lo, int row_hi, int row_elems,
 // row_elems that is merely a multiple of GROUP=32 (fusable()'s own, weaker contract).
 // =========================================================================================================
 
+/** Q6_K's per-16-element activation sums (its `bias_lo`/`bias_hi` split needs a finer granularity than
+ * `moeqd::ActBlocks::gsum`'s own per-32). Phase 1's `group()`-based path recomputed this from the raw
+ * activation bytes on EVERY (row, group) pair via `sum16_avx2` -- an O(n_rows) redundant recompute of a
+ * value that depends only on the activation column, never the row. `gemv_plane<Threads>` builds it ONCE
+ * per call (i.e. once per activation row, shared across however many output rows that call handles and
+ * however many threads split them) instead.
+ *
+ * O5 phase 2b-2b: PUBLIC (moved out of the AVX2-only `detail` namespace -- its own `build()` has no AVX2
+ * dependency, `detail::sum_n_portable` is the portable scalar summer, gated only by `SUB0_BBQD_AVX2`
+ * for physical-file locality, not by any real ISA requirement) and now CALLER-OWNED, REUSED scratch
+ * (AGENTS.md S1's own "size once outside the hot loop, reuse across calls"): `gemv_plane<Threads>`'s own
+ * `Gsum16*` parameter, when non-null, is built here (not per-thread, not per-call-site-internal) and
+ * `build()`'s `v.assign(...)` only reallocates when the activation width changes, exactly like
+ * `ActBlocks::quantize`'s own contract -- so a decode caller that owns one `Gsum16` per (thread, role)
+ * across the whole generation pays the heap cost once, not every token. This closes the
+ * `docs/BACKBONE_NATIVE_QUANT.md` S12i "TODO(phase 2b)" finding: decode's GDN out-proj wiring
+ * (`src/backends/cpu/decode.cpp`) is this type's first real per-token caller.
+ */
+struct Gsum16 {
+    std::vector<std::int32_t> v;   // v[2g+0] = sum(x.qs[g*32 : g*32+16)); v[2g+1] = sum of the other 16
+
+    void build(const ActBlocks& x) {
+        const auto groups = static_cast<std::size_t>(x.n / GROUP);
+        v.assign(groups * 2, 0);
+        for (std::size_t g = 0; g < groups; ++g) {
+            v[2 * g + 0] = detail::sum_n_portable(x.qs.data() + g * GROUP, 16);
+            v[2 * g + 1] = detail::sum_n_portable(x.qs.data() + g * GROUP + 16, 16);
+        }
+    }
+};
+
 #if defined(SUB0_BBQD_AVX2)
 namespace detail {
 
@@ -739,29 +770,9 @@ struct KScaleTable {
     }
 };
 
-/** Q6_K's per-16-element activation sums (its `bias_lo`/`bias_hi` split needs a finer granularity than
- * `moeqd::ActBlocks::gsum`'s own per-32). Phase 1's `group()`-based path recomputed this from the raw
- * activation bytes on EVERY (row, group) pair via `sum16_avx2` -- an O(n_rows) redundant recompute of a
- * value that depends only on the activation column, never the row. Built ONCE per `gemv_plane_avx2` call
- * (i.e. once per activation row, shared across however many output rows that call handles) instead.
- *
- * @note Not yet hoisted to a caller-owned, cross-call-persistent buffer the way `moeqd::ActBlocks` itself
- *       is (AGENTS.md S1's "size once outside the hot loop, reuse across calls") -- this phase has no
- *       decode-loop call site to own that buffer across tokens, so a local, once-per-call vector is the
- *       honest tradeoff available now; phase 2b's wiring work should hoist it if this path is adopted.
- */
-struct Gsum16 {
-    std::vector<std::int32_t> v;   // v[2g+0] = sum(x.qs[g*32 : g*32+16)); v[2g+1] = sum of the other 16
-
-    void build(const ActBlocks& x) {
-        const auto groups = static_cast<std::size_t>(x.n / GROUP);
-        v.assign(groups * 2, 0);
-        for (std::size_t g = 0; g < groups; ++g) {
-            v[2 * g + 0] = detail::sum_n_portable(x.qs.data() + g * GROUP, 16);
-            v[2 * g + 1] = detail::sum_n_portable(x.qs.data() + g * GROUP + 16, 16);
-        }
-    }
-};
+// Gsum16 moved to public sub0::bbqd scope (below, before this AVX2-only block) in O5 phase 2b-2b, so its
+// type is nameable -- and usable as caller-owned, reused scratch -- from a build without SUB0_BBQD_AVX2
+// too. See its own doc comment there for what changed and why.
 
 /** Q4_K, one row, streaming. Requires `row_base % 256 == 0 && row_elems % 256 == 0` (the caller's own
  * job to check once, not per row). Processes 64 elements (2 sub-blocks) per AVX2 chunk from one 32-byte
@@ -1703,9 +1714,13 @@ namespace detail {
  * a multiple of GROUP=32 -- correctness is never conditional on the 256 alignment, only which kernel
  * gets used.
  */
+// `gsum16_hint`: caller-owned, ALREADY-BUILT Q6_K per-16 sums (gemv_plane<Threads>'s own job to build it
+// exactly once, before any thread starts -- see that function's comment). nullptr means "build a local,
+// one-call one" -- the pre-O5-2b-2b behavior, kept for callers with no persistent scratch to hand in
+// (tests, the microbenchmark).
 [[nodiscard]] inline bool gemv_plane_avx2(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
                                           int n_rows, int row_elems, const ActBlocks& x, float* out,
-                                          int row_lo, int row_hi) {
+                                          int row_lo, int row_hi, const Gsum16* gsum16_hint = nullptr) {
     if (!plane_geometry_ok(type_raw, raw, n_rows, row_elems, row_lo, row_hi)) return false;
     const auto type = static_cast<gguf::TensorType>(type_raw);
     if (type == gguf::TensorType::Q8_0) {
@@ -1741,16 +1756,18 @@ namespace detail {
                     row_elems, x);
             return true;
         case gguf::TensorType::Q6_K: {
-            // TODO(phase 2b): Gsum16 heap-allocates per call, and per THREAD when gemv_plane<Threads>
-            // splits rows -- an AGENTS.md S1 violation the moment decode calls this per token. It stays
-            // here only because phase 2a has no call site that could own the buffer across calls; wiring
-            // must hand in a caller-owned, reused one (Gsum16's own @note).
-            Gsum16 gsum16;
-            gsum16.build(x);
+            // O5 phase 2b-2b: closes the TODO(phase 2b) this line used to carry (docs/BACKBONE_NATIVE_
+            // QUANT.md S12i). `gsum16_hint`, when the caller supplied one, is ALREADY built for this
+            // call's own `x` -- built exactly once in gemv_plane<Threads>, before any thread split, never
+            // per row and never per thread. Falling back to a local one-call build keeps every OTHER
+            // caller (tests, the microbenchmark) byte-for-byte unchanged.
+            Gsum16 local_gsum16;
+            const Gsum16* gsum16 = gsum16_hint;
+            if (!gsum16) { local_gsum16.build(x); gsum16 = &local_gsum16; }
             for (int r = row_lo; r < row_hi; ++r)
                 out[static_cast<std::size_t>(r - row_lo)] = dot_row_q6_k_avx2(
                     raw.data(), static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems),
-                    row_elems, x, gsum16);
+                    row_elems, x, *gsum16);
             return true;
         }
         default:
@@ -1761,12 +1778,18 @@ namespace detail {
 
 /// The kernel gemv_plane<Threads> runs for one row range: gemv_plane_avx2 where the target has AVX2
 /// (kAvx2Kernels), else gemv_plane_portable. Mirrors moeqd::detail::gemv_best's own convention exactly.
+/// `gsum16_hint`: forwarded to gemv_plane_avx2 unchanged (see its own comment); gemv_plane_portable never
+/// uses Gsum16 at all (its Q6_K path is the group()-based one, not the streaming one), so this parameter
+/// is simply unused on that arm -- [[maybe_unused]] would be redundant here since it is still named and
+/// read on the AVX2 arm.
 [[nodiscard]] inline bool gemv_plane_dispatch(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
                                               int n_rows, int row_elems, const ActBlocks& x, float* out,
-                                              int row_lo, int row_hi) {
+                                              int row_lo, int row_hi, const Gsum16* gsum16_hint = nullptr) {
 #if defined(SUB0_BBQD_AVX2)
-    if constexpr (kAvx2Kernels) return gemv_plane_avx2(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
+    if constexpr (kAvx2Kernels)
+        return gemv_plane_avx2(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi, gsum16_hint);
 #endif
+    (void)gsum16_hint;
     return gemv_plane_portable(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
 }
 
@@ -1788,16 +1811,32 @@ namespace detail {
  * @return false if the format is unfusable, `raw` is shorter than the geometry requires, or the row range
  *         is out of bounds -- `out` is left completely untouched in every refusal case, checked BEFORE
  *         any thread starts (plane_geometry_ok), not merely before this thread's own portion.
+ * @param gsum16 O5 phase 2b-2b: optional CALLER-OWNED scratch for Q6_K's per-16 activation sums
+ *        (docs/BACKBONE_NATIVE_QUANT.md S12i's own TODO). nullptr (the default) preserves every existing
+ *        caller's exact behavior (a local, one-call `Gsum16` built inside the AVX2 kernel, same as before
+ *        this parameter existed). When non-null, THIS function builds it ONCE, here, BEFORE any thread
+ *        starts -- never per row, never per thread -- and every thread/row-range below only READS it
+ *        (build() already finished, serially, by the time the parallel region opens), so sharing one
+ *        instance across the whole call is safe. `build()` reuses `gsum16->v`'s existing capacity when
+ *        the activation width has not changed (the same "assign only reallocates on a real size change"
+ *        contract `ActBlocks::quantize` already has), so a caller that owns one `Gsum16` per (thread,
+ *        role) across a whole decode generation pays its heap cost once, not every token -- the AGENTS.md
+ *        S1 fix this parameter exists for. Passed even for a non-Q6_K plane (build() is then simply
+ *        unused work downstream, not incorrect) -- cheap enough (O(row_elems/16)) that the caller need
+ *        not special-case which roles are Q6_K before deciding whether to pass one.
  */
 template <int Threads = 1>
 [[nodiscard]] inline bool gemv_plane(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
                                      int n_rows, int row_elems, const ActBlocks& x, float* out,
-                                     int row_lo = 0, int row_hi = -1) {
+                                     int row_lo = 0, int row_hi = -1, Gsum16* gsum16 = nullptr) {
     static_assert(Threads >= 1, "Threads must be >= 1");
     if (row_hi < 0) row_hi = n_rows;
     if (!plane_geometry_ok(type_raw, raw, n_rows, row_elems, row_lo, row_hi)) return false;
+    if (gsum16) gsum16->build(x);   // once, serially, before any thread below can read it
+    const Gsum16* gsum16_hint = gsum16;
     if constexpr (Threads == 1) {
-        return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
+        return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi,
+                                           gsum16_hint);
     } else {
 #if defined(_OPENMP)
         if (!omp_in_parallel()) {
@@ -1812,8 +1851,10 @@ template <int Threads = 1>
                     // gemv_plane_dispatch writes out[r - row_lo_of_THIS_call] for r in [lo, hi) -- offset
                     // the pointer by (lo - row_lo) so that lands at the SAME absolute out[r - row_lo] a
                     // single-threaded call would have used, since every thread shares one `out` buffer.
+                    // gsum16_hint is read-only here (its own build() above already finished before this
+                    // parallel region opened), so every thread sharing the one pointer is safe.
                     const bool arm_ok = detail::gemv_plane_dispatch(
-                        type_raw, raw, n_rows, row_elems, x, out + (lo - row_lo), lo, hi);
+                        type_raw, raw, n_rows, row_elems, x, out + (lo - row_lo), lo, hi, gsum16_hint);
                     if (!arm_ok) {
                         #pragma omp atomic write
                         ok = false;
@@ -1823,7 +1864,8 @@ template <int Threads = 1>
             return ok;
         }
 #endif
-        return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
+        return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi,
+                                           gsum16_hint);
     }
 }
 

@@ -21,6 +21,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -210,6 +211,21 @@ moeqd::ActBlocks g_moe_act_q{};
 // Sized at kv_reset(), before the first token. The first native backbone role wired here is the Q4_K
 // language-model head, whose activation width is D_MODEL on every token.
 thread_local bbqd::ActBlocks g_backbone_head_act_q{};
+
+// O5 phase 2b-2b (docs/BACKBONE_NATIVE_QUANT.md S16): caller-owned, reused scratch for the three native
+// GDN roles (in_qkv/in_z share one D_MODEL-wide quantized activation; out_proj needs its own
+// GDN_VALUE_DIM-wide one, gathered into GGUF/tiled column order first). Sized/derived once at
+// kv_reset(), never per token (AGENTS.md S1) -- mirrors g_backbone_head_act_q's own precedent exactly.
+// GDN_VALUE_DIM is always a valid, non-zero compile-time constant (layout.hpp's own N_HEADS*D_HEAD
+// fallback when USE_GATED_DELTANET is off), so these are valid array bounds in every build.
+thread_local bbqd::ActBlocks g_gdn_in_act_q{};    // D_MODEL-wide, shared by in_qkv/in_z
+thread_local bbqd::ActBlocks g_gdn_out_act_q{};   // GDN_VALUE_DIM-wide, out_proj's gathered activation
+thread_local std::array<std::uint32_t, GDN_VALUE_DIM> g_gdn_out_gather_idx{};
+thread_local std::array<float, GDN_VALUE_DIM> g_gdn_out_gather_buf{};
+// Closes the TODO(phase 2b) docs/BACKBONE_NATIVE_QUANT.md S12i names: Q6_K's per-16 activation-sum
+// scratch (bbqd::Gsum16), now caller-owned and reused across tokens instead of heap-allocated inside
+// gemv_plane on every call (see backbone_quant_dot.hpp's own Gsum16/gemv_plane comments).
+thread_local bbqd::Gsum16 g_gdn_out_gsum16{};
 
 // Runs one decode row's selected experts across MOE_DECODE_THREADS threads. Passed to
 // moe::forward_row_via_run, which computes each expert into its OWN output buffer and does the weighted
@@ -682,13 +698,44 @@ const float* Model::forward_one(int id, int pos) {
                 // decode path had the identical swap, independently) -- see that call site's comment.
                 [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> gdn_phase(prof::Phase::MixerGdn);
                 float gdn_scratch[GDN_SCRATCH1];
+                // O5 phase 2b-2b: the two GDN native-quant roles (in_qkv+in_z, out_proj) this layer's
+                // own S0B1 sidecar may carry -- 49.7% of backbone bytes/token when present at every GDN
+                // layer. A role absent at this layer (e.g. no sidecar loaded, or this layer's own plane
+                // did not pass the writer's format filter) leaves the corresponding gdn::Native field
+                // null, and gdn::forward falls back to the ordinary axpy path for exactly that pair --
+                // never a partial/undefined native computation (gdn_math.hpp's own in_ready()/out_ready()
+                // gate).
+                gdn::Native gdn_native{};
+                const gdn::Native* gdn_native_ptr = nullptr;
+                if constexpr (BACKBONE_QUANT_DOT) {
+                    const bbq::Desc* d_qkv = g_backbone_quant.find(bbq::Role::GdnInProjQkv, l);
+                    const bbq::Desc* d_z   = g_backbone_quant.find(bbq::Role::GdnInProjZ, l);
+                    const bbq::Desc* d_out = g_backbone_quant.find(bbq::Role::GdnOutProj, l);
+                    if (d_qkv && d_z) {
+                        gdn_native.in_qkv = d_qkv;
+                        gdn_native.in_qkv_raw = g_backbone_quant.raw(*d_qkv);
+                        gdn_native.in_z = d_z;
+                        gdn_native.in_z_raw = g_backbone_quant.raw(*d_z);
+                        gdn_native.x_q = &g_gdn_in_act_q;
+                    }
+                    if (d_out) {
+                        gdn_native.out = d_out;
+                        gdn_native.out_raw = g_backbone_quant.raw(*d_out);
+                        gdn_native.gated_q = &g_gdn_out_act_q;
+                        gdn_native.out_gather_idx = g_gdn_out_gather_idx.data();
+                        gdn_native.out_gather_buf = g_gdn_out_gather_buf.data();
+                        gdn_native.out_gsum16 = &g_gdn_out_gsum16;
+                    }
+                    if (gdn_native.in_ready() || gdn_native.out_ready()) gdn_native_ptr = &gdn_native;
+                }
                 gdn::forward<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(GDN_DIMS, 1, a,
                              L.gdn_in_qkv->pdata, L.gdn_in_z->pdata,
                              L.gdn_in_b->pdata, L.gdn_in_a->pdata,
                              L.gdn_conv->pdata, L.gdn_dt_bias->pdata,
                              L.gdn_a_log->pdata, L.gdn_norm->pdata,
                              L.gdn_out_proj->pdata,
-                             g_gdn_cache.state_of(e), g_gdn_cache.conv_of(e), proj, gdn_scratch);
+                             g_gdn_cache.state_of(e), g_gdn_cache.conv_of(e), proj, gdn_scratch,
+                             gdn_native_ptr);
                 gr_write_row(h, proj);                                       // residual (write step)
             }
         } else {
@@ -899,6 +946,22 @@ void kv_reset() {
             g_backbone_head_act_q.scale.reserve(D_MODEL / moeqd::GROUP);
             g_backbone_head_act_q.gsum.reserve(D_MODEL / moeqd::GROUP);
         }
+    }
+    // O5 phase 2b-2b: size the GDN native-quant scratch and derive the out-proj gather index ONCE per
+    // generation (not per token, AGENTS.md S1) -- cheap either way (O(GDN_VALUE_DIM) = O(6144)), but
+    // kv_reset() is the established seam for this (g_backbone_head_act_q's own precedent just above).
+    // gdn_out_gather_index() depends only on this build's compile-time GDN head axes, never on which
+    // sidecar (if any) is actually loaded, so it is always safe to compute -- reading it is gated on
+    // BACKBONE_QUANT_DOT and a real GdnOutProj Desc being found, inside forward_one's own per-layer loop.
+    if constexpr (BACKBONE_QUANT_DOT && USE_GATED_DELTANET) {
+        g_gdn_in_act_q.qs.reserve(D_MODEL);
+        g_gdn_in_act_q.scale.reserve(D_MODEL / moeqd::GROUP);
+        g_gdn_in_act_q.gsum.reserve(D_MODEL / moeqd::GROUP);
+        g_gdn_out_act_q.qs.reserve(GDN_VALUE_DIM);
+        g_gdn_out_act_q.scale.reserve(GDN_VALUE_DIM / moeqd::GROUP);
+        g_gdn_out_act_q.gsum.reserve(GDN_VALUE_DIM / moeqd::GROUP);
+        g_gdn_out_gsum16.v.reserve(2 * (GDN_VALUE_DIM / moeqd::GROUP));   // 2 per-16 sums per 32-group
+        bbq::gdn_out_gather_index(GDN_K_HEADS, GDN_V_HEADS, GDN_V_HEAD_DIM, g_gdn_out_gather_idx);
     }
     if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset();
     if constexpr (USE_QSA) g_qsa_cache.reset();   // the indexer's own raw-key store -- docs/QSA.md S6

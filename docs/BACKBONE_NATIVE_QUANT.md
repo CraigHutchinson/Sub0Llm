@@ -1245,3 +1245,246 @@ Checks on this host:
 Raw run logs are retained under `out/o5-native-head/` (`default.log`, `optin-paired.log`). The next integration
 increment must name each additional role explicitly, keep the default-off gate exact, and compare logits
 before treating its isolated kernel throughput as a decode win.
+
+---
+
+## 16. Phase 2b-2b — the GDN roles recovered, wired, and the Gsum16 TODO closed (2026-09-23)
+
+Two things phase 2b-1 deliberately left undone, both resolved this pass: the three VPerm-excluded GDN
+roles (`GdnInProjQkv`/`GdnInProjZ`/`GdnOutProj`, 49.7% of backbone bytes per token) are now IN the sidecar,
+and the sidecar's own bytes are wired into `gdn::forward` for the two GDN in-projections and the out
+projection. §12i's `Gsum16` `TODO(phase 2b)` (a per-call heap allocation) is fixed at the same time, since
+this phase's own GDN out-proj wiring is that TODO's first real per-token caller.
+
+### 16a. Phase A — recovering the three GDN roles
+
+`Role::GdnInProjQkv`/`GdnInProjZ`/`GdnOutProj` are APPENDED after `QsaOProj` (never inserted earlier --
+`Desc::role` is a plain int written to disk, AGENTS.md S3), giving `kRoleCount` 18.
+
+- **`GdnInProjQkv`/`GdnInProjZ` (Q5_K): a permuted ROW copy.** The writer computes, for each destination
+  (HF/grouped) row index, the source (GGUF/tiled) row that supplies it (`bbq::gdn_row_permutation`,
+  re-deriving `transplant::ungroup_v_heads`'s own `dst_head = k*rep+r` / `src_head = r*num_k_heads+k`
+  mapping generalized from per-float to per-head-group) and copies each raw row's whole quantized bytes
+  to its destination position. Rows outside the V block (the Q|K prefix of `attn_qkv`) copy through
+  unchanged. No re-quantization: a whole, independently block-quantized row commutes with a row
+  permutation exactly.
+- **`GdnOutProj` (Q6_K): stored RAW, GGUF/tiled order, unpermuted.** This role's permutation is on the
+  WITHIN-ROW axis (across K-quant superblock boundaries), which cannot survive a byte copy. The consumer
+  gathers the ACTIVATION into GGUF/tiled order before the dot instead (`bbq::gdn_out_gather_index`).
+- **Gather-direction proof (re-derived, not assumed, AGENTS.md S5).** Let `blob_col[o][j]` be the .bin
+  blob's own already-HF-ordered weight and `raw_row[o][i]` the sidecar's raw row. `ungroup_v_heads`
+  establishes `blob_col[o][gather_index[i]] == raw_row[o][i]` for every `i`. For an activation `x_hf`
+  and its gather `x_ggml[i] = x_hf[gather_index[i]]`: `dot(raw_row[o], x_ggml) = sum_i raw_row[o][i] *
+  x_hf[gather_index[i]] = sum_i blob_col[o][gather_index[i]] * x_hf[gather_index[i]]`, and because
+  `i -> gather_index[i]` is a bijection over the V block, re-indexing by `j = gather_index[i]` gives
+  `sum_j blob_col[o][j] * x_hf[j] = dot(blob_col[o], x_hf)` exactly. QED, and checked twice more: unit
+  tests cross-check both `gdn_row_permutation` and `gdn_out_gather_index` against `transplant::
+  ungroup_v_heads` itself (not against their own formulas) on a synthetic `num_k_heads=2, num_v_heads=4`
+  fixture (`tests/backbone_quant_tests.cpp`, two new cases), and the real-artifact gate below re-derives
+  the SAME proof numerically against real Q6_K bytes.
+
+**Real-artifact gates (AGENTS.md S9), 4-layer sub-stack (`sub0llm-transplant-q`, real
+`Qwen3.8-Flash-Next-GGUF/UD-IQ1_S` shards):**
+
+| Check | Result |
+|---|---:|
+| WP4e expert-plane sample check | 96/96, 0 mismatches |
+| Phase 2b-1 round-trip vs the real shard (permutation-aware for the 2 row-copy roles) | 45/45, 0 mismatches |
+| Phase 2b-1 sample cross-check vs the .bin blob | 36/36, 0 mismatches |
+| **GDN in-proj FULL-ROW cross-check vs the .bin blob** (layer 0, every row, not a sample) | **41,943,040/41,943,040, 0 mismatches** |
+| **GdnOutProj gather-direction proof** (layer 0, dot vs random x, absolute tolerance = 8% of the RMS dot-product scale across all 2560 outputs -- a per-output RELATIVE tolerance first flagged 81/2560 near-zero-magnitude false positives, fixed by moving to a global-scale tolerance) | **2560/2560, 0 mismatches** |
+
+Same gates, **48-layer full model** (`sub0llm-transplant-q48`, 167.7s): reconciliation 1074/1074, level-2
+stats 1073/1073, round-trip/cross-check/full-row/gather-direction all 0 mismatches at their own counts.
+Sidecar: **496 tensors included** (up from phase 2b-1's 388), Q8_0 242 / Q4_K 2 / Q5_K 212 (up from 142)
+/ Q6_K 40 (up from 2) -- the +108 is exactly 36 GDN layers x 3 recovered roles. **3.261 GiB native**
+against the same tensors' **8.972 GiB bf16 cost (2.75x)** -- matching §13c's own "4-format subtotal"
+prediction (3.262 GiB) almost exactly: this pass recovers essentially the FULL native-quant potential
+§13b's conservative VPerm exclusion had given up.
+
+**Backward compatibility (AGENTS.md S3), tested against a REAL pre-existing file, not reasoned about**:
+loaded phase 2b-2a's own original sidecar (388 roles, no GDN, written before this pass existed) with
+THIS pass's code. It opens cleanly (`kRoleCount` grew but the pre-existing role ordinals 0-14 are
+unchanged) and, run through the same opt-in decode path, reproduces phase 2b-2a's own recorded number
+**exactly**: L2-relative 0.162039, argmax 5/6 -- the missing GDN roles simply resolve to `nullptr` and
+fall back to the blob, precisely as designed.
+
+**Artifact placement.** `D:\ModelWeights\Sub0Llm-Qwen4-full48-bf16\qwen4_full48_q_bf16.bin` (the perf
+harness's own artifact) was hashed (SHA-256) against a fresh independent 48-layer transplant and found
+BYTE-IDENTICAL (`a2ceb97699d9072d3a6a1869644d0be5d0dc7243a09785e4400d7a6443af06a2`). Per this package's own
+brief, the new `.bbq`/`.bbq.pair` (496 roles) were written BESIDE that `.bin` --
+`qwen4_full48_q_bf16.bin.bbq` (3,501,777,920 bytes) and `.bbq.pair` -- rather than into a new
+`D:\ModelWeights\...` directory. No prior `.bbq` existed at that path (Codex's own phase 2b-2a pairing
+lived only in a separate agent worktree, `out/full48/`, untouched by this pass). 158+ GiB free on `D:`
+before and after.
+
+### 16b. Phase B — wiring the two GDN roles into decode, and closing the Gsum16 TODO
+
+**One seam, extended, not replaced (AGENTS.md S10).** `gdn::forward<UseSimd, Threads, WP>()`
+(`include/sub0/gdn_math.hpp`) gained ONE defaulted trailing parameter, `const gdn::Native* native =
+nullptr`. Every EXISTING call site -- `op_gdn`'s batched training/inference forward
+(`src/backends/cpu/backend.cpp`), `gdn_qwen4_fixture_tests.cpp`'s own gradient-check fixture, the CUDA
+CPU-reference call -- passes no `Native` at all and is therefore untouched (confirmed: the default-off
+engine suite's fingerprint hash is bit-identical before and after, see 16c). `gdn::Native` bundles:
+
+- `in_qkv`/`in_z` (`bbq::Desc*` + raw span) and ONE shared, caller-owned `bbqd::ActBlocks* x_q`
+  (D_MODEL-wide) -- quantized ONCE per (token, layer), feeding BOTH projections (AGENTS.md's own "one
+  distinct activation vector, one quantize call" discipline, matching B35's precedent).
+- `out` (`bbq::Desc*` + raw span), a separate `bbqd::ActBlocks* gated_q` (GDN_VALUE_DIM-wide), the
+  `out_gather_idx`/`out_gather_buf` pair (built once, applied every token: `gather_buf[i] =
+  gated[out_gather_idx[i]]` before quantizing), and `out_gsum16` (next section).
+
+**Only trusted at T==1** (a native GEMV is a single-row DOT, decode's own shape, not training's
+multi-position one) -- `forward()` re-checks `T == 1` itself, so a hypothetical T>1 caller that set
+`native` anyway is defended against rather than trusted. **Geometry re-validated inside `forward()`**
+(`in_f`/`out_f` against `hs`/`conv_dim`/`value_dim`), not merely assumed from the caller's own lookup --
+a mismatch falls back to the ordinary `gemv::axpy` path for exactly that pair, silently and correctly,
+never a partial/undefined computation.
+
+**`src/backends/cpu/decode.cpp`** owns the scratch, sized/derived once at `kv_reset()` (mirroring phase
+2b-2a's own `g_backbone_head_act_q` precedent exactly): `g_gdn_in_act_q`, `g_gdn_out_act_q`,
+`g_gdn_out_gather_idx` (filled once per generation via `bbq::gdn_out_gather_index`), `g_gdn_out_gather_buf`,
+`g_gdn_out_gsum16`. Inside `forward_one`'s existing GDN branch, a per-layer `gdn::Native` is populated
+from `g_backbone_quant.find(Role, l)` lookups (`if constexpr (BACKBONE_QUANT_DOT)`, the existing
+configure-time gate) and passed to `gdn::forward` -- a role absent at this layer leaves that half of
+`Native` null, and `gdn::forward`'s own `in_ready()`/`out_ready()` gate falls back cleanly.
+
+**Closing the `Gsum16` `TODO(phase 2b)` (`docs/BACKBONE_NATIVE_QUANT.md` S12i, AGENTS.md S1).** This
+pass's GDN out-proj call is `bbqd::gemv_plane`'s FIRST real per-token caller of the Q6_K streaming path
+that used `Gsum16` -- so the pre-existing "heap-allocates per call, and per THREAD" defect was no longer
+hypothetical. Fixed two ways at once:
+1. `Gsum16` moved from the AVX2-only `bbqd::detail` namespace to public `bbqd` scope (its `build()` has
+   no real AVX2 dependency -- `detail::sum_n_portable` is the portable scalar summer it calls, gated by
+   `SUB0_BBQD_AVX2` only for file locality) so it is nameable as caller-owned scratch at all.
+2. `gemv_plane<Threads>` gained an optional trailing `Gsum16* gsum16 = nullptr`. When supplied, it is
+   built EXACTLY ONCE, serially, inside `gemv_plane<Threads>` itself, BEFORE any thread starts -- never
+   per row, never per thread -- and every thread below only READS it (safe: `build()` already finished
+   before the parallel region opens). `build()`'s own `v.assign(...)` only reallocates on a real width
+   change, the same contract `ActBlocks::quantize` already has, so a caller owning one `Gsum16` per
+   (thread, role) across a whole generation pays its heap cost once, not every token. `nullptr` (every
+   pre-existing caller -- tests, the microbenchmark) preserves the exact prior behavior.
+
+New test (`tests/backbone_quant_dot_tests.cpp`): the caller-owned-`gsum16` path must reproduce the
+default (no-hint) result EXACTLY, at 1 and 4 threads, and the SAME `Gsum16` instance must survive being
+reused across a widened-then-narrowed activation width with no stale-data leak (2560 -> 6144 -> 2560
+elements) -- all pass.
+
+**Deliberately NOT wired this pass, named rather than silently deferred:** Gated Residual up/down
+(Q8_0), QSA q|gate/k/v/o, MoE shared-expert gate/up/down (Q5_K/Q8_0/the layer-2 Q6_K outlier). These
+roles ARE already in the sidecar (phase 2b-1 carried them) but have no `if constexpr (BACKBONE_QUANT_DOT)`
+consumer yet -- the same "role present, not yet wired" gap phase 2b-2a left for TokEmb/LmHead's own
+siblings, now narrowed from "386 roles" to "roughly half the sidecar's tensor count" by this pass, not
+closed. `bbqd::ActSuper` (§14's per-256 activation) was likewise not adopted for the new roles -- its own
+increased activation error has no end-to-end measurement yet, per this task's own scoping instruction.
+
+### 16c. Phase C — gates, all numbers
+
+**Default-off (§4), `out/build/native`, neutral d196 L11 H7 seq256 config (`sub0llm-configure --corpus
+data/gsm8k.txt --dmodel 196 --layers 11 --heads 7 --seq 256`, vocab 2259 real GSM8K-derived, not a toy
+vocabulary per AGENTS.md S7):**
+
+| Suite | Assertions / cases | vs. recorded baseline |
+|---|---:|---|
+| `sub0_tests` | **29,510,661 / 147** | EXACT match; decode fingerprint hash `d1625d19ed2258f1` bit-identical to the historically recorded value |
+| `sub0_frontend_tests` | **149,177 / 288** | baseline 148,922/285 + 255 assertions / 3 cases -- 2 new GDN-permutation/gather-direction proof cases, 1 new caller-owned-`gsum16` case, and 6 assertions from PRE-EXISTING role-enumerating cases (`bbq: every role has a name...`, `role_pattern reads from transplant::recipe_for...`) automatically covering the 3 new `Role` enumerators -- accounted for exactly, nothing unexplained |
+| Real 4- and 48-layer artifact, default-off `forward`/`forward_one` | L2-relative **0**, argmax **6/6** | exact, both scales |
+
+**Quality, opt-in, real 48-layer artifact** (`REAL_AXES` + `--backbone-quant-dot 1`, the paired sidecar
+above; `sub0llm-qwen4-forward --tokens 6`):
+
+- `forward()` (batched): row-by-row mean/rms/min/max/argmax **byte-identical** to the default-off run --
+  `gdn::Native` is only ever constructed inside `forward_one`, so the batched path is provably unaffected
+  (confirmed by direct comparison of the printed per-row stats, not merely argued from the code).
+- `forward()` vs `forward_one()` (decode), opt-in: **L2-relative 0.24556, argmax 5/6.** This combines
+  phase 2b-2a's own TokEmb/LmHead native path (its own isolated number: 0.162039) with this pass's three
+  GDN roles across all 36 real GDN layers -- a real, compounded quality cost, larger than either
+  precedent alone, in the same band as the FP8 backbone precedent (~0.43, "not recommended") without
+  reaching it.
+- **"Opt-in decode logits against default-off decode logits" (isolates what the native backbone costs,
+  this package's own brief) is the SAME number by transitivity**, not a separate measurement: default-off
+  `forward()` == default-off `forward_one()` exactly (L2 0 above), and opt-in `forward()` is unaffected
+  (previous bullet) -- so opt-in `forward_one()` vs default-off `forward_one()` equals opt-in
+  `forward_one()` vs opt-in `forward()`, which is the 0.24556/5-6 already measured.
+- **Backward-compatibility re-run** (16a): the OLD 388-role sidecar reproduces phase 2b-2a's own
+  0.162039/5-6 exactly under this pass's code -- the ONE piece of evidence that isolates "did adding the
+  GDN roles change anything about the ALREADY-wired TokEmb/LmHead path" (answer: no).
+
+**Throughput -- REDUCED protocol, reported plainly rather than dressed up as the full gate.**
+`docs/OPTIMIZATION_PROCESS.md` asks for >= 3-4 interleaved rounds, order-reversed on even rounds, a
+discarded cold first round, and a `--profile-phases` build for the per-phase table. Given this package's
+own remaining time budget, what was actually run is 2 rounds per arm, order-reversed, tokens=6, real
+48-layer artifact, recommended flags (`--decode-gemv-threads 8 --moe-decode-threads 10
+--decode-omp-spin 1`), no `--profile-phases` build, no cold-run discard. Contention check at the time:
+0 named competing processes, background CPU load ~5.8% (`Get-Counter`, 5 samples/2s) -- marginally ABOVE
+the project's own 5% gate, so this number carries that caveat explicitly rather than being presented as
+clean.
+
+*Before* the `Gsum16` fix (16b), 3 rounds, tokens=3:
+
+| Arm | Runs (s/token) | Median |
+|---|---|---:|
+| default | 1.128, 0.994, 1.054 | 1.054 |
+| opt-in | 1.233, 1.044, 0.969 | 1.044 |
+
+Flat / mixed direction -- opt-in was SLOWER in round 1 (the per-token `Gsum16` heap allocation eating
+into the kernel's own win), about even by round 3. This is reported as the honest first-pass number, not
+softened.
+
+*After* the `Gsum16` fix, 2 rounds, tokens=6:
+
+| Arm | Runs (s/token) | Median |
+|---|---|---:|
+| default | 1.069, 0.971 | 1.020 |
+| opt-in | 0.953, 0.966 | 0.960 |
+
+Opt-in faster in BOTH rounds this time (10.9% and 0.5%), median ~5.9% faster. Consistent with the fix
+removing a genuine per-token heap allocation from the GDN out-proj hot path, but this is 2 rounds against
+a policy minimum of 3-4, at a background-load reading just over the gate -- **directionally positive, not
+a clean KPI-gate pass.** A full `scripts/run_perf_suite.py --stage perf --arm ... --runs 4
+--profile-phases` run on a verified-idle host is the next, real step before citing a throughput number.
+
+### 16d. cpp-review findings and fixes
+
+Self-reviewed against AGENTS.md's own sections (the `cpp-review` skill's own reference set is written for
+a different, Unity-style codebase and does not apply directly here; its general discipline -- no heap
+allocation on a hot path, minimal/complete public surface, single source of truth, reinvention check --
+was applied by hand):
+
+- **Found and fixed (equivalent to a MUST): the `Gsum16` `TODO(phase 2b)` (AGENTS.md S1).** See 16b.
+  This is the one finding this pass would have shipped un-caught had the review pass been skipped --
+  exactly the failure mode AGENTS.md S12 exists to catch (a real per-token heap allocation, invisible to
+  both the correctness gates and the informal first throughput pass, which is why the first A/B above
+  came back flat).
+- **SHOULD, accepted as-is:** the two new tool-side verification blocks in `tools/sub0llm-transplant.cpp`
+  (full-row cross-check, gather-direction proof) do not reuse the existing sampled `CrossCheck` struct --
+  deliberate, since the task's own brief requires "every row... not a sample" for exactly these two
+  checks, which a 3x3-sample loop cannot express.
+- **SHOULD, accepted as-is:** `gdn::Native::in_ready()`/`out_ready()` check pointer non-nullness only,
+  not geometry -- deliberate, since `gdn::forward()` itself is the single place geometry is re-validated
+  (AGENTS.md S10's "one seam, not ten"); duplicating the check at the decode.cpp call site would be a
+  second source of truth that could drift.
+- **Nothing else raised.** No reinvented utility, no new heap allocation left in a per-token/per-call
+  path, no ownership ambiguity (every new pointer in `gdn::Native` is non-owning, caller-retained
+  scratch), no module-boundary or dependency-cycle concern (`gdn_math.hpp` including `backbone_quant.hpp`
+  is a new edge but both are already engine-free headers at the same layer).
+
+### 16e. What is still unproven, stated plainly
+
+- **The throughput number is directionally positive, not conclusively gated** -- 2 rounds against a
+  policy minimum of 3-4, background load marginally over the contention threshold, no `--profile-phases`
+  breakdown. The NEXT session should re-run the full protocol on a verified-idle host before this number
+  is cited as a KPI-gate pass.
+- **QSA/GR/MoE-shared-expert wiring is not started.** The sidecar already carries their bytes (phase
+  2b-1); only the `gdn::forward`-equivalent consumer wiring for those math headers (`qsa_math.hpp`,
+  `gated_residual_math.hpp`, the MoE shared-expert path in `moe_math.hpp`) remains.
+  - **Reason for the tight scope**, since this matters for anyone picking the thread back up: each of
+    those roles has real per-role complexity of its own this pass did not have budget to design AND
+    verify against real data in the same session -- QSA's `attn_q.weight` needs the `PerHeadHalf`
+    row-selection formula applied post-GEMV (never pre-split in the sidecar, per phase 2b-1's own
+    decision), and the MoE shared-expert path shares scratch with the ALREADY-live `MOE_QUANT_DOT`
+    routed-expert fused-dot machinery in `moe_math.hpp`, which needs its own consumer-enumeration pass
+    (AGENTS.md S10) before extending.
+- **Peak working set was not re-measured for this pass** -- the bf16 blob stays fully resident (phase
+  2b-2a's own scoping, unchanged here), so no resident-memory reduction is claimed or expected yet.
+- **`ActSuper` (per-256 activation) was not evaluated for the new roles**, per this task's own explicit
+  scoping instruction (evaluate only after the per-32 wiring is proven).

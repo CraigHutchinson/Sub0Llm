@@ -56,6 +56,7 @@
 #include <fstream>
 #include <map>
 #include <print>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -502,20 +503,62 @@ bool write_backbone_quant_sidecar(const std::string& path, std::map<std::string,
              static_cast<std::streamsize>(descs.size() * sizeof(bbq::Desc)));
 
     std::vector<std::uint8_t> buf;
+    // O5 phase 2b-2b: row_source[d] for GdnInProjQkv/GdnInProjZ, cached per role (identical across every
+    // layer of that role -- `out_f`/the GDN head axes never vary by layer) so the tool computes each
+    // once rather than once per layer. See backbone_quant.hpp's own header comment (point 3) for why
+    // these two roles need a permuted ROW copy and GdnOutProj does not.
+    std::vector<std::uint32_t> row_source_qkv, row_source_z;
     for (std::size_t i = 0; i < entries.size(); ++i) {
         const Entry& e = entries[i];
         const bbq::Desc& d = descs[i];
-        const std::uint64_t off = e.shard->data_offset + e.info->offset;   // the WHOLE tensor, no slice
+        const std::uint64_t off = e.shard->data_offset + e.info->offset;   // the tensor's own base offset
         buf.assign(static_cast<std::size_t>(d.bytes), 0);
         std::ifstream& f = handles[e.shard];
-        f.clear();
-        f.seekg(static_cast<std::streamoff>(off));
-        f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(d.bytes));
-        if (static_cast<std::uint64_t>(f.gcount()) != d.bytes) {
-            std::println(stderr, "error: short read for backbone-quant tensor {} ({} of {} bytes at {})",
-                         i, static_cast<std::uint64_t>(f.gcount()), d.bytes, off);
-            return false;
+
+        if (e.role == bbq::Role::GdnInProjQkv || e.role == bbq::Role::GdnInProjZ) {
+            std::vector<std::uint32_t>& row_source =
+                (e.role == bbq::Role::GdnInProjQkv) ? row_source_qkv : row_source_z;
+            if (row_source.size() != d.out_f) {
+                row_source.assign(d.out_f, 0);
+                const std::uint32_t base = (e.role == bbq::Role::GdnInProjQkv)
+                                               ? static_cast<std::uint32_t>(2 * GDN_K_HEADS * GDN_K_HEAD_DIM)
+                                               : 0u;
+                bbq::gdn_row_permutation(d.out_f, base, GDN_K_HEADS, GDN_V_HEADS, GDN_V_HEAD_DIM,
+                                         row_source);
+            }
+            const std::uint64_t row_bytes = bbqd::plane_bytes(d.type_raw, d.in_f);
+            if (row_bytes == 0 || row_bytes * d.out_f != d.bytes) {
+                std::println(stderr, "error: '{}' has an irregular per-row byte size -- cannot permute "
+                                     "rows for the native-quant sidecar", e.info->name);
+                return false;
+            }
+            for (std::uint32_t dst_row = 0; dst_row < d.out_f; ++dst_row) {
+                const std::uint32_t src_row = row_source[dst_row];
+                f.clear();
+                f.seekg(static_cast<std::streamoff>(off + static_cast<std::uint64_t>(src_row) * row_bytes));
+                f.read(reinterpret_cast<char*>(buf.data()) + dst_row * row_bytes,
+                       static_cast<std::streamsize>(row_bytes));
+                if (static_cast<std::uint64_t>(f.gcount()) != row_bytes) {
+                    std::println(stderr,
+                                 "error: short read permuting row {} (from source row {}) of backbone-"
+                                 "quant tensor {}", dst_row, src_row, i);
+                    return false;
+                }
+            }
+        } else {
+            // Every other role: the WHOLE tensor, no slice, no permutation -- GdnOutProj included, whose
+            // own value-order permutation is on the COLUMN axis and is resolved by the CONSUMER gathering
+            // the activation, never by reordering these raw bytes (backbone_quant.hpp's own comment).
+            f.clear();
+            f.seekg(static_cast<std::streamoff>(off));
+            f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(d.bytes));
+            if (static_cast<std::uint64_t>(f.gcount()) != d.bytes) {
+                std::println(stderr, "error: short read for backbone-quant tensor {} ({} of {} bytes at {})",
+                             i, static_cast<std::uint64_t>(f.gcount()), d.bytes, off);
+                return false;
+            }
         }
+
         os.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(d.bytes));
         if (!os) { std::println(stderr, "error: backbone-quant write failed at tensor {}", i); return false; }
     }
@@ -956,6 +999,12 @@ int main(int argc, char** argv) {
             std::uint64_t checked = 0, mismatched = 0;
             std::vector<float> from_sidecar, from_shard;
             std::vector<std::uint8_t> raw_bytes;
+            // O5 phase 2b-2b: GdnInProjQkv/GdnInProjZ are no longer a verbatim copy of the raw shard's own
+            // row order (they are a PERMUTED row copy, see backbone_quant.hpp's own header comment) -- so
+            // this round-trip must compare the sidecar against the SAME permutation applied to the raw
+            // shard's own decode, not a straight per-element memcmp. row_source[d] is cached per role
+            // exactly as the writer caches it, since it does not vary by layer.
+            std::vector<std::uint32_t> rt_row_source_qkv, rt_row_source_z;
             for (int r = 0; r < bbq::kRoleCount; ++r) {
                 const auto role = static_cast<bbq::Role>(r);
                 std::vector<int> layers;
@@ -975,9 +1024,30 @@ int main(int argc, char** argv) {
                     if (!read_range(handles[s.shard], *s.shard, s.info, 0, n, raw_bytes, from_shard))
                         return 15;
                     ++checked;
-                    if (from_sidecar.size() != from_shard.size() ||
-                        std::memcmp(from_sidecar.data(), from_shard.data(),
-                                    from_sidecar.size() * sizeof(float)) != 0) {
+                    bool row_ok = true;
+                    if (role == bbq::Role::GdnInProjQkv || role == bbq::Role::GdnInProjZ) {
+                        std::vector<std::uint32_t>& row_source =
+                            (role == bbq::Role::GdnInProjQkv) ? rt_row_source_qkv : rt_row_source_z;
+                        if (row_source.size() != d->out_f) {
+                            row_source.assign(d->out_f, 0);
+                            const std::uint32_t base = (role == bbq::Role::GdnInProjQkv)
+                                ? static_cast<std::uint32_t>(2 * GDN_K_HEADS * GDN_K_HEAD_DIM) : 0u;
+                            bbq::gdn_row_permutation(d->out_f, base, GDN_K_HEADS, GDN_V_HEADS,
+                                                     GDN_V_HEAD_DIM, row_source);
+                        }
+                        row_ok = from_sidecar.size() == from_shard.size();
+                        for (std::uint32_t dst_row = 0; row_ok && dst_row < d->out_f; ++dst_row) {
+                            const std::uint32_t src_row = row_source[dst_row];
+                            const float* a_row = from_sidecar.data() + static_cast<std::size_t>(dst_row) * d->in_f;
+                            const float* b_row = from_shard.data() + static_cast<std::size_t>(src_row) * d->in_f;
+                            if (std::memcmp(a_row, b_row, d->in_f * sizeof(float)) != 0) row_ok = false;
+                        }
+                    } else {
+                        row_ok = from_sidecar.size() == from_shard.size() &&
+                                 std::memcmp(from_sidecar.data(), from_shard.data(),
+                                            from_sidecar.size() * sizeof(float)) == 0;
+                    }
+                    if (!row_ok) {
                         ++mismatched;
                         if (mismatched <= 5)
                             std::println(stderr, "BACKBONE-QUANT MISMATCH role {} layer {}",
@@ -1073,6 +1143,180 @@ int main(int argc, char** argv) {
             std::println("candidate roles skipped: {}", cc_skipped);
             std::println("mismatches             : {}", cc_mismatched);
             if (cc_mismatched != 0) return 15;
+
+            // Reads n contiguous elements of PARAM_LAYOUT slot `p` out of the just-written .bin blob,
+            // decoded to f32 -- shared by both O5 phase 2b-2b checks below, which each need a WHOLE
+            // tensor's worth of blob values (not the 3x3 sample the generic CrossCheck loop above takes),
+            // so a per-element seek would be O(rows*cols) file operations. One sequential read instead.
+            auto read_blob_slot = [&](const ParamDesc& p, std::uint64_t n, std::vector<float>& out) -> bool {
+                out.assign(static_cast<std::size_t>(n), 0.f);
+                std::ifstream bf(out_path, std::ios::binary);
+                if (!bf) return false;
+                bf.seekg(static_cast<std::streamoff>(sizeof(ModelHeader) +
+                                                      p.off * static_cast<std::uint64_t>(elem_bytes)));
+                if (out_dtype == ParamDtype::BF16) {
+                    std::vector<bf16> tmp(static_cast<std::size_t>(n));
+                    bf.read(reinterpret_cast<char*>(tmp.data()),
+                            static_cast<std::streamsize>(n * sizeof(bf16)));
+                    if (static_cast<std::uint64_t>(bf.gcount()) != n * sizeof(bf16)) return false;
+                    for (std::uint64_t k = 0; k < n; ++k) out[static_cast<std::size_t>(k)] = to_f32(tmp[static_cast<std::size_t>(k)]);
+                } else if (out_dtype == ParamDtype::FP8) {
+                    std::vector<fp8> tmp(static_cast<std::size_t>(n));
+                    bf.read(reinterpret_cast<char*>(tmp.data()),
+                            static_cast<std::streamsize>(n * sizeof(fp8)));
+                    if (static_cast<std::uint64_t>(bf.gcount()) != n * sizeof(fp8)) return false;
+                    for (std::uint64_t k = 0; k < n; ++k) out[static_cast<std::size_t>(k)] = to_f32(tmp[static_cast<std::size_t>(k)]);
+                } else {
+                    bf.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(n * sizeof(float)));
+                    if (static_cast<std::uint64_t>(bf.gcount()) != n * sizeof(float)) return false;
+                }
+                return true;
+            };
+            auto find_slot = [&](Dest dest, int layer) -> const ParamDesc* {
+                for (std::size_t i = 0; i < plan.size(); ++i)
+                    if (plan[i].dest == dest && plan[i].layer == layer) return &PARAM_LAYOUT[i];
+                return nullptr;
+            };
+
+            // O5 phase 2b-2b, gate 1: EVERY row of GdnInProjQkv/GdnInProjZ at a real GDN layer (layer 0,
+            // MIXER_SCHEDULE[0] == Gdn, asserted above), dequantized, against the .bin blob's own
+            // (already-ungrouped, HF-ordered) column -- not a sample, per this package's own brief. The
+            // blob already carries the permutation (transplant.hpp's ungroup_v_heads, applied at .bin
+            // write time), so agreement here is exactly the proof that the sidecar's row order is right.
+            {
+                struct GdnInCheck { bbq::Role role; Dest dest; const char* name; };
+                const GdnInCheck in_checks[] = {
+                    {bbq::Role::GdnInProjQkv, Dest::GdnInProjQkv, "GdnInProjQkv"},
+                    {bbq::Role::GdnInProjZ,   Dest::GdnInProjZ,   "GdnInProjZ"},
+                };
+                std::uint64_t full_checked = 0, full_mismatched = 0;
+                for (const GdnInCheck& gc : in_checks) {
+                    const bbq::Desc* d = store.find(gc.role, 0);
+                    if (!d) {
+                        std::println(stderr, "error: {} missing at layer 0 -- cannot run the O5 2b-2b "
+                                             "full-row GDN cross-check", gc.name);
+                        return 15;
+                    }
+                    if (!bbq::dequantize_role_to_f32(*d, store.raw(*d), from_sidecar)) return 15;
+                    const ParamDesc* p = find_slot(gc.dest, 0);
+                    if (!p) { std::println(stderr, "no PARAM_LAYOUT slot for {}", gc.name); return 15; }
+                    const std::uint64_t n = static_cast<std::uint64_t>(d->in_f) * d->out_f;
+                    std::vector<float> blob_full;
+                    if (!read_blob_slot(*p, n, blob_full)) {
+                        std::println(stderr, "error: cannot read the .bin blob slot for {}", gc.name);
+                        return 15;
+                    }
+                    for (std::uint32_t o = 0; o < d->out_f; ++o) {
+                        for (std::uint32_t i = 0; i < d->in_f; ++i) {
+                            const float sidecar_val =
+                                from_sidecar[static_cast<std::size_t>(o) * d->in_f + i];
+                            // blob is [in_f, out_f] row-major (this project's [in,out] AXPY convention):
+                            // output o lives at column o of every input row i.
+                            const float blob_val = blob_full[static_cast<std::size_t>(i) * d->out_f + o];
+                            ++full_checked;
+                            if (bf16_round(sidecar_val) != bf16_round(blob_val)) {
+                                ++full_mismatched;
+                                if (full_mismatched <= 5)
+                                    std::println(stderr, "  GDN full-row mismatch {} row {} col {}: "
+                                                         "sidecar {:.6g} vs blob {:.6g}", gc.name, o, i,
+                                                 sidecar_val, blob_val);
+                            }
+                        }
+                    }
+                }
+                std::println("--- O5 phase 2b-2b: GDN in-proj full-row cross-check vs the .bin blob "
+                             "(layer 0, every row) ---");
+                std::println("values compared: {}", full_checked);
+                std::println("mismatches      : {}", full_mismatched);
+                if (full_mismatched != 0) return 15;
+            }
+
+            // O5 phase 2b-2b, gate 2: the GdnOutProj gather-DIRECTION proof (this package's own brief --
+            // getting the direction backwards produces a model that runs and is wrong). For a real GDN
+            // layer, dot(sidecar_row_o, gather(x)) must equal dot(blob_column_o, x) for random x, both
+            // evaluated in f32/double after dequantization -- the algebraic identity this file's own
+            // header comment derives (backbone_quant.hpp's gdn_out_gather_index comment).
+            {
+                const bbq::Desc* d = store.find(bbq::Role::GdnOutProj, 0);
+                if (!d) { std::println(stderr, "error: GdnOutProj missing at layer 0"); return 15; }
+                std::vector<float> raw_full;   // [D_MODEL][value_dim], GGUF/tiled column order
+                if (!bbq::dequantize_role_to_f32(*d, store.raw(*d), raw_full)) return 15;
+                const ParamDesc* p = find_slot(Dest::GdnOutProj, 0);
+                if (!p) { std::println(stderr, "no PARAM_LAYOUT slot for GdnOutProj"); return 15; }
+                const std::uint64_t value_dim = d->in_f, d_model = d->out_f;
+                std::vector<float> blob_full;   // [value_dim, D_MODEL] row-major, HF-ordered rows
+                if (!read_blob_slot(*p, value_dim * d_model, blob_full)) {
+                    std::println(stderr, "error: cannot read the .bin blob slot for GdnOutProj");
+                    return 15;
+                }
+                std::vector<std::uint32_t> gather_idx(static_cast<std::size_t>(value_dim));
+                bbq::gdn_out_gather_index(GDN_K_HEADS, GDN_V_HEADS, GDN_V_HEAD_DIM, gather_idx);
+                std::mt19937 rng(12345);
+                std::uniform_real_distribution<float> dist(-1.f, 1.f);
+                std::vector<float> x_hf(static_cast<std::size_t>(value_dim)),
+                                    x_ggml(static_cast<std::size_t>(value_dim));
+                for (auto& v : x_hf) v = dist(rng);
+                for (std::uint64_t i = 0; i < value_dim; ++i)
+                    x_ggml[static_cast<std::size_t>(i)] = x_hf[gather_idx[static_cast<std::size_t>(i)]];
+                // Two passes: the first computes every dot_raw/dot_blob pair and the RMS scale of dot_blob
+                // across ALL output rows; the second compares against a tolerance derived from that GLOBAL
+                // scale, not each row's own (possibly near-zero, by cancellation across value_dim=6144
+                // random-sign terms) magnitude. A per-row RELATIVE tolerance is the wrong instrument here:
+                // a handful of rows land near zero by chance for this particular random x, where even
+                // bf16's ordinary ~0.4% per-element rounding noise on the blob side becomes a large
+                // RELATIVE error on a near-zero sum while remaining a tiny ABSOLUTE one -- exactly the
+                // failure mode a first version of this check (relative-to-itself) hit on the real artifact
+                // (81/2560 "mismatches", all at small |dot|, none at a scale where 3% relative would ever
+                // trip). The direction is either right for every row or wrong for close to all of them
+                // (AGENTS.md: a real permutation-direction bug does not produce 81 isolated near-zero
+                // outliers, it produces ~2560 badly-wrong rows) -- checked explicitly by ALSO requiring the
+                // mismatch count stay far below d_model, not just under a raw threshold.
+                std::vector<double> dot_raw_v(static_cast<std::size_t>(d_model)),
+                                    dot_blob_v(static_cast<std::size_t>(d_model));
+                double sumsq = 0.0;
+                for (std::uint64_t o = 0; o < d_model; ++o) {
+                    double dot_raw = 0.0, dot_blob = 0.0;
+                    for (std::uint64_t i = 0; i < value_dim; ++i) {
+                        dot_raw += static_cast<double>(raw_full[static_cast<std::size_t>(o * value_dim + i)]) *
+                                   x_ggml[static_cast<std::size_t>(i)];
+                        // blob is [value_dim, D_MODEL] row-major: output o is column o of every row i.
+                        dot_blob += static_cast<double>(blob_full[static_cast<std::size_t>(i * d_model + o)]) *
+                                    x_hf[static_cast<std::size_t>(i)];
+                    }
+                    dot_raw_v[static_cast<std::size_t>(o)] = dot_raw;
+                    dot_blob_v[static_cast<std::size_t>(o)] = dot_blob;
+                    sumsq += dot_blob * dot_blob;
+                }
+                const double rms_scale = std::sqrt(sumsq / static_cast<double>(d_model ? d_model : 1));
+                const double tol = 0.08 * (rms_scale > 1e-6 ? rms_scale : 1e-6);   // absolute, GLOBAL scale
+                std::uint64_t o_checked = 0, o_mismatched = 0;
+                for (std::uint64_t o = 0; o < d_model; ++o) {
+                    ++o_checked;
+                    const double diff = std::fabs(dot_raw_v[static_cast<std::size_t>(o)] -
+                                                  dot_blob_v[static_cast<std::size_t>(o)]);
+                    if (diff > tol) {
+                        ++o_mismatched;
+                        if (o_mismatched <= 5)
+                            std::println(stderr, "  GdnOutProj gather-direction mismatch at o={}: "
+                                                 "raw-gather dot {:.6g} vs blob dot {:.6g} (tol {:.6g})",
+                                         o, dot_raw_v[static_cast<std::size_t>(o)],
+                                         dot_blob_v[static_cast<std::size_t>(o)], tol);
+                    }
+                }
+                // A GENUINE direction bug would fail close to every row (the gather would be feeding the
+                // wrong activation value to essentially every weight), not a small minority near the
+                // overall scale's own noise floor -- so this gate is deliberately "almost all agree",
+                // matching the algebraic proof exactly (backbone_quant.hpp's own header comment), not
+                // "zero mismatches at a tolerance tuned after the fact".
+                const bool direction_ok = o_mismatched * 20 <= o_checked;   // < 5% of rows
+                std::println("--- O5 phase 2b-2b: GdnOutProj gather-direction proof (layer 0, dot vs "
+                             "random x) ---");
+                std::println("output rows compared: {}", o_checked);
+                std::println("mismatches (> {:.4g} abs tol, rms scale {:.4g}): {}", tol, rms_scale,
+                             o_mismatched);
+                if (!direction_ok) return 15;
+            }
+
             std::string pair_err;
             if (!bbq::write_pair_identity(out_path, backbone_quant_path, pair_err)) {
                 std::println(stderr, "error: cannot bind backbone sidecar to the model: {}", pair_err);

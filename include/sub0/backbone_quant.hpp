@@ -54,15 +54,21 @@
 //          bytes: reassembling a valid, differently-ordered block stream would need real re-blocking
 //          (recomputing which elements fall in which sub-block), not a byte copy -- exactly the
 //          "must be handled explicitly, or stay bf16" fork this phase's brief names.
-//      Rather than build two different code paths (a row-copy permutation for two roles, a re-blocking
-//      permutation for the third) with no live kernel consumer yet to validate either against, this phase
-//      makes ONE decision for all three, deliberately conservative: EXCLUDE every VPerm-affected role from
-//      the sidecar. They stay in the existing bf16 blob. This gives up part of the Q5_K byte win (the GDN
-//      in-proj share of it) and almost all of Q6_K's INTENDED role coverage (`GdnOutProj` is Q6_K's only
-//      NAMED consumer in this table) -- a real, quantified cost, reported by the writer/tool rather than
-//      glossed over (see the tool's own totals output and docs/BACKBONE_NATIVE_QUANT.md's S9 resolution
-//      section for the measured bytes). Revisiting the row-copy option for the two `Cols`-axis roles is a
-//      named, scoped future increment, not attempted here -- see that same doc section.
+//      Phase 2b-1 made ONE decision for all three, deliberately conservative: EXCLUDE every VPerm-affected
+//      role from the sidecar. They stayed in the existing bf16 blob. That gave up part of the Q5_K byte
+//      win (the GDN in-proj share of it) and almost all of Q6_K's INTENDED role coverage (`GdnOutProj` is
+//      Q6_K's only NAMED consumer in this table) -- a real, quantified cost, reported by the writer/tool
+//      rather than glossed over (see docs/BACKBONE_NATIVE_QUANT.md's S13 resolution section).
+//
+//      **O5 phase 2b-2b (docs/BACKBONE_NATIVE_QUANT.md S16) RECOVERS all three, exactly along the two
+//      lines named above, once a real kernel consumer existed to validate against**: `GdnInProjQkv`/
+//      `GdnInProjZ` are carried as a PERMUTED ROW COPY (the writer copies each raw GGUF row to its
+//      HF-ordered destination row, byte for byte, no re-quantization -- `gdn_row_permutation` below); the
+//      sidecar's own row order for these two roles is therefore HF/grouped, matching the .bin blob's own
+//      column order, and a consumer needs no runtime permutation to read them. `GdnOutProj` is carried
+//      RAW, GGUF/tiled order, unpermuted (a within-row permutation still cannot be carried as a byte
+//      copy) -- its consumer must gather the ACTIVATION into GGUF/tiled order before the dot
+//      (`gdn_out_gather_index` below), not the weight.
 //
 //      ONE MORE THING FOUND BY ACTUALLY RUNNING THIS AGAINST THE REAL FILE (AGENTS.md S9), not assumed
 //      from the aggregate census table: the backbone is NOT uniformly one format per role the way the
@@ -213,11 +219,19 @@ static_assert(sizeof(PairIdentity) == 40);
 // supplies BOTH `Dest::QsaQProj` and `Dest::QsaGateProj` (transplant.hpp's `PerHeadHalf` op, a
 // non-contiguous per-head row selection -- see `role_pattern`'s own comment for why this sidecar stores
 // the tensor whole rather than pre-splitting it).
+// O5 phase 2b-2b: the three GDN roles phase 2b-1 excluded on VPerm grounds (this file's own header
+// comment, point 3) are APPENDED here, after every phase-2b-1 role and before Count -- never inserted
+// earlier -- because Desc::role is the role's plain enum-underlying int, written to disk (AGENTS.md S3):
+// reordering the existing members would silently reinterpret every already-written sidecar's role ids.
+// See docs/BACKBONE_NATIVE_QUANT.md S16 for how each of the three is now resolved (a permuted row COPY
+// for the two Cols-axis roles, a raw verbatim store + consumer-side activation gather for the one
+// Rows-axis role) rather than excluded.
 enum class Role : std::int32_t {
     TokEmb = 0, LmHead,
     GrAttnDown, GrAttnUp, GrFfnDown, GrFfnUp, GrExitDown, GrExitUp,
     MoeSharedGate, MoeSharedUp, MoeSharedDown,
     QsaQGateProj, QsaKProj, QsaVProj, QsaOProj,
+    GdnInProjQkv, GdnInProjZ, GdnOutProj,
     Count
 };
 inline constexpr int kRoleCount = static_cast<int>(Role::Count);
@@ -269,6 +283,9 @@ inline constexpr int kRoleCount = static_cast<int>(Role::Count);
         case Role::QsaKProj:      return recipe_for(Dest::QsaKProj).src;
         case Role::QsaVProj:      return recipe_for(Dest::QsaVProj).src;
         case Role::QsaOProj:      return recipe_for(Dest::QsaOProj).src;
+        case Role::GdnInProjQkv:  return recipe_for(Dest::GdnInProjQkv).src;
+        case Role::GdnInProjZ:    return recipe_for(Dest::GdnInProjZ).src;
+        case Role::GdnOutProj:    return recipe_for(Dest::GdnOutProj).src;
         case Role::Count:         break;
     }
     return nullptr;
@@ -291,9 +308,83 @@ inline constexpr int kRoleCount = static_cast<int>(Role::Count);
         case Role::QsaKProj:      return "QsaKProj";
         case Role::QsaVProj:      return "QsaVProj";
         case Role::QsaOProj:      return "QsaOProj";
+        case Role::GdnInProjQkv:  return "GdnInProjQkv";
+        case Role::GdnInProjZ:    return "GdnInProjZ";
+        case Role::GdnOutProj:    return "GdnOutProj";
         case Role::Count:         break;
     }
     return "?";
+}
+
+// --- O5 phase 2b-2b: the GDN value-head permutation, shared by the sidecar WRITER (a permuted ROW copy
+// for GdnInProjQkv/GdnInProjZ) and the DECODE consumer (an activation GATHER for GdnOutProj) -- one
+// derivation, not two hand-copied ones (AGENTS.md S5/S10). Both mirror transplant::ungroup_v_heads's own
+// src/dst head mapping exactly (dst_head = k*rep+r, the HF/repeat_interleave order; src_head =
+// r*num_k_heads+k, the GGUF/tiled ggml-broadcast order), generalized from PER-FLOAT to PER-HEAD-GROUP so
+// a whole row (or a whole gather-index run) can be permuted/derived at once instead of per element.
+//
+// WHY A ROW COPY IS LOSSLESS FOR GdnInProjQkv/Z BUT A GATHER (NOT A COPY) IS NEEDED FOR GdnOutProj: see
+// this file's own header comment, point 3 -- the two "Cols" roles permute the raw GGUF tensor's ROW axis
+// (whole, independently block-quantized rows), the one "Rows" role permutes its COLUMN axis (elements
+// WITHIN a row, across superblock boundaries a K-quant block cannot survive being re-cut at). The sidecar
+// therefore stores GdnOutProj's raw bytes completely unpermuted, GGUF order, and it is the ACTIVATION fed
+// into that role's dot product that must be reordered instead, once per (token, layer), before the dot.
+//
+// PROOF OF THE GATHER'S DIRECTION (re-derived here, not assumed -- AGENTS.md S5): let `blob_col[o][j]`
+// be the .bin blob's own (already-ungrouped, HF-ordered) weight value at output o, HF position j, and
+// `raw_row[o][i]` the sidecar's raw row o's value at GGUF/tiled position i. `ungroup_v_heads` establishes
+// `blob_col[o][gdn_out_gather_index()[i]] == raw_row[o][i]` for every i (its own dst[d_idx] = src[s_idx],
+// with d_idx = gather_index[i] and s_idx = i in this function's own naming). So for any activation x_hf
+// (HF order) and its gather x_ggml[i] = x_hf[gather_index[i]]:
+//   dot(raw_row[o], x_ggml) = sum_i raw_row[o][i] * x_hf[gather_index[i]]
+//                           = sum_i blob_col[o][gather_index[i]] * x_hf[gather_index[i]]
+// and because i -> gather_index[i] is a bijection over the V block (a permutation of [0, value_dim)),
+// substituting j = gather_index[i] re-sums this to sum_j blob_col[o][j] * x_hf[j] = dot(blob_col[o], x_hf)
+// exactly -- QED, checked once in prose here and re-checked numerically by
+// tests/backbone_quant_tests.cpp's own "GdnOutProj gather direction" case, on both a synthetic multi-head
+// fixture and the real sidecar/blob pair (AGENTS.md S9).
+[[nodiscard]] constexpr int gdn_v_src_head(int dst_head, int num_k_heads, int rep) {
+    const int k = dst_head / rep, r = dst_head % rep;
+    return r * num_k_heads + k;
+}
+
+// Fills `row_source[d] = the RAW GGUF row index that must be copied into sidecar row d`, for d in
+// [0, out_f) -- identity outside the V block [base, base + num_v_heads*head_v_dim). `row_source.size()`
+// must be >= out_f; extra tail entries (there are none at a real call site) are left untouched.
+inline void gdn_row_permutation(std::uint32_t out_f, std::uint32_t base, int num_k_heads, int num_v_heads,
+                                std::uint32_t head_v_dim, std::span<std::uint32_t> row_source) {
+    for (std::uint32_t i = 0; i < out_f && i < row_source.size(); ++i) row_source[i] = i;
+    if (num_k_heads <= 0 || num_v_heads <= 0 || num_v_heads % num_k_heads != 0) return;
+    const int rep = num_v_heads / num_k_heads;
+    for (int dst_head = 0; dst_head < num_v_heads; ++dst_head) {
+        const int src_head = gdn_v_src_head(dst_head, num_k_heads, rep);
+        for (std::uint32_t g = 0; g < head_v_dim; ++g) {
+            const std::uint32_t d = base + static_cast<std::uint32_t>(dst_head) * head_v_dim + g;
+            const std::uint32_t s = base + static_cast<std::uint32_t>(src_head) * head_v_dim + g;
+            if (d < out_f && s < out_f && d < row_source.size()) row_source[d] = s;
+        }
+    }
+}
+
+// Fills `idx[i] = the HF/grouped activation position GGUF/tiled column i needs`, for i in
+// [0, num_v_heads*head_v_dim) -- GdnOutProj's whole input axis is the V-head axis (base == 0, see this
+// file's header comment), so no base parameter is needed here the way gdn_row_permutation has one.
+// `idx.size()` must be >= num_v_heads*head_v_dim.
+inline void gdn_out_gather_index(int num_k_heads, int num_v_heads, std::uint32_t head_v_dim,
+                                 std::span<std::uint32_t> idx) {
+    const std::uint32_t value_dim = static_cast<std::uint32_t>(num_v_heads) * head_v_dim;
+    for (std::uint32_t i = 0; i < value_dim && i < idx.size(); ++i) idx[i] = i;
+    if (num_k_heads <= 0 || num_v_heads <= 0 || num_v_heads % num_k_heads != 0) return;
+    const int rep = num_v_heads / num_k_heads;
+    for (int src_head = 0; src_head < num_v_heads; ++src_head) {
+        const int k = src_head % num_k_heads, r = src_head / num_k_heads;
+        const int dst_head = k * rep + r;
+        for (std::uint32_t g = 0; g < head_v_dim; ++g) {
+            const std::uint32_t i = static_cast<std::uint32_t>(src_head) * head_v_dim + g;
+            const std::uint32_t j = static_cast<std::uint32_t>(dst_head) * head_v_dim + g;
+            if (i < value_dim && i < idx.size()) idx[i] = j;
+        }
+    }
 }
 
 // --- on-disk format --------------------------------------------------------------------------------

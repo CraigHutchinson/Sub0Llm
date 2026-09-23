@@ -144,12 +144,18 @@ TEST_CASE("bbq: role_pattern reads from transplant::recipe_for, not a second han
     // pattern (both are PerHeadHalf slices of the one GGUF tensor), so either is a valid key.
     CHECK(std::string(bbq::role_pattern(bbq::Role::QsaQGateProj)) == recipe_for(Dest::QsaQProj).src);
     CHECK(std::string(bbq::role_pattern(bbq::Role::QsaQGateProj)) == recipe_for(Dest::QsaGateProj).src);
+    // O5 phase 2b-2b: the three recovered GDN roles.
+    CHECK(std::string(bbq::role_pattern(bbq::Role::GdnInProjQkv)) == recipe_for(Dest::GdnInProjQkv).src);
+    CHECK(std::string(bbq::role_pattern(bbq::Role::GdnInProjZ)) == recipe_for(Dest::GdnInProjZ).src);
+    CHECK(std::string(bbq::role_pattern(bbq::Role::GdnOutProj)) == recipe_for(Dest::GdnOutProj).src);
 }
 
 TEST_CASE("bbq: no role's transplant Dest carries a Fold -- every included tensor is storable verbatim",
           "[backbonequantsidecar]") {
     // The header comment's own claim, checked mechanically rather than left as prose: none of the roles
     // this format actually stores need a value transform (RMSNorm 1+w / ssm_a's -exp(A_log)) applied.
+    // The three GDN roles DO carry a VPerm (that is the whole subject of this pass), but VPerm and Fold
+    // are independent transforms (transplant.hpp's own two enums) -- this case is only about Fold.
     using transplant::Dest;
     using transplant::fold_for;
     using transplant::Fold;
@@ -157,8 +163,98 @@ TEST_CASE("bbq: no role's transplant Dest carries a Fold -- every included tenso
                           Dest::GrFfnDown,     Dest::GrFfnUp,       Dest::GrExitDown,   Dest::GrExitUp,
                           Dest::MoeSharedGate, Dest::MoeSharedUp,   Dest::MoeSharedDown,
                           Dest::QsaQProj,      Dest::QsaGateProj,   Dest::QsaKProj,     Dest::QsaVProj,
-                          Dest::QsaOProj};
+                          Dest::QsaOProj,      Dest::GdnInProjQkv,  Dest::GdnInProjZ,   Dest::GdnOutProj};
     for (Dest d : dests) CHECK(fold_for(d) == Fold::None);
+}
+
+// O5 phase 2b-2b: gdn_row_permutation/gdn_out_gather_index must agree with transplant::ungroup_v_heads --
+// the EXISTING, already-vetted reference this design re-derives from (AGENTS.md S5), not merely with
+// themselves. Both helpers are cross-checked here against ungroup_v_heads run on identity-tagged synthetic
+// data, at a small multi-k-head fixture (num_k_heads=2, num_v_heads=4, so rep=2 and the permutation is
+// genuinely non-trivial -- the same "num_k_heads==1 is the identity, so it proves nothing" trap
+// transplant.hpp's own header comment names for ungroup_v_heads itself).
+TEST_CASE("bbq: gdn_row_permutation matches transplant::ungroup_v_heads's own Cols-axis mapping",
+          "[backbonequantsidecar]") {
+    constexpr int num_k_heads = 2, num_v_heads = 4, head_k_dim = 2;
+    constexpr std::uint32_t head_v_dim = 3;
+    constexpr std::uint32_t base = 2 * num_k_heads * head_k_dim;   // GdnInProjQkv's own "after Q|K" base
+    constexpr std::uint32_t value_dim = num_v_heads * head_v_dim;
+    constexpr std::uint32_t out_f = base + value_dim;
+
+    // Identity-tagged "row vector": raw_ids[i] = i, laid out as a [1, out_f] array so ungroup_v_heads's
+    // own Cols-axis permutation (a per-COLUMN reorder of a single row) is exactly the row-index mapping
+    // gdn_row_permutation computes -- no reinterpretation needed to compare them.
+    std::vector<float> raw_ids(out_f);
+    for (std::uint32_t i = 0; i < out_f; ++i) raw_ids[i] = static_cast<float>(i);
+    std::vector<float> dst_ids(out_f, -1.f);
+    const transplant::VPerm vp{transplant::VAxis::Cols, /*after_keys=*/true, /*wide=*/true};
+    transplant::ungroup_v_heads(raw_ids.data(), 1, static_cast<int>(out_f), vp, num_k_heads, num_v_heads,
+                                head_k_dim, static_cast<int>(head_v_dim), dst_ids.data());
+
+    std::vector<std::uint32_t> row_source(out_f, 0);
+    bbq::gdn_row_permutation(out_f, base, num_k_heads, num_v_heads, head_v_dim, row_source);
+
+    for (std::uint32_t d = 0; d < out_f; ++d) {
+        INFO("destination index " << d);
+        CHECK(row_source[d] == static_cast<std::uint32_t>(dst_ids[d]));
+    }
+    // Outside the V block: identity, both by ungroup_v_heads's own "copy through unchanged" contract and
+    // by row_source's own definition.
+    for (std::uint32_t d = 0; d < base; ++d) CHECK(row_source[d] == d);
+    // Inside the V block: a genuine permutation, not the identity -- num_k_heads=2/num_v_heads=4 means
+    // rep=2, so head 1 (dst_head=1) maps to src_head = 0*2+1 = ... actually verified structurally below:
+    // every value in [base, out_f) appears in row_source exactly once (it is a bijection of that range).
+    std::vector<bool> seen(value_dim, false);
+    for (std::uint32_t d = base; d < out_f; ++d) {
+        const std::uint32_t s = row_source[d];
+        REQUIRE(s >= base);
+        REQUIRE(s < out_f);
+        REQUIRE_FALSE(seen[s - base]);
+        seen[s - base] = true;
+    }
+    // And it is NOT the identity at this fixture (rep > 1) -- a real cross-check, not a vacuous one.
+    bool any_moved = false;
+    for (std::uint32_t d = base; d < out_f; ++d) any_moved |= (row_source[d] != d);
+    CHECK(any_moved);
+}
+
+TEST_CASE("bbq: gdn_out_gather_index is the functional inverse of ungroup_v_heads's own Rows-axis mapping "
+          "-- the direction that matters (AGENTS.md: getting it backwards runs and is wrong)",
+          "[backbonequantsidecar]") {
+    constexpr int num_k_heads = 2, num_v_heads = 4;
+    constexpr std::uint32_t head_v_dim = 3;
+    constexpr std::uint32_t value_dim = num_v_heads * head_v_dim;
+
+    // dst_ids[d_idx] = the RAW/GGUF row index that supplies HF row d_idx -- ungroup_v_heads's own Rows-
+    // axis semantics (one column, so dst[d_idx] = src[s_idx] directly).
+    std::vector<float> raw_ids(value_dim);
+    for (std::uint32_t i = 0; i < value_dim; ++i) raw_ids[i] = static_cast<float>(i);
+    std::vector<float> dst_ids(value_dim, -1.f);
+    const transplant::VPerm vp{transplant::VAxis::Rows, /*after_keys=*/false, /*wide=*/true};
+    transplant::ungroup_v_heads(raw_ids.data(), static_cast<int>(value_dim), 1, vp, num_k_heads, num_v_heads,
+                                /*head_k_dim=*/1, static_cast<int>(head_v_dim), dst_ids.data());
+
+    // The functional inverse: inv[s_idx] = d_idx such that dst_ids[d_idx] == s_idx. ungroup_v_heads's own
+    // mapping is a bijection over [0, value_dim) (a head permutation), so every s_idx has exactly one d_idx.
+    std::vector<std::uint32_t> inv(value_dim, 0);
+    std::vector<bool> covered(value_dim, false);
+    for (std::uint32_t d = 0; d < value_dim; ++d) {
+        const auto s = static_cast<std::uint32_t>(dst_ids[d]);
+        REQUIRE(s < value_dim);
+        REQUIRE_FALSE(covered[s]);
+        covered[s] = true;
+        inv[s] = d;
+    }
+
+    std::vector<std::uint32_t> idx(value_dim, 0);
+    bbq::gdn_out_gather_index(num_k_heads, num_v_heads, head_v_dim, idx);
+    for (std::uint32_t i = 0; i < value_dim; ++i) {
+        INFO("raw GGUF position " << i);
+        CHECK(idx[i] == inv[i]);
+    }
+    bool any_moved = false;
+    for (std::uint32_t i = 0; i < value_dim; ++i) any_moved |= (idx[i] != i);
+    CHECK(any_moved);
 }
 
 TEST_CASE("bbq: a written sidecar reads back, decodes bit-identically, and Store::find resolves the "

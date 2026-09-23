@@ -44,14 +44,65 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
+#include "sub0/backbone_quant.hpp"  // O5 phase 2b-2b: bbq::Desc + bbqd::gemv_plane/ActBlocks for the
+                                     // three native-quant GDN roles forward()'s Native path reads
 #include "sub0/gemv.hpp"
 #include "sub0/simd_reduce.hpp"  // B34/B38: sumsq_choice<UseSimd>() for this file's real contiguous
                                   // self-dot hot loops in forward()/backward()
                                   // (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
 
 namespace sub0::gdn {
+
+// O5 phase 2b-2b (docs/BACKBONE_NATIVE_QUANT.md S16): optional native-quant (S0B1 sidecar) weight
+// sources for the three GDN roles this pass wires -- in_qkv, in_z, out_proj, together 49.7% of the
+// backbone's bytes read per decode token. A default-constructed `Native{}` (every EXISTING call site's
+// implicit default at forward()'s new trailing parameter) means "read w_qkv/w_z/w_out exactly as
+// before" -- op_gdn's batched training/inference forward (src/backends/cpu/backend.cpp),
+// gdn_qwen4_fixture_tests.cpp, and src/backends/cuda's CPU-reference call are therefore byte-for-byte
+// unaffected by this change (AGENTS.md S4): forward()'s signature grew by one defaulted trailing
+// pointer, nothing about any existing call site's own arguments changed.
+//
+// ONLY MEANINGFUL AT T==1 (decode). A native GEMV kernel (`bbqd::gemv_plane`) is a single-row-in,
+// single-row-out DOT primitive (backbone_quant_dot.hpp's own "DOT, not AXPY" design, S3a) -- that is
+// decode's per-token shape, not training's per-window one. forward() itself re-checks `T == 1` before
+// trusting `native` (defense in depth: a T>1 caller that set one anyway falls back to the ordinary axpy
+// path for every position, rather than being trusted to have meant it).
+//
+// CALLER-OWNED, REUSED SCRATCH (AGENTS.md S1): `x_q`/`gated_q` must be sized once by the caller (decode's
+// kv_reset(), mirroring Codex's own g_backbone_head_act_q precedent) and are quantized EXACTLY ONCE per
+// (token, layer) inside forward() -- `x_q` feeds BOTH in_qkv and in_z (the same D_MODEL-wide input row),
+// never re-quantized per projection. `out_gather_buf`/`out_gather_idx` are likewise sized/derived once
+// by the caller, not per token.
+struct Native {
+    const bbq::Desc* in_qkv = nullptr;  std::span<const std::uint8_t> in_qkv_raw{};
+    const bbq::Desc* in_z   = nullptr;  std::span<const std::uint8_t> in_z_raw{};
+    const bbq::Desc* out    = nullptr;  std::span<const std::uint8_t> out_raw{};
+    bbqd::ActBlocks* x_q     = nullptr;   // hidden_size-wide, shared by in_qkv/in_z
+    bbqd::ActBlocks* gated_q = nullptr;   // value_dim-wide, out_proj's own quantized (gathered) input
+    // Caller-owned, reused Q6_K per-16 activation-sum scratch (docs/BACKBONE_NATIVE_QUANT.md S12i's own
+    // TODO(phase 2b), closed by this pass -- see bbqd::gemv_plane's own `gsum16` parameter comment).
+    // GdnOutProj is Q6_K in every real layer this census found, but passing this unconditionally costs
+    // nothing on a different format (gemv_plane's own contract: unused downstream, not incorrect).
+    bbqd::Gsum16* out_gsum16 = nullptr;
+    // GdnOutProj's raw sidecar bytes are GGUF/tiled column order, not this project's HF/grouped one
+    // (backbone_quant.hpp's own header comment, point 3) -- the ACTIVATION must be gathered into that
+    // order before the dot, never the weight. `out_gather_idx` (value_dim entries) is
+    // `bbq::gdn_out_gather_index()`'s own output, computed ONCE by the caller from this build's
+    // compile-time GDN head axes; `out_gather_buf` is caller-owned scratch (value_dim floats) the gather
+    // writes into before `gated_q->quantize()` reads it.
+    const std::uint32_t* out_gather_idx  = nullptr;
+    float*                out_gather_buf = nullptr;
+
+    [[nodiscard]] bool in_ready() const { return in_qkv != nullptr && in_z != nullptr && x_q != nullptr; }
+    [[nodiscard]] bool out_ready() const {
+        return out != nullptr && out_gather_idx != nullptr && out_gather_buf != nullptr &&
+               gated_q != nullptr;
+    }
+};
 
 // Every dimension the recurrence needs, explicit rather than closed over a build's own constants --
 // same reasoning as layout.hpp's depth_schedule_for/gdn_schedule_for: lets a standalone test (this
@@ -198,7 +249,12 @@ inline void forward(const Dims& d, int T,
                      WP w_out,
                      float* state, float* conv_hist,
                      float* out,
-                     float* scratch) {
+                     float* scratch,
+                     const Native* native = nullptr) {
+    // O5 phase 2b-2b: only trusted at T==1 (this struct's own header comment) -- every batched/training
+    // call (T possibly > 1) silently ignores a non-null `native` rather than mis-happening to use it.
+    const bool use_native_in  = native != nullptr && T == 1 && native->in_ready();
+    const bool use_native_out = native != nullptr && T == 1 && native->out_ready();
     const int hs = d.hidden_size;
     const int key_dim = d.key_dim(), value_dim = d.value_dim(), conv_dim = d.conv_dim();
     const int K = d.conv_kernel;
@@ -222,6 +278,18 @@ inline void forward(const Dims& d, int T,
     // cannot be wrong -- scratch_floats() accounts for exactly this row.
     float* gated    = scratch;                                    /* scratch += value_dim, unused after */
 
+    // O5 phase 2b-2b: geometry re-checked here (never trusted from the caller alone, AGENTS.md S10) --
+    // native->in_qkv/in_z's own Desc must actually be a [hs -> conv_dim]/[hs -> value_dim] row-major
+    // plane, or this falls back to the ordinary axpy path exactly as if `native` had been null.
+    const bool native_in_ok = use_native_in &&
+        native->in_qkv->in_f == static_cast<std::uint32_t>(hs) &&
+        native->in_qkv->out_f == static_cast<std::uint32_t>(conv_dim) &&
+        native->in_z->in_f == static_cast<std::uint32_t>(hs) &&
+        native->in_z->out_f == static_cast<std::uint32_t>(value_dim);
+    const bool native_out_ok = use_native_out &&
+        native->out->in_f == static_cast<std::uint32_t>(value_dim) &&
+        native->out->out_f == static_cast<std::uint32_t>(hs);
+
     // in_proj_qkv, in_proj_z, in_proj_b, in_proj_a -- this project's [in,out] weight convention.
     // O4 lever 1: in_proj_b/in_proj_a used to be a hand-written output-major dot-product loop (`for hh:
     // for i: bs += ...`), scalar and unthreaded. Routed through gemv::axpy instead: for a fixed output
@@ -237,8 +305,29 @@ inline void forward(const Dims& d, int T,
         float* zr = zb + static_cast<std::size_t>(t) * value_dim;
         float* br = beta + static_cast<std::size_t>(t) * Hv;
         float* gr = gg   + static_cast<std::size_t>(t) * Hv;
-        gemv::axpy<Threads>(xt, w_qkv, hs, conv_dim, qkvr);   // O2: include/sub0/gemv.hpp
-        gemv::axpy<Threads>(xt, w_z, hs, value_dim, zr);
+        if (native_in_ok) {
+            // O5 phase 2b-2b: quantize the D_MODEL-wide input row ONCE, shared by both in_qkv and in_z
+            // (AGENTS.md S1's own "one distinct activation vector, one quantize call" discipline). Both
+            // sidecar planes' row order already matches qkvr/zr's own destination layout exactly --
+            // in_qkv/in_z's V block was PERMUTED into HF order at sidecar-write time
+            // (backbone_quant.hpp's gdn_row_permutation), so this is a plain DOT, no runtime gather.
+            native->x_q->quantize(xt, hs);
+            const bool ok_qkv = bbqd::gemv_plane<Threads>(
+                native->in_qkv->type_raw, native->in_qkv_raw, static_cast<int>(native->in_qkv->out_f),
+                static_cast<int>(native->in_qkv->in_f), *native->x_q, qkvr);
+            const bool ok_z = bbqd::gemv_plane<Threads>(
+                native->in_z->type_raw, native->in_z_raw, static_cast<int>(native->in_z->out_f),
+                static_cast<int>(native->in_z->in_f), *native->x_q, zr);
+            if (!ok_qkv || !ok_z) {
+                std::fprintf(stderr, "fatal: gdn::forward's native in_qkv/in_z GEMV rejected a plane whose "
+                                     "geometry passed the outer check (unsupported GGML type or a row "
+                                     "width the kernel refuses)\n");
+                std::abort();
+            }
+        } else {
+            gemv::axpy<Threads>(xt, w_qkv, hs, conv_dim, qkvr);   // O2: include/sub0/gemv.hpp
+            gemv::axpy<Threads>(xt, w_z, hs, value_dim, zr);
+        }
         gemv::axpy<Threads>(xt, w_b, hs, Hv, br);             // O4: raw b_logit, transformed below
         gemv::axpy<Threads>(xt, w_a, hs, Hv, gr);             // O4: raw a_logit, transformed below
         for (int hh = 0; hh < Hv; ++hh) {
@@ -351,7 +440,28 @@ inline void forward(const Dims& d, int T,
                 gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
         });
         float* ot = out + static_cast<std::size_t>(t) * hs;
-        gemv::axpy<Threads>(gated, w_out, value_dim, hs, ot);
+        if (native_out_ok) {
+            // O5 phase 2b-2b: GdnOutProj's sidecar bytes are raw, GGUF/tiled column order (backbone_
+            // quant.hpp's own header comment -- the value-head permutation is on the WITHIN-ROW axis and
+            // cannot be carried as a byte copy, unlike in_qkv/in_z above). Gather `gated` (HF/grouped
+            // order) into GGUF order before quantizing -- see gdn_math.hpp's Native/gdn_out_gather_index
+            // comments for the derivation and tests/backbone_quant_tests.cpp for the proof this direction
+            // is right, not backwards.
+            for (int i = 0; i < value_dim; ++i)
+                native->out_gather_buf[i] = gated[native->out_gather_idx[static_cast<std::size_t>(i)]];
+            native->gated_q->quantize(native->out_gather_buf, value_dim);
+            const bool ok = bbqd::gemv_plane<Threads>(
+                native->out->type_raw, native->out_raw, static_cast<int>(native->out->out_f),
+                static_cast<int>(native->out->in_f), *native->gated_q, ot,
+                /*row_lo=*/0, /*row_hi=*/-1, native->out_gsum16);
+            if (!ok) {
+                std::fprintf(stderr, "fatal: gdn::forward's native out_proj GEMV rejected a plane whose "
+                                     "geometry passed the outer check\n");
+                std::abort();
+            }
+        } else {
+            gemv::axpy<Threads>(gated, w_out, value_dim, hs, ot);
+        }
     }
 }
 
