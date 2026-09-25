@@ -73,7 +73,12 @@ struct Shape {
 };
 constexpr Shape kShapes[] = {{"gate/up", 640, 2560}, {"down", 2560, 640}};   // real Qwen4 axes
 
-void run_case(TensorType type, const Shape& sh, bool stream, double min_seconds) {
+/// O7: which kernel `run_case` times. "best" is whatever `gemv_plane` dispatches to (the O7 fast kernel
+/// on this host); "vnni" bypasses the dispatcher to time O7 pass 3 (docs/optimization/opportunities/
+/// O7_expert_kernels.md S4c) directly, since it is deliberately NOT wired into gemv_best().
+enum class Kernel { Best, Vnni };
+
+void run_case(TensorType type, const Shape& sh, bool stream, double min_seconds, Kernel kernel) {
     const auto type_raw = static_cast<std::uint32_t>(type);
     const std::uint64_t elems = static_cast<std::uint64_t>(sh.rows) * static_cast<std::uint64_t>(sh.row_elems);
     const std::uint64_t plane_bytes = moeqd::plane_bytes(type_raw, elems);
@@ -96,11 +101,27 @@ void run_case(TensorType type, const Shape& sh, bool stream, double min_seconds)
 
     double checksum = 0.0;
     auto one = [&](std::size_t i) {
-        if (!moeqd::gemv_plane(type_raw, std::span<const std::uint8_t>(planes[i]), sh.rows, sh.row_elems, xq,
-                               out.data())) {
-            std::fprintf(stderr, "gemv_plane refused %s %s\n", name(type), sh.role);
-            std::exit(1);
+        if (kernel == Kernel::Best) {
+            if (!moeqd::gemv_plane(type_raw, std::span<const std::uint8_t>(planes[i]), sh.rows, sh.row_elems, xq,
+                                   out.data())) {
+                std::fprintf(stderr, "gemv_plane refused %s %s\n", name(type), sh.role);
+                std::exit(1);
+            }
+            return;
         }
+#if defined(__AVXVNNI__)
+        const auto run_vnni = [&](const auto& plane) {
+            moeqd::detail::gemv_avx2_vnni(plane, sh.rows, sh.row_elems, xq, out.data());
+        };
+        switch (type) {
+            case TensorType::IQ1_S:   run_vnni(moeqd::Iq1SPlane{planes[i].data()}); break;
+            case TensorType::IQ2_XXS: run_vnni(moeqd::Iq2XxsPlane{planes[i].data()}); break;
+            default:                  run_vnni(moeqd::Iq4NlPlane{planes[i].data()}); break;
+        }
+#else
+        std::fprintf(stderr, "--vnni requested but __AVXVNNI__ is not compiled in\n");
+        std::exit(2);
+#endif
     };
     for (std::size_t i = 0; i < n_planes; ++i) one(i);   // warm-up: page in every plane once
     for (float v : out) checksum += v;
@@ -128,22 +149,24 @@ void run_case(TensorType type, const Shape& sh, bool stream, double min_seconds)
 int main(int argc, char** argv) {
     double min_seconds = 1.0;
     bool do_hot = true, do_stream = true;
+    Kernel kernel = Kernel::Best;
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "--hot") do_stream = false;
         else if (a == "--stream") do_hot = false;
         else if (a == "--seconds" && i + 1 < argc) min_seconds = std::atof(argv[++i]);
+        else if (a == "--vnni") kernel = Kernel::Vnni;
         else {
-            std::fprintf(stderr, "usage: %s [--hot|--stream] [--seconds S]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--hot|--stream] [--seconds S] [--vnni]\n", argv[0]);
             return 2;
         }
     }
-    std::printf("fused MoE GEMV, one thread; ceilings %.0f GB/s DRAM, %.0f GMAC/s AVX2 int8\n", kDramGBs,
-                kAvx2GMacs);
+    std::printf("fused MoE GEMV, one thread; ceilings %.0f GB/s DRAM, %.0f GMAC/s AVX2 int8%s\n", kDramGBs,
+                kAvx2GMacs, kernel == Kernel::Vnni ? " (O7 pass-3 VNNI arm)" : "");
     for (const TensorType t : {TensorType::IQ1_S, TensorType::IQ2_XXS, TensorType::IQ4_NL})
         for (const Shape& sh : kShapes) {
-            if (do_hot) run_case(t, sh, false, min_seconds);
-            if (do_stream) run_case(t, sh, true, min_seconds);
+            if (do_hot) run_case(t, sh, false, min_seconds, kernel);
+            if (do_stream) run_case(t, sh, true, min_seconds, kernel);
         }
     return 0;
 }

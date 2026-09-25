@@ -55,6 +55,22 @@
 //
 // NO HEAP ALLOCATION PER CALL (AGENTS.md S1): ActBlocks is caller-owned and sized once; every kernel
 // writes only into caller-supplied buffers and its own stack.
+//
+// O7 (docs/optimization/opportunities/O7_expert_kernels.md): two further, BIT-EXACT passes on top of
+// O1's gemv_avx2, found by profiling per format and reading llama.cpp's own AVX2 kernels for these three
+// formats (AGENTS.md S5) rather than assuming the shape was already optimal. Pass 1 (SuperCache): IQ1_S
+// and IQ2_XXS share one f16 `d` scale across 8 consecutive 32-element groups (a 256-element superblock),
+// but the pre-O7 kernels re-decoded it on every one of those 8 calls; SuperCache hoists that decode to
+// once per superblock, providably without changing the value (half-to-single is lossless and
+// deterministic). Pass 2 (gather): the four-lane codebook/sign lookups were built with four scalar table
+// reads packed via `_mm256_set_epi64x` -- the SAME shape llama.cpp's own kernel uses, so this is a
+// deliberate departure from the reference, not a port of it -- replaced with a single
+// `_mm256_i32gather_epi64`, which reads the identical table at the identical per-lane index and so
+// cannot itself change any value. Both passes are folded directly into the kernel `gemv_plane` runs
+// (`gemv_fast`/`gemv_avx2_fast`) rather than gated behind a new toggle, because AGENTS.md's own numerics
+// rule for this package says a bit-exact kernel may replace the default outright; the pre-O7 kernels
+// (`gemv`/`gemv_avx2`, and each format's own `group()`/`group_v()`) stay in the tree, individually
+// tested, as the correctness reference and AGENTS.md S13's "park, never revert" precedent.
 
 #pragma once
 
@@ -186,6 +202,34 @@ struct WeightGroup {
     float delta = 0.f;   ///< IQ1_S's per-group additive offset; unused (and never read) elsewhere
 };
 
+/** Per-superblock cache for IQ1_S/IQ2_XXS: both formats share ONE f16 `d` scale across 8 consecutive
+ * 32-element GROUPs (a 256-element superblock), but `fields()`/`group()`/`group_v()` each re-decode `d`
+ * fresh on every one of those 8 calls (O1's own "next constraint" note -- see
+ * docs/optimization/opportunities/O7_expert_kernels.md S3 for the measurement this fixes).
+ * `group_cached()`/`group_v_cached()` below refresh this only when the group's own superblock differs
+ * from the cached one, and reuse the decoded float otherwise.
+ *
+ * PROVABLY bit-exact, not merely close: `d` is a pure function of the SAME 16-bit pattern every one of
+ * the 8 times a superblock's groups ask for it -- half-to-single is a lossless, deterministic
+ * conversion (IEEE 754's binary16 is exactly representable in binary32; there is no rounding step to
+ * reorder) -- so caching the result changes how many times the conversion runs, never the value it
+ * produces. `tests/moe_quant_tests.cpp`'s "O7" case still pins this against the uncached kernels
+ * directly, rather than resting on the argument alone.
+ *
+ * Reset once per ROW (default-constructed at the top of gemv_fast()/gemv_avx2_fast()'s row loop): a
+ * row's own first group does not generally start on a superblock boundary (the down projection's rows
+ * are 640 elements = 2.5 IQ1_S/IQ2_XXS superblocks), so nothing may be assumed to carry over from the
+ * previous row -- only ascending-`p` continuity WITHIN one row, which both callers provide by
+ * construction (p increases by GROUP every iteration, never jumps backward or skips a superblock).
+ */
+struct SuperCache {
+    std::uint64_t block = ~std::uint64_t{0};   ///< which 256-element superblock `d`/`d_f` currently hold
+    float         d      = 0.f;                ///< gguf::f16_to_f32(d_bits) -- the portable path's own cache
+#if defined(SUB0_MOEQD_AVX2)
+    float         d_f    = 0.f;                ///< _cvtsh_ss(d_bits) -- the AVX2 path's own cache (same value)
+#endif
+};
+
 #if defined(SUB0_MOEQD_AVX2)
 /** The AVX2 form of one decoded group: 32 weights as UNSIGNED magnitudes plus a separate sign source.
  *
@@ -210,6 +254,11 @@ struct WeightGroupV {
  */
 struct Iq1SPlane {
     static constexpr bool kHasDelta = true;
+    /// This format's `d` is shared by 8 consecutive 32-wide groups (one 256-element superblock) --
+    /// group_cached()/group_v_cached() below exploit that via SuperCache; see its own comment.
+    static constexpr bool kHasSuper = true;
+    static constexpr std::uint64_t kSuperElems = 256;
+    static constexpr std::uint64_t kBlockBytes = 50;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
     /// The group's bit fields: the ONE place this format's layout is read. group() and group_v() differ
@@ -228,9 +277,15 @@ struct Iq1SPlane {
         std::memcpy(&f.qh, blk + 34 + 2 * ib, sizeof f.qh);
         return f;
     }
+    /// This sub-group's own 11-bit grid index (8-bit `qs` byte | 3 high bits from `qh`) -- the ONE place
+    /// that bit formula is written; grid() and the gather-based group_v_cached() both read it from here
+    /// so a gather-vs-scalar index can never silently diverge from a scalar-vs-scalar one.
+    [[nodiscard]] static int index(const Fields& f, int l) noexcept {
+        return static_cast<int>(f.qs[l] | (((f.qh >> (3 * l)) & 7) << 8));
+    }
     /// Eight int8 weights, little-endian.
     [[nodiscard]] static std::uint64_t grid(const Fields& f, int l) noexcept {
-        return gguf::IQ1S_GRID[f.qs[l] | (((f.qh >> (3 * l)) & 7) << 8)];
+        return gguf::IQ1S_GRID[static_cast<std::size_t>(index(f, l))];
     }
     [[nodiscard]] static float scale(const Fields& f, float d) noexcept {
         return d * static_cast<float>(2 * ((f.qh >> 12) & 7) + 1);
@@ -238,11 +293,39 @@ struct Iq1SPlane {
     [[nodiscard]] static float delta(const Fields& f) noexcept {
         return (f.qh & 0x8000) ? -gguf::IQ1S_DELTA : gguf::IQ1S_DELTA;
     }
+    /// Refreshes `c` only when `p`'s own superblock differs from the one `c` already holds.
+    void refresh(std::uint64_t p, SuperCache& c) const noexcept {
+        const std::uint64_t blk = p / kSuperElems;
+        if (c.block == blk) return;
+        std::uint16_t d_bits;
+        std::memcpy(&d_bits, plane + blk * kBlockBytes, sizeof d_bits);
+        c.block = blk;
+        c.d = gguf::f16_to_f32(d_bits);
+#if defined(SUB0_MOEQD_AVX2)
+        c.d_f = _cvtsh_ss(d_bits);
+#endif
+    }
 
     [[nodiscard]] WeightGroup group(std::uint64_t p) const {
         const Fields f = fields(p);
         WeightGroup wg;
         wg.scale = scale(f, gguf::f16_to_f32(f.d_bits));
+        wg.delta = delta(f);
+        for (int l = 0; l < 4; ++l) {
+            const std::uint64_t g = grid(f, l);
+            std::memcpy(wg.q.data() + 8 * l, &g, sizeof g);
+        }
+        return wg;
+    }
+
+    /// O7 pass 1: same computation as group(), but `d` comes from `c` (refreshed at most once every 8
+    /// calls) instead of being re-decoded from `f.d_bits` every time -- see SuperCache's own comment for
+    /// why this cannot change the VALUE, only how often the conversion runs.
+    [[nodiscard]] WeightGroup group_cached(std::uint64_t p, SuperCache& c) const {
+        refresh(p, c);
+        const Fields f = fields(p);
+        WeightGroup wg;
+        wg.scale = scale(f, c.d);
         wg.delta = delta(f);
         for (int l = 0; l < 4; ++l) {
             const std::uint64_t g = grid(f, l);
@@ -258,6 +341,21 @@ struct Iq1SPlane {
         const __m256i w = _mm256_set_epi64x(ll(grid(f, 3)), ll(grid(f, 2)), ll(grid(f, 1)), ll(grid(f, 0)));
         return {_mm256_sign_epi8(w, w), w, scale(f, _cvtsh_ss(f.d_bits)), delta(f)};
     }
+
+    /// O7 pass 1+2, combined: `d` from `c` (as group_cached()), AND the four grid lookups done as ONE
+    /// `_mm256_i32gather_epi64` instead of four independent scalar table reads packed with
+    /// `_mm256_set_epi64x` -- llama.cpp's own reference kernel uses the scalar-set form (quoted in
+    /// docs/optimization/opportunities/O7_expert_kernels.md S2), so this is a genuine departure from it,
+    /// not a port; measured, not assumed, per AGENTS.md S13. Bit-exact against group_v(): same table,
+    /// same 2048 entries, same per-lane index, only the instruction that reads them differs.
+    [[nodiscard]] WeightGroupV group_v_cached(std::uint64_t p, SuperCache& c) const noexcept {
+        refresh(p, c);
+        const Fields f = fields(p);
+        const __m128i idx = _mm_set_epi32(index(f, 3), index(f, 2), index(f, 1), index(f, 0));
+        const __m256i w =
+            _mm256_i32gather_epi64(reinterpret_cast<const long long*>(gguf::IQ1S_GRID), idx, 8);
+        return {_mm256_sign_epi8(w, w), w, scale(f, c.d_f), delta(f)};
+    }
 #endif
 };
 
@@ -268,6 +366,11 @@ struct Iq1SPlane {
  */
 struct Iq2XxsPlane {
     static constexpr bool kHasDelta = false;
+    /// This format's `d` is shared by 8 consecutive 32-wide groups (one 256-element superblock) --
+    /// group_cached()/group_v_cached() below exploit that via SuperCache; see its own comment.
+    static constexpr bool kHasSuper = true;
+    static constexpr std::uint64_t kSuperElems = 256;
+    static constexpr std::uint64_t kBlockBytes = 66;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
     /// The group's bit fields: the ONE place this format's layout is read (see Iq1SPlane::Fields).
@@ -287,18 +390,51 @@ struct Iq2XxsPlane {
     [[nodiscard]] static std::uint64_t grid(const Fields& f, int l) noexcept {
         return gguf::IQ2XXS_GRID[(f.aux[0] >> (8 * l)) & 0xFFu];
     }
+    /// This sub-group's own 7-bit sign-table index -- the ONE place that bit formula is written; signs()
+    /// and the gather-based group_v_cached() both read it from here (see Iq1SPlane::index()).
+    [[nodiscard]] static int sign_index(const Fields& f, int l) noexcept {
+        return static_cast<int>((f.aux[1] >> (7 * l)) & 127u);
+    }
     /// Eight +1/-1 bytes, little-endian.
     [[nodiscard]] static std::uint64_t signs(const Fields& f, int l) noexcept {
-        return SIGNS64[(f.aux[1] >> (7 * l)) & 127u];
+        return SIGNS64[static_cast<std::size_t>(sign_index(f, l))];
     }
     [[nodiscard]] static float scale(const Fields& f, float d) noexcept {
         return d * (0.5f + static_cast<float>(f.aux[1] >> 28)) * 0.25f;
+    }
+    /// Refreshes `c` only when `p`'s own superblock differs from the one `c` already holds.
+    void refresh(std::uint64_t p, SuperCache& c) const noexcept {
+        const std::uint64_t blk = p / kSuperElems;
+        if (c.block == blk) return;
+        std::uint16_t d_bits;
+        std::memcpy(&d_bits, plane + blk * kBlockBytes, sizeof d_bits);
+        c.block = blk;
+        c.d = gguf::f16_to_f32(d_bits);
+#if defined(SUB0_MOEQD_AVX2)
+        c.d_f = _cvtsh_ss(d_bits);
+#endif
     }
 
     [[nodiscard]] WeightGroup group(std::uint64_t p) const {
         const Fields f = fields(p);
         WeightGroup wg;
         wg.scale = scale(f, gguf::f16_to_f32(f.d_bits));
+        std::array<std::int8_t, GROUP> sign{};
+        for (int l = 0; l < 4; ++l) {
+            const std::uint64_t g = grid(f, l), s = signs(f, l);
+            std::memcpy(wg.q.data() + 8 * l, &g, sizeof g);
+            std::memcpy(sign.data() + 8 * l, &s, sizeof s);
+        }
+        for (int j = 0; j < GROUP; ++j) wg.q[j] = static_cast<std::int8_t>(wg.q[j] * sign[j]);
+        return wg;
+    }
+
+    /// O7 pass 1: same computation as group(), but `d` comes from `c` (see Iq1SPlane::group_cached()).
+    [[nodiscard]] WeightGroup group_cached(std::uint64_t p, SuperCache& c) const {
+        refresh(p, c);
+        const Fields f = fields(p);
+        WeightGroup wg;
+        wg.scale = scale(f, c.d);
         std::array<std::int8_t, GROUP> sign{};
         for (int l = 0; l < 4; ++l) {
             const std::uint64_t g = grid(f, l), s = signs(f, l);
@@ -318,6 +454,26 @@ struct Iq2XxsPlane {
                 _mm256_set_epi64x(ll(signs(f, 3)), ll(signs(f, 2)), ll(signs(f, 1)), ll(signs(f, 0))),
                 scale(f, _cvtsh_ss(f.d_bits)), 0.f};
     }
+
+    /// O7 pass 1+2, combined. `d` from `c` (as group_cached()). The GRID lookup is one
+    /// `_mm256_i32gather_epi64` fed by a single `vpmovzxbd` that zero-extends `aux[0]`'s own four bytes
+    /// directly into the gather's index lanes -- `aux8[l]` (see this struct's file-header comment) IS
+    /// byte `l` of `aux[0]`, so no scalar shift/mask is needed to build the index at all, unlike IQ1_S's
+    /// grid (whose index also needs 3 bits out of `qh`) or this format's OWN sign index just below (whose
+    /// 7-bit fields are not byte-aligned, so its index vector is still built the scalar way and only the
+    /// TABLE READ becomes a gather). Bit-exact against group_v(): same two tables, same per-lane indices.
+    [[nodiscard]] WeightGroupV group_v_cached(std::uint64_t p, SuperCache& c) const noexcept {
+        refresh(p, c);
+        const Fields f = fields(p);
+        const __m128i idx_grid = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(static_cast<int>(f.aux[0])));
+        const __m256i w =
+            _mm256_i32gather_epi64(reinterpret_cast<const long long*>(gguf::IQ2XXS_GRID), idx_grid, 8);
+        const __m128i idx_sign =
+            _mm_set_epi32(sign_index(f, 3), sign_index(f, 2), sign_index(f, 1), sign_index(f, 0));
+        const __m256i s =
+            _mm256_i32gather_epi64(reinterpret_cast<const long long*>(SIGNS64.data()), idx_sign, 8);
+        return {w, s, scale(f, c.d_f), 0.f};
+    }
 #endif
 };
 
@@ -327,6 +483,10 @@ struct Iq2XxsPlane {
  */
 struct Iq4NlPlane {
     static constexpr bool kHasDelta = false;
+    /// Every block IS one 32-element group (its own `d`, no sharing across groups) -- nothing for
+    /// SuperCache to hoist, unlike IQ1_S/IQ2_XXS. gemv_fast()/gemv_avx2_fast() fall back to plain
+    /// group()/group_v() for this format via `if constexpr (!Plane::kHasSuper)`.
+    static constexpr bool kHasSuper = false;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
     /// The group's fields: the ONE place this format's layout is read (see Iq1SPlane::Fields).
@@ -418,6 +578,37 @@ void gemv(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, flo
     }
 }
 
+/** O7 pass 1: gemv()'s own computation, using Plane::group_cached() (SuperCache-hoisted `d` decode)
+ * where the format has one (Plane::kHasSuper), else plain group() (IQ4_NL, nothing to hoist).
+ *
+ * BIT-EXACT against gemv(): SuperCache changes only how often `d` is decoded, never the value (its own
+ * comment works through why); everything else -- the row walk, the MAC, the scale fold, the delta term,
+ * the accumulation order -- is untouched. `tests/moe_quant_tests.cpp`'s "O7" case requires exact
+ * agreement, not a tolerance, over real plane shapes.
+ */
+template <class Plane>
+void gemv_fast(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, float* out) {
+    const int ng = row_elems / GROUP;
+    for (int r = 0; r < n_rows; ++r) {
+        const std::uint64_t base = static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems);
+        float acc = 0.f;
+        SuperCache sc;   // reset every row -- see SuperCache's own comment on why
+        for (int g = 0; g < ng; ++g) {
+            const std::size_t gi = static_cast<std::size_t>(g);
+            const std::uint64_t p = base + static_cast<std::uint64_t>(g) * GROUP;
+            const WeightGroup wg = [&] {
+                if constexpr (Plane::kHasSuper) return plane.group_cached(p, sc);
+                else                            return plane.group(p);
+            }();
+            const int isum = dot_group(wg.q.data(), x.qs.data() + gi * GROUP);
+            float term = static_cast<float>(isum);
+            if constexpr (Plane::kHasDelta) term += wg.delta * static_cast<float>(x.gsum[gi]);
+            acc += x.scale[gi] * wg.scale * term;
+        }
+        out[r] = acc;
+    }
+}
+
 #if defined(SUB0_MOEQD_AVX2)
 /// Horizontal sum of eight floats.
 [[nodiscard]] inline float hsum(__m256 v) noexcept {
@@ -465,15 +656,99 @@ void gemv_avx2(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x
         out[r] = hsum(acc) + dacc;
     }
 }
+
+/** O7 pass 1+2: gemv_avx2()'s own computation, using Plane::group_v_cached() (SuperCache-hoisted `d`
+ * PLUS a single `_mm256_i32gather_epi64` in place of four scalar table reads + `_mm256_set_epi64x`)
+ * where the format has one, else plain group_v() (IQ4_NL).
+ *
+ * BIT-EXACT against gemv_avx2(): a gather reads the SAME table at the SAME per-lane index the scalar
+ * form did -- a gather is a set of loads, not an arithmetic operation, so it cannot itself introduce any
+ * numeric difference -- and SuperCache's own hoist is provably value-preserving (its own comment). Every
+ * other instruction in the loop (the MAC, the scale fold, the per-row vector accumulator, the one hsum
+ * at the end) is untouched. `tests/moe_quant_tests.cpp`'s "O7" case requires exact agreement against
+ * gemv_avx2(), not merely against the portable kernel's own looser tolerance.
+ */
+template <class Plane>
+void gemv_avx2_fast(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, float* out) noexcept {
+    const int ng = row_elems / GROUP;
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int r = 0; r < n_rows; ++r) {
+        const std::uint64_t base = static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems);
+        __m256 acc  = _mm256_setzero_ps();
+        float  dacc = 0.f;
+        SuperCache sc;   // reset every row -- see SuperCache's own comment on why
+        for (int g = 0; g < ng; ++g) {
+            const std::size_t gi = static_cast<std::size_t>(g);
+            const std::uint64_t p = base + static_cast<std::uint64_t>(g) * GROUP;
+            const WeightGroupV wg = [&] {
+                if constexpr (Plane::kHasSuper) return plane.group_v_cached(p, sc);
+                else                            return plane.group_v(p);
+            }();
+            const __m256i q   = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.qs.data() + gi * GROUP));
+            const __m256i p16 = _mm256_maddubs_epi16(wg.mag, _mm256_sign_epi8(q, wg.sgn));
+            const __m256i p32 = _mm256_madd_epi16(p16, ones);
+            const float   s   = x.scale[gi] * wg.scale;
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(s), acc);
+            if constexpr (Plane::kHasDelta) dacc += s * wg.delta * static_cast<float>(x.gsum[gi]);
+        }
+        out[r] = hsum(acc) + dacc;
+    }
+}
+
+#if defined(__AVXVNNI__)
+/** O7 pass 3 (evaluated, not shipped as the default -- see docs/optimization/opportunities/O7_expert_kernels.md
+ * S4c): gemv_avx2_fast()'s own computation, but the per-group `vpmaddubsw` + `vpmaddwd` pair (unsigned
+ * magnitude x signed activation -> int16 pairs -> horizontally-paired int32) is replaced by ONE
+ * `vpdpbusd` (AVX-VNNI, this host's own `_mm256_dpbusd_avx_epi32`), which computes the identical
+ * unsigned-times-signed 4-element dot AND the pairwise-to-int32 reduction in a single instruction.
+ * `docs/BACKBONE_NATIVE_QUANT.md` S12/S14 tried the analogous fold for the K-quant kernels and found it
+ * roughly PARITY there, because that kernel ALSO needed a separate integer multiply to fold in a
+ * per-sub-block scale after the dot; this kernel has no such extra step (the group's own float scale is
+ * already applied once, outside, exactly the same way with or without VNNI), so the instruction-count
+ * argument is cleaner here -- measured independently rather than assumed to transfer.
+ *
+ * BIT-EXACT against gemv_avx2_fast(): `vpdpbusd`'s own int32 result for four u8 x s8 pairs summed is the
+ * same integer `maddubs_epi16` (16-bit, no saturation in range -- see ActBlocks::quantize's own headroom
+ * note) followed by `madd_epi16` against an all-ones vector computes; only the INSTRUCTION differs, not
+ * the arithmetic. Not wired into gemv_best() -- see the O7 doc for the measured verdict.
+ */
+template <class Plane>
+void gemv_avx2_vnni(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, float* out) noexcept {
+    const int ng = row_elems / GROUP;
+    for (int r = 0; r < n_rows; ++r) {
+        const std::uint64_t base = static_cast<std::uint64_t>(r) * static_cast<std::uint64_t>(row_elems);
+        __m256 acc  = _mm256_setzero_ps();
+        float  dacc = 0.f;
+        SuperCache sc;   // reset every row -- see SuperCache's own comment on why
+        for (int g = 0; g < ng; ++g) {
+            const std::size_t gi = static_cast<std::size_t>(g);
+            const std::uint64_t p = base + static_cast<std::uint64_t>(g) * GROUP;
+            const WeightGroupV wg = [&] {
+                if constexpr (Plane::kHasSuper) return plane.group_v_cached(p, sc);
+                else                            return plane.group_v(p);
+            }();
+            const __m256i q   = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.qs.data() + gi * GROUP));
+            const __m256i p32 = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wg.mag, _mm256_sign_epi8(q, wg.sgn));
+            const float   s   = x.scale[gi] * wg.scale;
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(s), acc);
+            if constexpr (Plane::kHasDelta) dacc += s * wg.delta * static_cast<float>(x.gsum[gi]);
+        }
+        out[r] = hsum(acc) + dacc;
+    }
+}
+#endif
 #endif
 
-/// The kernel gemv_plane runs: gemv_avx2 where the target has it (kAvx2Kernels), else gemv.
+/// The kernel gemv_plane runs: the O7 fast kernel where AVX2 is available (kAvx2Kernels), else the
+/// portable one (also O7's fast form -- see gemv_fast()'s own comment for why this is safe to default
+/// to: both are bit-exact against their pre-O7 predecessors, kept below as the correctness reference and
+/// individually tested, per AGENTS.md S13's "park, never revert").
 template <class Plane>
 void gemv_best(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, float* out) {
 #if defined(SUB0_MOEQD_AVX2)
-    gemv_avx2(plane, n_rows, row_elems, x, out);
+    gemv_avx2_fast(plane, n_rows, row_elems, x, out);
 #else
-    gemv(plane, n_rows, row_elems, x, out);
+    gemv_fast(plane, n_rows, row_elems, x, out);
 #endif
 }
 
