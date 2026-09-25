@@ -864,3 +864,21 @@ Neutral gates confirmed exact so far: `sub0_tests` 29,510,661/147 (fingerprints 
   - neutral gates exact.
 - Merged with one guard added in `gemv_plane_range`.
 - The thread-count sweep is still open. Detail: `O8_moe_row_split.md` §7-§9.
+
+---
+
+**2026-09-26 Claude Code — PAUSED at the user's request.** Everything of mine is on local `main` (not pushed).
+
+- **Decode, recommended flags** (`optimization/opportunities/README.md`): about 5.7 tok/s long-run, and
+  about 6.6–7 tok/s in the six-token A/B. Native backbone, O8 row-split and 8 expert threads are all in.
+- **Quality gate:** G-PPL (`run_perf_suite.py --stage ppl`). The native backbone is quality-neutral, and O8
+  is bit-exact.
+- **Storage-stack S1 (Sonnet agent, worktree `agent-a2c56fde96fcac8ad`):** asked to commit WIP and stop.
+  Its hand-off gives the branch, the step status and the next step. It has not been reviewed or merged.
+- **Resume points, in order:**
+  1. Review and merge S1. Frontend baseline for it: 228,198/295.
+  2. O8's thread-count sweep (row-split with 12 or 16 threads, including E-cores), measured long-run.
+  3. libomp `kmp_set_blocktime(INT_MAX)` overflow warning under `--decode-omp-spin`.
+  4. Stop loading bf16 copies of sidecar-covered roles.
+  5. `SPECULATION_NGRAM_MOE_DESIGN.md` E1–E3 measurements, then PLE fidelity.
+
