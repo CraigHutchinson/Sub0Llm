@@ -38,14 +38,18 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace sub0;
@@ -1087,3 +1091,207 @@ TEST_CASE("moeq (O7 pass 3): gemv_avx2_vnni (parked, not wired into gemv_best) a
     }
 }
 #endif
+
+// --- O8 (docs/optimization/opportunities/O8_moe_row_split.md): row-split validity -------------------
+//
+// decode.cpp's RowSplitExperts splits a plane's rows into chunks and computes each chunk via
+// gemv_plane() on a BYTE-SLICED SUBSPAN of the plane's bytes, rather than calling moe_quant_dot.hpp's
+// kernels directly -- so what needs checking here is exactly the claim decode.cpp's own gemv_plane_range
+// comment makes: that subspan-slicing a plane at a row boundary and calling the PUBLIC gemv_plane() on
+// it produces bit-identical values to reading the same rows out of a single whole-plane call. Kept here
+// (not duplicating a private decode.cpp helper) reproduces gemv_plane_range's own logic independently, on
+// purpose -- an independent reimplementation is what catches an identity-swap bug a shared helper cannot
+// ([[independent-reimplementation-catches-identity-swap-bugs]]).
+
+namespace {
+
+// Row r of a plane begins at byte r * plane_bytes(type, row_elems) ONLY IF row_elems is a whole number
+// of that format's own blocks -- see gguf::block_spec (256-element super-blocks for IQ1_S/IQ2_XXS,
+// 32-element blocks for IQ4_NL). Computes the SAME per-row chunk list decode.cpp's RowSplitExperts does:
+// row-sliced chunks of `chunk_rows` when sliceable, else one chunk covering the whole plane.
+struct O8Chunk { int r0, r1; };
+std::vector<O8Chunk> o8_build_chunks(std::uint32_t type_raw, int n_rows, int row_elems, int chunk_rows) {
+    std::vector<O8Chunk> chunks;
+    const bool sliceable = moeqd::plane_bytes(type_raw, static_cast<std::uint64_t>(row_elems)) != 0;
+    if (!sliceable) { chunks.push_back({0, n_rows}); return chunks; }
+    for (int r0 = 0; r0 < n_rows; r0 += chunk_rows)
+        chunks.push_back({r0, std::min(r0 + chunk_rows, n_rows)});
+    return chunks;
+}
+
+// decode.cpp's own gemv_plane_range, reproduced independently (see this section's header comment): a
+// row-sliced call when the plane is block-aligned per row, else the ordinary whole-plane call (only ever
+// invoked with r0==0 in that case, by construction of o8_build_chunks above).
+bool o8_gemv_plane_range(std::uint32_t type_raw, std::span<const std::uint8_t> raw, int row_elems,
+                          int r0, int r1, const moeqd::ActBlocks& x, float* out) {
+    const std::uint64_t row_bytes = moeqd::plane_bytes(type_raw, static_cast<std::uint64_t>(row_elems));
+    if (row_bytes == 0) return moeqd::gemv_plane(type_raw, raw, r1 - r0, row_elems, x, out);
+    const std::uint64_t off = static_cast<std::uint64_t>(r0) * row_bytes;
+    const std::uint64_t len = static_cast<std::uint64_t>(r1 - r0) * row_bytes;
+    if (off + len > raw.size()) return false;
+    return moeqd::gemv_plane(type_raw, raw.subspan(off, len), r1 - r0, row_elems, x, out);
+}
+
+// Runs the row-chunk list across `threads` real std::thread workers (a STATIC round-robin split of the
+// chunk list, not OpenMP's schedule(dynamic) -- sub0_frontend_tests does not link the full OpenMP
+// runtime, only -fopenmp-simd, so this is genuine concurrency without depending on libomp). Each thread
+// only ever writes rows that belong to ITS OWN chunks, which are disjoint by construction, so this is
+// also a real (if small) check that no data race corrupts a neighbouring row.
+void o8_run_chunks_threaded(std::uint32_t type_raw, std::span<const std::uint8_t> raw, int row_elems,
+                             const std::vector<O8Chunk>& chunks, const moeqd::ActBlocks& x, float* out,
+                             int threads, std::atomic<bool>& ok) {
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threads));
+    for (int t = 0; t < threads; ++t) {
+        workers.emplace_back([&, t] {
+            for (std::size_t c = static_cast<std::size_t>(t); c < chunks.size();
+                 c += static_cast<std::size_t>(threads)) {
+                const O8Chunk ch = chunks[c];
+                if (!o8_gemv_plane_range(type_raw, raw, row_elems, ch.r0, ch.r1, x, out + ch.r0))
+                    ok.store(false, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+}
+
+// --- real-sidecar location, same graceful-skip pattern as backbone_quant_dot_tests.cpp's real_gguf_dir --
+std::string o8_real_moeq_path() {
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    const char* env = std::getenv("SUB0_QWEN4_MOEQ_PATH");
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    if (env) return env;
+    return "D:/ModelWeights/Sub0Llm-Qwen4-full48-bf16/qwen4_full48_q_bf16.bin.moeq";
+}
+
+}  // namespace
+
+TEST_CASE("O8: row-sliced gemv_plane agrees EXACTLY with the whole-plane result, real sidecar bytes, "
+          "at several thread counts",
+          "[moequant][o8]") {
+    std::string err;
+    moeq::Store store;
+    if (!store.open(o8_real_moeq_path(), err)) {
+        WARN("the real Qwen4 48-layer .moeq sidecar was not found (checked SUB0_QWEN4_MOEQ_PATH / "
+             << o8_real_moeq_path() << ": " << err << ") -- skipping the real-byte O8 row-split check");
+        return;
+    }
+    const moeq::Header& h = store.header();
+    INFO("sidecar: n_layers=" << h.n_layers << " num_experts=" << h.num_experts << " d_model=" << h.d_model
+                               << " d_ff=" << h.d_ff);
+
+    // Find one real Gate plane of each format this sidecar actually carries (scanning layers rather than
+    // assuming which layer has which -- AGENTS.md S10, "checked not assumed"), plus one real Down plane
+    // (expected IQ4_NL at every layer, per O8 doc S2, but read from the file rather than hardcoded).
+    const moeq::Desc* iq1s_gate = nullptr;
+    const moeq::Desc* iq2xxs_gate = nullptr;
+    const moeq::Desc* any_down = nullptr;
+    const int scan_layers = std::min(h.n_layers, 8);
+    for (int l = 0; l < scan_layers && (!iq1s_gate || !iq2xxs_gate || !any_down); ++l) {
+        const moeq::Desc& g = store.desc(l, 0, moeq::Gate);
+        if (!iq1s_gate && g.type_raw == static_cast<std::uint32_t>(gguf::TensorType::IQ1_S)) iq1s_gate = &g;
+        if (!iq2xxs_gate && g.type_raw == static_cast<std::uint32_t>(gguf::TensorType::IQ2_XXS))
+            iq2xxs_gate = &g;
+        if (!any_down) any_down = &store.desc(l, 0, moeq::Down);
+    }
+    REQUIRE(any_down != nullptr);
+    INFO("down plane format found: " << format_name(static_cast<gguf::TensorType>(any_down->type_raw)));
+
+    struct Pick { const moeq::Desc* d; int row_elems; int chunk_rows; const char* label; };
+    std::vector<Pick> picks;
+    if (iq1s_gate)   picks.push_back({iq1s_gate,   static_cast<int>(h.d_model), 64, "gate IQ1_S"});
+    if (iq2xxs_gate) picks.push_back({iq2xxs_gate, static_cast<int>(h.d_model), 64, "gate IQ2_XXS"});
+    picks.push_back({any_down, static_cast<int>(h.d_ff), 128, "down (real format)"});
+    if (!iq1s_gate) WARN("no IQ1_S gate plane found in the first " << scan_layers << " layers -- that "
+                         "format's row-split path is unexercised by this run");
+    if (!iq2xxs_gate) WARN("no IQ2_XXS gate plane found in the first " << scan_layers << " layers -- "
+                           "that format's row-split path is unexercised by this run");
+
+    for (const Pick& pk : picks) {
+        INFO("plane: " << pk.label << " row_elems=" << pk.row_elems);
+        // Desc::in_f is always the row width (row_elems) and out_f the row count (n_rows) -- moe_quant.
+        // hpp's own convention, the same one moeqd::detail::plane_ok checks -- so this doubles as a real
+        // geometry sanity check rather than an assumption.
+        REQUIRE(static_cast<int>(pk.d->in_f) == pk.row_elems);
+        const int n_rows = static_cast<int>(pk.d->out_f);
+        REQUIRE(n_rows > 0);
+        const std::span<const std::uint8_t> raw = store.raw(*pk.d);
+
+        std::vector<float> x(static_cast<std::size_t>(pk.row_elems));
+        std::mt19937 rng(7654321u + pk.d->type_raw);
+        std::normal_distribution<float> normal(0.f, 1.f);
+        for (float& v : x) v = normal(rng);
+        moeqd::ActBlocks xq;
+        xq.quantize(x.data(), pk.row_elems);
+
+        std::vector<float> reference(static_cast<std::size_t>(n_rows));
+        REQUIRE(moeqd::gemv_plane(pk.d->type_raw, raw, n_rows, pk.row_elems, xq, reference.data()));
+        for (float v : reference) REQUIRE(std::isfinite(v));
+
+        const std::vector<O8Chunk> chunks = o8_build_chunks(pk.d->type_raw, n_rows, pk.row_elems,
+                                                             pk.chunk_rows);
+        INFO("chunk count " << chunks.size());
+        for (const int threads : {1, 2, 4, 8}) {
+            std::vector<float> split(static_cast<std::size_t>(n_rows), std::numeric_limits<float>::quiet_NaN());
+            std::atomic<bool> ok{true};
+            o8_run_chunks_threaded(pk.d->type_raw, raw, pk.row_elems, chunks, xq, split.data(), threads, ok);
+            REQUIRE(ok.load());
+            INFO("threads " << threads);
+            for (int r = 0; r < n_rows; ++r) {
+                REQUIRE(split[static_cast<std::size_t>(r)] == reference[static_cast<std::size_t>(r)]);
+            }
+        }
+    }
+}
+
+TEST_CASE("O8: an unsliceable plane (row width not a whole number of its format's blocks) falls back "
+          "to a single whole-plane chunk, and still agrees with gemv_plane",
+          "[moequant][o8]") {
+    // The real hazard this covers (O8 doc S2): the down projection's row width (D_FF=640 at the real
+    // axes) is NOT a multiple of IQ1_S/IQ2_XXS's 256-element super-block, so plane_bytes() cannot give a
+    // per-row byte stride for THAT combination -- even though the real sidecar never actually assigns
+    // down to those formats (it is always IQ4_NL there, whose 32-element blocks divide 640 evenly; see
+    // the real-sidecar test above). Reproduced here with synthetic bytes at exactly that shape so the
+    // fallback path is exercised regardless of what any particular sidecar happens to contain.
+    constexpr int kDownLikeRowElems = 640;    // 640 % 256 == 128 != 0 for IQ1_S/IQ2_XXS
+    constexpr int kGateLikeRowElems = 2560;   // 2560 % 256 == 0 -- sliceable for every format
+    constexpr int kRows = 24;                 // small; this test is about the alignment check, not speed
+
+    for (const gguf::TensorType type : {gguf::TensorType::IQ1_S, gguf::TensorType::IQ2_XXS}) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        REQUIRE(moeqd::plane_bytes(raw_t, static_cast<std::uint64_t>(kDownLikeRowElems)) == 0);
+        REQUIRE(moeqd::plane_bytes(raw_t, static_cast<std::uint64_t>(kGateLikeRowElems)) != 0);
+
+        const std::vector<std::uint8_t> raw = make_iq_blocks(
+            type, static_cast<std::uint64_t>(kRows) * kDownLikeRowElems, 5150u + raw_t);
+        std::vector<float> x(kDownLikeRowElems);
+        std::mt19937 rng(24680u + raw_t);
+        std::normal_distribution<float> normal(0.f, 1.f);
+        for (float& v : x) v = normal(rng);
+        moeqd::ActBlocks xq;
+        xq.quantize(x.data(), kDownLikeRowElems);
+
+        std::vector<float> reference(kRows);
+        REQUIRE(moeqd::gemv_plane(raw_t, std::span<const std::uint8_t>(raw), kRows, kDownLikeRowElems, xq,
+                                  reference.data()));
+
+        const std::vector<O8Chunk> chunks = o8_build_chunks(raw_t, kRows, kDownLikeRowElems, 8);
+        REQUIRE(chunks.size() == 1);       // the fallback: ONE chunk covering the whole plane
+        REQUIRE(chunks[0].r0 == 0);
+        REQUIRE(chunks[0].r1 == kRows);
+
+        std::vector<float> split(kRows, std::numeric_limits<float>::quiet_NaN());
+        std::atomic<bool> ok{true};
+        o8_run_chunks_threaded(raw_t, std::span<const std::uint8_t>(raw), kDownLikeRowElems, chunks, xq,
+                                split.data(), 4, ok);
+        REQUIRE(ok.load());
+        for (int r = 0; r < kRows; ++r)
+            REQUIRE(split[static_cast<std::size_t>(r)] == reference[static_cast<std::size_t>(r)]);
+    }
+}
