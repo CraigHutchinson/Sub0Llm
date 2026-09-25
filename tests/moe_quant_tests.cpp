@@ -923,3 +923,167 @@ TEST_CASE("moeq (B35): a format the fused path cannot handle is refused, not sil
                                      std::span<const std::uint8_t>(q8), 1, 256, xq, &out));
     REQUIRE(out == 1234.f);                       // refused means untouched, not partially written
 }
+
+// --- O7: SuperCache (hoisted scale decode) + gather-based codebook lookup --------------------------
+//
+// O7 (docs/optimization/opportunities/O7_expert_kernels.md) replaced what `gemv_plane` actually runs
+// with `gemv_fast`/`gemv_avx2_fast` (SuperCache's hoisted `d` decode for IQ1_S/IQ2_XXS, plus a
+// `_mm256_i32gather_epi64` codebook/sign lookup on the AVX2 path), on the claim that both changes are
+// BIT-EXACT against the pre-O7 kernels (`gemv`/`gemv_avx2`, kept in the tree as the reference). The
+// cases below pin that claim directly -- REQUIRE exact equality, not a tolerance -- rather than resting
+// on "the O1 case's 2e-5 tolerance didn't move" as indirect evidence. Real plane shapes only (640x2560,
+// 2560x640): the down projection's 640-wide rows are the case that exercises SuperCache's own "reset
+// per row, not assumed superblock-aligned" contract, since 640 is 2.5 IQ1_S/IQ2_XXS superblocks and
+// consecutive rows begin at alternating phase (0, 128, 0, 128, ...) within a 256-element superblock.
+
+TEST_CASE("moeq (O7): gemv_fast (SuperCache) agrees EXACTLY with the pre-O7 portable gemv()",
+          "[moequant]") {
+    struct Shape { int rows, cols; };
+    for (const Shape sh : {Shape{640, 2560}, Shape{2560, 640}}) {
+        std::vector<float> x(static_cast<std::size_t>(sh.cols));
+        std::mt19937 rng(50505u + static_cast<std::uint32_t>(sh.cols));
+        std::normal_distribution<float> normal(0.f, 1.f);
+        for (float& v : x) v = normal(rng);
+        moeqd::ActBlocks xq;
+        xq.quantize(x.data(), sh.cols);
+
+        for (const gguf::TensorType type : kFusedFormats) {
+            INFO("format " << format_name(type) << ", " << sh.rows << " x " << sh.cols);
+            const auto raw_t = static_cast<std::uint32_t>(type);
+            const std::vector<std::uint8_t> raw = make_iq_blocks(
+                type, static_cast<std::uint64_t>(sh.rows) * static_cast<std::uint64_t>(sh.cols), 6060u + raw_t);
+
+            std::vector<float> old_out(static_cast<std::size_t>(sh.rows));
+            std::vector<float> fast_out(static_cast<std::size_t>(sh.rows));
+            const auto dispatch = [&](const auto& plane) {
+                moeqd::detail::gemv(plane, sh.rows, sh.cols, xq, old_out.data());
+                moeqd::detail::gemv_fast(plane, sh.rows, sh.cols, xq, fast_out.data());
+            };
+            switch (type) {
+                case gguf::TensorType::IQ1_S:   dispatch(moeqd::Iq1SPlane{raw.data()}); break;
+                case gguf::TensorType::IQ2_XXS: dispatch(moeqd::Iq2XxsPlane{raw.data()}); break;
+                default:                        dispatch(moeqd::Iq4NlPlane{raw.data()}); break;
+            }
+            for (int r = 0; r < sh.rows; ++r) {
+                REQUIRE(std::isfinite(old_out[static_cast<std::size_t>(r)]));
+                REQUIRE(old_out[static_cast<std::size_t>(r)] == fast_out[static_cast<std::size_t>(r)]);
+            }
+        }
+    }
+}
+
+#if defined(SUB0_MOEQD_AVX2)
+TEST_CASE("moeq (O7): gemv_avx2_fast (SuperCache + gather) agrees EXACTLY with the pre-O7 gemv_avx2()",
+          "[moequant]") {
+    struct Shape { int rows, cols; };
+    for (const Shape sh : {Shape{640, 2560}, Shape{2560, 640}}) {
+        std::vector<float> x(static_cast<std::size_t>(sh.cols));
+        std::mt19937 rng(70707u + static_cast<std::uint32_t>(sh.cols));
+        std::normal_distribution<float> normal(0.f, 1.f);
+        for (float& v : x) v = normal(rng);
+        moeqd::ActBlocks xq;
+        xq.quantize(x.data(), sh.cols);
+
+        for (const gguf::TensorType type : kFusedFormats) {
+            INFO("format " << format_name(type) << ", " << sh.rows << " x " << sh.cols);
+            const auto raw_t = static_cast<std::uint32_t>(type);
+            const std::vector<std::uint8_t> raw = make_iq_blocks(
+                type, static_cast<std::uint64_t>(sh.rows) * static_cast<std::uint64_t>(sh.cols), 8080u + raw_t);
+
+            std::vector<float> old_out(static_cast<std::size_t>(sh.rows));
+            std::vector<float> fast_out(static_cast<std::size_t>(sh.rows));
+            const auto dispatch = [&](const auto& plane) {
+                moeqd::detail::gemv_avx2(plane, sh.rows, sh.cols, xq, old_out.data());
+                moeqd::detail::gemv_avx2_fast(plane, sh.rows, sh.cols, xq, fast_out.data());
+            };
+            switch (type) {
+                case gguf::TensorType::IQ1_S:   dispatch(moeqd::Iq1SPlane{raw.data()}); break;
+                case gguf::TensorType::IQ2_XXS: dispatch(moeqd::Iq2XxsPlane{raw.data()}); break;
+                default:                        dispatch(moeqd::Iq4NlPlane{raw.data()}); break;
+            }
+            for (int r = 0; r < sh.rows; ++r) {
+                REQUIRE(std::isfinite(old_out[static_cast<std::size_t>(r)]));
+                REQUIRE(old_out[static_cast<std::size_t>(r)] == fast_out[static_cast<std::size_t>(r)]);
+            }
+        }
+    }
+}
+#endif
+
+TEST_CASE("moeq (O7): SuperCache actually gates the value -- a forged stale cache produces a WRONG "
+          "answer, and a genuine block change corrects it",
+          "[moequant]") {
+    // Proves the O7 exact-agreement cases above have teeth, rather than passing vacuously because
+    // refresh() happens to run every time anyway. Two IQ2_XXS superblocks with DELIBERATELY DIFFERENT
+    // `d` (random bytes could coincide by chance, so this is forced): if refresh() ever failed to detect
+    // a genuine superblock change -- e.g. an off-by-one in `p / kSuperElems` -- the symptom would be
+    // exactly what step 1 constructs below by hand: a cache that believes it already holds the current
+    // block's data and so returns a stale scale instead of decoding the real one.
+    constexpr int kN = 512;   // two IQ2_XXS superblocks
+    std::vector<std::uint8_t> raw = make_iq_blocks(gguf::TensorType::IQ2_XXS, kN, 9191u);
+    const std::uint16_t d0 = 0x3100, d1 = 0x3900;   // distinct positive f16 values
+    std::memcpy(raw.data(), &d0, 2);
+    std::memcpy(raw.data() + 66, &d1, 2);
+    moeqd::Iq2XxsPlane plane{raw.data()};
+
+    const moeqd::WeightGroup correct0 = plane.group(0);      // always-fresh reference, superblock 0
+    const moeqd::WeightGroup correct1 = plane.group(256);    // always-fresh reference, superblock 1
+    REQUIRE(correct0.scale != correct1.scale);   // else the whole check below would be vacuous
+
+    // Step 1: forge a cache that already claims block 0 (matching p=0's own superblock) but holds a
+    // WRONG scale for it -- exactly what a broken refresh() would look like from the outside.
+    moeqd::SuperCache forged;
+    forged.block = 0;
+    forged.d = correct0.scale * 7.0f + 1.0f;   // deliberately not correct0's real per-group d
+    const moeqd::WeightGroup wrong = plane.group_cached(0, forged);
+    REQUIRE(wrong.scale != correct0.scale);    // the forged corruption IS visible in the output --
+                                                // i.e. group_cached() really does read from the cache.
+
+    // Step 2: the SAME (still-forged) cache, asked for a group in superblock 1: a genuine block change,
+    // which refresh() must detect and correct regardless of what the cache held before.
+    const moeqd::WeightGroup corrected = plane.group_cached(256, forged);
+    REQUIRE(corrected.scale == correct1.scale);
+}
+
+#if defined(SUB0_MOEQD_AVX2) && defined(__AVXVNNI__)
+TEST_CASE("moeq (O7 pass 3): gemv_avx2_vnni (parked, not wired into gemv_best) agrees EXACTLY with "
+          "gemv_avx2_fast",
+          "[moequant]") {
+    // O7 pass 3 (docs/optimization/opportunities/O7_expert_kernels.md S4c) replaces the maddubs+madd_epi16
+    // pair with one vpdpbusd. Measured roughly parity-to-slightly-worse against pass 1+2 on real planes,
+    // so it is kept in the tree, tested, and NOT wired into gemv_best() -- AGENTS.md S13's "park, never
+    // revert". This pins that it is at least a correct park: same integer arithmetic, so exact agreement.
+    struct Shape { int rows, cols; };
+    for (const Shape sh : {Shape{640, 2560}, Shape{2560, 640}}) {
+        std::vector<float> x(static_cast<std::size_t>(sh.cols));
+        std::mt19937 rng(90909u + static_cast<std::uint32_t>(sh.cols));
+        std::normal_distribution<float> normal(0.f, 1.f);
+        for (float& v : x) v = normal(rng);
+        moeqd::ActBlocks xq;
+        xq.quantize(x.data(), sh.cols);
+
+        for (const gguf::TensorType type : kFusedFormats) {
+            INFO("format " << format_name(type) << ", " << sh.rows << " x " << sh.cols);
+            const auto raw_t = static_cast<std::uint32_t>(type);
+            const std::vector<std::uint8_t> raw = make_iq_blocks(
+                type, static_cast<std::uint64_t>(sh.rows) * static_cast<std::uint64_t>(sh.cols), 1212u + raw_t);
+
+            std::vector<float> fast_out(static_cast<std::size_t>(sh.rows));
+            std::vector<float> vnni_out(static_cast<std::size_t>(sh.rows));
+            const auto dispatch = [&](const auto& plane) {
+                moeqd::detail::gemv_avx2_fast(plane, sh.rows, sh.cols, xq, fast_out.data());
+                moeqd::detail::gemv_avx2_vnni(plane, sh.rows, sh.cols, xq, vnni_out.data());
+            };
+            switch (type) {
+                case gguf::TensorType::IQ1_S:   dispatch(moeqd::Iq1SPlane{raw.data()}); break;
+                case gguf::TensorType::IQ2_XXS: dispatch(moeqd::Iq2XxsPlane{raw.data()}); break;
+                default:                        dispatch(moeqd::Iq4NlPlane{raw.data()}); break;
+            }
+            for (int r = 0; r < sh.rows; ++r) {
+                REQUIRE(std::isfinite(fast_out[static_cast<std::size_t>(r)]));
+                REQUIRE(fast_out[static_cast<std::size_t>(r)] == vnni_out[static_cast<std::size_t>(r)]);
+            }
+        }
+    }
+}
+#endif
