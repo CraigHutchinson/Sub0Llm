@@ -35,14 +35,53 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 
+#include "sub0/backbone_quant_dot.hpp"  // O5 phase 2b-3 phase B: bbqd::Plane/ActBlocks/gemv_plane for
+                                         // attn_project_row's/attn_row's optional native-quant path --
+                                         // storage-agnostic, see that header's own "format-agnostic
+                                         // plane view" comment.
 #include "sub0/gemv.hpp"
 #include "sub0/simd_reduce.hpp"  // B34/B38: dot_choice/sumsq_choice/sum_choice<UseSimd>() for this
                                   // file's real scalar-reduction hot loops (docs/INDEPENDENT_REVIEW_
                                   // BACKLOG.md B38).
 
 namespace sub0::qsa {
+
+// O5 phase 2b-3 phase B (docs/BACKBONE_NATIVE_QUANT.md S18): optional native-quant weight sources for
+// the QSA attention sublayer's four projections -- q|gate (QsaQGateProj, the WHOLE `attn_q.weight`
+// tensor stored verbatim, GGUF/tiled row order: per head, the query half occupies rows
+// [h*2*head_dim, h*2*head_dim+head_dim) and the gate half [h*2*head_dim+head_dim, h*2*head_dim+2*head_dim)
+// -- backbone_quant.hpp's own role comment), k, v, and o. Mirrors gdn::Native's/gr::Native's own shape.
+//
+// THE Q|GATE SPLIT (backbone_quant.hpp S13b's own deferred decision, resolved here): the sidecar never
+// pre-splits q|gate at write time (a real risk of an off-by-one in the per-head row arithmetic with no
+// kernel consumer to catch it against, per that file's own comment) -- this is that consumer.
+// `transplant::per_head_half_transpose`'s own row-selection formula (`h*2*head_dim + half*head_dim`,
+// `half`: 0=query, 1=gate) is applied HERE, per head, as `row_lo`/`row_hi` into ONE `gemv_plane` call per
+// head per half (`bbqd::gemv_plane`'s own row-range parameters, backbone_quant_dot.hpp S6c) -- so the
+// split is a row-RANGE selection into the whole tensor's own GEMV, never a copy or a second kernel path.
+// Proven against the bf16 path by a dedicated differential test (tests/qsa_qwen4_fixture_tests.cpp), the
+// same discipline phase 2b-2b's gather-direction proof used for GDN's own out-proj permutation.
+//
+// ONLY MEANINGFUL AT T==1 (decode's own per-row call shape). CALLER-OWNED, REUSED SCRATCH (AGENTS.md S1):
+// `x_q` is quantized ONCE per call, shared by q|gate/k/v (all three read the SAME hidden_size-wide input
+// row `x` -- AGENTS.md's own "one distinct activation vector, one quantize call" discipline, matching
+// GDN's in_qkv/in_z precedent). `ao_q` is o_proj's own quantized (post-gate) attention-output input, a
+// genuinely different vector from `x_q`, quantized separately in attn_row().
+struct Native {
+    const bbqd::Plane* q_gate = nullptr;   // whole attn_q.weight, GGUF/tiled row order
+    const bbqd::Plane* k      = nullptr;
+    const bbqd::Plane* v      = nullptr;
+    const bbqd::Plane* o      = nullptr;
+    bbqd::ActBlocks* x_q  = nullptr;   // hidden_size-wide, shared by q_gate/k/v
+    bbqd::ActBlocks* ao_q = nullptr;   // q_width-wide, o_proj's own quantized (gated) attention output
+
+    [[nodiscard]] bool proj_ready() const { return q_gate != nullptr && k != nullptr && v != nullptr && x_q != nullptr; }
+    [[nodiscard]] bool o_ready() const { return o != nullptr && ao_q != nullptr; }
+};
 
 // Every dimension the mechanism needs, explicit rather than closed over a build's own constants -- same
 // reasoning as gdn_math.hpp's / gated_residual_math.hpp's / moe_math.hpp's own Dims (lets a standalone
@@ -331,11 +370,45 @@ template <bool UseSimd = false, int Threads = 1, class WP>
 inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
                               WP k_w, WP v_w, WP q_norm_w,
                               WP k_norm_w, const float* cos_pos, const float* sin_pos,
-                              float eps, float* out_q, float* out_gate, float* out_k, float* out_v) {
-    linear_row<Threads>(x, q_w,    d.hidden_size, d.q_width(),  out_q);
-    linear_row<Threads>(x, gate_w, d.hidden_size, d.q_width(),  out_gate);
-    linear_row<Threads>(x, k_w,    d.hidden_size, d.kv_width(), out_k);
-    linear_row<Threads>(x, v_w,    d.hidden_size, d.kv_width(), out_v);
+                              float eps, float* out_q, float* out_gate, float* out_k, float* out_v,
+                              const Native* native = nullptr) {
+    // O5 phase 2b-3 phase B: geometry re-validated here, never trusted from the caller alone
+    // (AGENTS.md S10) -- a mismatch falls back to the ordinary linear_row path for every projection,
+    // silently and correctly.
+    const bool native_ok = native != nullptr && native->proj_ready() &&
+        native->q_gate->row_elems == d.hidden_size && native->q_gate->n_rows == 2 * d.q_width() &&
+        native->k->row_elems == d.hidden_size && native->k->n_rows == d.kv_width() &&
+        native->v->row_elems == d.hidden_size && native->v->n_rows == d.kv_width();
+    if (native_ok) {
+        // AGENTS.md S1's own "one distinct activation vector, one quantize call" discipline: q_gate/k/v
+        // all read this SAME hidden_size-wide row, so it is quantized exactly once here.
+        native->x_q->quantize(x, d.hidden_size);
+        // The Q|GATE split (this struct's own header comment): per head, `transplant::
+        // per_head_half_transpose`'s own row-selection formula (`h*2*head_dim + half*head_dim`) picked
+        // out as a `[row_lo, row_hi)` range into the WHOLE tensor's own GEMV -- one gemv_plane call per
+        // head per half, writing straight into this head's own D_HEAD-wide slot of out_q/out_gate.
+        const int hd = d.head_dim;
+        bool ok = true;
+        for (int h = 0; h < d.n_heads; ++h) {
+            const int row0 = h * 2 * hd;
+            ok = ok && bbqd::gemv_plane<Threads>(*native->q_gate, *native->x_q, out_q + h * hd,
+                                                 row0, row0 + hd);
+            ok = ok && bbqd::gemv_plane<Threads>(*native->q_gate, *native->x_q, out_gate + h * hd,
+                                                 row0 + hd, row0 + 2 * hd);
+        }
+        ok = ok && bbqd::gemv_plane<Threads>(*native->k, *native->x_q, out_k);
+        ok = ok && bbqd::gemv_plane<Threads>(*native->v, *native->x_q, out_v);
+        if (!ok) {
+            std::fprintf(stderr, "fatal: qsa::attn_project_row's native q|gate/k/v GEMV rejected a plane "
+                                 "whose geometry passed the outer check\n");
+            std::abort();
+        }
+    } else {
+        linear_row<Threads>(x, q_w,    d.hidden_size, d.q_width(),  out_q);
+        linear_row<Threads>(x, gate_w, d.hidden_size, d.q_width(),  out_gate);
+        linear_row<Threads>(x, k_w,    d.hidden_size, d.kv_width(), out_k);
+        linear_row<Threads>(x, v_w,    d.hidden_size, d.kv_width(), out_v);
+    }
     for (int h = 0; h < d.n_heads; ++h) {
         float* qh = out_q + static_cast<std::size_t>(h) * d.head_dim;
         rms_norm_row<UseSimd>(qh, q_norm_w, d.head_dim, eps, qh);
@@ -357,7 +430,7 @@ inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
 template <bool UseSimd = false, int Threads = 1, class WP>
 inline void attn_row(const Dims& d, const float* q, const float* gate, const float* k_cache,
                       const float* v_cache, int kv_len, const float* mask, WP o_proj_w,
-                      float* out, float* scratch) {
+                      float* out, float* scratch, const Native* native = nullptr) {
     float* sc = scratch;                     // [kv_len]
     float* ao = scratch + kv_len;            // [q_width()]
     const float scale = 1.f / std::sqrt(static_cast<float>(d.head_dim));
@@ -393,7 +466,20 @@ inline void attn_row(const Dims& d, const float* q, const float* gate, const flo
     }
     // attn_output = attn_output * sigmoid(gate), elementwise over the flat [n_heads*head_dim] row.
     for (int o = 0; o < d.q_width(); ++o) ao[o] *= detail::sigmoid(gate[o]);
-    linear_row<Threads>(ao, o_proj_w, d.q_width(), d.hidden_size, out);
+    const bool native_ok = native != nullptr && native->o_ready() &&
+        native->o->row_elems == d.q_width() && native->o->n_rows == d.hidden_size;
+    if (native_ok) {
+        // A genuinely different activation vector from x_q (attn_project_row's own quantize) -- `ao` is
+        // this row's post-softmax, post-gate attention output, so its own quantize call here.
+        native->ao_q->quantize(ao, d.q_width());
+        if (!bbqd::gemv_plane<Threads>(*native->o, *native->ao_q, out)) {
+            std::fprintf(stderr, "fatal: qsa::attn_row's native o-projection GEMV rejected a plane whose "
+                                 "geometry passed the outer check\n");
+            std::abort();
+        }
+    } else {
+        linear_row<Threads>(ao, o_proj_w, d.q_width(), d.hidden_size, out);
+    }
 }
 
 // The whole QSA mixer sublayer for a T-row prefill (positions 0..T-1, causal). A thin loop over the row

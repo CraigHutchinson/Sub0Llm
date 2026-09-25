@@ -227,6 +227,34 @@ thread_local std::array<float, GDN_VALUE_DIM> g_gdn_out_gather_buf{};
 // gemv_plane on every call (see backbone_quant_dot.hpp's own Gsum16/gemv_plane comments).
 thread_local bbqd::Gsum16 g_gdn_out_gsum16{};
 
+// O5 phase 2b-3 phase B (docs/BACKBONE_NATIVE_QUANT.md S18): caller-owned, reused scratch for the
+// remaining native-quant roles -- Gated Residual (down/up), QSA (q|gate/k/v, o), and the MoE shared
+// expert (gate/up/down). Sized/derived once at kv_reset(), never per token (AGENTS.md S1) -- mirrors
+// g_gdn_in_act_q/g_gdn_out_act_q's own precedent exactly.
+//
+// Gated Residual: ONE (wide_q, lr_q) pair is shared across every gr::mix call this token makes
+// (gr_attn/gr_mlp per layer, plus the model-level exit collapse) -- every call within a token/layer is
+// strictly sequential (each quantize-then-GEMV pair fully consumes its own scratch before the next call
+// starts), so there is no cross-call aliasing hazard, the same reasoning g_moe_act_q's own "single global,
+// forward_one is single-threaded at the call level" comment already gives.
+thread_local bbqd::ActBlocks g_gr_wide_q{};   // HC_WIDE-wide (or D_MODEL when GR is off -- unused there)
+thread_local bbqd::ActBlocks g_gr_lr_q{};     // HC_LOWRANK_BUF-wide
+
+// QSA: x_q feeds q|gate/k/v (one shared D_MODEL-wide input row); ao_q is o_proj's own quantized
+// (post-gate) attention output, D_Q-wide.
+thread_local bbqd::ActBlocks g_qsa_x_q{};
+thread_local bbqd::ActBlocks g_qsa_ao_q{};
+
+// MoE shared expert: x_q feeds gate/up (one shared D_MODEL-wide input row); pre_q is down's own
+// quantized (post-SwiGLU) input, D_FF-wide; gsum16 is shared Q6_K scratch (the real layer-2 outlier).
+// gate_scr/up_scr are D_FF-wide GEMV outputs (plain fixed-size arrays -- D_FF is a compile-time constant,
+// so no reserve() ceremony is needed the way the variable-width ActBlocks buffers above need it).
+thread_local bbqd::ActBlocks g_moe_shared_x_q{};
+thread_local bbqd::ActBlocks g_moe_shared_pre_q{};
+thread_local bbqd::Gsum16    g_moe_shared_gsum16{};
+thread_local std::array<float, static_cast<std::size_t>(D_FF)> g_moe_shared_gate_scr{};
+thread_local std::array<float, static_cast<std::size_t>(D_FF)> g_moe_shared_up_scr{};
+
 // Runs one decode row's selected experts across MOE_DECODE_THREADS threads. Passed to
 // moe::forward_row_via_run, which computes each expert into its OWN output buffer and does the weighted
 // sum afterwards in the original selection order -- so this runner cannot change the answer, only who
@@ -266,6 +294,65 @@ struct ParallelExperts {
                              layer_index, err);
                 std::abort();
             }
+        }
+    }
+
+    // O5 phase 2b-3 phase B (docs/BACKBONE_NATIVE_QUANT.md S18): the ALWAYS-ON shared expert's own
+    // optional native-quant gate/up/down path. Detected by moe_math.hpp's forward_row_via_run_ex via
+    // `if constexpr (requires { run_experts.compute_shared(x, out); })` -- the SAME optional-hook
+    // pattern this struct's own prefetch() already uses, one seam up. Lives HERE, not as a Native struct
+    // inside moe_math.hpp, because that header must stay free of any bbqd dependency: routing it through
+    // moe_math.hpp would form a real header cycle (backbone_quant_dot.hpp -> moe_quant_dot.hpp ->
+    // moe_math.hpp -> backbone_quant_dot.hpp, since moe_quant_dot.hpp itself needs moe::Dims/
+    // moe::detail::silu) -- found by actually trying it, not assumed safe (AGENTS.md S10).
+    //
+    // Returns false (leaving `out` untouched) when the sidecar has no shared-expert roles at this layer,
+    // or their geometry does not match this build's axes -- forward_row_via_run_ex's own fallback then
+    // runs the ordinary f32/bf16 expert_ffn_row exactly as before this pass, never a partial computation.
+    [[nodiscard]] bool compute_shared(const float* x, float* out) const {
+        if constexpr (!BACKBONE_QUANT_DOT) {
+            (void)x; (void)out;
+            return false;
+        } else {
+            const auto& e_gate = g_backbone_roles.get(bbq::Role::MoeSharedGate, layer_index);
+            const auto& e_up   = g_backbone_roles.get(bbq::Role::MoeSharedUp, layer_index);
+            const auto& e_down = g_backbone_roles.get(bbq::Role::MoeSharedDown, layer_index);
+            if (!e_gate.present || !e_up.present || !e_down.present) return false;
+            // Geometry re-validated here, never trusted from the sidecar's own presence flag alone
+            // (AGENTS.md S10).
+            if (e_gate.plane.row_elems != D_MODEL || e_gate.plane.n_rows != D_FF ||
+                e_up.plane.row_elems != D_MODEL || e_up.plane.n_rows != D_FF ||
+                e_down.plane.row_elems != D_FF || e_down.plane.n_rows != D_MODEL)
+                return false;
+            // AGENTS.md S1's own "one distinct activation vector, one quantize call": gate and up both
+            // read this SAME hidden_size-wide `x`.
+            g_moe_shared_x_q.quantize(x, D_MODEL);
+            bool ok = bbqd::gemv_plane<DECODE_GEMV_THREADS>(e_gate.plane, g_moe_shared_x_q,
+                                                            g_moe_shared_gate_scr.data(), 0, -1,
+                                                            &g_moe_shared_gsum16);
+            ok = ok && bbqd::gemv_plane<DECODE_GEMV_THREADS>(e_up.plane, g_moe_shared_x_q,
+                                                             g_moe_shared_up_scr.data(), 0, -1,
+                                                             &g_moe_shared_gsum16);
+            // moe::detail::silu, not the FAST_MATH-gated silu_row (not yet declared at this point in the
+            // file, and not defined here to begin with): matches the exact SiLU expert_ffn_row's own
+            // fallback path already uses for the shared expert, so the native and non-native arms compute
+            // the SwiGLU gate with the SAME function.
+            for (int o = 0; o < D_FF; ++o) {
+                const auto oi = static_cast<std::size_t>(o);
+                g_moe_shared_up_scr[oi] = moe::detail::silu(g_moe_shared_gate_scr[oi]) * g_moe_shared_up_scr[oi];
+            }
+            // down's input is silu(gate(x))*up(x) -- a genuinely different vector from x_q, so its own
+            // quantize call, after the gate/up projections complete (mirrors gr::mix's own down/up
+            // split).
+            g_moe_shared_pre_q.quantize(g_moe_shared_up_scr.data(), D_FF);
+            ok = ok && bbqd::gemv_plane<DECODE_GEMV_THREADS>(e_down.plane, g_moe_shared_pre_q, out, 0, -1,
+                                                             &g_moe_shared_gsum16);
+            if (!ok) {
+                std::println(stderr, "fatal: the shared expert's native gate/up/down GEMV rejected a "
+                                     "plane whose geometry passed the outer check");
+                std::abort();
+            }
+            return true;
         }
     }
 
@@ -465,12 +552,31 @@ const float* Model::forward_one(int id, int pos) {
     // S2). Safe to write `wide` in place in gr_write_row: combine()'s per-(stream,channel) output
     // depends only on that SAME index's own input (plus mixer_out, a disjoint buffer), never on any
     // other index, so there is no read-after-write hazard.
+    // O5 phase 2b-3 phase B: `down_role`/`up_role`/`layer` name which sidecar roles (if any) this call's
+    // down/up projections may read natively -- GrAttnDown/Up and GrFfnDown/Up are per-layer (`layer` =
+    // `l`), GrExitDown/Up (the model-level exit collapse below, which does NOT go through this lambda)
+    // are not. A role absent at this build (no sidecar, or this specific role missing) leaves
+    // gr_native_ptr null and gr::mix falls back to the ordinary axpy path exactly as before this pass.
     auto gr_read_row = [&](const float* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w,
-                            Node* ln, float* out_a) {
+                            Node* ln, float* out_a, bbq::Role down_role, bbq::Role up_role, int layer) {
         [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> phase(prof::Phase::GatedResidual);
         if constexpr (USE_GATED_RESIDUAL) {
             gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, wide, norm_w->pdata, gr_normed);
-            gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed, gr_mixscr);
+            gr::Native gr_native{};
+            const gr::Native* gr_native_ptr = nullptr;
+            if constexpr (BACKBONE_QUANT_DOT) {
+                const auto& e_down = g_backbone_roles.get(down_role, layer);
+                const auto& e_up   = g_backbone_roles.get(up_role, layer);
+                if (e_down.present && e_up.present) {
+                    gr_native.down = &e_down.plane;
+                    gr_native.up = &e_up.plane;
+                    gr_native.wide_q = &g_gr_wide_q;
+                    gr_native.lr_q = &g_gr_lr_q;
+                    gr_native_ptr = &gr_native;
+                }
+            }
+            gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed,
+                                         gr_mixscr, gr_native_ptr);
             gr::gate(GR_DIMS, 1, gr_normed, inject_w->pdata, gr_inj);
             // WP4b blocker D: the mixer reads mixed_input DIRECTLY -- no Ln1/Ln2 exists under GR
             // (`ln` is nullptr), and gr::hc_norm above already applied the real model's own
@@ -514,9 +620,14 @@ const float* Model::forward_one(int id, int pos) {
     } else {
         bool native_embed = false;
         if constexpr (BACKBONE_QUANT_DOT && !USE_TIED_EMBEDDINGS) {
-            const bbq::Desc* d = g_backbone_quant.find(bbq::Role::TokEmb);
-            if (d && d->in_f == C && d->out_f == VOCAB) {
-                if (!bbq::dequantize_row(*d, g_backbone_quant.raw(*d), static_cast<std::uint32_t>(id),
+            // O5 phase 2b-3 phase A: resolved ONCE at load (g_backbone_roles), not looked up here.
+            const auto& e = g_backbone_roles.get(bbq::Role::TokEmb);
+            if (e.present && e.plane.row_elems == C && e.plane.n_rows == VOCAB) {
+                bbq::Desc td{};   // dequantize_row only reads type_raw/in_f/out_f -- see its own comment
+                td.type_raw = e.plane.type_raw;
+                td.in_f = static_cast<std::uint32_t>(e.plane.row_elems);
+                td.out_f = static_cast<std::uint32_t>(e.plane.n_rows);
+                if (!bbq::dequantize_row(td, e.plane.bytes, static_cast<std::uint32_t>(id),
                                          std::span<float>(h, C))) {
                     std::println(stderr, "fatal: the native token embedding has invalid row geometry");
                     std::abort();
@@ -586,7 +697,8 @@ const float* Model::forward_one(int id, int pos) {
         // `h` is mutated IN PLACE by gr_write_row below (unlike forward()'s Node graph, where a new
         // Node replaces `h`), so gr_read_row's read and gr_write_row's later write on the SAME `h`
         // need no separate "before" snapshot -- nothing between them mutates it.
-        gr_read_row(h, L.gr_attn_norm, L.gr_attn_down, L.gr_attn_up, L.gr_attn_inject, L.ln1, a);
+        gr_read_row(h, L.gr_attn_norm, L.gr_attn_down, L.gr_attn_up, L.gr_attn_inject, L.ln1, a,
+                    bbq::Role::GrAttnDown, bbq::Role::GrAttnUp, l);
         // The softmax-attention mixer sublayer, factored into a lambda (rather than duplicated
         // verbatim in both branches below) so the GDN_SCHEDULE dispatch reads as a single small
         // if/else rather than two copies of this block drifting apart over time.
@@ -654,11 +766,35 @@ const float* Model::forward_one(int id, int pos) {
                                       L.qsa_idx_qnorm->pdata, cos_pos, sin_pos, qsa::RMS_EPS,
                                       qsa_idx_q,
                                       raw_k_base + static_cast<size_t>(pos) * QSA_INDEXER_HEAD_DIM);
+            // O5 phase 2b-3 phase B: QsaQGateProj/QsaKProj/QsaVProj/QsaOProj -- the indexer's own
+            // projection (above) is BF16 (already the resident target format, backbone_quant.hpp's own
+            // exclusion list), so only the attention sublayer's four projections are native-quant
+            // candidates. A role absent at this layer (a GDN layer under GDN_FULL_ATTN_STRIDE) leaves
+            // qsa_native_ptr null and both calls below fall back to the ordinary linear_row path.
+            qsa::Native qsa_native{};
+            const qsa::Native* qsa_native_ptr = nullptr;
+            if constexpr (BACKBONE_QUANT_DOT) {
+                const auto& e_qg = g_backbone_roles.get(bbq::Role::QsaQGateProj, l);
+                const auto& e_k  = g_backbone_roles.get(bbq::Role::QsaKProj, l);
+                const auto& e_v  = g_backbone_roles.get(bbq::Role::QsaVProj, l);
+                const auto& e_o  = g_backbone_roles.get(bbq::Role::QsaOProj, l);
+                if (e_qg.present && e_k.present && e_v.present) {
+                    qsa_native.q_gate = &e_qg.plane;
+                    qsa_native.k = &e_k.plane;
+                    qsa_native.v = &e_v.plane;
+                    qsa_native.x_q = &g_qsa_x_q;
+                }
+                if (e_o.present) {
+                    qsa_native.o = &e_o.plane;
+                    qsa_native.ao_q = &g_qsa_ao_q;
+                }
+                if (qsa_native.proj_ready() || qsa_native.o_ready()) qsa_native_ptr = &qsa_native;
+            }
             qsa::attn_project_row<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(QSA_DIMS, a, L.qsa_q->pdata, L.qsa_gate->pdata,
                                    L.qsa_k->pdata, L.qsa_v->pdata,
                                    L.qsa_qnorm->pdata, L.qsa_knorm->pdata,
                                    cos_pos, sin_pos, qsa::RMS_EPS,
-                                   qn, qsa_gate_row, g_kv.krow(e, pos), g_kv.vrow(e, pos));
+                                   qn, qsa_gate_row, g_kv.krow(e, pos), g_kv.vrow(e, pos), qsa_native_ptr);
             // The pooled block keys persist across decode steps in this execution's own QsaCache
             // slot, exactly as the raw keys above already do -- the decode counterpart of the
             // batched path's in-scratch cache, filled by the SAME primitive (docs/QSA.md S11).
@@ -668,7 +804,7 @@ const float* Model::forward_one(int id, int pos) {
                                      g_qsa_cache.block_base(e), g_qsa_cache.n_cached_of(e),
                                      qsa_mask, qsa_sel_scr);
             qsa::attn_row<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
-                           qsa_mask, L.qsa_o->pdata, proj, qsa_att_scr);
+                           qsa_mask, L.qsa_o->pdata, proj, qsa_att_scr, qsa_native_ptr);
             gr_write_row(h, proj);                                           // residual (write step)
         };
         // Which of the two full-attention forms this build uses, decided ONCE at compile time. This
@@ -708,19 +844,17 @@ const float* Model::forward_one(int id, int pos) {
                 gdn::Native gdn_native{};
                 const gdn::Native* gdn_native_ptr = nullptr;
                 if constexpr (BACKBONE_QUANT_DOT) {
-                    const bbq::Desc* d_qkv = g_backbone_quant.find(bbq::Role::GdnInProjQkv, l);
-                    const bbq::Desc* d_z   = g_backbone_quant.find(bbq::Role::GdnInProjZ, l);
-                    const bbq::Desc* d_out = g_backbone_quant.find(bbq::Role::GdnOutProj, l);
-                    if (d_qkv && d_z) {
-                        gdn_native.in_qkv = d_qkv;
-                        gdn_native.in_qkv_raw = g_backbone_quant.raw(*d_qkv);
-                        gdn_native.in_z = d_z;
-                        gdn_native.in_z_raw = g_backbone_quant.raw(*d_z);
+                    // O5 phase 2b-3 phase A: resolved ONCE at load (g_backbone_roles), not looked up here.
+                    const auto& e_qkv = g_backbone_roles.get(bbq::Role::GdnInProjQkv, l);
+                    const auto& e_z   = g_backbone_roles.get(bbq::Role::GdnInProjZ, l);
+                    const auto& e_out = g_backbone_roles.get(bbq::Role::GdnOutProj, l);
+                    if (e_qkv.present && e_z.present) {
+                        gdn_native.in_qkv = &e_qkv.plane;
+                        gdn_native.in_z = &e_z.plane;
                         gdn_native.x_q = &g_gdn_in_act_q;
                     }
-                    if (d_out) {
-                        gdn_native.out = d_out;
-                        gdn_native.out_raw = g_backbone_quant.raw(*d_out);
+                    if (e_out.present) {
+                        gdn_native.out = &e_out.plane;
                         gdn_native.gated_q = &g_gdn_out_act_q;
                         gdn_native.out_gather_idx = g_gdn_out_gather_idx.data();
                         gdn_native.out_gather_buf = g_gdn_out_gather_buf.data();
@@ -742,7 +876,8 @@ const float* Model::forward_one(int id, int pos) {
             do_full_attn_mixer();
         }
         }
-        gr_read_row(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2, a);
+        gr_read_row(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2, a,
+                    bbq::Role::GrFfnDown, bbq::Role::GrFfnUp, l);
         {   // PROFILE_PHASES: the FFN sublayer -- MoE (router + routed experts + shared expert) or dense
         [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> ffn_phase(prof::Phase::Moe);
         if constexpr (USE_MOE) {
@@ -779,6 +914,11 @@ const float* Model::forward_one(int id, int pos) {
             // O(hidden_size * d_ff * experts_per_tok) of dot work, but only if it is genuinely hoisted
             // out of the per-expert lambda, which is the point of doing it at this line).
             if constexpr (USE_MOE_QUANT && MOE_QUANT_DOT) g_moe_act_q.quantize(a, MOE_DIMS.hidden_size);
+            // O5 phase 2b-3 phase B: the shared expert's own optional native-quant gate/up/down path
+            // lives on `ParallelExperts::compute_shared` below (moe_math.hpp's forward_row_via_run_ex
+            // detects it via the SAME `requires`-based optional-hook pattern already used for
+            // `prefetch()` -- see that function's own comment for why it lives there, not here, as a
+            // Native struct: routing it through moe_math.hpp itself would form a real header cycle).
             moe::forward_row_via_run_ex<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(
                 MOE_DIMS, a, L.moe_router->pdata,
                 [&](int k, int e, float* out_ptr, float* ffn, float* g) {
@@ -888,7 +1028,23 @@ const float* Model::forward_one(int id, int pos) {
     [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> head_phase(prof::Phase::LmHead);
     if constexpr (USE_GATED_RESIDUAL) {
         gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, h, gr_top_norm->pdata, gr_normed);
-        gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed, gr_mixscr);
+        // O5 phase 2b-3 phase B: the model-level exit collapse's own down/up pair (GrExitDown/Up,
+        // layer=-1 -- a model-level role, mirroring TokEmb/LmHead's own layer=-1 convention).
+        gr::Native gr_top_native{};
+        const gr::Native* gr_top_native_ptr = nullptr;
+        if constexpr (BACKBONE_QUANT_DOT) {
+            const auto& e_down = g_backbone_roles.get(bbq::Role::GrExitDown);
+            const auto& e_up   = g_backbone_roles.get(bbq::Role::GrExitUp);
+            if (e_down.present && e_up.present) {
+                gr_top_native.down = &e_down.plane;
+                gr_top_native.up = &e_up.plane;
+                gr_top_native.wide_q = &g_gr_wide_q;
+                gr_top_native.lr_q = &g_gr_lr_q;
+                gr_top_native_ptr = &gr_top_native;
+            }
+        }
+        gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed,
+                                     gr_mixscr, gr_top_native_ptr);
         for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = gr_mixed[j];
         // No final norm under GR -- the exit collapse's own hc_norm is it, so mixed_input feeds the
         // head directly. Mirrors forward()'s own branch exactly (the forward-vs-forward_one parity
@@ -903,12 +1059,12 @@ const float* Model::forward_one(int id, int pos) {
     } else {
         bool native_head = false;
         if constexpr (BACKBONE_QUANT_DOT) {
-            const bbq::Desc* d = g_backbone_quant.find(bbq::Role::LmHead);
-            if (d && d->type_raw == static_cast<std::uint32_t>(gguf::TensorType::Q4_K) &&
-                d->in_f == C && d->out_f == VOCAB) {
+            // O5 phase 2b-3 phase A: resolved ONCE at load (g_backbone_roles), not looked up here.
+            const auto& e = g_backbone_roles.get(bbq::Role::LmHead);
+            if (e.present && e.plane.type_raw == static_cast<std::uint32_t>(gguf::TensorType::Q4_K) &&
+                e.plane.row_elems == C && e.plane.n_rows == VOCAB) {
                 g_backbone_head_act_q.quantize(a, C);
-                if (!bbqd::gemv_plane<DECODE_GEMV_THREADS>(d->type_raw, g_backbone_quant.raw(*d),
-                                                           VOCAB, C, g_backbone_head_act_q, logits.data())) {
+                if (!bbqd::gemv_plane<DECODE_GEMV_THREADS>(e.plane, g_backbone_head_act_q, logits.data())) {
                     std::println(stderr, "fatal: the native Q4_K language-model head has invalid geometry");
                     std::abort();
                 }
@@ -940,8 +1096,11 @@ void kv_reset() {
 #endif
     g_kv.reset();
     if constexpr (BACKBONE_QUANT_DOT && !USE_TIED_EMBEDDINGS) {
-        if (const bbq::Desc* d = g_backbone_quant.find(bbq::Role::LmHead);
-            d && d->type_raw == static_cast<std::uint32_t>(gguf::TensorType::Q4_K) && d->in_f == D_MODEL) {
+        // O5 phase 2b-3 phase A: g_backbone_roles is already built (load_backbone_quant_sidecar ran
+        // before the first kv_reset()) -- this reads it, it does not build it.
+        if (const auto& e = g_backbone_roles.get(bbq::Role::LmHead);
+            e.present && e.plane.type_raw == static_cast<std::uint32_t>(gguf::TensorType::Q4_K) &&
+            e.plane.row_elems == D_MODEL) {
             g_backbone_head_act_q.qs.reserve(D_MODEL);
             g_backbone_head_act_q.scale.reserve(D_MODEL / moeqd::GROUP);
             g_backbone_head_act_q.gsum.reserve(D_MODEL / moeqd::GROUP);
@@ -962,6 +1121,34 @@ void kv_reset() {
         g_gdn_out_act_q.gsum.reserve(GDN_VALUE_DIM / moeqd::GROUP);
         g_gdn_out_gsum16.v.reserve(2 * (GDN_VALUE_DIM / moeqd::GROUP));   // 2 per-16 sums per 32-group
         bbq::gdn_out_gather_index(GDN_K_HEADS, GDN_V_HEADS, GDN_V_HEAD_DIM, g_gdn_out_gather_idx);
+    }
+    // O5 phase 2b-3 phase B: size the remaining native-quant scratch ONCE per generation (AGENTS.md S1),
+    // mirroring the GDN reservations just above exactly.
+    if constexpr (BACKBONE_QUANT_DOT && USE_GATED_RESIDUAL) {
+        constexpr int WIDE = HC_COUNT * D_MODEL;
+        g_gr_wide_q.qs.reserve(WIDE);
+        g_gr_wide_q.scale.reserve(WIDE / moeqd::GROUP);
+        g_gr_wide_q.gsum.reserve(WIDE / moeqd::GROUP);
+        g_gr_lr_q.qs.reserve(HC_LOWRANK);
+        g_gr_lr_q.scale.reserve(HC_LOWRANK / moeqd::GROUP);
+        g_gr_lr_q.gsum.reserve(HC_LOWRANK / moeqd::GROUP);
+    }
+    if constexpr (BACKBONE_QUANT_DOT && USE_QSA) {
+        g_qsa_x_q.qs.reserve(D_MODEL);
+        g_qsa_x_q.scale.reserve(D_MODEL / moeqd::GROUP);
+        g_qsa_x_q.gsum.reserve(D_MODEL / moeqd::GROUP);
+        g_qsa_ao_q.qs.reserve(sub0::D_Q);
+        g_qsa_ao_q.scale.reserve(sub0::D_Q / moeqd::GROUP);
+        g_qsa_ao_q.gsum.reserve(sub0::D_Q / moeqd::GROUP);
+    }
+    if constexpr (BACKBONE_QUANT_DOT && USE_MOE) {
+        g_moe_shared_x_q.qs.reserve(D_MODEL);
+        g_moe_shared_x_q.scale.reserve(D_MODEL / moeqd::GROUP);
+        g_moe_shared_x_q.gsum.reserve(D_MODEL / moeqd::GROUP);
+        g_moe_shared_pre_q.qs.reserve(D_FF);
+        g_moe_shared_pre_q.scale.reserve(D_FF / moeqd::GROUP);
+        g_moe_shared_pre_q.gsum.reserve(D_FF / moeqd::GROUP);
+        g_moe_shared_gsum16.v.reserve(2 * (D_FF / moeqd::GROUP));
     }
     if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset();
     if constexpr (USE_QSA) g_qsa_cache.reset();   // the indexer's own raw-key store -- docs/QSA.md S6

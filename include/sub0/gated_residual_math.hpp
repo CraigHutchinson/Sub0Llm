@@ -26,12 +26,41 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 
+#include "sub0/backbone_quant_dot.hpp"  // O5 phase 2b-3 phase B: bbqd::Plane/ActBlocks/gemv_plane for
+                                         // mix()'s optional native-quant down/up path -- storage-agnostic,
+                                         // see that header's own "format-agnostic plane view" comment.
 #include "sub0/gemv.hpp"
 #include "sub0/simd_reduce.hpp"  // B34/B38: sumsq_choice<UseSimd>() for this file's real scalar-reduction
                                   // hot loop, hc_norm's `ms` (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
 
 namespace sub0::gr {
+
+// O5 phase 2b-3 phase B (docs/BACKBONE_NATIVE_QUANT.md S18): optional native-quant weight sources for
+// mix()'s down/up projections -- the Gated Residual roles the S0B1 sidecar already carries (phase 2b-1)
+// but had no consumer until this pass (GrAttnDown/Up, GrFfnDown/Up, GrExitDown/Up, all Q8_0). Mirrors
+// gdn::Native's own shape and defaults exactly (AGENTS.md S10: one seam, extended per role, not a new
+// mechanism per role).
+//
+// ONLY MEANINGFUL AT T==1 (decode's own per-row call shape -- a native GEMV is a single-row DOT). mix()
+// itself re-checks `T == 1` before trusting `native`.
+//
+// CALLER-OWNED, REUSED SCRATCH (AGENTS.md S1): `wide_q`/`lr_q` must be sized once by the caller
+// (decode's kv_reset()) and are quantized EXACTLY ONCE per call -- `wide_q` from `normed` (the down
+// projection's own input), `lr_q` from `down_pre` (the up projection's own input, itself down's output --
+// a genuinely different vector, so this is NOT a case of "one activation feeds two projections" the way
+// GDN's in_qkv/in_z share `x_q`; down's OUTPUT becomes up's INPUT after a nonlinearity, so no quantize
+// call can be shared between the two).
+struct Native {
+    const bbqd::Plane* down = nullptr;
+    const bbqd::Plane* up   = nullptr;
+    bbqd::ActBlocks* wide_q = nullptr;   // wide-wide, down's own quantized input (= `normed`)
+    bbqd::ActBlocks* lr_q   = nullptr;   // hc_lowrank-wide, up's own quantized input (= down's output)
+
+    [[nodiscard]] bool ready() const { return down != nullptr && up != nullptr && wide_q != nullptr && lr_q != nullptr; }
+};
 
 // Every dimension the module needs, explicit rather than closed over a build's own constants -- same
 // reasoning as gdn_math.hpp's own Dims (lets a standalone test exercise the real fixture's own shape
@@ -114,14 +143,29 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float
 // out_mixed: [T, hidden_size]. scratch: >= T*hc_lowrank floats (the down-projection's pre-activation).
 template <int Threads = 1, class WP>
 inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
-                 float* out_mixed, float* scratch) {
+                 float* out_mixed, float* scratch, const Native* native = nullptr) {
     const int hs = d.hidden_size, hc = d.hc_count, wide = d.wide(), lr = d.hc_lowrank;
+    // O5 phase 2b-3 phase B: only trusted at T==1 (this struct's own header comment), and geometry
+    // re-validated here rather than trusted from the caller (AGENTS.md S10) -- a mismatch falls back to
+    // the ordinary axpy path, silently and correctly, never a partial/undefined computation.
+    const bool native_ok = native != nullptr && T == 1 && native->ready() &&
+        native->down->row_elems == wide && native->down->n_rows == lr &&
+        native->up->row_elems == lr && native->up->n_rows == wide;
     float* down_pre = scratch;                                    // [T, hc_lowrank]
     float* up_val   = down_pre + static_cast<std::size_t>(T) * lr; // [wide], reused per row (below)
     for (int t = 0; t < T; ++t) {
         const float* xr = normed + static_cast<std::size_t>(t) * wide;
         float* dr = down_pre + static_cast<std::size_t>(t) * lr;
-        gemv::axpy<Threads>(xr, down_w, wide, lr, dr);   // O3: include/sub0/gemv.hpp, same per-output order
+        if (native_ok) {
+            native->wide_q->quantize(xr, wide);
+            if (!bbqd::gemv_plane<Threads>(*native->down, *native->wide_q, dr)) {
+                std::fprintf(stderr, "fatal: gr::mix's native down-projection GEMV rejected a plane whose "
+                                     "geometry passed the outer check\n");
+                std::abort();
+            }
+        } else {
+            gemv::axpy<Threads>(xr, down_w, wide, lr, dr);   // O3: include/sub0/gemv.hpp, same per-output order
+        }
         for (int o = 0; o < lr; ++o) dr[o] = detail::silu(dr[o] / static_cast<float>(hc));
     }
     const float inv_hc = 1.f / static_cast<float>(hc);
@@ -138,7 +182,18 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
         // any cache line) found in a post-merge performance review, not present at this stage's own
         // small test scale. Purely a summation-ORDER change -- same terms, same result within float32
         // rounding (gated by this test file's own 5e-5 tolerance, comfortably wider than reordering noise).
-        gemv::axpy<Threads>(dr, up_w, lr, wide, up_val);   // O3: see the down projection above
+        if (native_ok) {
+            // down's OUTPUT feeds up's INPUT -- a genuinely different activation vector from `xr`, so
+            // this is its OWN quantize call, not a reuse of wide_q (see Native's own comment).
+            native->lr_q->quantize(dr, lr);
+            if (!bbqd::gemv_plane<Threads>(*native->up, *native->lr_q, up_val)) {
+                std::fprintf(stderr, "fatal: gr::mix's native up-projection GEMV rejected a plane whose "
+                                     "geometry passed the outer check\n");
+                std::abort();
+            }
+        } else {
+            gemv::axpy<Threads>(dr, up_w, lr, wide, up_val);   // O3: see the down projection above
+        }
         for (int j = 0; j < hs; ++j) out[j] = 0.f;
         for (int s = 0; s < hc; ++s) {
             for (int j = 0; j < hs; ++j) {

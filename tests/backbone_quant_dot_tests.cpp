@@ -44,6 +44,9 @@
 
 #include "sub0/backbone_quant_dot.hpp"
 #include "sub0/gguf.hpp"
+#include "sub0/transplant.hpp"  // O5 phase 2b-3 phase B: per_head_half_transpose, for the QSA q|gate
+                                 // proof case below (cross-checks gemv_plane's row-range selection
+                                 // against the SAME row formula the .bin blob's own transplant uses)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -900,6 +903,89 @@ TEST_CASE("bbqd (pass 4, AGENTS.md S9): validated against REAL bytes, activation
         // logits (the FP8/B35 precedent's own ~0.2-0.4 L2-relative band, docs/BACKBONE_NATIVE_QUANT.md
         // S5b/S12g).
         REQUIRE(rel_g_new < 0.25);
+    }
+}
+
+TEST_CASE("bbqd (O5 phase 2b-3 phase B): gemv_plane's row-range selection reproduces "
+          "transplant::per_head_half_transpose's own q|gate split, cross-checked against the "
+          "TRANSPOSED (bf16-blob-shaped) weight, not merely a second dequantize of the same rows",
+          "[backbonequant]") {
+    // qsa_math.hpp's Native path reads QsaQGateProj (the WHOLE `attn_q.weight` tensor, stored verbatim in
+    // GGUF/tiled row order by backbone_quant.hpp) via one bbqd::gemv_plane call per (head, half), with
+    // row_lo/row_hi = h*2*head_dim + half*head_dim .. +head_dim -- exactly `transplant::
+    // per_head_half_transpose`'s own per-head row-selection arithmetic (transplant.hpp), applied as a ROW
+    // RANGE into the whole tensor's own GEMV instead of a pre-split copy (backbone_quant.hpp's own
+    // deliberate "no pre-split, no off-by-one risk" decision, S13b).
+    //
+    // This is the proof AGAINST THE BF16 PATH the task brief asks for, not merely a re-derivation of the
+    // same formula: `per_head_half_transpose` is run on the SAME dequantized bytes to build the transposed
+    // [in_f, n_heads*head_dim] matrix the .bin blob itself actually stores (this project's own [in,out]
+    // AXPY convention -- QsaQProj/QsaGateProj's real on-disk shape, layout.hpp's own PKind::QsaQProj/
+    // QsaGateProj table). The reference dot is then computed against THAT transposed matrix via a plain
+    // AXPY-shaped accumulation (the exact sum gemv::axpy itself would perform), so a wrong row/column
+    // convention on EITHER side of this comparison would show up as a numeric mismatch, not merely as
+    // "these two formulas happen to agree with each other".
+    constexpr int kHeads = 4, kHeadDim = 32, kIn = 2560;   // small, fast-iteration shape (AGENTS.md S7 --
+                                                            // real vocabulary is irrelevant to a pure
+                                                            // kernel/layout check)
+    constexpr int kRows = kHeads * 2 * kHeadDim;   // GGUF/tiled row count: n_heads * 2 * head_dim
+    const std::vector<float> x = lossless_row(kIn, 909);
+    bbqd::ActBlocks xq;
+    xq.quantize(x.data(), kIn);
+
+    for (const gguf::TensorType type : kFormats) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kIn,
+                                                           555u + raw_t);
+
+        // The reference side: dequantize the WHOLE tensor once (gguf::to_f32, the project's own already-
+        // verified scalar decoder -- never bbqd's own code), then apply per_head_half_transpose to build
+        // the [kIn, kHeads*kHeadDim] transposed matrix for each half, exactly as the real transplant path
+        // (tools/sub0llm-transplant.cpp) builds QsaQProj/QsaGateProj into the .bin blob.
+        gguf::TensorInfo t;
+        t.type_raw = raw_t;
+        t.dims = {static_cast<std::uint64_t>(kRows) * kIn};
+        std::vector<float> dequant;
+        REQUIRE(gguf::to_f32(t, raw, dequant));
+
+        for (int half = 0; half < 2; ++half) {
+            std::vector<float> transposed(static_cast<std::size_t>(kIn) * kHeads * kHeadDim, 0.f);
+            transplant::per_head_half_transpose(dequant.data(), kHeads, kHeadDim, kIn, half,
+                                                transposed.data());
+            const int out_f = kHeads * kHeadDim;
+
+            for (int h = 0; h < kHeads; ++h) {
+                // transplant.hpp's own row-selection formula (per_head_half_transpose's own comment),
+                // re-derived here independently rather than copied from a shared constant.
+                const int row0 = h * 2 * kHeadDim + half * kHeadDim;
+                std::vector<float> out(kHeadDim, 0.f);
+                REQUIRE(bbqd::gemv_plane<1>(raw_t, std::span<const std::uint8_t>(raw), kRows, kIn, xq,
+                                            out.data(), row0, row0 + kHeadDim));
+                for (int d = 0; d < kHeadDim; ++d) {
+                    const int col = h * kHeadDim + d;
+                    // The AXPY-shaped reference: sum_i x[i] * transposed[i*out_f + col] -- the exact sum
+                    // gemv::axpy would compute reading this column out of the TRANSPOSED (bf16-blob-
+                    // convention) matrix.
+                    double ref = 0.0;
+                    for (int i = 0; i < kIn; ++i)
+                        ref += static_cast<double>(x[static_cast<std::size_t>(i)]) *
+                               transposed[static_cast<std::size_t>(i) * out_f + col];
+                    INFO("head " << h << " half " << half << " d " << d);
+                    REQUIRE(std::fabs(ref) > 0.0);
+                    const double rel =
+                        std::fabs(static_cast<double>(out[static_cast<std::size_t>(d)]) - ref) / std::fabs(ref);
+                    // Float-rounding scale only -- slightly looser than this file's other 1e-5 bounds
+                    // because THIS reference sums kIn=2560 terms in a plain sequential double accumulator
+                    // (no SIMD/pairwise reduction), while gemv_plane's own AVX2 path reduces in a
+                    // different (still exact-for-integers, but float-accumulated) order; measured worst
+                    // case here is ~1.6e-5, comfortably inside this bound and far below any real layout
+                    // bug's signature (a shifted row is wrong by 100%, not 1e-5).
+                    REQUIRE(rel < 5e-5);
+
+                }
+            }
+        }
     }
 }
 
