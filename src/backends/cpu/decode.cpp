@@ -520,6 +520,23 @@ struct RowSplitExperts : ParallelExperts {
                     pl.up.bytes   = g_moe_quant.raw(du);
                     pl.down.bytes = g_moe_quant.raw(dd);
                 }
+                // Geometry re-validated here, never trusted from the sidecar's own descriptor alone
+                // (AGENTS.md S10) -- the SAME check moeqd::expert_ffn_row_quant's own reference path
+                // runs (detail::plane_ok) before it will compute anything. Skipping this would let a
+                // row-range read proceed even when the sidecar's declared axes disagree with this
+                // build's, which gemv_plane_range's own byte-bounds check alone cannot catch: a
+                // TRUNCATED read that still fits inside a too-large `raw` span passes that check while
+                // silently reading the wrong bytes.
+                if (!moeqd::detail::plane_ok(pl.gate, d.d_ff, d.hidden_size) ||
+                    !moeqd::detail::plane_ok(pl.up, d.d_ff, d.hidden_size) ||
+                    !moeqd::detail::plane_ok(pl.down, d.hidden_size, d.d_ff)) {
+                    std::println(stderr,
+                                 "fatal: routed expert {} of layer {} cannot be row-split -- an "
+                                 "unsupported GGML type, a row width that is not a multiple of {}, or "
+                                 "a plane whose declared geometry disagrees with this build's axes",
+                                 e, layer_index, moeqd::GROUP);
+                    std::abort();
+                }
             }
 
             // Phase-1 work list: (k, Gate|Up) x row chunks of d.d_ff rows. A plane that cannot be
