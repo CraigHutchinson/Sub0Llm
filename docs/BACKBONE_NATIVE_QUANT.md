@@ -1668,3 +1668,43 @@ With the native backbone on, `--moe-decode-threads 8` beats 10: the routed-exper
 46.8 ms, and decode reaches **6.58 tok/s median, 6.90–6.94 in clean rounds**. See
 `optimization/opportunities/O7_expert_kernels.md` §11 for the four-arm table.
 
+---
+
+## 19. Quality verdict: the native backbone is quality-neutral (2026-09-26)
+
+§17–§18 left the flag opt-in because the six-token forward/forward_one comparison showed L2 0.2926 and
+argmax 3/6. Six tokens cannot decide that, so a proper oracle was built. **Perplexity of the decode path
+itself** on ~2,400 tokens of blended real text (`ppl_blend_v1`: educational prose, textbook prose, mixed web
+text, math word problems), compared token by token between the two arms (`docs/OPTIMIZATION_PROCESS.md`
+§2a, `run_perf_suite.py --stage ppl`). Both arms omit the n-gram table, so the pairing cancels that.
+
+Recommended flags, 8 expert threads, 2,418 scored tokens:
+
+| | bf16 backbone | native backbone |
+|---|---:|---:|
+| **perplexity** | 15.0338 | **14.8488** |
+| mean NLL, nats/token | 2.7103 | 2.6979 |
+| top-1 accuracy | 48.35% | 48.64% |
+| long-run decode | 3.79 tok/s | **5.14 tok/s (+36%)** |
+
+**Paired per-token NLL difference, native − bf16: −0.0124 nats/token, 95% CI −0.0354 to +0.0106.** That is
+indistinguishable from zero, and if anything slightly better. The two arms pick the same top-1 token 84.5%
+of the time. Why it is not worse, although activations are quantized to int8, is plausible rather than
+proven: the native path reads the GGUF weights exactly, while the bf16 path reads a re-rounded copy of
+them.
+
+**Consequences:**
+- G-QUALITY's six-token L2/argmax is demoted to a smoke check, and G-PPL becomes the gate for
+  decode-path precision changes.
+- `--backbone-quant-dot 1` stays a *configure* flag, because it needs the paired sidecar, which a
+  default build does not have. On the real artifact it is now recommended without a quality caveat.
+- The long-run speeds (3.79 / 5.14 tok/s) are below the six-token A/B numbers (~4.6 / ~6.6), because
+  attention grows with position over 127-token windows. Both measures agree on the direction and roughly
+  on the size of the gain.
+
+**Found on the way, not yet investigated:** libomp prints
+`kmp_set_blocktime(ms) maximum value "-1830827008" will be used` when `--decode-omp-spin` sets the
+blocktime to `INT_MAX`. That looks like an overflow inside libomp's millisecond-to-microsecond conversion.
+O3 measured spinning as a real gain, so the setting evidently still spins, but it should be checked, and
+set to a large *valid* value.
+

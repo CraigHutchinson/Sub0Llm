@@ -129,12 +129,34 @@ gates warn. A hard-gate failure means park (§3), never revert.
 
 | Gate | Threshold | Severity | Why |
 |---|---|---|---|
-| `G-HASH` neutral-build decode fingerprint | unchanged (`816c4a54ad49b8cf`) | hard | AGENTS.md §4 — proves nothing leaked into the default path |
+| `G-HASH` neutral-build decode fingerprint | unchanged (`d1625d19ed2258f1` since 2026-09-25) | hard | AGENTS.md §4 — proves nothing leaked into the default path |
 | `G-SUITE` suite assertion counts | exact, or delta fully explained by added tests | hard | a changed count nobody can attribute is an unexplained behaviour change |
 | `G-PARITY` `forward`/`forward_one` | exactly 0 in any arm not deliberately breaking it | hard | the invariant B34 broke and had to repair |
-| `G-QUALITY` logit L2 vs the unfused path | ≤ 0.43 (the FP8 precedent), argmax ≥ 3/6 | hard | below that an arm is not shippable even default-off |
+| `G-QUALITY` logit L2 vs the unfused path | ≤ 0.43 (the FP8 precedent), argmax ≥ 3/6 | hard | smoke check only: six tokens cannot decide quality (§2a) |
+| `G-PPL` decode-path perplexity, paired vs the baseline arm | 95% CI upper bound ≤ +0.03 nats/token | hard | **the** quality gate for any decode-path precision change (§2a) |
 | `G-PERF` decode s/token | no regression > 2% (the noise floor) | hard | |
 | `G-COMPETITOR` vs llama.cpp, same host + model | tracked, not gated | soft | the external bar; see §6 |
+
+### 2a. The perplexity gate (`--stage ppl`)
+
+Any change to decode-path *precision* — a quantized kernel, an activation format, a native weight path —
+is judged by perplexity, not by the six-token logit L2. Six tokens cannot decide quality: the native
+backbone scored argmax 3/6 there, and then proved quality-neutral over 2,418 tokens.
+
+    python scripts/run_perf_suite.py --stage ppl --label <id> --arm "base:<flags>" --arm "new:<flags>"
+
+- **Text.** `scripts/make_ppl_fixture.py` builds `ppl_blend_v1` (~2,400 tokens: educational prose,
+  textbook prose, mixed web text, math word problems) from the local corpora, pinned by SHA-256. It is not
+  committed, because the corpora's redistribution terms are unverified. A machine whose corpora differ
+  fails loudly rather than scoring different text.
+- **What is scored.** `sub0llm-qwen4-gen --ppl` teacher-forces `forward_one`, which is the path precision
+  changes touch, over `SEQ_LEN` windows with the caches reset per window. It writes one row per token.
+- **How arms are compared.** Paired, per token, against the first arm: mean NLL difference with a 95% CI,
+  and top-1 agreement. Pairing cancels the text's own difficulty, and anything both arms omit (today, the
+  n-gram table). That makes a small effect visible that two bare perplexities would hide.
+- **Cost.** Deterministic, so one run per arm, and contention changes only the reported speed. About 8
+  minutes per arm at ~5 tok/s. The run also gives a long-run decode tok/s, which is lower than the
+  six-token A/B's because attention grows with position. Use it for comparing arms, not as a headline.
 
 ## 3. Park, never revert
 

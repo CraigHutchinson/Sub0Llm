@@ -1,12 +1,12 @@
 # Sub0Llm performance report
 
-Generated 2026-09-22T10:50:49Z -- label `O3-spin`
+Generated 2026-09-25T11:09:49Z -- label `ppl-harness-v1`
 
 ## Gate panel
 
 | Gate | Detail | Value | Status |
 |---|---|---|---|
-| `G-PERF` | spin vs nospin | -20.2% | PASS |
+| `G-PPL` | native vs bf16, 2418 tokens | -0.0124 nats/token (95% CI -0.0354..+0.0106), ppl x0.9877, top-1 agree 84.5% | PASS |
 | `G-HASH` | neutral-build decode fingerprint unchanged | n/a | n/a |
 | `G-SUITE-ENGINE` | sub0_tests assertion count | n/a | n/a |
 | `G-SUITE-FRONTEND` | sub0_frontend_tests assertion count | n/a | n/a |
@@ -14,11 +14,11 @@ Generated 2026-09-22T10:50:49Z -- label `O3-spin`
 | `G-QUALITY` | logit L2-relative vs the unfused path | n/a | n/a |
 | `G-COMPETITOR` | llama.cpp gap on the same host and model | n/a | n/a |
 
-## Throughput (interleaved)
+## Perplexity (ppl_blend_v1, decode path)
 
-| Arm | Median s/token | Spread | Runs |
-|---|---:|---:|---|
-| nospin | 0.267 | 28.5% | 0.267, 0.340, 0.264 |
-| spin | 0.213 | 14.1% | 0.205, 0.213, 0.235 |
+| Arm | Perplexity | Mean NLL | Top-1 | Decode tok/s |
+|---|---:|---:|---:|---:|
+| bf16 | 15.0338 | 2.7103 | 0.4835 | 4.00 |
+| native | 14.8488 | 2.6979 | 0.4864 | 5.49 |
 
 History: `perf_history.jsonl`. Policy: `docs/OPTIMIZATION_PROCESS.md`.

@@ -96,9 +96,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <print>
 #include <random>
 #include <string>
@@ -197,20 +200,101 @@ bool is_ascii(std::string_view s) {
     return std::all_of(s.begin(), s.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; });
 }
 
+
+/// Load the model and lay out its parameter Nodes, printing the same lines both modes need.
+/// graph_reset() is required before forward_one: decode does not execute the Node graph, but it reads
+/// the parameter Nodes graph_reset() lays out -- exactly as in sub0llm-qwen4-forward.
+bool load_engine(const std::string& model_path) {
+    report_memory("before load");
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!sub0::load_model(model_path.c_str())) {
+        std::println(stderr, "FAIL: load_model rejected '{}' (see the reason printed above)", model_path);
+        return false;
+    }
+    const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::println("load_model: ACCEPTED in {:.1f}s", load_s);
+    report_memory("after load");
+    sub0::graph_reset();
+    report_memory("after graph_reset");
+    return true;
+}
+
+/** --ppl: teacher-forced next-token NLL through forward_one -- the decode path, which is what a
+ * decode-only change (the native backbone, the int8 MoE dot) alters -- over windows of SEQ_LEN tokens,
+ * with the decode caches reset per window. Two builds scored on the same text see identical tokens and
+ * windows, so anything this engine omits relative to the reference model (the n-gram table) cancels out
+ * of a comparison between them. That makes this the quality oracle for decode-path precision changes;
+ * the six-token forward/forward_one L2 is too small a sample to decide one.
+ *
+ * @param max_scored  stop after this many scored tokens (a window's first token has no context and is
+ *                    never scored).
+ * @param dump_path   optional per-token record (position, target, nll, argmax) for a paired comparison.
+ * @return the process exit code.
+ */
+int run_ppl(const std::vector<int>& ids, long max_scored, const std::string& dump_path) {
+    std::ofstream dump;
+    if (!dump_path.empty() && !(dump.open(dump_path), dump)) {
+        std::println(stderr, "FAIL: cannot open --ppl-dump '{}' for writing", dump_path);
+        return 6;
+    }
+    const int n = static_cast<int>(ids.size());
+    double nll_sum = 0.0, fwd_s = 0.0;
+    long scored = 0, top1 = 0;
+    for (int w0 = 0; w0 + 1 < n && scored < max_scored; w0 += SEQ_LEN) {
+        const int w = std::min(SEQ_LEN, n - w0);
+        sub0::kv_reset();
+        for (int pos = 0; pos + 1 < w && scored < max_scored; ++pos) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const float* logits = sub0::forward_one(ids[static_cast<std::size_t>(w0 + pos)], pos);
+            fwd_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            const int target = ids[static_cast<std::size_t>(w0 + pos + 1)];
+            int arg = 0;
+            for (int v = 1; v < VOCAB; ++v)
+                if (logits[v] > logits[arg]) arg = v;
+            const double mx = logits[arg];
+            double z = 0.0;
+            for (int v = 0; v < VOCAB; ++v) z += std::exp(static_cast<double>(logits[v]) - mx);
+            const double nll = std::log(z) + mx - static_cast<double>(logits[target]);
+            nll_sum += nll;
+            ++scored;
+            top1 += arg == target ? 1 : 0;
+            if (dump.is_open()) std::println(dump, "{}\t{}\t{:.6f}\t{}", w0 + pos + 1, target, nll, arg);
+        }
+        std::println("[ppl] window at token {}: {} scored, running ppl {:.4f}", w0, scored,
+                     std::exp(nll_sum / static_cast<double>(scored)));
+    }
+    if (scored == 0) {
+        std::println(stderr, "FAIL: nothing to score (the text encoded to fewer than 2 tokens)");
+        return 7;
+    }
+    const double mean = nll_sum / static_cast<double>(scored);
+    // One line with a stable prefix, for scripts.
+    std::println("PPL-RESULT tokens={} ppl={:.6f} mean_nll={:.6f} top1={:.4f} decode_tok_s={:.3f}", scored,
+                 std::exp(mean), mean, static_cast<double>(top1) / static_cast<double>(scored),
+                 static_cast<double>(scored) / fwd_s);
+    report_memory("final");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     CLI::App app{"sub0llm-qwen4-gen: WP5c -- real Qwen tokenizer + real transplanted model + real "
                  "sampling, end to end"};
-    std::string model_path, tok_dir_cli, prompt;
+    std::string model_path, tok_dir_cli, prompt, ppl_path, ppl_dump;
     int n = 20, topk = 40;
+    long ppl_tokens = 1024;
     float temp = 0.8f;
     unsigned seed = 1234;
     app.add_option("--model", model_path,
                    "the transplanted S0L5 artifact (the engine derives its .moeq sidecar path from this)")
        ->required();
-    app.add_option("--prompt", prompt, "the prompt text, fed to encode() VERBATIM -- no chat template")
-       ->required();
+    app.add_option("--prompt", prompt, "the prompt text, fed to encode() VERBATIM -- no chat template");
+    app.add_option("--ppl", ppl_path,
+                   "score this text file instead of generating: teacher-forced perplexity through forward_one");
+    app.add_option("--ppl-tokens", ppl_tokens, "--ppl: stop after this many scored tokens")
+       ->capture_default_str()->check(CLI::PositiveNumber);
+    app.add_option("--ppl-dump", ppl_dump, "--ppl: write position, target, nll, argmax per scored token");
     app.add_option("--tokenizer-dir", tok_dir_cli,
                    "directory holding vocab.json / merges.txt / tokenizer_config.json "
                    "(default: $SUB0_QWEN_TOKENIZER_DIR, then <repo>/data/qwen_tokenizer)");
@@ -221,6 +305,10 @@ int main(int argc, char** argv) {
     app.add_option("--seed", seed, "RNG seed -- fixing this makes the whole run deterministic")
        ->capture_default_str();
     CLI11_PARSE(app, argc, argv);
+    if (prompt.empty() == ppl_path.empty()) {
+        std::println(stderr, "FAIL: pass exactly one of --prompt or --ppl");
+        return 2;
+    }
     // Unbuffered: this run is minutes long at 48 layers and streams as it goes, so a buffered stdout
     // redirected to a file would show nothing until the end -- and if it dies, the partial output IS
     // the finding. Same reasoning, and the same call, as sub0llm-qwen4-forward.
@@ -262,6 +350,25 @@ int main(int argc, char** argv) {
     }
     std::println("padding rows the tokenizer does not name: {} (sampling may land there; decode skips them)",
                  VOCAB - tk.vocab_size());
+
+    if (!ppl_path.empty()) {
+        std::ifstream f(ppl_path, std::ios::binary);
+        if (!f) {
+            std::println(stderr, "FAIL: cannot read --ppl '{}'", ppl_path);
+            return 3;
+        }
+        const std::string text{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+        const std::vector<int> ppl_ids = tk.encode(text);
+        for (const int id : ppl_ids)
+            if (id < 0 || id >= VOCAB) {
+                std::println(stderr, "FAIL: text id {} is outside this build's VOCAB [0, {})", id, VOCAB);
+                return 3;
+            }
+        std::println("\n--- ppl: {} ({} bytes -> {} tokens), windows of SEQ_LEN {}, up to {} scored ---",
+                     ppl_path, text.size(), ppl_ids.size(), SEQ_LEN, ppl_tokens);
+        if (!load_engine(model_path)) return 5;
+        return run_ppl(ppl_ids, ppl_tokens, ppl_dump);
+    }
 
     // --- 2. encode, and the round trip ------------------------------------------------------------
     std::println("\n--- 2. encode + round trip ----------------------------------------------");
@@ -308,21 +415,7 @@ int main(int argc, char** argv) {
 
     // --- 4. the model -----------------------------------------------------------------------------
     std::println("\n--- 4. load the real transplanted model ---------------------------------");
-    report_memory("before load");
-    const auto t_load0 = std::chrono::steady_clock::now();
-    if (!sub0::load_model(model_path.c_str())) {
-        std::println(stderr, "FAIL: load_model rejected '{}' (see the reason printed above)", model_path);
-        return 5;
-    }
-    const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
-    std::println("load_model: ACCEPTED in {:.1f}s ({:.2f} GiB of f32 parameters)", load_s,
-                 static_cast<double>(sub0::PARAM_FLOATS) * 4.0 / (1024.0 * 1024.0 * 1024.0));
-    report_memory("after load");
-    // graph_reset() lays out this thread's parameter Nodes and allocates its Worker arenas. The
-    // decode path does not execute the Node graph, but it does read those parameter Nodes, so this is
-    // required before forward_one -- exactly as in sub0llm-qwen4-forward.
-    sub0::graph_reset();
-    report_memory("after graph_reset");
+    if (!load_engine(model_path)) return 5;
 
     // --- 5. generate ------------------------------------------------------------------------------
     std::println("\n--- 5. generate ---------------------------------------------------------");

@@ -15,6 +15,13 @@ Stages (each skippable, so iteration stays fast):
   2. quality  -- forward/forward_one parity + logit stats, real artifact (G-PARITY, G-QUALITY)
   3. perf     -- interleaved multi-arm decode throughput, real artifact  (G-PERF)
   4. compete  -- llama.cpp on the same host and model                    (G-COMPETITOR, soft)
+  5. ppl      -- teacher-forced perplexity of the decode path on a pinned blended text, one run per
+                 arm (it is deterministic), each arm compared token by token with the first (G-PPL).
+                 The quality gate for any change to decode-path precision.
+
+  # Does a precision change cost quality? (fixture: scripts/make_ppl_fixture.py)
+  python scripts/run_perf_suite.py --stage ppl --label O5 \
+      --arm "bf16:--moe-quant-dot 1" --arm "native:--moe-quant-dot 1 --backbone-quant-dot 1"
 
 Typical invocations:
 
@@ -39,6 +46,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import pathlib
 import re
 import statistics
@@ -183,6 +191,62 @@ def stage_perf(build: pathlib.Path, arms: list[tuple[str, list[str]]], runs: int
     return out
 
 
+def qwen_tokenizer_dir() -> pathlib.Path:
+    """$SUB0_QWEN_TOKENIZER_DIR, else the Hugging Face cache snapshot holding the real tokenizer files."""
+    env = os.environ.get("SUB0_QWEN_TOKENIZER_DIR")
+    if env:
+        return pathlib.Path(env)
+    hub = pathlib.Path.home() / ".cache" / "huggingface" / "hub" / "models--Qwen--Qwen3.8-Flash-Next" / "snapshots"
+    for merges in sorted(hub.glob("*/merges.txt")):
+        return merges.parent
+    raise FileNotFoundError("no Qwen tokenizer: set SUB0_QWEN_TOKENIZER_DIR")
+
+
+PPL_GATE_NATS = 0.03   # per token; ~3% perplexity. See the G-PPL entry in kpi_gates.json.
+
+
+def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens: int) -> dict:
+    """Score the pinned fixture through forward_one per arm, then compare each arm with the first.
+
+    Perplexity is deterministic for a given build and text, so one run per arm suffices; contention
+    changes only the reported decode speed, never the score. The comparison is PAIRED (per-token NLL
+    differences on identical tokens), which cancels the text's own difficulty and is far more sensitive
+    than comparing two perplexities.
+    """
+    import make_ppl_fixture
+    fixture = make_ppl_fixture.ensure(ROOT / "out" / "quality" / f"{make_ppl_fixture.VERSION}.txt")
+    tok = qwen_tokenizer_dir()
+    per_arm: dict = {}
+    nll: dict[str, list[float]] = {}
+    argmax: dict[str, list[str]] = {}
+    for name, flags in arms:
+        configure(build, flags)
+        build_target(build, "sub0llm-qwen4-gen")
+        dump = build / f"ppl_{name}.tsv"
+        out = run([str(build / "sub0llm-qwen4-gen.exe"), "--model", ARTIFACT, "--tokenizer-dir", str(tok),
+                   "--ppl", str(fixture), "--ppl-tokens", str(max_tokens), "--ppl-dump", str(dump)],
+                  timeout=4 * 3600)
+        m = re.search(r"PPL-RESULT (.*)", out)
+        if not m:
+            raise RuntimeError(f"arm {name}: no PPL-RESULT line")
+        per_arm[name] = {k: float(v) for k, v in (kv.split("=") for kv in m.group(1).split())}
+        rows = [line.split("\t") for line in dump.read_text(encoding="utf-8").splitlines() if line]
+        nll[name] = [float(r[2]) for r in rows]
+        argmax[name] = [r[3] for r in rows]
+        print(f"  {name}: ppl {per_arm[name]['ppl']:.4f} over {int(per_arm[name]['tokens'])} tokens", flush=True)
+    base, *rest = [a for a, _ in arms]
+    paired = {}
+    for other in rest:
+        d = [b - a for a, b in zip(nll[base], nll[other])]
+        mean = statistics.fmean(d)
+        se = statistics.stdev(d) / len(d) ** 0.5
+        paired[other] = {"vs": base, "tokens": len(d), "mean_dnll": mean, "se": se,
+                         "ci95": [mean - 1.96 * se, mean + 1.96 * se],
+                         "ppl_ratio": per_arm[other]["ppl"] / per_arm[base]["ppl"],
+                         "top1_agreement": sum(x == y for x, y in zip(argmax[base], argmax[other])) / len(d)}
+    return {"fixture": make_ppl_fixture.VERSION, "arms": per_arm, "paired": paired}
+
+
 def evaluate_gates(results: dict, gates: dict) -> list[dict]:
     """Only gates whose inputs this run actually produced are evaluated; the rest report 'n/a'.
 
@@ -204,8 +268,18 @@ def evaluate_gates(results: dict, gates: dict) -> list[dict]:
                 # Inside the noise floor is explicitly neither a win nor a regression.
                 "status": "noise" if abs(delta) < noise else ("PASS" if delta < 0 else "FAIL"),
             })
+    for other, p in results.get("ppl", {}).get("paired", {}).items():
+        lo, hi = p["ci95"]
+        verdicts.append({
+            "id": "G-PPL",
+            "label": f"{other} vs {p['vs']}, {p['tokens']} tokens",
+            "value": f"{p['mean_dnll']:+.4f} nats/token (95% CI {lo:+.4f}..{hi:+.4f}), "
+                     f"ppl x{p['ppl_ratio']:.4f}, top-1 agree {p['top1_agreement']:.1%}",
+            # Confidently no worse than the threshold -> PASS; confidently worse -> FAIL; else more tokens.
+            "status": "PASS" if hi <= PPL_GATE_NATS else ("FAIL" if lo > PPL_GATE_NATS else "inconclusive"),
+        })
     for g in gates["gates"]:
-        if g["id"].startswith("G-PERF"):
+        if g["id"].startswith("G-PERF") or (g["id"] == "G-PPL" and "ppl" in results):
             continue
         verdicts.append({"id": g["id"], "label": g["label"],
                          "value": results.get(g["id"], "n/a"), "status": "n/a"})
@@ -285,8 +359,10 @@ def contention_check(sb) -> tuple[dict, list[str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--stage", action="append", choices=["suites", "quality", "perf", "compete", "vtune"],
+    ap.add_argument("--stage", action="append", choices=["suites", "quality", "perf", "compete", "vtune", "ppl"],
                     help="repeatable; default is perf only")
+    ap.add_argument("--ppl-tokens", type=int, default=5000,
+                    help="ppl stage: cap on scored tokens (the v1 fixture has ~2,400)")
     ap.add_argument("--arm", action="append", default=[],
                     help='"name:flags", e.g. "fused:--moe-quant-dot 1". First arm is the baseline.')
     ap.add_argument("--build", default="out/build/wp5c_full48", help="build dir for real-artifact stages")
@@ -355,6 +431,9 @@ def run_suite(args, sb) -> int:
         results["perf"] = stage_perf(build, arms, args.runs, args.tokens, args.cold)
         results["cache"] = "cold" if args.cold else "warm"
 
+    if "ppl" in stages:
+        results["ppl"] = stage_ppl(build, arms, args.ppl_tokens)
+
     if "vtune" in stages:
         # Profiles the LAST arm -- normally the one under investigation, since profiling the baseline
         # tells you about code you are not changing.
@@ -378,6 +457,11 @@ def run_suite(args, sb) -> int:
         for name, st in results["perf"].items():
             runs = ", ".join(f"{x:.3f}" for x in st["runs"])
             lines.append(f"| {name} | {st['median']:.3f} | {st['spread_pct']:.1f}% | {runs} |")
+    if results.get("ppl"):
+        lines += ["", f"## Perplexity ({results['ppl']['fixture']}, decode path)", "",
+                  "| Arm | Perplexity | Mean NLL | Top-1 | Decode tok/s |", "|---|---:|---:|---:|---:|"]
+        for name, a in results["ppl"]["arms"].items():
+            lines.append(f"| {name} | {a['ppl']:.4f} | {a['mean_nll']:.4f} | {a['top1']:.4f} | {a['decode_tok_s']:.2f} |")
     lines += ["", "History: `perf_history.jsonl`. Policy: `docs/OPTIMIZATION_PROCESS.md`.", ""]
     REPORT.write_text("\n".join(lines), encoding="utf-8")
 

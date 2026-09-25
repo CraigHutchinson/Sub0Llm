@@ -52,7 +52,17 @@
       "op": "lte",
       "threshold": 0.43,
       "severity": "hard",
-      "_note": "0.43 is the FP8 precedent (B33/B37) -- the worst quality this project has been willing to ship even default-off. Reference points: BF16 0.199 @5/6 argmax (shipped default), B35 fused 0.2938 @4/6 (shipped default-off)."
+      "_note": "0.43 is the FP8 precedent (B33/B37) -- the worst quality this project has been willing to ship even default-off. Reference points: BF16 0.199 @5/6 argmax (shipped default), B35 fused 0.2938 @4/6 (shipped default-off). Since 2026-09-26 this is a smoke check only: six tokens are too few to decide quality (it flagged the native backbone at argmax 3/6; G-PPL then showed it quality-neutral). G-PPL is the deciding gate for decode-path precision changes."
+    },
+    {
+      "id": "G-PPL",
+      "label": "decode-path perplexity vs the baseline arm, paired per token",
+      "stage": "run_perf_suite.py --stage ppl (sub0llm-qwen4-gen --ppl) @ real 48-layer, fixture ppl_blend_v1",
+      "metric": "mean per-token NLL difference vs the first arm, nats/token, with 95% CI",
+      "op": "lte",
+      "threshold": 0.03,
+      "severity": "hard",
+      "_note": "PASS if the 95% CI upper bound <= +0.03 nats/token (~3% perplexity): confidently no worse. FAIL if the lower bound exceeds it. Otherwise inconclusive: score more tokens. Paired on identical tokens, so text difficulty cancels, and so does anything both arms omit (the n-gram table). Reference, 2026-09-26: bf16 backbone ppl 15.0338, native backbone 14.8488, delta -0.0124 (CI -0.0354..+0.0106), top-1 agreement 84.5%, 2,418 tokens."
     },
     {
       "id": "G-PERF",
