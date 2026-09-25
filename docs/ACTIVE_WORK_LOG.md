@@ -822,3 +822,24 @@ commits ahead of `origin/main`, **not pushed**.
 Completed documentation coordination across MemPage, TieredCache and Llm. Scope: plans, requirements,
 consumer audit and NVIDIA source research. No engine files, builds or hardware workloads held.
 GPU transport and model integration remain unimplemented and require the recorded gates.
+
+---
+
+**2026-09-26 Claude Code — PARKED; the host is released for Sub0MemPage work.** No Claude Code track is
+running and none is queued; no CPU-heavy build, test or benchmark of mine is in flight. Everything is on
+`main`.
+
+- **Decode**, recommended flags (see `optimization/opportunities/README.md`): ~4.6 tok/s default,
+  **~6.6 tok/s median, 6.9 clean, with the opt-in native backbone** (`--backbone-quant-dot 1`).
+- **Resume points**, in order:
+  1. A quality oracle for the native backbone (llama.cpp logits with PLE handled on both sides).
+     L2 is 0.2926 and argmax 3/6 today, so the flag stays opt-in.
+  2. Stop loading bf16 copies of sidecar-covered roles (memory).
+  3. O7's SuperCache-without-gather pass, and a ten-thread `sub0llm-bench-moeqd` mode.
+  4. The measurements in `SPECULATION_NGRAM_MOE_DESIGN.md` §6 (E1–E3), then PLE fidelity.
+- **Artifacts to keep:**
+  - `D:/ModelWeights/Sub0Llm-Qwen4-full48-bf16/*.bbq(.pair)`: the 496-role sidecar.
+  - `D:/ModelWeights/o5-headonly/`: hardlinks plus a head-only `.bbq`, for sidecar-variant A/Bs.
+  - Agent worktree `agent-af27db7f3602819b1/out/full48`: Codex's older paired set. Its branch content is
+    already on `main` (as `3442dbf`/`44dade3`); the worktree is kept only for those files.
+

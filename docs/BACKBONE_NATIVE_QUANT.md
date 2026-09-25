@@ -1662,3 +1662,9 @@ Six interleaved rounds against the previous build:
 
 Default-off gates are unchanged: 29,510,661 / 147 with the same fingerprints; frontend 208,910 / 293.
 
+### 18b. Thread count, re-measured on the native build (2026-09-26)
+
+With the native backbone on, `--moe-decode-threads 8` beats 10: the routed-expert phase is 43.6 against
+46.8 ms, and decode reaches **6.58 tok/s median, 6.90–6.94 in clean rounds**. See
+`optimization/opportunities/O7_expert_kernels.md` §11 for the four-arm table.
+

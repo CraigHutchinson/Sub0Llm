@@ -379,3 +379,25 @@ AGENTS.md §13: one decode pass, not a verdict. Candidate reasons, and the next 
    `ParallelExperts`, and re-measure both kernels there before drawing conclusions from the bench again.
 3. **Thread placement.** Re-run with `--moe-decode-threads 8` (O4 measured 8 and 10 equal on the old
    kernels), which keeps every expert thread on a P-core.
+
+## 11. Pass 2 in decode: the E-core theory refuted (2026-09-26)
+
+Four arms, five rotating rounds, native backbone on, full flags: O7 kernels off/on × 8/10 expert
+threads. Medians:
+
+| arm | routed experts ms | tok/s |
+|---|---:|---:|
+| O7 off, 10 threads (previous default) | 46.8 | 6.25 |
+| O7 on, 10 threads | 48.5 | 6.06 |
+| **O7 off, 8 threads** | **43.6** | **6.58** |
+| O7 on, 8 threads | 45.0 | 6.54 |
+
+- **O7 is slower at both thread counts**, by 1.4–1.7 ms. With 8 threads every expert runs on a P-core, so
+  §10's leading theory (the gather is costly on the two E-cores that 10 threads spill onto) is refuted.
+  O7 stays parked. The remaining untested pass is SuperCache *without* the gather, and a ten-thread
+  bench mode, since the one-thread bench's wins have not predicted decode twice now.
+- **Eight expert threads beat ten on the current build**: the phase is ~3 ms faster in 4 of 5 rounds,
+  and clean rounds reach 6.90–6.94 tok/s. O4 had found 8 and 10 equal on the older, pre-native build;
+  with the native backbone they no longer are. `--moe-decode-threads 8` is now the recommended flag.
+- L2 was 0.292615 in all 20 runs.
+

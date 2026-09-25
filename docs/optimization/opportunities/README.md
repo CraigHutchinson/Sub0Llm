@@ -58,6 +58,13 @@ re-run it, rather than something noticed months later.
 operating point). MoE **68.7%**, mixer GDN/QSA **21.2%**, lm_head 5.4%, gated-residual 4.6%. Lever
 selection must cite this, not the pre-B35 numbers.
 
+### Current recommended real-axes decode flags (2026-09-26)
+
+`--moe-quant-dot 1 --decode-gemv-threads 8 --moe-decode-threads 8 --decode-omp-spin 1 --backbone-quant-dot 1`
+(the last is opt-in: faster, with a quality cost still awaiting a llama.cpp oracle, see
+`../../BACKBONE_NATIVE_QUANT.md` §18). With all five: ~6.6 tok/s median, 6.9 in clean rounds. Older
+opportunity docs quote the flags of their own day; they are records, not the current recipe.
+
 ### Briefed and ready
 
 | ID | Opportunity | Status | Evidence |
@@ -67,7 +74,7 @@ selection must cite this, not the pre-B35 numbers.
 | [O3](O3_gr_threads_and_spin.md) | Gated Residual via the GEMV primitive; `--decode-omp-spin` | **merged** | **0.313 → 0.213 s/token** (spin alone −20%, spread halved) | 1 |
 | [O4](O4_gdn_threads_and_moe_schedule.md) | Thread GDN across heads/channels; `schedule(dynamic)` for routed experts | **merged** | **0.236 → 0.211 s/token**; GDN phase −18.5%, bit-exact. MoE lever did NOT reproduce (−2.4%, in noise) | 1 |
 | [O5](../../BACKBONE_NATIVE_QUANT.md) | Native-quant backbone: keep the unsloth GGUF's Q8_0/Q4_K/Q5_K/Q6_K bytes resident, fused int8-activation dot | **all sidecar roles wired**, opt-in `--backbone-quant-dot 1` | **~4.2–4.6 → ~6.4 tok/s** (clean rounds 6.3–6.5, after §18a's q|gate merge); GR −33%, QSA −38%, GDN −43%, lm_head −52%. L2 0.2926, argmax 3/6 — opt-in until a llama.cpp oracle (§18) | 3 |
-| [O7](O7_expert_kernels.md) | IQ1_S/IQ2_XXS expert kernels: per-superblock scale hoist + vector gather | **parked**, default off (`kO7Kernels`) | Bit-exact; 14–26% faster per plane in the 1-thread bench, but routed experts **44.7 → 46.6 ms** (+4%, 5/5 rounds) in real decode. Next passes named in §10 | 1 |
+| [O7](O7_expert_kernels.md) | IQ1_S/IQ2_XXS expert kernels: per-superblock scale hoist + vector gather | **parked**, default off (`kO7Kernels`) | Bit-exact; 14–26% faster per plane in the 1-thread bench, but slower in real decode at both 10 and 8 expert threads (§10–§11). Found on the way: 8 expert threads beat 10 (−3 ms) | 2 |
 
 **Candidates, not yet briefed — ordered and costed in [`../../SPECULATION_NGRAM_MOE_DESIGN.md`](../../SPECULATION_NGRAM_MOE_DESIGN.md).**
 
