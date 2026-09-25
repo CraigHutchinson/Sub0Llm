@@ -152,6 +152,7 @@ static void ensure_shared_params() {
 
 moeq::Store g_moe_quant;
 bbq::Store g_backbone_quant;
+BackboneRoleTable g_backbone_roles;   // O5 phase 2b-3 phase A: built once in load_backbone_quant_sidecar
 MoeIoStage g_moe_io_stage;                              // B36 -- sized once, beside the open below
 moeio::PlaneIo<MOE_IO_MAX_INFLIGHT> g_moe_decode_io;   // B36 -- opened alongside g_moe_quant below, only
                                                         // under MOE_IO_PIPELINED
@@ -2085,6 +2086,9 @@ bool load_backbone_quant_sidecar(const char* model_path) {
         // The pairing check read the file through the file cache, which does not map its pages into
         // this view; fault them in now, at load, rather than inside the first decode tokens.
         [[maybe_unused]] const volatile std::uint64_t touched = g_backbone_quant.prefault();
+        // O5 phase 2b-3 phase A: resolve every (role, layer) ONCE here, not per token -- see
+        // BackboneRoleTable's own comment (internal.hpp) for the full reasoning.
+        g_backbone_roles.build(g_backbone_quant);
         return true;
     }
 }
