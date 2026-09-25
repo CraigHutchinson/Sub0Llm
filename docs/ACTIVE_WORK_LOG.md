@@ -843,3 +843,16 @@ running and none is queued; no CPU-heavy build, test or benchmark of mine is in 
   - Agent worktree `agent-af27db7f3602819b1/out/full48`: Codex's older paired set. Its branch content is
     already on `main` (as `3442dbf`/`44dade3`); the worktree is kept only for those files.
 
+---
+
+**2026-09-25 Sonnet 5 subagent (isolated worktree, agent-ad606c1301068aeef) — O8: row-split scheduling
+for the routed MoE experts in decode, status: active.** Branch: worktree-local (not pushed).
+Files/areas: `include/sub0/moe_math.hpp` (the `run_rows` hook only), `src/backends/cpu/decode.cpp`
+(`RowSplitExperts`, `gemv_plane_range`), `tools/configurator.cpp` (`--moe-row-split`/`MOE_ROW_SPLIT`),
+`tests/moe_quant_tests.cpp` (new `[o8]` cases), new `docs/optimization/opportunities/O8_moe_row_split.md`.
+Does NOT touch `moe_quant_dot.hpp`'s kernels, `kO7Kernels`, or the backbone headers. Own build dir
+`out/build/o8`; will use `D:/ModelWeights/Sub0Llm-Qwen4-full48-bf16/qwen4_full48_q_bf16.bin.moeq`
+(read-only, memory-mapped) and run `sub0llm-qwen4-forward`/`run_perf_suite.py` real-model gates next.
+Neutral gates confirmed exact so far: `sub0_tests` 29,510,661/147 (fingerprints unchanged),
+`sub0_frontend_tests` 228,198/295 (208,910/293 + 19,288/+2 new `[o8]` cases). Will update this row to
+`done`/handed off when finished; not merging (primary agent reviews and merges).
