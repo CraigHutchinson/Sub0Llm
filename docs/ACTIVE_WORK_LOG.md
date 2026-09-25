@@ -864,3 +864,17 @@ Neutral gates confirmed exact so far: `sub0_tests` 29,510,661/147 (fingerprints 
   - neutral gates exact.
 - Merged with one guard added in `gemv_plane_range`.
 - The thread-count sweep is still open. Detail: `O8_moe_row_split.md` §7-§9.
+
+---
+
+**2026-09-26 Sonnet 5 subagent (isolated worktree, agent-a2c56fde96fcac8ad) — storage-stack S1 (Llm
+side), active.** `docs/STORAGE_STACK_PLAN.md`'s "Next: S1 on the Sub0Llm side" handoff, steps 1-6.
+Branch: worktree-local (not pushed), merged onto `main` at `0179e9e` (O8). Files/areas: new
+`include/sub0/ngram_tiered_storage.hpp` (isolated -- nothing in `src/`/`tools/` includes it, same
+pattern as `backbone_quant_dot.hpp`), new `tests/ngram_tiered_storage_tests.cpp`, an additive block in
+`tests/CMakeLists.txt` (new `SUB0_STORAGE_TIEREDCACHE` option, default OFF; a new
+`sub0_storage_tiered_cache_tests` target when ON, FetchContent-pinned to Sub0MemPage `213acdd2` /
+Sub0TieredCache `e4da6a7e`). No file overlap with O8 or any other row above. CPU-heavy work: one clean
+default-config rebuild + suite run (baseline), one toggle-ON rebuild + new-target run, one mutation
+rebuild. Correctness only, no performance measurement, `-j 4`. Will update this row to `done` when
+finished.
