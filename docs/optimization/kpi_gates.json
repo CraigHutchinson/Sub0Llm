@@ -30,9 +30,9 @@
       "stage": "sub0_frontend_tests @ d196check",
       "metric": "assertions",
       "op": "gte",
-      "threshold": 206818,
+      "threshold": 208910,
       "severity": "hard",
-      "_note": "Grows as tests are added; must never shrink. 206818/292 as of the O7 merge (2026-09-25)."
+      "_note": "Grows as tests are added; must never shrink. 208910/293 as of the O5 2b-3 merge (2026-09-26)."
     },
     {
       "id": "G-PARITY",

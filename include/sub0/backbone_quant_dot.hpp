@@ -79,13 +79,44 @@
 #pragma once
 
 #include "sub0/gguf.hpp"
-#include "sub0/moe_quant_dot.hpp"   // moeqd::ActBlocks, moeqd::GROUP -- reused verbatim, not re-derived
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <span>
+
+// --- O5 phase 2b-3 phase A: bbqd::Plane, defined BEFORE the moe_quant_dot.hpp include below -----------
+//
+// WHY THIS IS SPLIT OUT OF THE MAIN `namespace sub0::bbqd` BLOCK FURTHER DOWN. Plane is a pure POD view
+// (four fields, no dependency on ActBlocks/moeqd at all -- see its own doc comment). Every `*_math.hpp`
+// header (gdn_math.hpp, gated_residual_math.hpp, qsa_math.hpp, moe_math.hpp) needs it to stay
+// storage-agnostic. moe_math.hpp is ALSO a transitive dependency of `#include "sub0/moe_quant_dot.hpp"`
+// just below (moe_quant_dot.hpp includes moe_math.hpp for `moe::Dims`) -- so if Plane were declared only
+// in the main block AFTER that include, a build with moe_math.hpp's own native-quant wiring (phase B)
+// would form a real cycle: backbone_quant_dot.hpp -> moe_quant_dot.hpp -> moe_math.hpp ->
+// backbone_quant_dot.hpp (for Plane), reaching moe_math.hpp's own `bbqd::Plane` use before this header's
+// own namespace block had ever been opened. Declaring Plane here, before that include, breaks the cycle
+// without touching moe_quant_dot.hpp (out of scope per this pass's own brief) or moe_math.hpp's own
+// otherwise-natural single `#include "sub0/backbone_quant_dot.hpp"`.
+namespace sub0::bbqd {
+
+/** A format-agnostic view of one weight plane's bytes -- decouples the `*_math.hpp` headers (gdn_math.hpp,
+ * gated_residual_math.hpp, qsa_math.hpp, moe_math.hpp) from the S0B1 sidecar's own storage format
+ * (backbone_quant.hpp's `bbq::Desc`). Built once by the caller (decode's resolved-role table, O5 phase A)
+ * from whatever storage format actually backs it; the math headers only ever see this. See `gemv_plane`'s
+ * own Plane overload, further down this file, for the one seam every math header calls through.
+ */
+struct Plane {
+    std::uint32_t                 type_raw  = 0;
+    int                            n_rows    = 0;   ///< bbqd's own `n_rows` (the GEMV's output width)
+    int                            row_elems = 0;   ///< bbqd's own `row_elems` (the GEMV's contraction width)
+    std::span<const std::uint8_t> bytes{};          ///< the plane's own encoded payload, exactly as gemv_plane wants
+};
+
+}  // namespace sub0::bbqd
+
+#include "sub0/moe_quant_dot.hpp"   // moeqd::ActBlocks, moeqd::GROUP -- reused verbatim, not re-derived
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -1867,6 +1898,37 @@ template <int Threads = 1>
         return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi,
                                            gsum16_hint);
     }
+}
+
+// --- O5 phase 2b-3, phase A: the format-agnostic plane view's GEMV overload ----------------------------
+//
+// `Plane` itself is declared near the TOP of this file, before the `moe_quant_dot.hpp` include -- see
+// that declaration's own comment for why (a real include cycle once moe_math.hpp also needs it, phase B).
+// WHY Plane EXISTS AT ALL. Before this pass, gdn_math.hpp (and, as of phase B, gated_residual_math.hpp/
+// qsa_math.hpp/moe_math.hpp) included backbone_quant.hpp directly and stored a `const bbq::Desc*` +
+// its raw byte span in their own `Native` structs -- coupling every math header that wants a native-quant
+// weight source to the S0B1 SIDECAR'S OWN on-disk format (bbq::Desc's role/layer/off/bytes fields, none of
+// which a GEMV kernel needs). That is a real layering inversion: the math headers are this project's
+// storage-agnostic forward-math core (this file's own header comment, "engine-free"), and backbone_quant.hpp
+// is one PARTICULAR storage format for one particular residency strategy. A future second storage form
+// (e.g. a resident dequantized cache, or a different sidecar shape) would have had to either grow a second
+// Native variant per math header or force every math header to learn a second storage type.
+//
+// This is the fix: a plane is fully described by the four fields `gemv_plane(type_raw, raw, n_rows,
+// row_elems, ...)` already takes as loose parameters -- so naming that tuple once, here, in the KERNEL
+// header (not the storage header), lets every math header depend on `backbone_quant_dot.hpp` alone. The
+// caller (decode.cpp, which already depends on both bbq::Store for loading and bbqd for kernels) is the
+// one place that converts a `bbq::Desc` (or any other future storage format) into a `Plane`.
+
+/** `gemv_plane<Threads>` over a `Plane` view, otherwise identical to the loose-parameter overload above
+ * (same defaults, same row-range/threading/Gsum16 contract) -- see that overload's own doc comment for the
+ * full behavior. This is the ONE overload every `*_math.hpp` Native struct calls; the loose-parameter form
+ * stays available for existing test/benchmark callers.
+ */
+template <int Threads = 1>
+[[nodiscard]] inline bool gemv_plane(const Plane& p, const ActBlocks& x, float* out,
+                                     int row_lo = 0, int row_hi = -1, Gsum16* gsum16 = nullptr) {
+    return gemv_plane<Threads>(p.type_raw, p.bytes, p.n_rows, p.row_elems, x, out, row_lo, row_hi, gsum16);
 }
 
 }  // namespace sub0::bbqd

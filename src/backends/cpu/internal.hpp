@@ -328,6 +328,68 @@ extern moeq::Store g_moe_quant;
 // Opened once during model load; decode reads the validated mapping without owning it.
 extern bbq::Store g_backbone_quant;
 
+// O5 phase 2b-3 phase A (docs/BACKBONE_NATIVE_QUANT.md S17/S18): a per-layer table of RESOLVED native
+// planes, built ONCE when the sidecar loads (load_backbone_quant_sidecar, backend.cpp), not looked up
+// per role per layer per token. Before this pass, decode called `g_backbone_quant.find(role, layer)` --
+// an unordered_map lookup -- for every role, on every layer, of every generated token (up to
+// kRoleCount * N_LAYERS lookups/token). Table membership never changes after build() (the sidecar is
+// immutable for the process lifetime, same as g_backbone_quant itself), so every entry can be resolved
+// exactly once and read many times, per AGENTS.md S1's "size once outside the hot loop, reuse across
+// calls" rule -- this IS that hot-loop cost, moved out.
+//
+// A missing role (sidecar not loaded, or this role absent at this layer -- e.g. a QSA role on a GDN
+// layer) is a `present == false` entry: every consumer treats that as "fall back to the bf16 blob",
+// exactly as a null bbq::Store::find() result did before this pass -- this table changes WHEN the lookup
+// happens, not what an absent role means.
+//
+// Stores `bbqd::Plane` (backbone_quant_dot.hpp's own storage-agnostic view, not `bbq::Desc`) so that
+// every `*_math.hpp` Native struct that reads an entry from this table never has to include
+// backbone_quant.hpp at all -- see that header's own "format-agnostic plane view" comment for why this
+// decoupling matters. `layer == -1` (a model-level role -- TokEmb/LmHead/GrExitDown/GrExitUp) is stored
+// at index N_LAYERS, one past the last real per-layer slot, so `get()` needs no branch on
+// `bbq::role_per_layer()` at read time (only at build() time, where the cost is amortized once).
+struct BackboneRoleTable {
+    struct Entry {
+        bool          present = false;
+        bbqd::Plane   plane{};
+    };
+    std::array<std::array<Entry, static_cast<std::size_t>(bbq::kRoleCount)>,
+               static_cast<std::size_t>(N_LAYERS) + 1> t{};
+
+    // Only meaningful (and only ever called) under BACKBONE_QUANT_DOT -- see load_backbone_quant_sidecar
+    // (backend.cpp), the one call site. `store` must already be open() and prefault()ed.
+    void build(const bbq::Store& store) {
+        for (int r = 0; r < bbq::kRoleCount; ++r) {
+            const auto role = static_cast<bbq::Role>(r);
+            if (bbq::role_per_layer(role)) {
+                for (int l = 0; l < N_LAYERS; ++l) fill(store, role, l);
+            } else {
+                fill(store, role, -1);
+            }
+        }
+    }
+
+    [[nodiscard]] const Entry& get(bbq::Role role, int layer = -1) const {
+        const std::size_t li = layer < 0 ? static_cast<std::size_t>(N_LAYERS) : static_cast<std::size_t>(layer);
+        return t[li][static_cast<std::size_t>(role)];
+    }
+
+private:
+    void fill(const bbq::Store& store, bbq::Role role, int layer) {
+        const bbq::Desc* d = store.find(role, layer);
+        if (!d) return;
+        const std::size_t li = layer < 0 ? static_cast<std::size_t>(N_LAYERS) : static_cast<std::size_t>(layer);
+        Entry& e = t[li][static_cast<std::size_t>(role)];
+        e.present = true;
+        e.plane = bbqd::Plane{d->type_raw, static_cast<int>(d->out_f), static_cast<int>(d->in_f),
+                              store.raw(*d)};
+    }
+};
+// Built once (load_backbone_quant_sidecar) after g_backbone_quant.open()+prefault(); read-only for the
+// rest of the process, so concurrent decode threads reading it need no synchronization -- the same
+// "immutable after load" argument g_backbone_quant itself already relies on.
+extern BackboneRoleTable g_backbone_roles;
+
 // B36 (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36): decode's explicit-overlapped-I/O reader for the
 // sidecar's payload, opened only when MOE_IO_PIPELINED -- a SEPARATE open handle from g_moe_quant's own
 // read-only mapping (which stays exactly as it is, still used by the batched op_moe path and by

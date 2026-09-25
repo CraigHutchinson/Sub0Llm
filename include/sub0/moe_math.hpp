@@ -366,7 +366,25 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
     // `F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output`. Always
     // f32-resident: it runs for EVERY token, so there is nothing for a quantized-resident form to save
     // (see include/sub0/moe_quant.hpp's own header comment).
-    expert_ffn_row<Threads>(d, x, shared_gate_w, shared_up_w, shared_down_w, expert_out, ffn_scratch, g_scratch);
+    // O5 phase 2b-3 phase B (docs/BACKBONE_NATIVE_QUANT.md S18): the shared expert's own optional
+    // native-quant gate/up/down path. This header stays engine-free and storage-agnostic (no bbqd/
+    // backbone_quant_dot.hpp dependency -- including it here would form a real cycle: backbone_quant_dot.
+    // hpp -> moe_quant_dot.hpp -> moe_math.hpp -> backbone_quant_dot.hpp, since moe_quant_dot.hpp itself
+    // depends on moe::Dims/moe::detail::silu, AGENTS.md S10's "enumerate the consumers" caught this
+    // during authoring, not after). So the native path is detected the SAME way `run_experts.prefetch()`
+    // already is, one seam up (B36's own precedent, this file's own comment just above): an OPTIONAL
+    // `compute_shared(x, out) -> bool` method on the caller's `RunExperts` object (decode.cpp's own
+    // `ParallelExperts`, which already depends on bbqd -- a .cpp file, not a header, so it has no cycle
+    // to worry about). Returning `false` (or not providing the method at all -- SerialExperts and every
+    // other existing caller) means "computed nothing, fall back to the ordinary path", exactly like a
+    // null/absent Native pointer does in gdn_math.hpp/gated_residual_math.hpp/qsa_math.hpp.
+    bool shared_native_ok = false;
+    if constexpr (requires { run_experts.compute_shared(x, expert_out); }) {
+        shared_native_ok = run_experts.compute_shared(x, expert_out);
+    }
+    if (!shared_native_ok) {
+        expert_ffn_row<Threads>(d, x, shared_gate_w, shared_up_w, shared_down_w, expert_out, ffn_scratch, g_scratch);
+    }
     // B34/B38: was a scalar `for(i) gate_logit += x[i]*w[i];` reduction -- see simd_reduce.hpp. Gated on
     // USE_SIMD_REDUCE via the `UseSimd` template parameter above; UseSimd=false reproduces the exact
     // original scalar accumulation order.
