@@ -190,7 +190,20 @@ subset of an unmodified kernel's output rows a given call produces, and which th
 `--moe-row-split 1` (§6), `max |forward - forward_one|` identical (5.12861 at row 2), argmax agreement
 identical (3/6). `G-PARITY`'s own hard threshold (`max |forward - forward_one| == 0.0`) is already waived
 project-wide for `--moe-quant-dot` (the int8-activation error, not this package); this package adds no
-new deviation from THAT waived value.
+new deviation from THAT waived value. §6's perplexity run then confirmed the same claim over 2,418 real
+tokens, exactly, not just 6.
+
+**A real gap caught in self-review, fixed before this was considered done.** The first implementation
+built each expert's row-chunk work list straight from the sidecar's `Desc` without re-checking that
+`Desc.in_f`/`out_f` actually match this build's `d.hidden_size`/`d.d_ff` — the same
+`moeqd::detail::plane_ok` check `expert_ffn_row_quant`'s own reference path runs before it will compute
+anything. Without it, a sidecar built at different axes could pass `gemv_plane_range`'s own byte-bounds
+check (a too-small read still fits inside a too-large `raw` span) while silently computing from the
+wrong bytes, instead of the loud abort the non-split path already gives for that mismatch. Not observed
+in practice — the real sidecar's axes match this build exactly, which is why neither the unit test nor
+the real-artifact runs caught it — but the reference path guards it and this one now does too
+(`RowSplitExperts::run_rows`, re-checked once per selected expert per layer, before the row-chunk lists
+are built).
 
 ## 5. Neutral gates (default build unaffected — AGENTS.md §4)
 
@@ -217,9 +230,19 @@ exact assertion/fingerprint match above confirms it, not just the `if constexpr`
 | base (`--moe-row-split` unset) | 0.292615 | 5.12861 (row 2) | 3/6 |
 | split (`--moe-row-split 1`) | **0.292615** (identical) | **5.12861** (identical) | 3/6 |
 
-Perplexity gate (`scripts/run_perf_suite.py --stage ppl`, fixture `ppl_blend_v1`, paired per-token NLL):
+Perplexity gate (`scripts/run_perf_suite.py --stage ppl --label O8`, fixture `ppl_blend_v1`, 2,418
+real tokens, paired per-token NLL, same recommended flags):
 
-<!-- PPL_RESULTS -->
+| arm | perplexity | mean NLL | top-1 |
+|---|---:|---:|---:|
+| base | 14.84875 | 2.697916 | 0.4864 |
+| split | **14.84875** (identical) | **2.697916** (identical) | 0.4864 |
+
+**Paired delta: +0.0000 nats/token, 95% CI [+0.0000, +0.0000], `se=0.0`, top-1 agreement 100.0%** — every
+one of the 2,418 tokens' NLL matched EXACTLY, not merely on average (`se=0.0` is what a truly zero
+per-token difference produces, not a coincidentally-small mean over a real spread). `G-PPL`: **PASS**.
+This is the strongest correctness evidence in this package: it is the SAME bit-exactness claim as the
+6-token L2 check above, now confirmed over 2,418 real tokens of real text instead of 6.
 
 ## 7. Throughput
 
