@@ -1409,6 +1409,10 @@ above; `sub0llm-qwen4-forward --tokens 6`):
   0.162039/5-6 exactly under this pass's code -- the ONE piece of evidence that isolates "did adding the
   GDN roles change anything about the ALREADY-wired TokEmb/LmHead path" (answer: no).
 
+> **Superseded — do not cite the throughput below (primary agent, 2026-09-25).** Both arms were built
+> without `--moe-quant-dot 1`, so the old dequantize-and-transpose MoE path dominated (~1.0 s/token
+> against ~0.19 at the real flags). It also ran before the first-touch fault fix. §17 has the valid A/B.
+
 **Throughput -- REDUCED protocol, reported plainly rather than dressed up as the full gate.**
 `docs/OPTIMIZATION_PROCESS.md` asks for >= 3-4 interleaved rounds, order-reversed on even rounds, a
 discarded cold first round, and a `--profile-phases` build for the per-phase table. Given this package's
@@ -1488,3 +1492,79 @@ was applied by hand):
   2b-2a's own scoping, unchanged here), so no resident-memory reduction is claimed or expected yet.
 - **`ActSuper` (per-256 activation) was not evaluated for the new roles**, per this task's own explicit
   scoping instruction (evaluate only after the per-32 wiring is proven).
+
+---
+
+## 17. The first real end-to-end number, and the first-touch trap that hid it (2026-09-25)
+
+Primary-agent integration of phase 2b-2b. Everything here was measured at the real recommended flags —
+`--moe-quant-dot 1 --decode-gemv-threads 8 --moe-decode-threads 10 --decode-omp-spin 1`, plus
+`--profile-phases 1` — on the real 48-layer artifact, with both arms built from one tree and differing only
+by `--backbone-quant-dot`.
+
+### 17a. First measurement: flat — and why that was wrong
+
+Five interleaved rounds gave 0.189 s/token for both arms. The native lm_head was 25% faster, but the three
+native GDN projections — half the backbone's bytes — gained nothing, although the kernels are 1.8–2.2x
+faster per row in isolation.
+
+The GDN native path was engaged: running the same binary against the older head-only sidecar (hardlinked
+beside the same `.bin`/`.moeq`, so both arms shared one page cache) changed L2 from 0.27882 to 0.240299.
+What differed was **page faults inside the timed decode**:
+
+| arm | faults during `forward_one`, 6 tokens |
+|---|---:|
+| default (bf16) | 82 k |
+| native head only | 173 k |
+| native head + GDN | **551 k** |
+
+The tool runs the batched `forward()` first, which touches every bf16 weight, so the default arm's decode
+is warm. `forward()` never reads the native sidecar: it is a memory-mapped file whose only reader is
+decode. So the native arm paid a first-touch soft fault per 4 KiB page of ~1.4 GB of GDN planes inside the
+timed tokens. The pairing hash reads the file through the file cache, which does not map pages into the
+process's view, so it did not help.
+
+**Fix:** `bbq::Store::prefault()`, one read per page at load (`load_backbone_quant_sidecar`). The working
+set after load grows by 3.26 GiB (the sidecar, now resident, as the bf16 blob already is). Decode faults
+drop to 94 k. Numerics are unchanged: L2 is identical. This is an engine fix, not only a measurement one;
+a real generation would otherwise pay the faults on its first tokens.
+
+### 17b. The valid A/B (6 rounds, arm order alternated, round 1 discarded)
+
+| phase, median ms/token | default | native head + GDN | change |
+|---|---:|---:|---:|
+| **total s/token** | **0.218** | **0.202** | **−7.3%** |
+| GDN mixer | 75.3 | 56.5 | −25% |
+| lm_head | 19.5 | 10.6 | −46% |
+| QSA mixer | 32.5 | 35.4 | +9% |
+| Gated Residual | 31.4 | 35.3 | +12% |
+| routed experts | 44.3 | 46.7 | +5% |
+| router + shared + combine | 14.1 | 15.9 | +13% |
+
+Native is faster in all six rounds. Quality: forward-vs-forward_one L2 **0.27882** against the default's
+0.23252, with argmax 4/6 in both.
+
+Host conditions: AC power, background load 4–5%, but noisier than two days earlier. The default arm ran at
+0.189 s/token on 2026-09-23 and ~0.218 here, so compare only within a run.
+
+### 17c. The open question this raises
+
+**Every phase still on bf16 got 5–13% slower in the native arm**, although its code is unchanged. That
+gives back about 11 ms of the ~28 ms gross win. Uniform slowdown of untouched code points at a machine-level
+cause rather than a code one. Candidates, in the order they should be tested:
+
+1. **Clocks.** Heavier integer-SIMD load on a thermally limited laptop may lower sustained frequency for
+   everything that follows. Log core frequency across both arms.
+2. **Memory footprint.** The native arm keeps both the full bf16 blob and the 3.26 GiB sidecar resident, and
+   touches both every token. Test by not loading the bf16 copies of roles the sidecar covers. That is also
+   the memory reduction §13 promised and has not yet been realized.
+3. **Cache/TLB.** A second large mapped region streaming through the same caches.
+
+This is the next lever on the native path, alongside wiring the remaining roles (Gated Residual, QSA,
+shared expert: about 2.9 GB/token still read as bf16).
+
+### 17d. Status
+
+`--backbone-quant-dot 1` stays **default-off** (AGENTS.md §4). It is recommended for speed at the stated
+quality cost, pending a better quality oracle than forward-vs-forward_one. That means llama.cpp logits
+with PLE disabled on both sides, or perplexity on a text set.
