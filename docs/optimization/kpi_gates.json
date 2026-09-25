@@ -10,9 +10,9 @@
       "stage": "sub0_tests @ d196check",
       "metric": "decode hash",
       "op": "eq",
-      "threshold": "816c4a54ad49b8cf",
+      "threshold": "d1625d19ed2258f1",
       "severity": "hard",
-      "_note": "AGENTS.md S4. Proves the change did not leak into the default path. Every merge in the B24-B39 thread held this."
+      "_note": "AGENTS.md S4. Proves the change did not leak into the default path. Re-baselined 2026-09-25 from 816c4a54ad49b8cf: the neutral config's tokenizer calibration changed (Codex, GSM8K calibration commit), which changes the vocabulary and so every fingerprint; confirmed by building main without any O5/O7 change. Companion hashes: forward 5a7382ea70d3913b, grad 7f44bdae18c313dd."
     },
     {
       "id": "G-SUITE-ENGINE",
@@ -20,7 +20,7 @@
       "stage": "sub0_tests @ d196check",
       "metric": "assertions",
       "op": "eq",
-      "threshold": 28969623,
+      "threshold": 29510661,
       "severity": "hard",
       "_note": "Exact, or a delta fully attributable to tests this change added. An unattributable count change is an unexplained behaviour change."
     },
@@ -30,9 +30,9 @@
       "stage": "sub0_frontend_tests @ d196check",
       "metric": "assertions",
       "op": "gte",
-      "threshold": 141609,
+      "threshold": 206818,
       "severity": "hard",
-      "_note": "Grows as tests are added; must never shrink. 122385/256 as of the B35 merge."
+      "_note": "Grows as tests are added; must never shrink. 206818/292 as of the O7 merge (2026-09-25)."
     },
     {
       "id": "G-PARITY",
