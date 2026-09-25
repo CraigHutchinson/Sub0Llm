@@ -597,6 +597,22 @@ public:
 
     [[nodiscard]] std::uint64_t resident_bytes() const { return h_.data_bytes; }
 
+    /** Read one byte of every 4 KiB page of the mapped payload, so decode never takes a first-touch
+     * soft page fault on it.
+     *
+     * The bf16 blob is read into memory at load, and the batched forward() touches it again; this
+     * sidecar is only mapped, and decode is its only reader. Without this, the first decode tokens pay
+     * about one fault per page of native weights inside the timed path: ~470k extra faults over six
+     * tokens with the GDN roles present, which hid their whole gain (docs/BACKBONE_NATIVE_QUANT.md S17).
+     * @return a byte sum, so the reads cannot be optimized away.
+     */
+    [[nodiscard]] std::uint64_t prefault() const noexcept {
+        constexpr std::uint64_t kPage = 4096;
+        std::uint64_t sum = 0;
+        for (std::uint64_t off = 0; off < h_.data_bytes; off += kPage) sum += data_[off];
+        return sum;
+    }
+
 private:
     Header                                    h_{};
     std::vector<Desc>                         descs_;

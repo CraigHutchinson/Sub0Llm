@@ -2082,6 +2082,9 @@ bool load_backbone_quant_sidecar(const char* model_path) {
             std::println(stderr, "error: BACKBONE_QUANT_DOT model/sidecar pairing failed: {}", err);
             return false;
         }
+        // The pairing check read the file through the file cache, which does not map its pages into
+        // this view; fault them in now, at load, rather than inside the first decode tokens.
+        [[maybe_unused]] const volatile std::uint64_t touched = g_backbone_quant.prefault();
         return true;
     }
 }
