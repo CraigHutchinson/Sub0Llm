@@ -244,6 +244,8 @@ thread_local bbqd::ActBlocks g_gr_lr_q{};     // HC_LOWRANK_BUF-wide
 // (post-gate) attention output, D_Q-wide.
 thread_local bbqd::ActBlocks g_qsa_x_q{};
 thread_local bbqd::ActBlocks g_qsa_ao_q{};
+// The whole q|gate GEMV's output, before qsa::attn_project_row scatters it per head.
+thread_local std::array<float, 2 * static_cast<std::size_t>(QSA_DIMS_BUF.q_width())> g_qsa_qg_buf{};
 
 // MoE shared expert: x_q feeds gate/up (one shared D_MODEL-wide input row); pre_q is down's own
 // quantized (post-SwiGLU) input, D_FF-wide; gsum16 is shared Q6_K scratch (the real layer-2 outlier).
@@ -783,6 +785,7 @@ const float* Model::forward_one(int id, int pos) {
                     qsa_native.k = &e_k.plane;
                     qsa_native.v = &e_v.plane;
                     qsa_native.x_q = &g_qsa_x_q;
+                    qsa_native.qg_buf = g_qsa_qg_buf.data();
                 }
                 if (e_o.present) {
                     qsa_native.o = &e_o.plane;

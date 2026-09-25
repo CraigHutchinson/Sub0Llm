@@ -1647,3 +1647,18 @@ ours. **The flag stays opt-in until that comparison exists.**
    whether dual residency costs anything.
 3. **The quality oracle above.**
 
+### 18a. Refinement: one q|gate GEMV instead of 48 (2026-09-26)
+
+QSA's q|gate split had been 2 × 24 heads = 48 `gemv_plane<8>` calls per QSA layer, each its own OpenMP
+region over 256 rows. It is now one GEMV over the whole stored tensor into a caller-owned buffer
+(`g_qsa_qg_buf`), followed by a per-head copy. The kernel computes every output row independently, so the
+result is bit-identical: L2 stays exactly 0.292615, argmax 3/6.
+
+Six interleaved rounds against the previous build:
+- **QSA phase 29.1 → 22.1 ms (−24%), faster in all six rounds.**
+- **Total: clean rounds 6.33–6.49 tok/s against 5.95–6.13.** Per round: 6.45 / 6.33 / 5.41 / 4.57 /
+  6.49 / 6.45 against 5.95 / 6.10 / 6.10 / 4.57 / 6.13 / 5.99. The 4.57 pair was both arms in the slow
+  host state; the 5.41 was this arm drawing it alone.
+
+Default-off gates are unchanged: 29,510,661 / 147 with the same fingerprints; frontend 208,910 / 293.
+

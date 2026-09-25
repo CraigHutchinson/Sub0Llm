@@ -79,8 +79,11 @@ struct Native {
     const bbqd::Plane* o      = nullptr;
     bbqd::ActBlocks* x_q  = nullptr;   // hidden_size-wide, shared by q_gate/k/v
     bbqd::ActBlocks* ao_q = nullptr;   // q_width-wide, o_proj's own quantized (gated) attention output
+    float*           qg_buf = nullptr; // 2*q_width floats, caller-owned: the whole q|gate GEMV, pre-scatter
 
-    [[nodiscard]] bool proj_ready() const { return q_gate != nullptr && k != nullptr && v != nullptr && x_q != nullptr; }
+    [[nodiscard]] bool proj_ready() const {
+        return q_gate != nullptr && k != nullptr && v != nullptr && x_q != nullptr && qg_buf != nullptr;
+    }
     [[nodiscard]] bool o_ready() const { return o != nullptr && ao_q != nullptr; }
 };
 
@@ -384,18 +387,16 @@ inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
         // AGENTS.md S1's own "one distinct activation vector, one quantize call" discipline: q_gate/k/v
         // all read this SAME hidden_size-wide row, so it is quantized exactly once here.
         native->x_q->quantize(x, d.hidden_size);
-        // The Q|GATE split (this struct's own header comment): per head, `transplant::
-        // per_head_half_transpose`'s own row-selection formula (`h*2*head_dim + half*head_dim`) picked
-        // out as a `[row_lo, row_hi)` range into the WHOLE tensor's own GEMV -- one gemv_plane call per
-        // head per half, writing straight into this head's own D_HEAD-wide slot of out_q/out_gate.
+        // The Q|GATE split (this struct's own header comment): ONE GEMV over the whole stored tensor, then
+        // `transplant::per_head_half_transpose`'s row formula (`h*2*head_dim + half*head_dim`) as a
+        // per-head copy. The kernel computes every output row independently, so this is bit-identical to
+        // one row-range call per head per half, without that form's 2*n_heads OpenMP fork/joins per layer.
         const int hd = d.head_dim;
-        bool ok = true;
+        bool ok = bbqd::gemv_plane<Threads>(*native->q_gate, *native->x_q, native->qg_buf);
         for (int h = 0; h < d.n_heads; ++h) {
-            const int row0 = h * 2 * hd;
-            ok = ok && bbqd::gemv_plane<Threads>(*native->q_gate, *native->x_q, out_q + h * hd,
-                                                 row0, row0 + hd);
-            ok = ok && bbqd::gemv_plane<Threads>(*native->q_gate, *native->x_q, out_gate + h * hd,
-                                                 row0 + hd, row0 + 2 * hd);
+            const float* rows = native->qg_buf + static_cast<std::size_t>(h) * 2 * hd;
+            std::copy_n(rows, hd, out_q + h * hd);
+            std::copy_n(rows + hd, hd, out_gate + h * hd);
         }
         ok = ok && bbqd::gemv_plane<Threads>(*native->k, *native->x_q, out_k);
         ok = ok && bbqd::gemv_plane<Threads>(*native->v, *native->x_q, out_v);
