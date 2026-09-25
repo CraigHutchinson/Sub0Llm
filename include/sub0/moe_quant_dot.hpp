@@ -66,11 +66,10 @@
 // reads packed via `_mm256_set_epi64x` -- the SAME shape llama.cpp's own kernel uses, so this is a
 // deliberate departure from the reference, not a port of it -- replaced with a single
 // `_mm256_i32gather_epi64`, which reads the identical table at the identical per-lane index and so
-// cannot itself change any value. Both passes are folded directly into the kernel `gemv_plane` runs
-// (`gemv_fast`/`gemv_avx2_fast`) rather than gated behind a new toggle, because AGENTS.md's own numerics
-// rule for this package says a bit-exact kernel may replace the default outright; the pre-O7 kernels
-// (`gemv`/`gemv_avx2`, and each format's own `group()`/`group_v()`) stay in the tree, individually
-// tested, as the correctness reference and AGENTS.md S13's "park, never revert" precedent.
+// cannot itself change any value. Both passes live in `gemv_fast`/`gemv_avx2_fast`, selected by
+// `detail::kO7Kernels` -- currently OFF, because the real decode measured them slower (see gemv_best).
+// The pre-O7 kernels (`gemv`/`gemv_avx2`, and each format's own `group()`/`group_v()`) are the default
+// and the correctness reference; every form is individually tested.
 
 #pragma once
 
@@ -739,16 +738,22 @@ void gemv_avx2_vnni(const Plane& plane, int n_rows, int row_elems, const ActBloc
 #endif
 #endif
 
-/// The kernel gemv_plane runs: the O7 fast kernel where AVX2 is available (kAvx2Kernels), else the
-/// portable one (also O7's fast form -- see gemv_fast()'s own comment for why this is safe to default
-/// to: both are bit-exact against their pre-O7 predecessors, kept below as the correctness reference and
-/// individually tested, per AGENTS.md S13's "park, never revert").
+/// O7's SuperCache + gather kernels (gemv_fast/gemv_avx2_fast). PARKED, default off: bit-exact and
+/// 14-26% faster per plane in the one-thread bench, but ~4% SLOWER on the real decode's routed-expert
+/// phase (44.7 -> 46.6 ms/token, 5 of 5 interleaved rounds). One decode pass, not a verdict (AGENTS.md
+/// S13): docs/optimization/opportunities/O7_expert_kernels.md S10 names the next passes.
+inline constexpr bool kO7Kernels = false;
+
+/// The kernel gemv_plane runs: AVX2 where available (kAvx2Kernels), else portable; the O7 forms only
+/// when kO7Kernels is on. Every form is bit-exact against the others and individually tested.
 template <class Plane>
 void gemv_best(const Plane& plane, int n_rows, int row_elems, const ActBlocks& x, float* out) {
 #if defined(SUB0_MOEQD_AVX2)
-    gemv_avx2_fast(plane, n_rows, row_elems, x, out);
+    if constexpr (kO7Kernels) gemv_avx2_fast(plane, n_rows, row_elems, x, out);
+    else                      gemv_avx2(plane, n_rows, row_elems, x, out);
 #else
-    gemv_fast(plane, n_rows, row_elems, x, out);
+    if constexpr (kO7Kernels) gemv_fast(plane, n_rows, row_elems, x, out);
+    else                      gemv(plane, n_rows, row_elems, x, out);
 #endif
 }
 

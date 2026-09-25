@@ -1,6 +1,7 @@
 # O7 — faster routed-expert (MoE) kernels: SuperCache + gather, VNNI evaluated and parked
 
-**Status:** pass 1+2 implemented, default (bit-exact, folded into `gemv_plane`'s own dispatch, no new
+**Status: PARKED, default off (`detail::kO7Kernels = false`), after the real decode measured it ~4% slower — see §10.**
+Originally: pass 1+2 implemented, default (bit-exact, folded into `gemv_plane`'s own dispatch, no new
 toggle); pass 3 (VNNI) implemented, tested, **parked** — measured roughly parity-to-slightly-worse, not
 wired into the default path. Real-artifact decode timing NOT run (out of this package's scope; the
 primary agent runs it at merge time per the brief).
@@ -351,3 +352,30 @@ decode-level) improvement on IQ1_S/IQ2_XXS.
   IQ2_XXS vs IQ4_NL share of the 46 ms/token) once this package's kernels are exercised in a real decode
   run — this doc's §1 baseline is a kernel microbenchmark, not a decode-phase profile, and the two should
   be reconciled before naming the next MoE lever.
+
+## 10. Real-decode verdict (primary agent, 2026-09-25): bit-exact, slower, parked
+
+Three arms, five rotating rounds, real 48-layer artifact, recommended flags with `--profile-phases 1`,
+round 1 discarded. Medians:
+
+| arm | total s/token | routed experts ms | L2 |
+|---|---:|---:|---:|
+| pre-O7 kernels | 0.217 | **44.7** (44.1–44.9) | 0.23252 |
+| O7 kernels | 0.216 | **46.6** (46.0–46.8) | 0.23252 |
+
+- **Bit-exact, confirmed end to end:** L2 is identical to the digit, with and without the native backbone
+  (0.27882 in that arm).
+- **Slower on the phase it targets, in every round** (no overlap between the two ranges), despite being
+  14–26% faster per plane in the one-thread bench (§5a).
+
+So it is parked behind `detail::kO7Kernels` (default off; pre-O7 kernels are the default again), per
+AGENTS.md §13: one decode pass, not a verdict. Candidate reasons, and the next passes to take in order:
+
+1. **The gather.** `_mm256_i32gather_epi64` is microcoded and far costlier on E-cores, and decode runs
+   **10** expert threads on **8** P-cores, so two land on E-cores every token. Test SuperCache alone,
+   without the gather (pass 1 had its own measurable win).
+2. **The bench shape.** §5 measured one thread against hot or streamed planes. Decode is ten concurrent
+   threads sharing L3 and memory bandwidth. Add a ten-thread mode to `sub0llm-bench-moeqd` that mirrors
+   `ParallelExperts`, and re-measure both kernels there before drawing conclusions from the bench again.
+3. **Thread placement.** Re-run with `--moe-decode-threads 8` (O4 measured 8 and 10 equal on the old
+   kernels), which keeps every expert thread on a P-core.

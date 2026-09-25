@@ -1547,7 +1547,19 @@ Native is faster in all six rounds. Quality: forward-vs-forward_one L2 **0.27882
 Host conditions: AC power, background load 4–5%, but noisier than two days earlier. The default arm ran at
 0.189 s/token on 2026-09-23 and ~0.218 here, so compare only within a run.
 
-### 17c. The open question this raises
+### 17c. The open question this raises — revised the same day: it is bimodal machine state
+
+**Revision (2026-09-25, after a second five-round run for O7):** the native arm's runs split cleanly into
+*fast* (0.174–0.181 s/token, with Gated Residual and QSA at their normal ~30–31 ms) and *slow* (0.204–0.215,
+with **every** phase ~20% slower, including the native ones: GDN 57–59 vs 44–45 ms). The default arm has
+slow runs too (one at 0.256 s/token). So the slowdown below is the machine dropping into a slower state
+(most likely clocks), not a cost the native path imposes on other phases. In its fast state, **native
+decode is ~0.177 s/token against ~0.212 default: −16%.** Medians over five rounds understate that when two
+of them draw the slow state. Measuring clocks per run is the way to separate the two properly; see the
+P1 process item.
+
+The text below is the original reading, kept for the record:
+
 
 **Every phase still on bf16 got 5–13% slower in the native arm**, although its code is unchanged. That
 gives back about 11 ms of the ~28 ms gross win. Uniform slowdown of untouched code points at a machine-level
