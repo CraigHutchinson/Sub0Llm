@@ -1580,3 +1580,70 @@ shared expert: about 2.9 GB/token still read as bf16).
 `--backbone-quant-dot 1` stays **default-off** (AGENTS.md §4). It is recommended for speed at the stated
 quality cost, pending a better quality oracle than forward-vs-forward_one. That means llama.cpp logits
 with PLE disabled on both sides, or perplexity on a text set.
+
+---
+
+## 18. Phase 2b-3 — every sidecar role wired: ~6.1 tok/s (2026-09-26)
+
+Delegated agent built phases A and B, then hit a rate limit before its gates. The primary agent ran
+phase C: the gates and the A/B below.
+
+**Phase A (the seam, fixed before copying it three more times).**
+- Decode no longer looks up `Store::find(role, layer)` per role per layer per token. A per-layer
+  `BackboneRoleTable` (`internal.hpp`) is built once in `load_backbone_quant_sidecar`, and decode reads
+  it. A missing role is a `present == false` entry that falls back to the bf16 blob.
+- The math headers no longer include the sidecar format header. They take `bbqd::Plane` —
+  `{type_raw, n_rows, row_elems, bytes}` — defined in the kernel header, plus a `gemv_plane` overload
+  over it.
+
+**Phase B.** Gated Residual (Q8_0), QSA q|gate/k/v/o (Q5_K), and the MoE shared expert (Q5_K gate/up,
+Q8_0 down, Q6_K outlier at layer 2) now read native planes behind the same `--backbone-quant-dot` flag.
+- Each distinct activation vector is quantized once per (token, layer), with caller-owned scratch sized
+  at `kv_reset`.
+- QSA's q|gate stays one stored tensor. The per-head split is a row-range selection into it, proven
+  against `transplant::per_head_half_transpose` on independently decoded bytes
+  (`tests/backbone_quant_dot_tests.cpp`).
+
+**Gates, default off (exact):**
+- `sub0_tests` 29,510,661 / 147, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` /
+  `d1625d19ed2258f1`;
+- `sub0_frontend_tests` 208,910 / 293 (+2,092 / +1: the q|gate split proof).
+
+**A/B.** Three arms, six rotating rounds, round 1 discarded, full recommended flags. The arms are
+default, the previous native build (head + GDN, §17) and this one:
+
+| median, rounds 2–6 | default | native head+GDN | **native, all roles** |
+|---|---:|---:|---:|
+| **tok/s** | 4.24 | 5.43 | **6.10** |
+| GDN mixer ms | 83.2 | 46.6 | 47.8 |
+| QSA mixer ms | 35.6 | 33.2 | 29.5 |
+| Gated Residual ms | 34.0 | 32.9 | 22.7 |
+| router + shared expert ms | 15.2 | 15.1 | 10.4 |
+| lm_head ms | 21.7 | 10.7 | 10.5 |
+| routed experts ms | 45.5 | 46.8 | 46.1 |
+| decode page faults (6 tokens) | 82 k | 94 k | 98 k |
+
+Per-round tok/s (the host's bimodal state is visible, so read these rather than the medians alone):
+
+- default: 3.97, 4.24, 4.72, 3.73, 4.69;
+- head+GDN: 4.44, 5.43, 5.56, 3.76, 5.49;
+- all roles: 5.41, 5.08, 6.13, 6.29, 6.10.
+
+All-roles beats head+GDN in 4 of 5 rounds. Its clean rounds reach **6.1–6.3 tok/s**. The default arm
+drew slow states this run; against its clean ~4.6–4.7 tok/s, full native is about **+30%**.
+
+**Quality:** forward-vs-forward_one L2 **0.292615, argmax 3/6**, against 0.27882 / 4/6 (head+GDN) and
+0.23252 / 4/6 (default). One fewer argmax match over six tokens is a small sample, but it is the first
+drop, so treat it as a warning. The reference here is the bf16 batched path, which is itself a
+re-rounded copy of these same GGUF weights. The fair oracle is llama.cpp, which runs the same native
+weights with int8 activations. That comparison needs PLE disabled on its side, or PLE implemented on
+ours. **The flag stays opt-in until that comparison exists.**
+
+**Next on this path:**
+1. **Refine QSA's q|gate split.** It is 48 separate `gemv_plane<8>` calls per QSA layer, each its own
+   OpenMP region over 256 rows. One GEMV over the whole tensor plus a per-head scatter should cut the
+   fork/join cost.
+2. **Stop loading the bf16 copies of covered roles.** That realizes §13's memory promise, and tests
+   whether dual residency costs anything.
+3. **The quality oracle above.**
+

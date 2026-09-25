@@ -63,7 +63,8 @@ namespace sub0::qsa {
 // `half`: 0=query, 1=gate) is applied HERE, per head, as `row_lo`/`row_hi` into ONE `gemv_plane` call per
 // head per half (`bbqd::gemv_plane`'s own row-range parameters, backbone_quant_dot.hpp S6c) -- so the
 // split is a row-RANGE selection into the whole tensor's own GEMV, never a copy or a second kernel path.
-// Proven against the bf16 path by a dedicated differential test (tests/qsa_qwen4_fixture_tests.cpp), the
+// Proven against the bf16 path by a dedicated differential test (tests/backbone_quant_dot_tests.cpp,
+// "gemv_plane's row-range selection reproduces transplant::per_head_half_transpose..."), the
 // same discipline phase 2b-2b's gather-direction proof used for GDN's own out-proj permutation.
 //
 // ONLY MEANINGFUL AT T==1 (decode's own per-row call shape). CALLER-OWNED, REUSED SCRATCH (AGENTS.md S1):
