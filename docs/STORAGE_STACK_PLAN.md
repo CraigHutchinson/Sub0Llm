@@ -1,7 +1,8 @@
 # Coordinated storage stack: Sub0Llm, Sub0TieredCache, Sub0MemPage
 
-Revision S1, 2026-09-25. **Plan, not an implemented integration.** Source audit starts at Sub0Llm
-`5eede7d`, Sub0TieredCache `e1639f8`, Sub0MemPage `2ce9306`. Existing compute and checkpoint behavior
+Revision S1, 2026-09-25 (checkpoint updated the same day; see "Current checkpoint"). **Plan, not an
+implemented integration.** Source audit starts at Sub0Llm `5eede7d`, Sub0TieredCache `e1639f8`,
+Sub0MemPage `2ce9306`. Lower libraries are now at Sub0TieredCache `e4da6a7` and Sub0MemPage `213acdd`. Existing compute and checkpoint behavior
 remain the baseline. This document owns application acceptance and cross-project sequencing;
 [cache requirements](../../Sub0TieredCache/REQUIREMENTS.md) own row semantics and
 [transfer requirements](../../Sub0MemPage/REQUIREMENTS.md) own byte/lifetime semantics.
@@ -128,6 +129,98 @@ work package. Dependency pins advance only after consumer CI is green.
 
 ## Current checkpoint
 
-Only MemPage's optional Intel capability inventory exists. TieredCache is still a skeleton and Llm has
-not adopted either library. This plan authorizes staged design/implementation work, not a claim that
-NVIDIA GDS, a CUDA row cache, or the end-to-end stack is already available.
+Updated 2026-09-25. Llm has **not** adopted either library yet: no Sub0Llm build, engine or test
+file depends on Sub0TieredCache or Sub0MemPage. This plan authorizes staged design/implementation
+work. It does not claim that NVIDIA GDS, a CUDA row cache or the end-to-end stack is available.
+
+### Pinned lower revisions (both on `main`)
+
+| Repository | Revision | Content | Evidence |
+|---|---|---|---|
+| Sub0MemPage | `213acdd2121cec369c6b9606c514db2231e94f27` | M2 state machines (`slot_pool.hpp`, `transfer_set.hpp`); M3 slice 1 `local_file_backend.hpp`, a portable worker-pool local-file backend (POSIX `pread`, Windows positional overlapped `ReadFile`); `Sub0MemPage::testing` CMake target (deterministic fake backend); optional Intel capability inventory | `docs/validation/2026-09-25/README.md` (M2); `docs/implementation-plan.md` "Checkpoint: dev loop + M3 slice 1" |
+| Sub0TieredCache | `e4da6a7e87bcbc65f79257bef9843d41adbec66d` (pins MemPage `213acdd`) | T0 bounded row cache `row_cache.hpp` (`Table`/`RowCache`/`RowLease`, CLOCK eviction, coalescing, generation-bound `invalidate`, bf16->f32 codec); T1 sharded local-file sources `local_file_source.hpp` (`FlatFileResolver`, `register_local_file_shard`); T3 remote HTTP mirror plus `remote/mirror_backend.hpp` | `docs/validation/2026-09-25/README.md`: 9/9 CTest on GCC/clang, ASan+UBSan and TSan clean, mingw/Wine with the same counts, GitHub Actions on Linux, macOS and Windows MSVC |
+
+Not started: MemPage M3 native async (io_uring, IOCP), M4 staged CUDA, and M5/M6 (Intel USM,
+cuFile); TieredCache T2 (GPU rows/codec lifecycle) and T4 (Intel, NVIDIA). T3 exists ahead of its S4
+slice. It is not an S1 dependency and gives no S4 acceptance yet: its fixtures are synthetic and it
+supports plain HTTP only. No timing claim exists in any of the three repositories.
+
+### Slice status
+
+| Slice | Status |
+|---|---|
+| S0 contract/fixtures | **Lower layers done**: MemPage M2 plus the fake backend, and the TieredCache T0 oracle. The Llm-side E1–E5 fixture shapes are still unwritten; E1 is being written first, in S1. |
+| S1 local CPU vertical slice | **Lower half done**: MemPage M3 slice 1 and TieredCache T1 run on real MemPage at the pins above. **Llm half not started**: the E1 fixture, the adapter, the resident-reference comparison, then E2's byte adapter. |
+| S2–S5 | Not started. T3 remote code exists early; see above. |
+
+### Next: S1 on the Sub0Llm side (handoff for a local session)
+
+The steps are the "Joined-up development sequence" S1 row, applied to E1. None of it has landed in
+Sub0Llm yet: a cloud session studied the APIs and stopped before writing code.
+
+1. **Coordinate.** Check `docs/ACTIVE_WORK_LOG.md` and add a row for the files below. The 2026-09-26
+   entry released the host and lists no active storage/ngram work. Take no performance measurements
+   for S1; correctness only. Any later timing follows `OPTIMIZATION_PROCESS.md` on the dedicated machine.
+2. **E1 fixture (Llm owns it; see "Shared fixture and change protocol").** A small, deterministic,
+   generated external table, written to a temp file by the test:
+   - row count;
+   - source dtype bf16, output dtype f32 (width x2);
+   - row width in elements;
+   - an ordered request of row IDs with duplicates and non-monotonic order, including row 0 and the
+     last row;
+   - an out-of-range ID case that must fail as a whole (all-or-nothing);
+   - an expected-bytes oracle derived from the generator formula, never from the adapter;
+   - source hash, generation and extents.
+
+   Mirror the real Qwen4 shape in miniature, 16 rows per position with 160 elements per row (see
+   `NGRAM_TABLE_TIERED_STORAGE.md` §0 and `tests/fixtures/qwen4_preview/ngram_embedding_manifest.json`),
+   but keep the row count small.
+3. **Resident reference.** The existing resident path is the plain branch of `op_embed` in
+   `src/backends/cpu/backend.cpp`: `o[t, j] = tab[ids[t] * C + j]` over a row-major table. The
+   `ParamCPtr` read widens bf16 through `sub0::bf16_widen` in `include/sub0/bf16.hpp`. `op_embed` is a
+   `static` function inside the engine, so there are two options:
+   - re-express the plain gather engine-free, as `tests/ngram_qwen4_fixture_tests.cpp` already does for
+     the concat convention, and state that choice;
+   - or expose a small shared gather so the reference is the engine's own code. This option touches
+     `backend.cpp` (a shared file), so coordinate first.
+
+   Compare the adapter byte-for-byte against the reference and the generator oracle. Model-output
+   parity (E1's second acceptance clause) needs engine wiring and is a later step. Trainable ngram
+   tables (`ngram_tab`) stay in engine arenas and are not replaced.
+4. **Thin adapter.** Build it over `sub0tieredcache::Table`:
+   - `Representation::bf16_to_f32` with `source_row_bytes = width * 2` and
+     `output_row_bytes = width * 4`;
+   - `FlatFileResolver` plus `register_local_file_shard` on a caller-owned
+     `sub0mempage::LocalFileBackend`;
+   - `resolve_into(rows, leases)` in request order, then copy each lease's bytes into the caller's
+     preallocated output (AGENTS.md §1: size the lease and output buffers once, outside the per-call
+     path).
+
+   Relevant API facts:
+   - `TableConfig` needs `output_storage` sized `budget_rows * output_row_bytes`, `scratch_storage`
+     sized `scratch_rows * source_row_bytes`, and nonzero `max_tickets` and `max_batch_rows`.
+   - `LocalFileBackend::create(LocalFileBackendConfig{.workers, .queue_capacity, .max_sources})`.
+   - Duplicate rows in one call get separate leases on one slot and cause exactly one fetch; check this
+     with `Table::stats().fetches` and `.coalesced`.
+5. **Default-off build toggle, no default dependency.** Add a CMake option, for example
+   `SUB0_STORAGE_TIEREDCACHE`, default OFF. It is a build-dependency switch and not a model capability,
+   so it follows the `SUB0_BUILD_SPIKE_TESTS` pattern rather than a configurator `constexpr`. When ON,
+   it `FetchContent`s both repositories at the full SHAs above and builds a separate test target; no
+   existing target changes. Integration pitfalls found while reading the lower `CMakeLists.txt` files:
+   - When Sub0TieredCache is a subproject, its `CMakeLists.txt` does **not** fetch or link Sub0MemPage.
+     Sub0Llm must bring in Sub0MemPage itself at `213acdd` and link `Sub0MemPage::Sub0MemPage`.
+   - Set `SUB0MEMPAGE_BUILD_TESTING=OFF` and `SUB0TIEREDCACHE_BUILD_TESTING=OFF` before
+     `FetchContent_MakeAvailable`. Sub0MemPage builds its tests even as a subproject when that option
+     is ON.
+   - For offline builds, support `FETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE`,
+     `FETCHCONTENT_SOURCE_DIR_SUB0TIEREDCACHE` and `FETCHCONTENT_FULLY_DISCONNECTED=ON`.
+   - Both libraries are C++23 header-only interface targets. On Windows, Sub0TieredCache links
+     `ws2_32`.
+6. **Gates** (AGENTS.md §4, §10, §12):
+   - Rebuild the unmodified default configuration and confirm `sub0_tests` and `sub0_frontend_tests`
+     assertion/case counts are identical. The latest recorded baselines are 29,510,661/147 and
+     208,910/293 (ACTIVE_WORK_LOG O5 2b-3). Re-record them on the local machine before the change.
+   - Run the new target with the toggle ON on Windows and Linux.
+   - Run a `cpp-review` pass over the diff.
+   - Write an S1 acceptance manifest recording the three SHAs, contract S1, fixture hash, compilers,
+     OS and test counts.
