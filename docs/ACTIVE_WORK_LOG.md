@@ -814,3 +814,9 @@ commits ahead of `origin/main`, **not pushed**.
   - P1: a lean default-workflow version of `OPTIMIZATION_PROCESS.md`.
   - P2: rename `sub0_tests` → `sub0llm_tests`, on a quiet tree. Open question: rename
     `sub0_frontend_tests` too?
+
+## 2026-09-25 storage stack design
+
+Completed documentation coordination across MemPage, TieredCache and Llm. Scope: plans, requirements,
+consumer audit and NVIDIA source research. No engine files, builds or hardware workloads held.
+GPU transport and model integration remain unimplemented and require the recorded gates.

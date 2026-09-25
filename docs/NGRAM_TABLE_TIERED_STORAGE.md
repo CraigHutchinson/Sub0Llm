@@ -1,5 +1,7 @@
 # N-gram / sparse embedding table tiered storage — design + staged plan
 
+The current cross-project storage responsibilities and delivery gates are in the [storage stack plan](STORAGE_STACK_PLAN.md). Earlier tiering proposals here are historical input; the shared plan and each library's requirements govern new integration.
+
 Status: **DESIGN ONLY. No engine code this pass.** Follows the staging convention of
 `docs/DEPTH_ATTENTION.md`/`docs/GATED_DELTANET.md`/`docs/NGRAM_EMBEDDING.md` (numbered findings, a
 staged plan with checkable exit conditions, an explicit "novel vs reuses an existing idiom" split,

@@ -1,5 +1,7 @@
 # Qwen4-preview memory/data orchestration — cross-tier placement design
 
+The current cross-project storage responsibilities and delivery gates are in the [storage stack plan](STORAGE_STACK_PLAN.md). Earlier tiering proposals here are historical input; the shared plan and each library's requirements govern new integration.
+
 Status: **v2 — LIVING DOCUMENT, RESEARCH + DESIGN ONLY.** No engine code lands this pass. Every number
 below is tagged with how it was obtained (a real fetch/measurement this pass, a real fetch from a prior
 pass, an arithmetic derivation from a verified quantity, or an estimate) and how confident it is,

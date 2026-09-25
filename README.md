@@ -1,5 +1,7 @@
 # Sub0Llm
 
+The current cross-project storage responsibilities and delivery gates are in the [storage stack plan](docs/STORAGE_STACK_PLAN.md). Earlier tiering proposals here are historical input; the shared plan and each library's requirements govern new integration.
+
 A single-engine **CPU/GPU transformer language model in C++23**. The model's dimensions and its
 vocabulary are *baked in at build time*: a configurator tokenizes the corpus, **auto-sizes** the model
 to the corpus scale, derives the vocabulary, and emits `constexpr` config headers the engine is compiled

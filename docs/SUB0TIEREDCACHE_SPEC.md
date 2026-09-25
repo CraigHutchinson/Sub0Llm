@@ -1,5 +1,7 @@
 # Sub0TieredCache — a tiered cache for huge frozen sparse-lookup tables
 
+The current cross-project storage responsibilities and delivery gates are in the [storage stack plan](STORAGE_STACK_PLAN.md). Earlier tiering proposals here are historical input; the shared plan and each library's requirements govern new integration.
+
 Status: **SPEC / REQUIREMENTS DRAFT.** Written to be handed to whoever bootstraps the standalone
 repository — no code exists yet, in either Sub0Llm or a separate repo. This document is the
 README-shaped spec for that repository; the design reasoning behind why it should exist as a separate
