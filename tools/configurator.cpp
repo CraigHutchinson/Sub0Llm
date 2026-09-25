@@ -691,6 +691,10 @@ int main(int argc, char** argv) {
                                  // loops (moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp).
                                  // 0 = off (default, today's plain scalar reduction, bit-exact). See the
                                  // --simd-reduce CLI option below for the real measured tradeoff.
+    int moe_row_split = 0;      // O8: split the routed-expert GEMVs by ROW RANGE across MOE_DECODE_THREADS
+                                 // instead of handing whole experts to whole threads. 0 = off (default,
+                                 // today's ParallelExperts fan-out, bit-exact). See --moe-row-split's own
+                                 // CLI help below for the measured tradeoff.
     // The proven architecture stack defaults ON (each is a measured win, verified at production d448 --
     // gated FFN, tied embeddings, QK-norm; project memory arch-features-off-by-default). Pass `--gated-ffn 0`
     // etc. to opt out (e.g. importing a GGUF of a different shape).
@@ -913,6 +917,20 @@ int main(int argc, char** argv) {
                    "core (B40, fixed); measured since: 10 threads cut the routed-expert phase 185 -> 39 ms. "
                    "Scheduling only: the combine order is fixed, so the answer is bit-identical at any value.")
        ->capture_default_str()->check(CLI::Range(1, 64));
+    app.add_option("--moe-row-split", moe_row_split,
+                   "O8 (docs/optimization/opportunities/O8_moe_row_split.md): 1 = split each selected "
+                   "expert's gate/up/down GEMVs by ROW RANGE and schedule the ranges dynamically across "
+                   "the --moe-decode-threads team, instead of handing whole experts to whole threads "
+                   "(ParallelExperts's default fan-out, which leaves 2 of 10 experts' work unbalanced at "
+                   "8 threads). A plane whose row width is not a whole number of its own quantized "
+                   "format's blocks (the down projection's 640-wide rows under IQ1_S/IQ2_XXS, whose "
+                   "256-element super-blocks do not divide 640 evenly) cannot be row-sliced and is "
+                   "computed whole either way -- bit-exact by construction regardless: every row is still "
+                   "produced by the same gemv_plane kernel on the same bytes in the same per-row order, "
+                   "only WHICH thread computes which row range changes. Requires --moe-quant-dot 1 (there "
+                   "is nothing to row-split in the dequantize-then-f32-FFN path). 0 = off (default, "
+                   "today's ParallelExperts behavior, bit-exact decode hash).")
+       ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--simd-reduce", simd_reduce,
                    "1 = multi-accumulator SIMD restructuring (include/sub0/simd_reduce.hpp) of the hot "
                    "reduction loops in moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp -- "
@@ -1262,6 +1280,13 @@ int main(int argc, char** argv) {
     if (moe_quant_dot != 0 && moe_quant_experts == 0) {
         std::println(stderr, "configure error: moe-quant-dot requires --moe-quant-experts 1 -- there "
                              "are no native quantized expert bytes to compute against otherwise");
+        return 1;
+    }
+    // O8: the row-split runner only ever exists to schedule expert_ffn_row_quant's own GEMVs -- it has
+    // nothing to split in the dequantize-then-f32-FFN path.
+    if (moe_row_split != 0 && moe_quant_dot == 0) {
+        std::println(stderr, "configure error: moe-row-split requires --moe-quant-dot 1 -- there is no "
+                             "quantized-dot GEMV work to split by row range otherwise");
         return 1;
     }
     // QSA: mirrors layout.hpp's own static_asserts as a configure-time diagnostic naming the flags,
@@ -1879,6 +1904,14 @@ int main(int argc, char** argv) {
     // format -- a checkpoint saved under one setting loads and computes CORRECTLY (to within
     // reassociation-noise tolerance, same as any other compute-precision choice) under the other.
     cos << "constexpr bool USE_SIMD_REDUCE = " << (simd_reduce ? "true" : "false") << ";\n";
+    // O8 (docs/optimization/opportunities/O8_moe_row_split.md): row-range scheduling of the routed-
+    // expert GEMVs, default off/false == today's ParallelExperts whole-expert fan-out, bit-exact. See
+    // --moe-row-split's own CLI help above for the measured tradeoff.
+    // AGENTS.md S10 classification: deliberately does NOT join ARCH_FINGERPRINT/ARCH_FINGERPRINT2 --
+    // scheduling only (same reasoning as MOE_DECODE_THREADS_CFG/DECODE_OMP_SPIN just below): the combine
+    // order in moe_math.hpp's phase 2 is unchanged, so which thread computed which row can never be part
+    // of the answer, and no on-disk shape or checkpoint identity is affected.
+    cos << "constexpr bool MOE_ROW_SPLIT = " << (moe_row_split ? "true" : "false") << ";\n";
     // Measurement instrumentation only: changes no arithmetic and no checkpoint shape, so it joins
     // neither ARCH_FINGERPRINT nor PARAM_FLOATS (AGENTS.md S10: deliberately variable between builds).
     cos << "constexpr bool PROFILE_PHASES = " << (profile_phases ? "true" : "false") << ";\n";

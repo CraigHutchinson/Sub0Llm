@@ -351,9 +351,27 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
     }
 
     // Phase 1: every selected expert into its own buffer. Order-independent by construction.
-    run_experts(d.experts_per_tok, ffn_scratch, g_scratch, [&](int k, float* ffn, float* g) {
-        compute_expert(k, topk_idx[k], routed_out + static_cast<std::size_t>(k) * d.hidden_size, ffn, g);
-    });
+    //
+    // O8 (docs/optimization/opportunities/O8_moe_row_split.md): a SECOND optional hook, one seam beside
+    // prefetch()/compute_shared() above -- `run_rows(d, topk_idx, n, routed_out)`. Where prefetch() and
+    // compute_shared() add work AROUND the existing per-expert `compute_expert` callback, this one
+    // REPLACES phase 1 entirely: it is for a runner that wants to split each selected expert's own GEMVs
+    // by ROW RANGE across the team, instead of handing whole experts to whole threads -- a decomposition
+    // `compute_expert`'s "one opaque call per k" signature cannot express, since the row-level GEMV
+    // kernel knowledge (plane formats, block alignment) lives in moe_quant_dot.hpp/decode.cpp, not here
+    // (this header stays engine-free and format-agnostic, same reasoning as compute_shared's own comment
+    // on why ITS native path lives on the caller's RunExperts object instead of a Native struct here).
+    // Detected via the same `requires` pattern, so SerialExperts/ParallelExperts (no such method) take
+    // the exact same phase-1 path as before -- no branch at all in that case (the `if constexpr` compiles
+    // away). `compute_expert` is simply unused on the run_rows arm; its own captures (S.pre_q's resolve
+    // logic etc.) are dead code there, which is fine -- a lambda that is never invoked costs nothing.
+    if constexpr (requires { run_experts.run_rows(d, topk_idx, d.experts_per_tok, routed_out); }) {
+        run_experts.run_rows(d, topk_idx, d.experts_per_tok, routed_out);
+    } else {
+        run_experts(d.experts_per_tok, ffn_scratch, g_scratch, [&](int k, float* ffn, float* g) {
+            compute_expert(k, topk_idx[k], routed_out + static_cast<std::size_t>(k) * d.hidden_size, ffn, g);
+        });
+    }
     // Phase 2: the weighted sum, in the original selection order, on one thread.
     for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
     for (int k = 0; k < d.experts_per_tok; ++k) {
