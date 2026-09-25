@@ -456,17 +456,17 @@ struct ParallelExperts {
 // One (selected-expert k, row range) work item. `which` is moeq::Gate/Up for the phase-1 (gate/up) list;
 // the phase-3 (down) list always uses 0 and never reads it back, so it is left there for clarity rather
 // than needing a second, narrower struct.
-struct O8RowChunk { std::int16_t k, which; int r0, r1; };
+struct RowSplitChunk { std::int16_t k, which; int r0, r1; };
 
-constexpr int O8_GU_CHUNK_ROWS = 64;    // against D_FF=640: 10 chunks/stream at the real axes
-constexpr int O8_DN_CHUNK_ROWS = 128;   // against D_MODEL=2560: 20 chunks/expert at the real axes
+constexpr int ROW_SPLIT_GU_CHUNK_ROWS = 64;    // against D_FF=640: 10 chunks/stream at the real axes
+constexpr int ROW_SPLIT_DN_CHUNK_ROWS = 128;   // against D_MODEL=2560: 20 chunks/expert at the real axes
 // Never zero-length (AGENTS.md S1's own never-degenerate idiom, matching moe_scratch/qsa_* above): these
 // stay valid array bounds in a MoE-off or non-quant-dot build, where nothing ever reads them.
-constexpr int O8_EPT_BUF = EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1;
-constexpr int O8_GU_ROWS_BUF = D_FF > 0 ? D_FF : 1;
-constexpr int O8_DN_ROWS_BUF = D_MODEL > 0 ? D_MODEL : 1;
-constexpr int O8_MAX_GU_CHUNKS = O8_EPT_BUF * 2 * ((O8_GU_ROWS_BUF + O8_GU_CHUNK_ROWS - 1) / O8_GU_CHUNK_ROWS);
-constexpr int O8_MAX_DN_CHUNKS = O8_EPT_BUF * ((O8_DN_ROWS_BUF + O8_DN_CHUNK_ROWS - 1) / O8_DN_CHUNK_ROWS);
+constexpr int ROW_SPLIT_EPT_BUF = EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1;
+constexpr int ROW_SPLIT_GU_ROWS_BUF = D_FF > 0 ? D_FF : 1;
+constexpr int ROW_SPLIT_DN_ROWS_BUF = D_MODEL > 0 ? D_MODEL : 1;
+constexpr int ROW_SPLIT_MAX_GU_CHUNKS = ROW_SPLIT_EPT_BUF * 2 * ((ROW_SPLIT_GU_ROWS_BUF + ROW_SPLIT_GU_CHUNK_ROWS - 1) / ROW_SPLIT_GU_CHUNK_ROWS);
+constexpr int ROW_SPLIT_MAX_DN_CHUNKS = ROW_SPLIT_EPT_BUF * ((ROW_SPLIT_DN_ROWS_BUF + ROW_SPLIT_DN_CHUNK_ROWS - 1) / ROW_SPLIT_DN_CHUNK_ROWS);
 
 // O8 row-split scratch: EXPERTS_PER_TOK-wide, one gate/up accumulator pair and one quantized-h ActBlocks
 // PER SELECTED-EXPERT SLOT k -- NOT per thread. Several threads may write DIFFERENT ROW RANGES of the
@@ -476,15 +476,15 @@ constexpr int O8_MAX_DN_CHUNKS = O8_EPT_BUF * ((O8_DN_ROWS_BUF + O8_DN_CHUNK_ROW
 // at the call level, so only this token's own MOE_DECODE_THREADS team, inside ONE parallel region, ever
 // touches it. Sized once (AGENTS.md S1); ActBlocks::quantize itself only (re)allocates on a width change,
 // which never happens here after the first token (D_FF is a compile-time constant).
-struct O8RowSplitScratch {
-    std::array<std::array<float, static_cast<std::size_t>(O8_GU_ROWS_BUF)>, static_cast<std::size_t>(O8_EPT_BUF)> gate{}, up{};
-    std::array<moeqd::ActBlocks, static_cast<std::size_t>(O8_EPT_BUF)> pq{};
-    std::array<moeqd::ExpertPlanes, static_cast<std::size_t>(O8_EPT_BUF)> planes{};
-    std::array<O8RowChunk, static_cast<std::size_t>(O8_MAX_GU_CHUNKS)> gu_chunks{};
-    std::array<O8RowChunk, static_cast<std::size_t>(O8_MAX_DN_CHUNKS)> dn_chunks{};
+struct RowSplitScratch {
+    std::array<std::array<float, static_cast<std::size_t>(ROW_SPLIT_GU_ROWS_BUF)>, static_cast<std::size_t>(ROW_SPLIT_EPT_BUF)> gate{}, up{};
+    std::array<moeqd::ActBlocks, static_cast<std::size_t>(ROW_SPLIT_EPT_BUF)> pq{};
+    std::array<moeqd::ExpertPlanes, static_cast<std::size_t>(ROW_SPLIT_EPT_BUF)> planes{};
+    std::array<RowSplitChunk, static_cast<std::size_t>(ROW_SPLIT_MAX_GU_CHUNKS)> gu_chunks{};
+    std::array<RowSplitChunk, static_cast<std::size_t>(ROW_SPLIT_MAX_DN_CHUNKS)> dn_chunks{};
     int gu_count = 0, dn_count = 0;
 };
-O8RowSplitScratch g_row_split{};
+RowSplitScratch g_row_split{};
 
 // Implements moe_math.hpp's `run_rows` hook. Inherits ParallelExperts' prefetch()/compute_shared()
 // UNCHANGED (B36 pipelined I/O and O5's native shared-expert path are both orthogonal to how the ROUTED
@@ -498,7 +498,7 @@ struct RowSplitExperts : ParallelExperts {
             (void)d; (void)idx; (void)n; (void)routed_out;   // never installed on this build -- see the call site
         } else {
             [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> routed(prof::Phase::MoeRouted);
-            O8RowSplitScratch& S = g_row_split;
+            RowSplitScratch& S = g_row_split;
 
             // This row's per-expert plane descriptors + bytes -- mirrors ParallelExperts' own body
             // lambda's Gate/Up/Down Desc lookups (moved here since run_rows replaces that lambda
@@ -534,8 +534,8 @@ struct RowSplitExperts : ParallelExperts {
                     const bool sliceable =
                         moeqd::plane_bytes(ep.desc.type_raw, static_cast<std::uint64_t>(d.hidden_size)) != 0;
                     if (sliceable) {
-                        for (int r0 = 0; r0 < d.d_ff; r0 += O8_GU_CHUNK_ROWS) {
-                            const int r1 = std::min(r0 + O8_GU_CHUNK_ROWS, d.d_ff);
+                        for (int r0 = 0; r0 < d.d_ff; r0 += ROW_SPLIT_GU_CHUNK_ROWS) {
+                            const int r1 = std::min(r0 + ROW_SPLIT_GU_CHUNK_ROWS, d.d_ff);
                             S.gu_chunks[static_cast<std::size_t>(S.gu_count++)] =
                                 {static_cast<std::int16_t>(k), static_cast<std::int16_t>(which), r0, r1};
                         }
@@ -552,8 +552,8 @@ struct RowSplitExperts : ParallelExperts {
                 const bool sliceable =
                     moeqd::plane_bytes(ep.desc.type_raw, static_cast<std::uint64_t>(d.d_ff)) != 0;
                 if (sliceable) {
-                    for (int r0 = 0; r0 < d.hidden_size; r0 += O8_DN_CHUNK_ROWS) {
-                        const int r1 = std::min(r0 + O8_DN_CHUNK_ROWS, d.hidden_size);
+                    for (int r0 = 0; r0 < d.hidden_size; r0 += ROW_SPLIT_DN_CHUNK_ROWS) {
+                        const int r1 = std::min(r0 + ROW_SPLIT_DN_CHUNK_ROWS, d.hidden_size);
                         S.dn_chunks[static_cast<std::size_t>(S.dn_count++)] = {static_cast<std::int16_t>(k), 0, r0, r1};
                     }
                 } else {
@@ -577,7 +577,7 @@ struct RowSplitExperts : ParallelExperts {
                 // real measured per-format cost spread, O1's kernel bench).
                 #pragma omp for schedule(dynamic)
                 for (int c = 0; c < S.gu_count; ++c) {
-                    const O8RowChunk ch = S.gu_chunks[static_cast<std::size_t>(c)];
+                    const RowSplitChunk ch = S.gu_chunks[static_cast<std::size_t>(c)];
                     const moeqd::EncodedPlane& ep = ch.which == moeq::Gate
                         ? S.planes[static_cast<std::size_t>(ch.k)].gate
                         : S.planes[static_cast<std::size_t>(ch.k)].up;
@@ -604,7 +604,7 @@ struct RowSplitExperts : ParallelExperts {
                 // fixed-k-order weighted sum) reads from next.
                 #pragma omp for schedule(dynamic)
                 for (int c = 0; c < S.dn_count; ++c) {
-                    const O8RowChunk ch = S.dn_chunks[static_cast<std::size_t>(c)];
+                    const RowSplitChunk ch = S.dn_chunks[static_cast<std::size_t>(c)];
                     const moeqd::EncodedPlane& ep = S.planes[static_cast<std::size_t>(ch.k)].down;
                     float* dst = routed_out
                                  + static_cast<std::size_t>(ch.k) * static_cast<std::size_t>(d.hidden_size);
