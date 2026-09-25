@@ -873,8 +873,21 @@ Neutral gates confirmed exact so far: `sub0_tests` 29,510,661/147 (fingerprints 
   about 6.6–7 tok/s in the six-token A/B. Native backbone, O8 row-split and 8 expert threads are all in.
 - **Quality gate:** G-PPL (`run_perf_suite.py --stage ppl`). The native backbone is quality-neutral, and O8
   is bit-exact.
-- **Storage-stack S1 (Sonnet agent, worktree `agent-a2c56fde96fcac8ad`):** asked to commit WIP and stop.
-  Its hand-off gives the branch, the step status and the next step. It has not been reviewed or merged.
+- **Storage-stack S1 (Sonnet agent), paused cleanly.** Branch `worktree-agent-a2c56fde96fcac8ad` @
+  `6fc7055`, with `main` (O8) already merged in. It is not reviewed and not merged.
+  - Plan steps 1–4 are done: the work-log row, the E1 fixture (24×160 bf16, duplicates, non-monotonic
+    order, all-or-nothing out-of-range case, an independent oracle), an engine-free `op_embed`
+    reference, and the adapter `include/sub0/ngram_tiered_storage.hpp`.
+  - Step 5 is written but never built: the `SUB0_STORAGE_TIEREDCACHE` option, pinned FetchContent, and
+    the `sub0_storage_tiered_cache_tests` target.
+  - Step 6 has not started: no gate numbers exist.
+  - **Resume:** build `out/build/s1check` (the neutral config is already generated there) and check the
+    counts (29,510,661/147; 228,198/295). Then do the toggle-ON build with `FETCHCONTENT_SOURCE_DIR_*`
+    pointed at the pinned detached checkouts, the mutation check, `cpp-review`, and the acceptance
+    manifest.
+  - Those checkouts are git worktrees of the Sub0MemPage and Sub0TieredCache repos, placed in this
+    session's scratchpad (`.../scratchpad/pins/`). If the scratchpad is cleared, run `git worktree prune`
+    in both repos.
 - **Resume points, in order:**
   1. Review and merge S1. Frontend baseline for it: 228,198/295.
   2. O8's thread-count sweep (row-split with 12 or 16 threads, including E-cores), measured long-run.
