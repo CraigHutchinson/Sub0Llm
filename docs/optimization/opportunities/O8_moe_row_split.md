@@ -1,8 +1,8 @@
 # O8 — row-split scheduling for the routed MoE experts in decode
 
-**Status:** implemented, default off (`--moe-row-split 1`, `MOE_ROW_SPLIT`). Bit-exact end to end (L2
-0.292615 identical with/without, forward vs forward_one parity unaffected — already waived for
-`--moe-quant-dot`). Real-decode measurement: see §7 (filled in after the interleaved A/B).
+**Status:** merged 2026-09-26, default off (`--moe-row-split 1`, `MOE_ROW_SPLIT`), and **recommended on
+for the real model**. Bit-exact end to end (§6). **Long-run decode 5.16 → 5.71 tok/s (+11%)**, measured
+in both arm orders (§7).
 
 **Expected gain (brief estimate):** the routed-expert phase from ~44 to ~27 ms/token, roughly
 6.6 → 7.5 tok/s (see the brief's own problem statement). **Risk:** low — bit-exact by construction,
@@ -246,15 +246,49 @@ This is the strongest correctness evidence in this package: it is the SAME bit-e
 
 ## 7. Throughput
 
-<!-- PERF_RESULTS -->
+Measured by the primary agent on a quiet host: two `--stage ppl` passes, whose long-run decode speed
+over the same 2,418 tokens is the throughput measure here. The arm order was reversed between passes.
+Recommended flags plus `--backbone-quant-dot 1`.
+
+| pass | order | base tok/s | split tok/s | gain |
+|---|---|---:|---:|---:|
+| 1 | base, split | 5.12 | 5.74 | +12% |
+| 2 | split, base | 5.20 | 5.67 | +9% |
+| **mean** | | **5.16** | **5.71** | **+11%** |
+
+Split wins in both orders, so arm order and thermal drift do not explain it. The authoring agent's own
+first pass, run while another agent was building, gave +15% by the same measure.
+
+**A contradicting number, and why it is not used.** The authoring agent also ran
+`--stage perf --tokens 3`, six interleaved rounds: base 0.160, split 0.171 s/token median (−7%). Its
+per-arm spreads were 24.5% and 43.3%, several times the effect being measured, over only three decoded
+tokens per run. That run cannot resolve an 11% difference either way. Long runs amortize start-up,
+average thousands of expert selections instead of 30, and are what generation actually does.
+
+The estimate in the brief (~44 → ~27 ms on the routed-expert phase, about 6.6 → 7.5 tok/s short-run) was
+not confirmed or refuted phase by phase: no `--profile-phases` table was taken before the agent's session
+ended. The end-to-end +11% is the measured claim.
 
 ## 8. Thread-count findings
 
-<!-- THREAD_RESULTS -->
+**Not measured.** The sweep the brief asked for (`--moe-decode-threads` 8 against 12 or 16) was not run
+before the authoring agent's session ended. It is the natural next pass: whole experts could not use
+E-cores well (one E-core expert cost ~2.1x a P-core one), but row chunks are small and dynamically
+scheduled, so a larger team that includes E-cores might now pay. Measure it with the same long-run
+method as §7.
 
 ## 9. `cpp-review` pass
 
-<!-- CPP_REVIEW -->
+- **Authoring agent:** renamed the O8-prefixed symbols to `RowSplit*` (WIP 5/n), and re-validates plane
+  geometry before splitting (WIP 6/n).
+- **Primary agent, at merge:** `gemv_plane_range`'s fallback for a plane whose rows cannot be addressed
+  (`plane_bytes == 0`) computed the whole plane from row 0 whatever range it was given. `run_rows` only
+  ever passes such a plane one full `[0, n_rows)` chunk, so the result was correct, but a future partial
+  range would silently have written rows `[0, r1-r0)` where `[r0, r1)` belongs. It now refuses any range
+  not starting at row 0. No behaviour change, since that branch is never taken on this sidecar (§2).
+- **Build note:** the neutral `d196check` build needed its generated config regenerated (same recipe)
+  to pick up the new `MOE_ROW_SPLIT` constant. The regenerated header differs from the old one only by
+  that line.
 
 ## 10. Risks & mitigations
 

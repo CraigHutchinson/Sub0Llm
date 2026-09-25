@@ -436,9 +436,10 @@ struct ParallelExperts {
     const std::uint64_t row_bytes =
         moeqd::plane_bytes(p.desc.type_raw, static_cast<std::uint64_t>(row_elems));
     if (row_bytes == 0) {
-        // Not row-block-aligned: the caller only ever schedules an UNsliceable plane as ONE chunk
-        // covering [0, n_rows) (build_row_chunks logic in RowSplitExperts::run_rows below), so this is
-        // just the ordinary whole-plane call -- r0 is always 0 in this branch.
+        // Not row-block-aligned, so rows cannot be addressed: only the whole plane can be computed.
+        // run_rows only ever schedules such a plane as ONE chunk from row 0; refuse anything else rather
+        // than compute rows [0, r1-r0) and write them where [r0, r1) belongs.
+        if (r0 != 0) return false;
         return moeqd::gemv_plane(p.desc.type_raw, p.bytes, r1 - r0, row_elems, x, out);
     }
     const std::uint64_t off = static_cast<std::uint64_t>(r0) * row_bytes;
