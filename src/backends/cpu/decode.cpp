@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -389,6 +390,253 @@ struct ParallelExperts {
             // (docs/optimization/opportunities/O4_gdn_threads_and_moe_schedule.md S5).
             #pragma omp for schedule(dynamic)
             for (int k = 0; k < n; ++k) body(k, S.ffn.data(), S.ffn.data() + D_FF);
+        }
+    }
+};
+
+// --- O8: row-split scheduling for MOE_QUANT_DOT's routed experts ------------------------------------
+//
+// docs/optimization/opportunities/O8_moe_row_split.md. ParallelExperts above hands WHOLE experts to
+// threads: at EXPERTS_PER_TOK=10 and MOE_DECODE_THREADS=8, two threads each draw two experts and every
+// layer waits on the slower of the two instead of ~10/8 experts' worth of work. RowSplitExperts below
+// instead splits each selected expert's gate/up/down GEMVs by ROW RANGE and lets `schedule(dynamic)`
+// balance the (expert, plane, row-chunk) work items across the whole team -- a decomposition
+// moe_math.hpp's `compute_expert` callback cannot express (its own `run_rows` hook comment explains why:
+// the row-level GEMV kernel knowledge -- plane formats, block alignment -- lives in moe_quant_dot.hpp/
+// here, not in the engine-free math core), so this implements that hook directly instead of going
+// through `compute_expert`.
+//
+// THREE PHASES PER LAYER, matching moeqd::expert_ffn_row_quant's own three steps exactly, so every
+// output float is produced by the SAME kernel on the SAME bytes in the SAME per-row order as the
+// non-split path -- see gemv_plane_range's own comment for why a row RANGE computes bit-identically to
+// the same rows read out of a whole-plane call.
+//   1. gate + up: (k, Gate|Up, row range) work items, split across the team, `schedule(dynamic)`.
+//   2. barrier (the implicit one at the end of an `omp for`), then per k: h = silu(gate)*up (D_FF
+//      floats) and quantize h into that expert's OWN ActBlocks -- small (EXPERTS_PER_TOK*D_FF elements
+//      total against the GEMVs' D_FF*D_MODEL each), so a plain `schedule(static)` over k.
+//   3. barrier, then down: (k, row range) work items over D_MODEL output rows, `schedule(dynamic)`,
+//      writing directly into routed_out -- moe_math.hpp's own phase 2 (the fixed-k-order weighted sum)
+//      is completely unchanged; this hook only ever replaces phase 1.
+//
+// ROW-SLICING VALIDITY, PER PLANE (checked, not assumed -- AGENTS.md S10). A plane's row r begins at
+// byte r * plane_bytes(type, row_elems) ONLY IF row_elems is a whole number of that format's own blocks
+// (IQ1_S/IQ2_XXS: 256-element super-blocks; IQ4_NL: 32-element blocks) -- plane_bytes() returns 0
+// otherwise, which is the sliceable/not signal this code checks directly, per plane, rather than
+// assuming it from the role. At the real Qwen4 axes (measured against the real sidecar, O8 doc S2):
+// gate/up rows are D_MODEL=2560 wide, a whole 10 super-blocks for EVERY format observed there (IQ1_S,
+// IQ2_XXS) -- always sliceable. Down rows are D_FF=640 wide, NOT a whole number of 256-element
+// super-blocks (640/256 = 2.5) -- would be UNsliceable if down were ever IQ1_S/IQ2_XXS, but the real
+// sidecar's down plane is ALWAYS IQ4_NL (24576 of 24576 down tensors, every layer, every expert), whose
+// 32-element blocks divide 640 evenly, so down is sliceable there too. A hypothetical sidecar that DID
+// assign down to IQ1_S/IQ2_XXS (not observed, not excluded by the format) would compute that one
+// expert's down projection as a SINGLE whole-plane chunk instead of several -- still correct, just less
+// parallel for that one plane; the fallback exists for that case, not for anything seen in this file.
+[[nodiscard]] bool gemv_plane_range(const moeqd::EncodedPlane& p, int row_elems, int r0, int r1,
+                                    const moeqd::ActBlocks& x, float* out) {
+    const std::uint64_t row_bytes =
+        moeqd::plane_bytes(p.desc.type_raw, static_cast<std::uint64_t>(row_elems));
+    if (row_bytes == 0) {
+        // Not row-block-aligned: the caller only ever schedules an UNsliceable plane as ONE chunk
+        // covering [0, n_rows) (build_row_chunks logic in RowSplitExperts::run_rows below), so this is
+        // just the ordinary whole-plane call -- r0 is always 0 in this branch.
+        return moeqd::gemv_plane(p.desc.type_raw, p.bytes, r1 - r0, row_elems, x, out);
+    }
+    const std::uint64_t off = static_cast<std::uint64_t>(r0) * row_bytes;
+    const std::uint64_t len = static_cast<std::uint64_t>(r1 - r0) * row_bytes;
+    if (off + len > p.bytes.size()) return false;
+    // Bit-exact against gemv_plane() called on the WHOLE plane, rows [r0,r1) read out of its result:
+    // row_bytes is exact (row_elems is a whole number of blocks), so this subspan's own row 0 is
+    // EXACTLY the original plane's row r0 -- every unpacker (Iq1SPlane/Iq2XxsPlane/Iq4NlPlane) addresses
+    // purely by element position relative to its OWN base pointer, never by any assumption about what
+    // came before it in the stream, so shifting that base pointer by a whole number of rows changes
+    // nothing else about what it computes.
+    return moeqd::gemv_plane(p.desc.type_raw, p.bytes.subspan(off, len), r1 - r0, row_elems, x, out);
+}
+
+// One (selected-expert k, row range) work item. `which` is moeq::Gate/Up for the phase-1 (gate/up) list;
+// the phase-3 (down) list always uses 0 and never reads it back, so it is left there for clarity rather
+// than needing a second, narrower struct.
+struct RowSplitChunk { std::int16_t k, which; int r0, r1; };
+
+constexpr int ROW_SPLIT_GU_CHUNK_ROWS = 64;    // against D_FF=640: 10 chunks/stream at the real axes
+constexpr int ROW_SPLIT_DN_CHUNK_ROWS = 128;   // against D_MODEL=2560: 20 chunks/expert at the real axes
+// Never zero-length (AGENTS.md S1's own never-degenerate idiom, matching moe_scratch/qsa_* above): these
+// stay valid array bounds in a MoE-off or non-quant-dot build, where nothing ever reads them.
+constexpr int ROW_SPLIT_EPT_BUF = EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1;
+constexpr int ROW_SPLIT_GU_ROWS_BUF = D_FF > 0 ? D_FF : 1;
+constexpr int ROW_SPLIT_DN_ROWS_BUF = D_MODEL > 0 ? D_MODEL : 1;
+constexpr int ROW_SPLIT_MAX_GU_CHUNKS = ROW_SPLIT_EPT_BUF * 2 * ((ROW_SPLIT_GU_ROWS_BUF + ROW_SPLIT_GU_CHUNK_ROWS - 1) / ROW_SPLIT_GU_CHUNK_ROWS);
+constexpr int ROW_SPLIT_MAX_DN_CHUNKS = ROW_SPLIT_EPT_BUF * ((ROW_SPLIT_DN_ROWS_BUF + ROW_SPLIT_DN_CHUNK_ROWS - 1) / ROW_SPLIT_DN_CHUNK_ROWS);
+
+// O8 row-split scratch: EXPERTS_PER_TOK-wide, one gate/up accumulator pair and one quantized-h ActBlocks
+// PER SELECTED-EXPERT SLOT k -- NOT per thread. Several threads may write DIFFERENT ROW RANGES of the
+// SAME slot's gate/up arrays concurrently (disjoint indices, no data race), and the down projection's
+// per-expert input (silu(gate)*up) differs per k, so each slot needs its own quantized copy. A plain
+// global, not thread_local, for the same reason g_moe_act_q above is one: forward_one is single-threaded
+// at the call level, so only this token's own MOE_DECODE_THREADS team, inside ONE parallel region, ever
+// touches it. Sized once (AGENTS.md S1); ActBlocks::quantize itself only (re)allocates on a width change,
+// which never happens here after the first token (D_FF is a compile-time constant).
+struct RowSplitScratch {
+    std::array<std::array<float, static_cast<std::size_t>(ROW_SPLIT_GU_ROWS_BUF)>, static_cast<std::size_t>(ROW_SPLIT_EPT_BUF)> gate{}, up{};
+    std::array<moeqd::ActBlocks, static_cast<std::size_t>(ROW_SPLIT_EPT_BUF)> pq{};
+    std::array<moeqd::ExpertPlanes, static_cast<std::size_t>(ROW_SPLIT_EPT_BUF)> planes{};
+    std::array<RowSplitChunk, static_cast<std::size_t>(ROW_SPLIT_MAX_GU_CHUNKS)> gu_chunks{};
+    std::array<RowSplitChunk, static_cast<std::size_t>(ROW_SPLIT_MAX_DN_CHUNKS)> dn_chunks{};
+    int gu_count = 0, dn_count = 0;
+};
+RowSplitScratch g_row_split{};
+
+// Implements moe_math.hpp's `run_rows` hook. Inherits ParallelExperts' prefetch()/compute_shared()
+// UNCHANGED (B36 pipelined I/O and O5's native shared-expert path are both orthogonal to how the ROUTED
+// experts' own compute is scheduled) and adds run_rows, which forward_row_via_run_ex calls INSTEAD OF
+// the inherited operator() when both are present (moe_math.hpp's own `requires` dispatch prefers
+// run_rows) -- so operator() itself is unreachable on this path, kept only via inheritance, not
+// duplicated.
+struct RowSplitExperts : ParallelExperts {
+    void run_rows(const moe::Dims& d, const int* idx, int n, float* routed_out) const {
+        if constexpr (!(USE_MOE_QUANT && MOE_QUANT_DOT)) {
+            (void)d; (void)idx; (void)n; (void)routed_out;   // never installed on this build -- see the call site
+        } else {
+            [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> routed(prof::Phase::MoeRouted);
+            RowSplitScratch& S = g_row_split;
+
+            // This row's per-expert plane descriptors + bytes -- mirrors ParallelExperts' own body
+            // lambda's Gate/Up/Down Desc lookups (moved here since run_rows replaces that lambda
+            // entirely on this build).
+            for (int k = 0; k < n; ++k) {
+                moeqd::ExpertPlanes& pl = S.planes[static_cast<std::size_t>(k)];
+                const int e = idx[k];
+                const moeq::Desc& dg = g_moe_quant.desc(layer_index, e, moeq::Gate);
+                const moeq::Desc& du = g_moe_quant.desc(layer_index, e, moeq::Up);
+                const moeq::Desc& dd = g_moe_quant.desc(layer_index, e, moeq::Down);
+                pl.gate.desc = dg; pl.up.desc = du; pl.down.desc = dd;
+                if constexpr (MOE_IO_PIPELINED) {
+                    moe_io_wait_expert(k, layer_index, e);
+                    pl.gate.bytes = moe_io_staged(k, moeq::Gate, dg);
+                    pl.up.bytes   = moe_io_staged(k, moeq::Up, du);
+                    pl.down.bytes = moe_io_staged(k, moeq::Down, dd);
+                } else {
+                    pl.gate.bytes = g_moe_quant.raw(dg);
+                    pl.up.bytes   = g_moe_quant.raw(du);
+                    pl.down.bytes = g_moe_quant.raw(dd);
+                }
+                // Geometry re-validated here, never trusted from the sidecar's own descriptor alone
+                // (AGENTS.md S10) -- the SAME check moeqd::expert_ffn_row_quant's own reference path
+                // runs (detail::plane_ok) before it will compute anything. Skipping this would let a
+                // row-range read proceed even when the sidecar's declared axes disagree with this
+                // build's, which gemv_plane_range's own byte-bounds check alone cannot catch: a
+                // TRUNCATED read that still fits inside a too-large `raw` span passes that check while
+                // silently reading the wrong bytes.
+                if (!moeqd::detail::plane_ok(pl.gate, d.d_ff, d.hidden_size) ||
+                    !moeqd::detail::plane_ok(pl.up, d.d_ff, d.hidden_size) ||
+                    !moeqd::detail::plane_ok(pl.down, d.hidden_size, d.d_ff)) {
+                    std::println(stderr,
+                                 "fatal: routed expert {} of layer {} cannot be row-split -- an "
+                                 "unsupported GGML type, a row width that is not a multiple of {}, or "
+                                 "a plane whose declared geometry disagrees with this build's axes",
+                                 e, layer_index, moeqd::GROUP);
+                    std::abort();
+                }
+            }
+
+            // Phase-1 work list: (k, Gate|Up) x row chunks of d.d_ff rows. A plane that cannot be
+            // row-sliced (plane_bytes(type, d.hidden_size) == 0 -- gemv_plane_range's own comment)
+            // becomes ONE chunk covering [0, d.d_ff) instead of several.
+            S.gu_count = 0;
+            for (int k = 0; k < n; ++k) {
+                for (int which = 0; which < 2; ++which) {   // moeq::Gate == 0, moeq::Up == 1
+                    const moeqd::EncodedPlane& ep = which == moeq::Gate
+                        ? S.planes[static_cast<std::size_t>(k)].gate
+                        : S.planes[static_cast<std::size_t>(k)].up;
+                    const bool sliceable =
+                        moeqd::plane_bytes(ep.desc.type_raw, static_cast<std::uint64_t>(d.hidden_size)) != 0;
+                    if (sliceable) {
+                        for (int r0 = 0; r0 < d.d_ff; r0 += ROW_SPLIT_GU_CHUNK_ROWS) {
+                            const int r1 = std::min(r0 + ROW_SPLIT_GU_CHUNK_ROWS, d.d_ff);
+                            S.gu_chunks[static_cast<std::size_t>(S.gu_count++)] =
+                                {static_cast<std::int16_t>(k), static_cast<std::int16_t>(which), r0, r1};
+                        }
+                    } else {
+                        S.gu_chunks[static_cast<std::size_t>(S.gu_count++)] =
+                            {static_cast<std::int16_t>(k), static_cast<std::int16_t>(which), 0, d.d_ff};
+                    }
+                }
+            }
+            // Phase-3 work list: (k) x row chunks of d.hidden_size rows, over the down plane.
+            S.dn_count = 0;
+            for (int k = 0; k < n; ++k) {
+                const moeqd::EncodedPlane& ep = S.planes[static_cast<std::size_t>(k)].down;
+                const bool sliceable =
+                    moeqd::plane_bytes(ep.desc.type_raw, static_cast<std::uint64_t>(d.d_ff)) != 0;
+                if (sliceable) {
+                    for (int r0 = 0; r0 < d.hidden_size; r0 += ROW_SPLIT_DN_CHUNK_ROWS) {
+                        const int r1 = std::min(r0 + ROW_SPLIT_DN_CHUNK_ROWS, d.hidden_size);
+                        S.dn_chunks[static_cast<std::size_t>(S.dn_count++)] = {static_cast<std::int16_t>(k), 0, r0, r1};
+                    }
+                } else {
+                    S.dn_chunks[static_cast<std::size_t>(S.dn_count++)] = {static_cast<std::int16_t>(k), 0, 0, d.hidden_size};
+                }
+            }
+
+            // Shared across the team below: set on any rejected plane (an unsupported format or a
+            // geometry mismatch -- see gemv_plane's own contract), checked once after the region.
+            // std::atomic rather than a plain bool: several threads may set it concurrently, and a
+            // plain bool would be a data race even though every write stores the same value.
+            std::atomic<bool> ok{true};
+            #pragma omp parallel num_threads(MOE_DECODE_THREADS)
+            {
+                // FTZ/DAZ per worker -- same reasoning as ParallelExperts::operator()'s own comment: a
+                // thread that skipped it would compute DIFFERENT floats the moment an intermediate went
+                // subnormal, not merely slower ones.
+                set_flush_denormals();
+                // Phase 1: gate + up, split by row range, dynamically scheduled (O4's own lever-2
+                // precedent: a token's selected planes are not uniform work -- different formats have a
+                // real measured per-format cost spread, O1's kernel bench).
+                #pragma omp for schedule(dynamic)
+                for (int c = 0; c < S.gu_count; ++c) {
+                    const RowSplitChunk ch = S.gu_chunks[static_cast<std::size_t>(c)];
+                    const moeqd::EncodedPlane& ep = ch.which == moeq::Gate
+                        ? S.planes[static_cast<std::size_t>(ch.k)].gate
+                        : S.planes[static_cast<std::size_t>(ch.k)].up;
+                    float* dst = (ch.which == moeq::Gate ? S.gate[static_cast<std::size_t>(ch.k)].data()
+                                                          : S.up[static_cast<std::size_t>(ch.k)].data());
+                    if (!gemv_plane_range(ep, d.hidden_size, ch.r0, ch.r1, g_moe_act_q, dst + ch.r0))
+                        ok.store(false, std::memory_order_relaxed);
+                }
+                // Phase 2 (implicit barrier above already separates it from phase 1): SiLU-gate combine
+                // + per-expert re-quantization of the down projection's own input. Small against the
+                // GEMVs either side of it, so a plain static split over k is enough.
+                #pragma omp for schedule(static)
+                for (int k = 0; k < n; ++k) {
+                    auto& g = S.gate[static_cast<std::size_t>(k)];
+                    auto& u = S.up[static_cast<std::size_t>(k)];
+                    for (int o = 0; o < d.d_ff; ++o) {
+                        const auto oi = static_cast<std::size_t>(o);
+                        u[oi] = moe::detail::silu(g[oi]) * u[oi];
+                    }
+                    S.pq[static_cast<std::size_t>(k)].quantize(u.data(), d.d_ff);
+                }
+                // Phase 3 (implicit barrier above): down, split by row range, dynamically scheduled --
+                // writes directly into routed_out, the SAME buffer moe_math.hpp's own phase 2 (the
+                // fixed-k-order weighted sum) reads from next.
+                #pragma omp for schedule(dynamic)
+                for (int c = 0; c < S.dn_count; ++c) {
+                    const RowSplitChunk ch = S.dn_chunks[static_cast<std::size_t>(c)];
+                    const moeqd::EncodedPlane& ep = S.planes[static_cast<std::size_t>(ch.k)].down;
+                    float* dst = routed_out
+                                 + static_cast<std::size_t>(ch.k) * static_cast<std::size_t>(d.hidden_size);
+                    if (!gemv_plane_range(ep, d.d_ff, ch.r0, ch.r1, S.pq[static_cast<std::size_t>(ch.k)],
+                                          dst + ch.r0))
+                        ok.store(false, std::memory_order_relaxed);
+                }
+            }
+            if (!ok.load(std::memory_order_relaxed)) {
+                std::println(stderr,
+                             "fatal: O8 row-split MoE resolve rejected a plane at layer {} -- an "
+                             "unsupported GGML type or a geometry mismatch against this build's axes",
+                             layer_index);
+                std::abort();
+            }
         }
     }
 };
@@ -922,9 +1170,13 @@ const float* Model::forward_one(int id, int pos) {
             // detects it via the SAME `requires`-based optional-hook pattern already used for
             // `prefetch()` -- see that function's own comment for why it lives there, not here, as a
             // Native struct: routing it through moe_math.hpp itself would form a real header cycle).
-            moe::forward_row_via_run_ex<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(
-                MOE_DIMS, a, L.moe_router->pdata,
-                [&](int k, int e, float* out_ptr, float* ffn, float* g) {
+            // O8 (docs/optimization/opportunities/O8_moe_row_split.md): the per-expert compute lambda is
+            // named so it is written ONCE regardless of which runner below consumes it -- RowSplitExperts
+            // never actually CALLS it (its own run_rows hook replaces phase 1 entirely, moe_math.hpp's
+            // own comment on why), but forward_row_via_run_ex's `compute_expert` parameter is still
+            // required by the function signature, so the same lambda is passed on both arms rather than
+            // duplicated.
+            auto compute_one_expert = [&](int k, int e, float* out_ptr, float* ffn, float* g) {
                     const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
                     MoeDecodeThread& S = *g_moe_decode[static_cast<std::size_t>(t)];
                     if constexpr (USE_MOE_QUANT && MOE_QUANT_DOT) {
@@ -984,11 +1236,27 @@ const float* Model::forward_one(int id, int pos) {
                         const moe::ExpertWeights w = moe_resolve(L, l, e, S.cache);
                         moe::expert_ffn_row(MOE_DIMS, a, w.gate, w.up, w.down, out_ptr, ffn, g);
                     }
-                },
-                ParallelExperts{l},
-                L.moe_shared_gate->pdata, L.moe_shared_up->pdata,
-                L.moe_shared_down->pdata, L.moe_shared_gate_proj->pdata,
-                proj, moe_scratch);
+            };
+            // O8: RowSplitExperts only when the toggle AND its own prerequisite (MOE_QUANT_DOT -- there
+            // is nothing to row-split in the dequantize-then-f32-FFN or f32-resident paths) both hold;
+            // every other build keeps ParallelExperts's existing whole-expert fan-out unchanged. Two
+            // `if constexpr` arms rather than a runtime choice: the runner is a TEMPLATE argument of
+            // forward_row_via_run_ex, so which one is instantiated must be a compile-time decision.
+            if constexpr (MOE_ROW_SPLIT && USE_MOE_QUANT && MOE_QUANT_DOT) {
+                moe::forward_row_via_run_ex<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(
+                    MOE_DIMS, a, L.moe_router->pdata, compute_one_expert,
+                    RowSplitExperts{ParallelExperts{l}},
+                    L.moe_shared_gate->pdata, L.moe_shared_up->pdata,
+                    L.moe_shared_down->pdata, L.moe_shared_gate_proj->pdata,
+                    proj, moe_scratch);
+            } else {
+                moe::forward_row_via_run_ex<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(
+                    MOE_DIMS, a, L.moe_router->pdata, compute_one_expert,
+                    ParallelExperts{l},
+                    L.moe_shared_gate->pdata, L.moe_shared_up->pdata,
+                    L.moe_shared_down->pdata, L.moe_shared_gate_proj->pdata,
+                    proj, moe_scratch);
+            }
         } else if constexpr (USE_GATED_FFN) {
             linear_row(a, L.Wg, nullptr, g1, C, D_FF);
             linear_row(a, L.W1, nullptr, f1, C, D_FF);
