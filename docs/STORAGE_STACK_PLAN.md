@@ -129,9 +129,13 @@ work package. Dependency pins advance only after consumer CI is green.
 
 ## Current checkpoint
 
-Updated 2026-09-25. Llm has **not** adopted either library yet: no Sub0Llm build, engine or test
-file depends on Sub0TieredCache or Sub0MemPage. This plan authorizes staged design/implementation
-work. It does not claim that NVIDIA GDS, a CUDA row cache or the end-to-end stack is available.
+Updated 2026-09-26. **S1 (Llm side) is done** -- see "S1 acceptance manifest (Llm side)" below. Llm's
+adoption is still test-only: `tests/ngram_tiered_storage_tests.cpp` and its own
+`include/sub0/ngram_tiered_storage.hpp` adapter are the only things in the tree that depend on
+Sub0TieredCache/Sub0MemPage, gated behind the default-OFF `SUB0_STORAGE_TIEREDCACHE` CMake option --
+no `src/`, `tools/` or default-build file depends on either library. This plan authorizes staged
+design/implementation work. It does not claim that NVIDIA GDS, a CUDA row cache or the end-to-end
+stack is available.
 
 ### Pinned lower revisions (both on `main`)
 
@@ -150,7 +154,7 @@ supports plain HTTP only. No timing claim exists in any of the three repositorie
 | Slice | Status |
 |---|---|
 | S0 contract/fixtures | **Lower layers done**: MemPage M2 plus the fake backend, and the TieredCache T0 oracle. The Llm-side E1–E5 fixture shapes are still unwritten; E1 is being written first, in S1. |
-| S1 local CPU vertical slice | **Lower half done**: MemPage M3 slice 1 and TieredCache T1 run on real MemPage at the pins above. **Llm half not started**: the E1 fixture, the adapter, the resident-reference comparison, then E2's byte adapter. |
+| S1 local CPU vertical slice | **Done**, both halves: MemPage M3 slice 1 and TieredCache T1 run on real MemPage at the pins above; Llm's E1 fixture, adapter (`include/sub0/ngram_tiered_storage.hpp`) and resident-reference comparison are merged behind `SUB0_STORAGE_TIEREDCACHE` (default OFF). See "S1 acceptance manifest (Llm side)" below. E2's byte adapter is not started -- E1 only. |
 | S2–S5 | Not started. T3 remote code exists early; see above. |
 
 ### Next: S1 on the Sub0Llm side (handoff for a local session)
@@ -224,3 +228,34 @@ Sub0Llm yet: a cloud session studied the APIs and stopped before writing code.
    - Run a `cpp-review` pass over the diff.
    - Write an S1 acceptance manifest recording the three SHAs, contract S1, fixture hash, compilers,
      OS and test counts.
+
+### S1 acceptance manifest (Llm side) -- DONE 2026-09-26
+
+Steps 1-6 above, completed. Adapter: `include/sub0/ngram_tiered_storage.hpp`
+(`sub0::storage::NgramTieredAdapter`, isolated -- nothing in `src/`/`tools/` includes it). Test:
+`tests/ngram_tiered_storage_tests.cpp` (2 cases, 17 assertions). Build toggle:
+`SUB0_STORAGE_TIEREDCACHE` (default OFF), `tests/CMakeLists.txt`.
+
+| Field | Value |
+|---|---|
+| Contract revision | S1 |
+| Sub0Llm SHA (base this manifest was built from) | `0179e9e` (O8 merge on `main`), plus this session's own commits on top |
+| Sub0MemPage pin | `213acdd2121cec369c6b9606c514db2231e94f27` |
+| Sub0TieredCache pin | `e4da6a7e87bcbc65f79257bef9843d41adbec66d` |
+| E1 fixture shape | 24 rows x 160 elements (mirrors the real Qwen4 `head_dim_per_ngram=160` in miniature, `NGRAM_TABLE_TIERED_STORAGE.md` sec 0), source dtype bf16 (2 B/elem), output dtype f32 (4 B/elem, `Representation::bf16_to_f32`), single flat-file shard |
+| E1 fixture hash | `930e8b911cdcaaa9ee017ef6f2f4fb01fb0503e01429a374102f3d3b6e2f56d6` (SHA-256 of the 7,680-byte generated file; deterministic from `gen_bits()`'s formula in the test, not a checked-in binary -- reproducible from source, recorded here for the manifest) |
+| Compilers | Windows: `clang++` 22.1.6 (LLVM), `-march=native`, `-std=gnu++26`. Linux (WSL): `g++-15` (Ubuntu 15.2.0-14ubuntu1~24~ppa1), `-std=gnu++26` |
+| Build tools | CMake 4.2.3, Ninja |
+| OS | Windows 11 Home 10.0.26220 (host: Core Ultra 9 275HX); WSL2 Ubuntu 24.04 on the same host |
+| Toggle-OFF gate (before, this machine) | `sub0_tests` 29,510,661/147 (fingerprints forward `5a7382ea70d3913b`, grad `7f44bdae18c313dd`, decode `d1625d19ed2258f1`); `sub0_frontend_tests` 228,198/295 |
+| Toggle-OFF gate (after, same machine) | Identical: `sub0_tests` 29,510,661/147, same three fingerprints; `sub0_frontend_tests` 228,198/295 |
+| Toggle-ON gate, Windows | `sub0_storage_tiered_cache_tests`: 17 assertions / 2 test cases, all passed. `sub0_tests` re-run in the same (toggle-ON) build tree: unchanged, 29,510,661/147, same fingerprints |
+| Toggle-ON gate, Linux (WSL/g++-15) | `sub0_storage_tiered_cache_tests`: 17 assertions / 2 test cases, all passed |
+| Mutation check | Deliberate off-by-one row offset in `FlatFileResolver`'s `base_offset` (adapter's `create()`) -> rebuilt -> test correctly FAILED (11/12 assertions, 1/2 cases, the out-of-bounds last-row read); reverted -> rebuilt -> back to 17/2 |
+| `cpp-review` | One real gap found and fixed (doc-only): `resolve_rows()` silently narrows `Table`'s own thread-safety guarantee (the adapter's `lease_scratch_` has no lock of its own) -- documented with an explicit `@note`; also documented why `table_`'s member-declaration position relative to `backend_`/`resolver_`/the storage vectors is load-bearing for destruction order. No behavior change |
+| Boy-scout fix (pre-existing, found while bringing up the Linux run) | Root `CMakeLists.txt` applied Clang's `-fconstexpr-steps` unconditionally under `if(NOT MSVC)`, which fails outright on GCC (`unrecognized command-line option`) for every TU in the tree. Scoped to `$<CXX_COMPILER_ID:Clang>`; verified a no-op for the existing Clang/Windows build (both suites reproduce exactly) and verified positively unblocking the WSL/GCC 15 configure+build |
+| Not verified this pass | E2 (routed-MoE byte adapter), model-output parity (E1's second acceptance clause -- needs engine wiring, a later step), macOS, any accelerator path |
+
+Slice status: **S1 done** (both halves). Next: E2's byte adapter, then Stage 3 engine wiring
+(`docs/NGRAM_TABLE_TIERED_STORAGE.md` sec 5) once a real consumer is ready to depend on
+`ngram_tiered_storage.hpp` from `src/`.

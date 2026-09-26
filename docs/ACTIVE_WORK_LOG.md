@@ -868,16 +868,28 @@ Neutral gates confirmed exact so far: `sub0_tests` 29,510,661/147 (fingerprints 
 ---
 
 **2026-09-26 Sonnet 5 subagent (isolated worktree, agent-a2c56fde96fcac8ad) — storage-stack S1 (Llm
-side), active (resumed after a pause).** `docs/STORAGE_STACK_PLAN.md`'s "Next: S1 on the Sub0Llm side"
-handoff, steps 1-6. Branch: worktree-local (not pushed), merged onto `main` at `0179e9e` (O8). Files/areas: new
+side), status: done.** `docs/STORAGE_STACK_PLAN.md`'s "Next: S1 on the Sub0Llm side"
+handoff, steps 1-6, all complete. Branch: worktree-local (not pushed), merged onto `main` at `0179e9e` (O8). Files/areas: new
 `include/sub0/ngram_tiered_storage.hpp` (isolated -- nothing in `src/`/`tools/` includes it, same
 pattern as `backbone_quant_dot.hpp`), new `tests/ngram_tiered_storage_tests.cpp`, an additive block in
 `tests/CMakeLists.txt` (new `SUB0_STORAGE_TIEREDCACHE` option, default OFF; a new
 `sub0_storage_tiered_cache_tests` target when ON, FetchContent-pinned to Sub0MemPage `213acdd2` /
-Sub0TieredCache `e4da6a7e`). No file overlap with O8 or any other row above. CPU-heavy work: one clean
-default-config rebuild + suite run (baseline), one toggle-ON rebuild + new-target run, one mutation
-rebuild. Correctness only, no performance measurement, `-j 4`. Will update this row to `done` when
-finished.
+Sub0TieredCache `e4da6a7e`). One boy-scout fix to `CMakeLists.txt` (root): `-fconstexpr-steps` was
+Clang-only but applied under a blanket `if(NOT MSVC)`, breaking every GCC configure outright; scoped
+to `$<CXX_COMPILER_ID:Clang>`, verified a no-op for the existing Clang/Windows build. No file overlap
+with O8 or any other row above.
+
+**Gates, all green:** toggle-OFF `sub0_tests` 29,510,661/147 (fingerprints `5a7382ea70d3913b` /
+`7f44bdae18c313dd` / `d1625d19ed2258f1`, unchanged before/after) and `sub0_frontend_tests` 228,198/295,
+both identical before/after the change. Toggle-ON `sub0_storage_tiered_cache_tests` 17 assertions/2
+cases on **both** Windows (clang++ 22.1.6) and Linux (WSL2 Ubuntu 24.04, g++-15 -- no clang available
+there, hence the boy-scout fix above). Mutation check done: a deliberate off-by-one row offset in the
+adapter's `FlatFileResolver` construction made the test fail as expected (11/12 assertions), reverted
+cleanly back to 17/2. `cpp-review` pass found and fixed one real doc gap (the adapter silently narrows
+`Table`'s thread-safety guarantee -- now documented) plus the destruction-order rationale for its
+non-owning members. Full manifest: `docs/STORAGE_STACK_PLAN.md` "S1 acceptance manifest (Llm side)".
+Not done: E2 (routed-MoE byte adapter), model-output parity, macOS/accelerator paths -- all named as
+next steps, not silently dropped.
 
 **2026-09-26 Claude Code — PAUSED at the user's request (historical; S1 resumed above).** Everything of mine is on local `main` (not pushed).
 
