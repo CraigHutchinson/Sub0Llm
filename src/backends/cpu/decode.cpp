@@ -1363,8 +1363,12 @@ void kv_reset() {
     // thread that masters decode's teams, because libomp teams inherit their master's blocktime. The cost
     // is idle workers burning their cores between regions for the duration of a generation. libomp-only
     // (KMP_VERSION_MAJOR comes from LLVM's omp.h); any other runtime skips it.
+    // The value is libomp's own ceiling, ~36 minutes: it stores microseconds, so anything above
+    // INT_MAX / 1000 ms is clamped to exactly this. Passing INT_MAX instead stored the same value but
+    // printed a spurious "maximum value <garbage> will be used" line on every kv_reset (measured with
+    // kmp_get_blocktime; the garbage differs per run, i.e. a libomp message bug).
 #if defined(_OPENMP) && defined(KMP_VERSION_MAJOR)
-    if constexpr (DECODE_OMP_SPIN) kmp_set_blocktime(std::numeric_limits<int>::max());
+    if constexpr (DECODE_OMP_SPIN) kmp_set_blocktime(std::numeric_limits<int>::max() / 1000);
 #endif
     g_kv.reset();
     if constexpr (BACKBONE_QUANT_DOT && !USE_TIED_EMBEDDINGS) {
