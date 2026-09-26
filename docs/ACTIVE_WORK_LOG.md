@@ -868,8 +868,8 @@ Neutral gates confirmed exact so far: `sub0_tests` 29,510,661/147 (fingerprints 
 ---
 
 **2026-09-26 Sonnet 5 subagent (isolated worktree, agent-a2c56fde96fcac8ad) — storage-stack S1 (Llm
-side), active.** `docs/STORAGE_STACK_PLAN.md`'s "Next: S1 on the Sub0Llm side" handoff, steps 1-6.
-Branch: worktree-local (not pushed), merged onto `main` at `0179e9e` (O8). Files/areas: new
+side), active (resumed after a pause).** `docs/STORAGE_STACK_PLAN.md`'s "Next: S1 on the Sub0Llm side"
+handoff, steps 1-6. Branch: worktree-local (not pushed), merged onto `main` at `0179e9e` (O8). Files/areas: new
 `include/sub0/ngram_tiered_storage.hpp` (isolated -- nothing in `src/`/`tools/` includes it, same
 pattern as `backbone_quant_dot.hpp`), new `tests/ngram_tiered_storage_tests.cpp`, an additive block in
 `tests/CMakeLists.txt` (new `SUB0_STORAGE_TIEREDCACHE` option, default OFF; a new
@@ -878,3 +878,31 @@ Sub0TieredCache `e4da6a7e`). No file overlap with O8 or any other row above. CPU
 default-config rebuild + suite run (baseline), one toggle-ON rebuild + new-target run, one mutation
 rebuild. Correctness only, no performance measurement, `-j 4`. Will update this row to `done` when
 finished.
+
+**2026-09-26 Claude Code — PAUSED at the user's request (historical; S1 resumed above).** Everything of mine is on local `main` (not pushed).
+
+- **Decode, recommended flags** (`optimization/opportunities/README.md`): about 5.7 tok/s long-run, and
+  about 6.6–7 tok/s in the six-token A/B. Native backbone, O8 row-split and 8 expert threads are all in.
+- **Quality gate:** G-PPL (`run_perf_suite.py --stage ppl`). The native backbone is quality-neutral, and O8
+  is bit-exact.
+- **Storage-stack S1 (Sonnet agent), paused cleanly.** Branch `worktree-agent-a2c56fde96fcac8ad` @
+  `6fc7055`, with `main` (O8) already merged in. It is not reviewed and not merged.
+  - Plan steps 1–4 are done: the work-log row, the E1 fixture (24×160 bf16, duplicates, non-monotonic
+    order, all-or-nothing out-of-range case, an independent oracle), an engine-free `op_embed`
+    reference, and the adapter `include/sub0/ngram_tiered_storage.hpp`.
+  - Step 5 is written but never built: the `SUB0_STORAGE_TIEREDCACHE` option, pinned FetchContent, and
+    the `sub0_storage_tiered_cache_tests` target.
+  - Step 6 has not started: no gate numbers exist.
+  - **Resume:** build `out/build/s1check` (the neutral config is already generated there) and check the
+    counts (29,510,661/147; 228,198/295). Then do the toggle-ON build with `FETCHCONTENT_SOURCE_DIR_*`
+    pointed at the pinned detached checkouts, the mutation check, `cpp-review`, and the acceptance
+    manifest.
+  - Those checkouts are git worktrees of the Sub0MemPage and Sub0TieredCache repos, placed in this
+    session's scratchpad (`.../scratchpad/pins/`). If the scratchpad is cleared, run `git worktree prune`
+    in both repos.
+- **Resume points, in order:**
+  1. Review and merge S1. Frontend baseline for it: 228,198/295.
+  2. O8's thread-count sweep (row-split with 12 or 16 threads, including E-cores), measured long-run.
+  3. libomp `kmp_set_blocktime(INT_MAX)` overflow warning under `--decode-omp-spin`.
+  4. Stop loading bf16 copies of sidecar-covered roles.
+  5. `SPECULATION_NGRAM_MOE_DESIGN.md` E1–E3 measurements, then PLE fidelity.
