@@ -266,3 +266,59 @@ endif()
 catch_discover_tests(sub0_tests
   DL_PATHS ${_sub0_test_dl_paths}
   DISCOVERY_MODE PRE_TEST)
+
+# --- Storage-stack S1 (docs/STORAGE_STACK_PLAN.md) -------------------------------------------------
+#
+# A build-dependency switch, not a model capability -- follows tests/CMakeLists.txt's own
+# SUB0_BUILD_SPIKE_TESTS pattern (default OFF, own test target, no existing target touched) rather than
+# a sub0llm-configure constexpr, per AGENTS.md sec 8/sec 2's "only add surface that's consumed" and the
+# plan's own step 5. OFF: nothing here is fetched or built, and SUB0_STORAGE_TIEREDCACHE_ROW_BYTES etc.
+# below are never evaluated. ON: FetchContent's the two pinned sibling libraries and builds ONE isolated
+# test target (sub0_storage_tiered_cache_tests) against include/sub0/ngram_tiered_storage.hpp, which
+# nothing in src/ or tools/ includes yet (Stage 3 of docs/NGRAM_TABLE_TIERED_STORAGE.md sec 5 is the
+# future engine-wiring step -- this is S1's correctness slice only).
+option(SUB0_STORAGE_TIEREDCACHE
+  "Build the Sub0TieredCache/Sub0MemPage S1 integration test (fetches two pinned sibling libraries)" OFF)
+if(SUB0_STORAGE_TIEREDCACHE)
+  include(FetchContent)
+
+  # Pinned lower revisions (docs/STORAGE_STACK_PLAN.md "Current checkpoint" -> "Pinned lower
+  # revisions"). Advance these only once the plan's own pin-advance gate (consumer CI green) is met --
+  # never silently track a branch. Offline/sibling-checkout development: set
+  # FETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE / _SUB0TIEREDCACHE to a local checkout AT EXACTLY this
+  # revision (a detached worktree, e.g. `git worktree add --detach <dir> <sha>` -- never point this at
+  # a shared checkout's live working tree, which another session may be advancing past the pin) plus
+  # -DFETCHCONTENT_FULLY_DISCONNECTED=ON to guarantee no network access is attempted.
+  set(SUB0_STORAGE_SUB0MEMPAGE_REVISION "213acdd2121cec369c6b9606c514db2231e94f27")
+  set(SUB0_STORAGE_SUB0TIEREDCACHE_REVISION "e4da6a7e87bcbc65f79257bef9843d41adbec66d")
+
+  # Sub0Llm must fetch+link Sub0MemPage itself: Sub0TieredCache's own CMakeLists.txt only fetches
+  # Sub0MemPage when it is the TOP-level project (`if(NOT IS_SUBPROJECT)`), and here it is always a
+  # subproject of sub0llm's own project() -- so its target_link_libraries(Sub0TieredCache INTERFACE
+  # Sub0MemPage::Sub0MemPage) call never runs either. Declared and made available BEFORE
+  # Sub0TieredCache so Sub0TieredCache's own (skipped) fetch of the same package name never races it.
+  set(SUB0MEMPAGE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(SUB0MEMPAGE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(SUB0MEMPAGE_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+  set(SUB0MEMPAGE_BUILD_INTEL_USM_PROBE OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(Sub0MemPage
+    GIT_REPOSITORY https://github.com/CraigHutchinson/Sub0MemPage.git
+    GIT_TAG ${SUB0_STORAGE_SUB0MEMPAGE_REVISION})
+  FetchContent_MakeAvailable(Sub0MemPage)
+
+  set(SUB0TIEREDCACHE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(SUB0TIEREDCACHE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(Sub0TieredCache
+    GIT_REPOSITORY https://github.com/CraigHutchinson/Sub0TieredCache.git
+    GIT_TAG ${SUB0_STORAGE_SUB0TIEREDCACHE_REVISION})
+  FetchContent_MakeAvailable(Sub0TieredCache)
+
+  # tests/ngram_tiered_storage_tests.cpp: S1's own gate (docs/STORAGE_STACK_PLAN.md step 6) -- byte-for-
+  # byte adapter-vs-resident-reference-vs-generator-oracle agreement, duplicates/non-monotonic order,
+  # row 0 + the last row, an out-of-range id failing the whole request, and one fetch for duplicate rows.
+  add_executable(sub0_storage_tiered_cache_tests ngram_tiered_storage_tests.cpp)
+  target_include_directories(sub0_storage_tiered_cache_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  target_link_libraries(sub0_storage_tiered_cache_tests PRIVATE
+    Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache Catch2::Catch2WithMain)
+  catch_discover_tests(sub0_storage_tiered_cache_tests)
+endif()
