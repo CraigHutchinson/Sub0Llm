@@ -65,7 +65,15 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 # sub0llm-transplant already each set it locally and why the ENGINE now needs it too. Changes no
 # generated code at any smaller config: an unused budget costs nothing.
 if(NOT MSVC)
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fconstexpr-steps=1000000000>)
+  # `-fconstexpr-steps` is Clang's own flag name (GCC's equivalent, a different flag with different
+  # semantics, is `-fconstexpr-ops-limit`) -- found blocking every non-MSVC configuration, not just
+  # Clang, while bringing up a WSL/GCC build for the storage-stack S1 gate (docs/STORAGE_STACK_PLAN.md):
+  # `g++-15: error: unrecognized command-line option '-fconstexpr-steps=1000000000'` on literally every
+  # TU in the tree, including third-party Catch2. Scoped to Clang specifically rather than papering over
+  # it with a GCC flag this project has never needed (AGENTS.md sec 8: no speculative surface) --
+  # nothing here has exercised a GCC build before, so there is no evidence yet that GCC's default
+  # constexpr-step budget is insufficient for this project's own consteval walks.
+  add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang>>:-fconstexpr-steps=1000000000>)
 endif()
 
 # Native tuning. This project is always built on the machine the model will run
