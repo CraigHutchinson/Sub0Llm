@@ -918,3 +918,15 @@ next steps, not silently dropped.
   3. libomp `kmp_set_blocktime(INT_MAX)` overflow warning under `--decode-omp-spin`.
   4. Stop loading bf16 copies of sidecar-covered roles.
   5. `SPECULATION_NGRAM_MOE_DESIGN.md` E1–E3 measurements, then PLE fidelity.
+
+**2026-09-26 Claude Code — storage-stack S1 merged.**
+- Re-verified independently before merging:
+  - default-off `sub0_tests` 29,510,661/147 with unchanged fingerprints, and `sub0_frontend_tests`
+    228,198/295;
+  - toggle-ON `sub0_storage_tiered_cache_tests` 17/2 passing, built against fresh detached checkouts of
+    Sub0MemPage `213acdd` and Sub0TieredCache `e4da6a7` (since removed).
+- One change at merge: the agent's GCC-portability fix scoped `-fconstexpr-steps` to `Clang` only, which
+  would silently drop it for AppleClang on macOS. It now matches `Clang,AppleClang`.
+- Correction to the S1 dispatch note: the lower repos' checkouts were *behind* the pins at dispatch, not
+  ahead. A fast-forward pull moved both to the pinned merge commits. Nothing was lost.
+

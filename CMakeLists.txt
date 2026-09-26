@@ -69,11 +69,12 @@ if(NOT MSVC)
   # semantics, is `-fconstexpr-ops-limit`) -- found blocking every non-MSVC configuration, not just
   # Clang, while bringing up a WSL/GCC build for the storage-stack S1 gate (docs/STORAGE_STACK_PLAN.md):
   # `g++-15: error: unrecognized command-line option '-fconstexpr-steps=1000000000'` on literally every
-  # TU in the tree, including third-party Catch2. Scoped to Clang specifically rather than papering over
+  # TU in the tree, including third-party Catch2. Scoped to Clang (and AppleClang: CMake gives Apple's
+  # build of it a separate compiler ID, which a bare `Clang` would miss on macOS) rather than papering over
   # it with a GCC flag this project has never needed (AGENTS.md sec 8: no speculative surface) --
   # nothing here has exercised a GCC build before, so there is no evidence yet that GCC's default
   # constexpr-step budget is insufficient for this project's own consteval walks.
-  add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang>>:-fconstexpr-steps=1000000000>)
+  add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang,AppleClang>>:-fconstexpr-steps=1000000000>)
 endif()
 
 # Native tuning. This project is always built on the machine the model will run
