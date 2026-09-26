@@ -39,6 +39,12 @@ namespace sub0::storage {
 
 /// A flat row-major bf16-on-disk table, widened to f32 on resolve
 /// (sub0tieredcache::Representation::bf16_to_f32). One registered file (single shard).
+///
+/// @note NOT thread-safe by itself, unlike the sub0tieredcache::Table it wraps (that type's own
+/// mutex-guarded contract does not extend to this adapter): resolve_rows() reuses this instance's own
+/// `lease_scratch_` scratch array across calls with no lock of its own, so two threads must not call
+/// resolve_rows() on the SAME NgramTieredAdapter concurrently. Give each thread its own adapter, or
+/// serialize calls with an external lock.
 class NgramTieredAdapter {
     struct Passkey {};
 
@@ -75,6 +81,12 @@ public:
     [[nodiscard]] sub0tieredcache::TableStats stats() const noexcept { return table_->stats(); }
 
 private:
+    // Declaration order is load-bearing: table_ holds non-owning references into backend_ (via
+    // sub0mempage::FillBackendRef) and resolver_ (via sub0tieredcache::RowExtentResolverRef), and reads
+    // through output_storage_/scratch_storage_'s spans for as long as it exists. C++ destroys members in
+    // REVERSE declaration order, so table_ (declared after all four) is destroyed first, retiring its
+    // worker thread and releasing every claim before backend_/resolver_/the storage vectors are freed --
+    // never reorder these without re-checking that invariant.
     std::uint64_t row_width_ = 0;
     std::uint32_t max_batch_rows_ = 0;
     std::unique_ptr<sub0mempage::LocalFileBackend> backend_;
