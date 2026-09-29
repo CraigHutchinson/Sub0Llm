@@ -1931,4 +1931,35 @@ template <int Threads = 1>
     return gemv_plane<Threads>(p.type_raw, p.bytes, p.n_rows, p.row_elems, x, out, row_lo, row_hi, gsum16);
 }
 
+// --- O9 (docs/BACKBONE_NATIVE_QUANT.md, this pass): the Plane-overload counterpart of gemv_plane_super ---
+
+/** `gemv_plane_super<Threads>` over a `Plane` view, otherwise identical to the loose-parameter overload
+ * above `super_fusable` (same defaults, same row-range/threading contract) -- mirrors `gemv_plane(const
+ * Plane&, ...)`'s own reason for existing exactly: every `*_math.hpp` Native struct stores a `const
+ * Plane*`, never a `bbq::Desc`, so this is the overload those headers' O9 dispatch calls through.
+ */
+template <int Threads = 1>
+[[nodiscard]] inline bool gemv_plane_super(const Plane& p, const ActSuper& x, float* out,
+                                           int row_lo = 0, int row_hi = -1) {
+    return gemv_plane_super<Threads>(p.type_raw, p.bytes, p.n_rows, p.row_elems, x, out, row_lo, row_hi);
+}
+
+/** O9's ONE eligibility check, called by every native-quant consumer before choosing `gemv_plane_super`
+ * over the existing per-32 `gemv_plane` path for a given plane -- so "does this specific plane's real
+ * format support the fused per-256 kernel" is decided in exactly one place, not re-derived per consumer
+ * (AGENTS.md S10's "one seam, not ten"). `xs` is the caller's OWN `ActSuper*` scratch for this activation
+ * vector: null whenever the caller never wired one (a build with `BACKBONE_ACT_SUPER` off, per
+ * `tools/sub0llm-configure`'s own default-off convention -- see that flag's own CLI help), so this
+ * returns false unconditionally in that case with no further evaluation, exactly the same "presence is
+ * runtime-derived from a pointer" idiom `gdn::Native::in_ready()`/`qsa::Native::proj_ready()` already use
+ * for `BACKBONE_QUANT_DOT` itself. Checked, not assumed: `super_fusable` re-examines the plane's OWN
+ * `type_raw`/`row_elems` every call (this task's own brief: "check each plane's real format; don't assume
+ * it from the role"), since two sibling roles reading the same activation (GDN's in_qkv/in_z, QSA's
+ * q_gate/k/v) are not guaranteed to share one quantization format even though real Qwen4-preview shards
+ * happen to, per §13c's per-role census.
+ */
+[[nodiscard]] inline bool super_ok(const Plane& p, const ActSuper* xs) {
+    return xs != nullptr && super_fusable(p.type_raw, p.row_elems);
+}
+
 }  // namespace sub0::bbqd

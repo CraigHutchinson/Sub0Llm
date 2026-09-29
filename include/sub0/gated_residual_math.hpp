@@ -53,6 +53,15 @@ namespace sub0::gr {
 // a genuinely different vector, so this is NOT a case of "one activation feeds two projections" the way
 // GDN's in_qkv/in_z share `x_q`; down's OUTPUT becomes up's INPUT after a nonlinearity, so no quantize
 // call can be shared between the two).
+//
+// O9 (docs/BACKBONE_NATIVE_QUANT.md, this pass): deliberately NOT extended with an ActSuper pointer pair
+// the way gdn::Native/qsa::Native were. Every real role this struct reads (GrAttnDown/Up, GrFfnDown/Up,
+// GrExitDown/Up) is Q8_0 (docs/BACKBONE_NATIVE_QUANT.md S13c's own per-format census: "Q8_0 tensors: 242
+// (100% of the file's Q8_0 -- no exclusions apply to this format)"), and `bbqd::super_fusable` refuses
+// Q8_0 unconditionally (S14b: its native block already IS 32 wide, so a coarser per-256 scale would only
+// cost accuracy with nothing to fold). Adding an always-null, never-eligible ActSuper field here would be
+// surface area nothing reads (AGENTS.md S8) -- so this struct, and mix()'s own down/up call sites, are
+// untouched by this pass.
 struct Native {
     const bbqd::Plane* down = nullptr;
     const bbqd::Plane* up   = nullptr;

@@ -656,6 +656,11 @@ int main(int argc, char** argv) {
     int moe_quant_dot     = 0;
     // O5: selected decode roles can use native backbone bytes from the S0B1 sidecar.
     int backbone_quant_dot = 0;
+    // O9 (docs/BACKBONE_NATIVE_QUANT.md S14, docs/optimization/opportunities/O9_act_super.md): every
+    // BACKBONE_QUANT_DOT role whose plane is Q4_K/Q5_K/Q6_K and passes bbqd::super_fusable uses the
+    // per-256 ActSuper kernel (bbqd::gemv_plane_super) instead of the per-32 ActBlocks path. 0 = off
+    // (default, today's per-32 path, bit-exact).
+    int backbone_act_super = 0;
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
     // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
@@ -848,6 +853,19 @@ int main(int argc, char** argv) {
                    "head dot and token-embedding gather); roles without supported sidecar planes use "
                    "the existing bf16 path. Requires a valid <model_path>.bbq S0B1 sidecar when 1. "
                    "0 = off (default, existing decode behavior).")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--backbone-act-super", backbone_act_super,
+                   "O9 (docs/BACKBONE_NATIVE_QUANT.md S14): every --backbone-quant-dot role whose real "
+                   "sidecar plane is Q4_K/Q5_K/Q6_K and satisfies bbqd::super_fusable (256-element-"
+                   "aligned rows) uses the per-256 ActSuper kernel (measured 2.35x/2.87x/2.50x faster "
+                   "than bf16 for Q5_K/Q6_K/Q4_K, against 1.68-2.11x for the per-32 path) instead of "
+                   "today's per-32 ActBlocks path. Q8_0 roles (Gated Residual, the shared expert's down "
+                   "projection) are unaffected -- ActSuper has nothing to fold for a format whose native "
+                   "block already IS 32 wide. NOT bit-exact: a per-256 activation scale is coarser, "
+                   "measured 2.17x-3.48x the per-32 path's own activation-quantization error on real "
+                   "weights (docs/BACKBONE_NATIVE_QUANT.md S14e) -- gated on end-to-end perplexity "
+                   "(docs/optimization/kpi_gates.json G-PPL), not merely a per-dot error bound. Requires "
+                   "--backbone-quant-dot 1. 0 = off (default, today's per-32 path, bit-exact).")
        ->capture_default_str()->check(CLI::Range(0, 1));
     // Qwen Sparse Attention (docs/QSA.md): Stage 0 -- every axis hard-clamped to 0. All five must be
     // set together; a half-configured QSA build is refused both here and by layout.hpp's static_assert.
@@ -1051,6 +1069,14 @@ int main(int argc, char** argv) {
     }
     if (backbone_quant_dot && tie_embeddings) {
         std::println(stderr, "configure error: --backbone-quant-dot currently requires --tie-embeddings 0");
+        return 1;
+    }
+    // O9: the per-256 ActSuper kernel has nothing to feed without a real backbone sidecar loaded --
+    // mirrors --moe-row-split's own "requires --moe-quant-dot 1" refusal exactly.
+    if (backbone_act_super && !backbone_quant_dot) {
+        std::println(stderr, "configure error: --backbone-act-super requires --backbone-quant-dot 1 -- "
+                             "there is no native backbone plane to compute the fused super kernel "
+                             "against otherwise");
         return 1;
     }
     // Tied embeddings: GPU support landed (launch_tied_head/launch_tied_head_bwd in backend_cuda.cu,
@@ -1869,6 +1895,14 @@ int main(int argc, char** argv) {
     // Inference arithmetic only: no model shape or checkpoint identity changes. The sidecar's own
     // PARAM_FLOATS and layer checks guard pairing when this is enabled.
     cos << "constexpr bool BACKBONE_QUANT_DOT = " << (backbone_quant_dot ? "true" : "false") << ";\n";
+    // O9 (docs/BACKBONE_NATIVE_QUANT.md S14, docs/optimization/opportunities/O9_act_super.md): the
+    // per-256 ActSuper kernel selector for every BACKBONE_QUANT_DOT role that is Q4_K/Q5_K/Q6_K and
+    // 256-aligned. Inference arithmetic only, same classification as BACKBONE_QUANT_DOT itself: no model
+    // shape or checkpoint identity changes, so this does NOT join ARCH_FINGERPRINT/ARCH_FINGERPRINT2 or
+    // PARAM_FLOATS (AGENTS.md S10) -- the same sidecar and the same model load and compute correctly
+    // (to within the measured activation-quantization tolerance, docs/BACKBONE_NATIVE_QUANT.md S14e)
+    // under either setting.
+    cos << "constexpr bool BACKBONE_ACT_SUPER = " << (backbone_act_super ? "true" : "false") << ";\n";
     // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
     cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
     cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";

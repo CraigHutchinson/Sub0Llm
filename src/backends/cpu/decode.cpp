@@ -212,6 +212,14 @@ moeqd::ActBlocks g_moe_act_q{};
 // Sized at kv_reset(), before the first token. The first native backbone role wired here is the Q4_K
 // language-model head, whose activation width is D_MODEL on every token.
 thread_local bbqd::ActBlocks g_backbone_head_act_q{};
+// O9 (docs/BACKBONE_NATIVE_QUANT.md, this pass): the per-256 ActSuper counterpart of every ActBlocks
+// scratch object below that feeds a role capable of the fused super kernel (Q4_K/Q5_K/Q6_K -- LmHead is
+// Q4_K, S13c's own census). Only ever quantized/read when `BACKBONE_ACT_SUPER` is on AND the specific
+// role's real plane passes `bbqd::super_ok` -- see each `if constexpr (BACKBONE_ACT_SUPER)` construction
+// site below. Declaring these unconditionally costs nothing at rest (an empty `std::vector`-backed
+// struct, no allocation until `quantize()` first runs, AGENTS.md S1), mirroring how g_gdn_out_gsum16 etc.
+// are already declared unconditionally and simply unused in a build/role that never reaches them.
+thread_local bbqd::ActSuper g_backbone_head_act_q_super{};
 
 // O5 phase 2b-2b (docs/BACKBONE_NATIVE_QUANT.md S16): caller-owned, reused scratch for the three native
 // GDN roles (in_qkv/in_z share one D_MODEL-wide quantized activation; out_proj needs its own
@@ -221,6 +229,9 @@ thread_local bbqd::ActBlocks g_backbone_head_act_q{};
 // fallback when USE_GATED_DELTANET is off), so these are valid array bounds in every build.
 thread_local bbqd::ActBlocks g_gdn_in_act_q{};    // D_MODEL-wide, shared by in_qkv/in_z
 thread_local bbqd::ActBlocks g_gdn_out_act_q{};   // GDN_VALUE_DIM-wide, out_proj's gathered activation
+// O9: ActSuper counterparts -- see g_backbone_head_act_q_super's own comment above.
+thread_local bbqd::ActSuper g_gdn_in_act_q_super{};
+thread_local bbqd::ActSuper g_gdn_out_act_q_super{};
 thread_local std::array<std::uint32_t, GDN_VALUE_DIM> g_gdn_out_gather_idx{};
 thread_local std::array<float, GDN_VALUE_DIM> g_gdn_out_gather_buf{};
 // Closes the TODO(phase 2b) docs/BACKBONE_NATIVE_QUANT.md S12i names: Q6_K's per-16 activation-sum
@@ -245,6 +256,9 @@ thread_local bbqd::ActBlocks g_gr_lr_q{};     // HC_LOWRANK_BUF-wide
 // (post-gate) attention output, D_Q-wide.
 thread_local bbqd::ActBlocks g_qsa_x_q{};
 thread_local bbqd::ActBlocks g_qsa_ao_q{};
+// O9: ActSuper counterparts -- see g_backbone_head_act_q_super's own comment above.
+thread_local bbqd::ActSuper g_qsa_x_q_super{};
+thread_local bbqd::ActSuper g_qsa_ao_q_super{};
 // The whole q|gate GEMV's output, before qsa::attn_project_row scatters it per head.
 thread_local std::array<float, 2 * static_cast<std::size_t>(QSA_DIMS_BUF.q_width())> g_qsa_qg_buf{};
 
@@ -254,6 +268,10 @@ thread_local std::array<float, 2 * static_cast<std::size_t>(QSA_DIMS_BUF.q_width
 // so no reserve() ceremony is needed the way the variable-width ActBlocks buffers above need it).
 thread_local bbqd::ActBlocks g_moe_shared_x_q{};
 thread_local bbqd::ActBlocks g_moe_shared_pre_q{};
+// O9: the ActSuper counterpart of g_moe_shared_x_q -- gate/up are Q5_K (or the real layer-2 Q6_K
+// outlier), both super-fusable; the shared expert's own `down` stays Q8_0 always (S13c's own census), so
+// g_moe_shared_pre_q has no ActSuper counterpart, matching gated_residual_math.hpp's own Native comment.
+thread_local bbqd::ActSuper  g_moe_shared_x_q_super{};
 thread_local bbqd::Gsum16    g_moe_shared_gsum16{};
 thread_local std::array<float, static_cast<std::size_t>(D_FF)> g_moe_shared_gate_scr{};
 thread_local std::array<float, static_cast<std::size_t>(D_FF)> g_moe_shared_up_scr{};
@@ -327,15 +345,31 @@ struct ParallelExperts {
                 e_up.plane.row_elems != D_MODEL || e_up.plane.n_rows != D_FF ||
                 e_down.plane.row_elems != D_FF || e_down.plane.n_rows != D_MODEL)
                 return false;
+            // O9: gate/up independently decide super-vs-per-32 from their OWN plane's real format
+            // (bbqd::super_ok) -- real shards are Q5_K, except the layer-2 outlier which is Q6_K (S13c),
+            // both super-fusable, but this is re-checked per plane, never assumed from the layer index.
+            bool gate_super = false, up_super = false;
+            if constexpr (BACKBONE_ACT_SUPER) {
+                gate_super = bbqd::super_ok(e_gate.plane, &g_moe_shared_x_q_super);
+                up_super   = bbqd::super_ok(e_up.plane, &g_moe_shared_x_q_super);
+            }
             // AGENTS.md S1's own "one distinct activation vector, one quantize call": gate and up both
-            // read this SAME hidden_size-wide `x`.
-            g_moe_shared_x_q.quantize(x, D_MODEL);
-            bool ok = bbqd::gemv_plane<DECODE_GEMV_THREADS>(e_gate.plane, g_moe_shared_x_q,
-                                                            g_moe_shared_gate_scr.data(), 0, -1,
-                                                            &g_moe_shared_gsum16);
-            ok = ok && bbqd::gemv_plane<DECODE_GEMV_THREADS>(e_up.plane, g_moe_shared_x_q,
-                                                             g_moe_shared_up_scr.data(), 0, -1,
-                                                             &g_moe_shared_gsum16);
+            // read this SAME hidden_size-wide `x`, so each representation actually needed is quantized
+            // exactly once, never per projection.
+            if (!gate_super || !up_super) g_moe_shared_x_q.quantize(x, D_MODEL);
+            if (gate_super || up_super) g_moe_shared_x_q_super.quantize(x, D_MODEL);
+            bool ok = gate_super
+                ? bbqd::gemv_plane_super<DECODE_GEMV_THREADS>(e_gate.plane, g_moe_shared_x_q_super,
+                                                              g_moe_shared_gate_scr.data())
+                : bbqd::gemv_plane<DECODE_GEMV_THREADS>(e_gate.plane, g_moe_shared_x_q,
+                                                         g_moe_shared_gate_scr.data(), 0, -1,
+                                                         &g_moe_shared_gsum16);
+            ok = ok && (up_super
+                ? bbqd::gemv_plane_super<DECODE_GEMV_THREADS>(e_up.plane, g_moe_shared_x_q_super,
+                                                              g_moe_shared_up_scr.data())
+                : bbqd::gemv_plane<DECODE_GEMV_THREADS>(e_up.plane, g_moe_shared_x_q,
+                                                         g_moe_shared_up_scr.data(), 0, -1,
+                                                         &g_moe_shared_gsum16));
             // moe::detail::silu, not the FAST_MATH-gated silu_row (not yet declared at this point in the
             // file, and not defined here to begin with): matches the exact SiLU expert_ffn_row's own
             // fallback path already uses for the shared expert, so the native and non-native arms compute
@@ -1035,10 +1069,16 @@ const float* Model::forward_one(int id, int pos) {
                     qsa_native.v = &e_v.plane;
                     qsa_native.x_q = &g_qsa_x_q;
                     qsa_native.qg_buf = g_qsa_qg_buf.data();
+                    // O9: wired unconditionally alongside x_q -- qsa_math.hpp's own bbqd::super_ok
+                    // re-checks each of q_gate/k/v's real format per call, so a non-super-fusable plane
+                    // (or BACKBONE_ACT_SUPER off, in which case this branch never runs at all) simply
+                    // never takes this path.
+                    if constexpr (BACKBONE_ACT_SUPER) qsa_native.x_q_super = &g_qsa_x_q_super;
                 }
                 if (e_o.present) {
                     qsa_native.o = &e_o.plane;
                     qsa_native.ao_q = &g_qsa_ao_q;
+                    if constexpr (BACKBONE_ACT_SUPER) qsa_native.ao_q_super = &g_qsa_ao_q_super;
                 }
                 if (qsa_native.proj_ready() || qsa_native.o_ready()) qsa_native_ptr = &qsa_native;
             }
@@ -1104,10 +1144,14 @@ const float* Model::forward_one(int id, int pos) {
                         gdn_native.in_qkv = &e_qkv.plane;
                         gdn_native.in_z = &e_z.plane;
                         gdn_native.x_q = &g_gdn_in_act_q;
+                        // O9: wired unconditionally alongside x_q -- gdn_math.hpp's own bbqd::super_ok
+                        // re-checks in_qkv's/in_z's real format independently per call.
+                        if constexpr (BACKBONE_ACT_SUPER) gdn_native.x_q_super = &g_gdn_in_act_q_super;
                     }
                     if (e_out.present) {
                         gdn_native.out = &e_out.plane;
                         gdn_native.gated_q = &g_gdn_out_act_q;
+                        if constexpr (BACKBONE_ACT_SUPER) gdn_native.gated_q_super = &g_gdn_out_act_q_super;
                         gdn_native.out_gather_idx = g_gdn_out_gather_idx.data();
                         gdn_native.out_gather_buf = g_gdn_out_gather_buf.data();
                         gdn_native.out_gsum16 = &g_gdn_out_gsum16;
@@ -1335,8 +1379,22 @@ const float* Model::forward_one(int id, int pos) {
             const auto& e = g_backbone_roles.get(bbq::Role::LmHead);
             if (e.present && e.plane.type_raw == static_cast<std::uint32_t>(gguf::TensorType::Q4_K) &&
                 e.plane.row_elems == C && e.plane.n_rows == VOCAB) {
-                g_backbone_head_act_q.quantize(a, C);
-                if (!bbqd::gemv_plane<DECODE_GEMV_THREADS>(e.plane, g_backbone_head_act_q, logits.data())) {
+                // O9: LmHead is Q4_K, super-fusable whenever C (D_MODEL) is a multiple of 256 (real
+                // Qwen4-preview: 2560 -- S13c's own census). Checked via bbqd::super_ok, not assumed from
+                // the type_raw check just above (which only pins the format, not the 256-alignment
+                // super_fusable also requires).
+                bool head_super = false;
+                if constexpr (BACKBONE_ACT_SUPER) head_super = bbqd::super_ok(e.plane, &g_backbone_head_act_q_super);
+                bool ok;
+                if (head_super) {
+                    g_backbone_head_act_q_super.quantize(a, C);
+                    ok = bbqd::gemv_plane_super<DECODE_GEMV_THREADS>(e.plane, g_backbone_head_act_q_super,
+                                                                     logits.data());
+                } else {
+                    g_backbone_head_act_q.quantize(a, C);
+                    ok = bbqd::gemv_plane<DECODE_GEMV_THREADS>(e.plane, g_backbone_head_act_q, logits.data());
+                }
+                if (!ok) {
                     std::println(stderr, "fatal: the native Q4_K language-model head has invalid geometry");
                     std::abort();
                 }
@@ -1380,6 +1438,16 @@ void kv_reset() {
             g_backbone_head_act_q.qs.reserve(D_MODEL);
             g_backbone_head_act_q.scale.reserve(D_MODEL / moeqd::GROUP);
             g_backbone_head_act_q.gsum.reserve(D_MODEL / moeqd::GROUP);
+            // O9: reserve the ActSuper counterpart too -- cheap either way, and this role's super
+            // eligibility can only be confirmed per-token (bbqd::super_ok also checks 256-alignment,
+            // which this reservation does not need to re-derive to be a valid upper bound).
+            if constexpr (BACKBONE_ACT_SUPER) {
+                if (D_MODEL % 256 == 0) {
+                    g_backbone_head_act_q_super.qs.reserve(D_MODEL);
+                    g_backbone_head_act_q_super.d.reserve(D_MODEL / 256);
+                    g_backbone_head_act_q_super.bsums.reserve(D_MODEL / 16);
+                }
+            }
         }
     }
     // O5 phase 2b-2b: size the GDN native-quant scratch and derive the out-proj gather index ONCE per
@@ -1397,6 +1465,19 @@ void kv_reset() {
         g_gdn_out_act_q.gsum.reserve(GDN_VALUE_DIM / moeqd::GROUP);
         g_gdn_out_gsum16.v.reserve(2 * (GDN_VALUE_DIM / moeqd::GROUP));   // 2 per-16 sums per 32-group
         bbq::gdn_out_gather_index(GDN_K_HEADS, GDN_V_HEADS, GDN_V_HEAD_DIM, g_gdn_out_gather_idx);
+        // O9: ActSuper counterparts -- see g_backbone_head_act_q_super's own reservation comment above.
+        if constexpr (BACKBONE_ACT_SUPER) {
+            if (D_MODEL % 256 == 0) {
+                g_gdn_in_act_q_super.qs.reserve(D_MODEL);
+                g_gdn_in_act_q_super.d.reserve(D_MODEL / 256);
+                g_gdn_in_act_q_super.bsums.reserve(D_MODEL / 16);
+            }
+            if (GDN_VALUE_DIM % 256 == 0) {
+                g_gdn_out_act_q_super.qs.reserve(GDN_VALUE_DIM);
+                g_gdn_out_act_q_super.d.reserve(GDN_VALUE_DIM / 256);
+                g_gdn_out_act_q_super.bsums.reserve(GDN_VALUE_DIM / 16);
+            }
+        }
     }
     // O5 phase 2b-3 phase B: size the remaining native-quant scratch ONCE per generation (AGENTS.md S1),
     // mirroring the GDN reservations just above exactly.
@@ -1416,6 +1497,19 @@ void kv_reset() {
         g_qsa_ao_q.qs.reserve(sub0::D_Q);
         g_qsa_ao_q.scale.reserve(sub0::D_Q / moeqd::GROUP);
         g_qsa_ao_q.gsum.reserve(sub0::D_Q / moeqd::GROUP);
+        // O9: ActSuper counterparts -- see g_backbone_head_act_q_super's own reservation comment above.
+        if constexpr (BACKBONE_ACT_SUPER) {
+            if (D_MODEL % 256 == 0) {
+                g_qsa_x_q_super.qs.reserve(D_MODEL);
+                g_qsa_x_q_super.d.reserve(D_MODEL / 256);
+                g_qsa_x_q_super.bsums.reserve(D_MODEL / 16);
+            }
+            if (sub0::D_Q % 256 == 0) {
+                g_qsa_ao_q_super.qs.reserve(sub0::D_Q);
+                g_qsa_ao_q_super.d.reserve(sub0::D_Q / 256);
+                g_qsa_ao_q_super.bsums.reserve(sub0::D_Q / 16);
+            }
+        }
     }
     if constexpr (BACKBONE_QUANT_DOT && USE_MOE) {
         g_moe_shared_x_q.qs.reserve(D_MODEL);
@@ -1425,6 +1519,15 @@ void kv_reset() {
         g_moe_shared_pre_q.scale.reserve(D_FF / moeqd::GROUP);
         g_moe_shared_pre_q.gsum.reserve(D_FF / moeqd::GROUP);
         g_moe_shared_gsum16.v.reserve(2 * (D_FF / moeqd::GROUP));
+        // O9: ActSuper counterpart of g_moe_shared_x_q only -- down (g_moe_shared_pre_q) is always Q8_0,
+        // never super-fusable (this file's own g_moe_shared_x_q_super comment).
+        if constexpr (BACKBONE_ACT_SUPER) {
+            if (D_MODEL % 256 == 0) {
+                g_moe_shared_x_q_super.qs.reserve(D_MODEL);
+                g_moe_shared_x_q_super.d.reserve(D_MODEL / 256);
+                g_moe_shared_x_q_super.bsums.reserve(D_MODEL / 16);
+            }
+        }
     }
     if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset();
     if constexpr (USE_QSA) g_qsa_cache.reset();   // the indexer's own raw-key store -- docs/QSA.md S6

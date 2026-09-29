@@ -90,10 +90,21 @@ struct Native {
     const bbqd::Plane* out    = nullptr;
     bbqd::ActBlocks* x_q     = nullptr;   // hidden_size-wide, shared by in_qkv/in_z
     bbqd::ActBlocks* gated_q = nullptr;   // value_dim-wide, out_proj's own quantized (gathered) input
+    // O9 (docs/BACKBONE_NATIVE_QUANT.md, this pass): the per-256 ActSuper counterparts of x_q/gated_q
+    // above, caller-owned and reused exactly like them. Null whenever the caller's build has
+    // `BACKBONE_ACT_SUPER` off (tools/sub0llm-configure's own default-off flag) -- `bbqd::super_ok`
+    // treats a null pointer here as "never take the super path", so this struct's behavior is IDENTICAL
+    // to before this pass whenever these two fields are left at their default. in_qkv and in_z are not
+    // guaranteed to share one real GGUF quantization format even though they read the SAME activation
+    // row (bbqd::super_ok is re-checked per plane, per call, never assumed uniform across siblings).
+    bbqd::ActSuper* x_q_super     = nullptr;   // hidden_size-wide, shared by in_qkv/in_z when eligible
+    bbqd::ActSuper* gated_q_super = nullptr;   // value_dim-wide, out_proj's own gathered+quantized input
     // Caller-owned, reused Q6_K per-16 activation-sum scratch (docs/BACKBONE_NATIVE_QUANT.md S12i's own
     // TODO(phase 2b), closed by this pass -- see bbqd::gemv_plane's own `gsum16` parameter comment).
     // GdnOutProj is Q6_K in every real layer this census found, but passing this unconditionally costs
-    // nothing on a different format (gemv_plane's own contract: unused downstream, not incorrect).
+    // nothing on a different format (gemv_plane's own contract: unused downstream, not incorrect). Only
+    // consulted on the per-32 ActBlocks fallback path -- ActSuper carries its own per-16 `bsums` (S14c),
+    // so the O9 super path never reads this.
     bbqd::Gsum16* out_gsum16 = nullptr;
     // GdnOutProj's raw sidecar bytes are GGUF/tiled column order, not this project's HF/grouped one
     // (backbone_quant.hpp's own header comment, point 3) -- the ACTIVATION must be gathered into that
@@ -310,14 +321,25 @@ inline void forward(const Dims& d, int T,
         float* br = beta + static_cast<std::size_t>(t) * Hv;
         float* gr = gg   + static_cast<std::size_t>(t) * Hv;
         if (native_in_ok) {
-            // O5 phase 2b-2b: quantize the D_MODEL-wide input row ONCE, shared by both in_qkv and in_z
-            // (AGENTS.md S1's own "one distinct activation vector, one quantize call" discipline). Both
-            // sidecar planes' row order already matches qkvr/zr's own destination layout exactly --
-            // in_qkv/in_z's V block was PERMUTED into HF order at sidecar-write time
-            // (backbone_quant.hpp's gdn_row_permutation), so this is a plain DOT, no runtime gather.
-            native->x_q->quantize(xt, hs);
-            const bool ok_qkv = bbqd::gemv_plane<Threads>(*native->in_qkv, *native->x_q, qkvr);
-            const bool ok_z = bbqd::gemv_plane<Threads>(*native->in_z, *native->x_q, zr);
+            // O9: each of in_qkv/in_z independently decides super-vs-per-32 from its OWN plane's real
+            // format (bbqd::super_ok, never assumed shared) -- see this struct's own x_q_super comment.
+            const bool qkv_super = bbqd::super_ok(*native->in_qkv, native->x_q_super);
+            const bool z_super   = bbqd::super_ok(*native->in_z, native->x_q_super);
+            // O5 phase 2b-2b / O9: quantize the D_MODEL-wide input row ONCE PER REPRESENTATION actually
+            // needed, shared by both in_qkv and in_z (AGENTS.md S1's own "one distinct activation vector,
+            // one quantize call" discipline, extended here to "one quantize call per representation" --
+            // never per projection). Both sidecar planes' row order already matches qkvr/zr's own
+            // destination layout exactly -- in_qkv/in_z's V block was PERMUTED into HF order at
+            // sidecar-write time (backbone_quant.hpp's gdn_row_permutation), so this is a plain DOT, no
+            // runtime gather, under either representation.
+            if (!qkv_super || !z_super) native->x_q->quantize(xt, hs);
+            if (qkv_super || z_super) native->x_q_super->quantize(xt, hs);
+            const bool ok_qkv = qkv_super
+                ? bbqd::gemv_plane_super<Threads>(*native->in_qkv, *native->x_q_super, qkvr)
+                : bbqd::gemv_plane<Threads>(*native->in_qkv, *native->x_q, qkvr);
+            const bool ok_z = z_super
+                ? bbqd::gemv_plane_super<Threads>(*native->in_z, *native->x_q_super, zr)
+                : bbqd::gemv_plane<Threads>(*native->in_z, *native->x_q, zr);
             if (!ok_qkv || !ok_z) {
                 std::fprintf(stderr, "fatal: gdn::forward's native in_qkv/in_z GEMV rejected a plane whose "
                                      "geometry passed the outer check (unsupported GGML type or a row "
@@ -449,9 +471,19 @@ inline void forward(const Dims& d, int T,
             // is right, not backwards.
             for (int i = 0; i < value_dim; ++i)
                 native->out_gather_buf[i] = gated[native->out_gather_idx[static_cast<std::size_t>(i)]];
-            native->gated_q->quantize(native->out_gather_buf, value_dim);
-            const bool ok = bbqd::gemv_plane<Threads>(*native->out, *native->gated_q, ot,
-                /*row_lo=*/0, /*row_hi=*/-1, native->out_gsum16);
+            // O9: same per-plane eligibility check as the in-projections above. The super path needs
+            // no Gsum16 hint (ActSuper carries its own per-16 bsums, S14c) -- only the per-32 fallback
+            // reads native->out_gsum16.
+            const bool out_super = bbqd::super_ok(*native->out, native->gated_q_super);
+            bool ok;
+            if (out_super) {
+                native->gated_q_super->quantize(native->out_gather_buf, value_dim);
+                ok = bbqd::gemv_plane_super<Threads>(*native->out, *native->gated_q_super, ot);
+            } else {
+                native->gated_q->quantize(native->out_gather_buf, value_dim);
+                ok = bbqd::gemv_plane<Threads>(*native->out, *native->gated_q, ot,
+                    /*row_lo=*/0, /*row_hi=*/-1, native->out_gsum16);
+            }
             if (!ok) {
                 std::fprintf(stderr, "fatal: gdn::forward's native out_proj GEMV rejected a plane whose "
                                      "geometry passed the outer check\n");

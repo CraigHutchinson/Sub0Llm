@@ -79,6 +79,14 @@ struct Native {
     const bbqd::Plane* o      = nullptr;
     bbqd::ActBlocks* x_q  = nullptr;   // hidden_size-wide, shared by q_gate/k/v
     bbqd::ActBlocks* ao_q = nullptr;   // q_width-wide, o_proj's own quantized (gated) attention output
+    // O9 (docs/BACKBONE_NATIVE_QUANT.md, this pass): the per-256 ActSuper counterparts of x_q/ao_q,
+    // caller-owned and reused exactly like them. Null whenever the caller's build has
+    // `BACKBONE_ACT_SUPER` off -- `bbqd::super_ok` treats a null pointer here as "never take the super
+    // path", so leaving these two at their default reproduces this struct's exact prior behavior.
+    // q_gate/k/v are not assumed to share one real quantization format (bbqd::super_ok is re-checked per
+    // plane, per call), even though real Qwen4-preview shards happen to quantize all four QSA roles Q5_K.
+    bbqd::ActSuper* x_q_super  = nullptr;   // hidden_size-wide, shared by q_gate/k/v when eligible
+    bbqd::ActSuper* ao_q_super = nullptr;   // q_width-wide, o_proj's own gathered+quantized input
     float*           qg_buf = nullptr; // 2*q_width floats, caller-owned: the whole q|gate GEMV, pre-scatter
 
     [[nodiscard]] bool proj_ready() const {
@@ -384,22 +392,33 @@ inline void attn_project_row(const Dims& d, const float* x, WP q_w, WP gate_w,
         native->k->row_elems == d.hidden_size && native->k->n_rows == d.kv_width() &&
         native->v->row_elems == d.hidden_size && native->v->n_rows == d.kv_width();
     if (native_ok) {
+        // O9: each of q_gate/k/v independently decides super-vs-per-32 from its OWN plane's real format
+        // (bbqd::super_ok, never assumed shared -- see this struct's own x_q_super comment).
+        const bool qg_super = bbqd::super_ok(*native->q_gate, native->x_q_super);
+        const bool k_super  = bbqd::super_ok(*native->k, native->x_q_super);
+        const bool v_super  = bbqd::super_ok(*native->v, native->x_q_super);
         // AGENTS.md S1's own "one distinct activation vector, one quantize call" discipline: q_gate/k/v
-        // all read this SAME hidden_size-wide row, so it is quantized exactly once here.
-        native->x_q->quantize(x, d.hidden_size);
+        // all read this SAME hidden_size-wide row, so each representation it needs is quantized exactly
+        // once here, never per projection.
+        if (!qg_super || !k_super || !v_super) native->x_q->quantize(x, d.hidden_size);
+        if (qg_super || k_super || v_super) native->x_q_super->quantize(x, d.hidden_size);
         // The Q|GATE split (this struct's own header comment): ONE GEMV over the whole stored tensor, then
         // `transplant::per_head_half_transpose`'s row formula (`h*2*head_dim + half*head_dim`) as a
         // per-head copy. The kernel computes every output row independently, so this is bit-identical to
         // one row-range call per head per half, without that form's 2*n_heads OpenMP fork/joins per layer.
         const int hd = d.head_dim;
-        bool ok = bbqd::gemv_plane<Threads>(*native->q_gate, *native->x_q, native->qg_buf);
+        bool ok = qg_super
+            ? bbqd::gemv_plane_super<Threads>(*native->q_gate, *native->x_q_super, native->qg_buf)
+            : bbqd::gemv_plane<Threads>(*native->q_gate, *native->x_q, native->qg_buf);
         for (int h = 0; h < d.n_heads; ++h) {
             const float* rows = native->qg_buf + static_cast<std::size_t>(h) * 2 * hd;
             std::copy_n(rows, hd, out_q + h * hd);
             std::copy_n(rows + hd, hd, out_gate + h * hd);
         }
-        ok = ok && bbqd::gemv_plane<Threads>(*native->k, *native->x_q, out_k);
-        ok = ok && bbqd::gemv_plane<Threads>(*native->v, *native->x_q, out_v);
+        ok = ok && (k_super ? bbqd::gemv_plane_super<Threads>(*native->k, *native->x_q_super, out_k)
+                            : bbqd::gemv_plane<Threads>(*native->k, *native->x_q, out_k));
+        ok = ok && (v_super ? bbqd::gemv_plane_super<Threads>(*native->v, *native->x_q_super, out_v)
+                            : bbqd::gemv_plane<Threads>(*native->v, *native->x_q, out_v));
         if (!ok) {
             std::fprintf(stderr, "fatal: qsa::attn_project_row's native q|gate/k/v GEMV rejected a plane "
                                  "whose geometry passed the outer check\n");
@@ -472,9 +491,18 @@ inline void attn_row(const Dims& d, const float* q, const float* gate, const flo
         native->o->row_elems == d.q_width() && native->o->n_rows == d.hidden_size;
     if (native_ok) {
         // A genuinely different activation vector from x_q (attn_project_row's own quantize) -- `ao` is
-        // this row's post-softmax, post-gate attention output, so its own quantize call here.
-        native->ao_q->quantize(ao, d.q_width());
-        if (!bbqd::gemv_plane<Threads>(*native->o, *native->ao_q, out)) {
+        // this row's post-softmax, post-gate attention output, so its own quantize call here. O9: same
+        // per-plane eligibility check as attn_project_row's own q_gate/k/v.
+        const bool o_super = bbqd::super_ok(*native->o, native->ao_q_super);
+        bool ok;
+        if (o_super) {
+            native->ao_q_super->quantize(ao, d.q_width());
+            ok = bbqd::gemv_plane_super<Threads>(*native->o, *native->ao_q_super, out);
+        } else {
+            native->ao_q->quantize(ao, d.q_width());
+            ok = bbqd::gemv_plane<Threads>(*native->o, *native->ao_q, out);
+        }
+        if (!ok) {
             std::fprintf(stderr, "fatal: qsa::attn_row's native o-projection GEMV rejected a plane whose "
                                  "geometry passed the outer check\n");
             std::abort();

@@ -930,3 +930,18 @@ next steps, not silently dropped.
 - Correction to the S1 dispatch note: the lower repos' checkouts were *behind* the pins at dispatch, not
   ahead. A fast-forward pull moved both to the pinned merge commits. Nothing was lost.
 
+**2026-09-29 Claude Code (subagent) -- O9 STARTED, status: active.** ISOLATED worktree
+(`.claude/worktrees/agent-a208ab6f13e379618`), branch `worktree-agent-a208ab6f13e379618`, ff-merged to
+`main` @ `155c6a7` at dispatch -- no shared-tree file contention. Files/areas: `include/sub0/
+backbone_quant_dot.hpp` (a small Plane-overload + `super_ok` helper, no kernel changes), `include/sub0/
+gdn_math.hpp` / `qsa_math.hpp` (their `Native` seams), `src/backends/cpu/decode.cpp`, `tools/
+configurator.cpp` (new `--backbone-act-super` option), `tests/backbone_quant_dot_tests.cpp` +
+`gdn_qwen4_fixture_tests.cpp` + `qsa_qwen4_fixture_tests.cpp`, and a new `docs/optimization/opportunities/
+O9_act_super.md`. Task: wire pass-4's per-256 `bbqd::ActSuper` kernels into decode behind a new
+default-off `BACKBONE_ACT_SUPER` toggle (docs/BACKBONE_NATIVE_QUANT.md S14), gated on the real-model
+G-PPL quality run before it can be recommended. Will need CPU time for the default-off gate build/test
+and, if the wiring lands cleanly, a real-artifact `--stage ppl` run against
+`D:\ModelWeights\Sub0Llm-Qwen4-full48-bf16\qwen4_full48_q_bf16.bin` -- flagging here since that is a
+perf-sensitive workload other agents' own throughput numbers could be confounded by, even with zero file
+overlap (AGENTS.md's own preamble).
+
