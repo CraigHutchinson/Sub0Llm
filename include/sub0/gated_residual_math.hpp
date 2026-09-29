@@ -154,7 +154,9 @@ enum class MixStage : unsigned char { Quantize, Down, Elementwise, Up };
 // simplification, not an oversight; see that section for why the duplicated cost is bounded and cheap).
 // down_w: [wide, hc_lowrank], up_w: [hc_lowrank, wide], this project's own [in,out] convention.
 // out_mixed: [T, hidden_size]. scratch: >= T*hc_lowrank floats (the down-projection's pre-activation).
-template <int Threads = 1, class WP, class Probe = NoStageProbe>
+// O12: `Q8Fast` (default false = today's exact path) routes the two native GEMVs through the vector-
+// accumulator Q8_0 kernel (bbqd::gemv_plane<Threads, true>); the caller bakes it from BACKBONE_Q8_FAST.
+template <int Threads = 1, bool Q8Fast = false, class WP, class Probe = NoStageProbe>
 inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
                  float* out_mixed, float* scratch, const Native* native = nullptr, Probe probe = {}) {
     const int hs = d.hidden_size, hc = d.hc_count, wide = d.wide(), lr = d.hc_lowrank;
@@ -173,7 +175,7 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
         if (native_ok) {
             native->wide_q->quantize(xr, wide);
             probe(MixStage::Down);
-            if (!bbqd::gemv_plane<Threads>(*native->down, *native->wide_q, dr)) {
+            if (!bbqd::gemv_plane<Threads, Q8Fast>(*native->down, *native->wide_q, dr)) {
                 std::fprintf(stderr, "fatal: gr::mix's native down-projection GEMV rejected a plane whose "
                                      "geometry passed the outer check\n");
                 std::abort();
@@ -205,7 +207,7 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
             // this is its OWN quantize call, not a reuse of wide_q (see Native's own comment).
             native->lr_q->quantize(dr, lr);
             probe(MixStage::Up);
-            if (!bbqd::gemv_plane<Threads>(*native->up, *native->lr_q, up_val)) {
+            if (!bbqd::gemv_plane<Threads, Q8Fast>(*native->up, *native->lr_q, up_val)) {
                 std::fprintf(stderr, "fatal: gr::mix's native up-projection GEMV rejected a plane whose "
                                      "geometry passed the outer check\n");
                 std::abort();

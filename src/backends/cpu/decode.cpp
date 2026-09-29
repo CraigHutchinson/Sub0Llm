@@ -384,8 +384,10 @@ struct ParallelExperts {
             // quantize call, after the gate/up projections complete (mirrors gr::mix's own down/up
             // split).
             g_moe_shared_pre_q.quantize(g_moe_shared_up_scr.data(), D_FF);
-            ok = ok && bbqd::gemv_plane<DECODE_GEMV_THREADS>(e_down.plane, g_moe_shared_pre_q, out, 0, -1,
-                                                             &g_moe_shared_gsum16);
+            // O12: the shared expert's down projection is Q8_0 (S13c's census) -- BACKBONE_Q8_FAST picks the
+            // vector-accumulator kernel for it; inert for any non-Q8_0 plane.
+            ok = ok && bbqd::gemv_plane<DECODE_GEMV_THREADS, BACKBONE_Q8_FAST>(
+                e_down.plane, g_moe_shared_pre_q, out, 0, -1, &g_moe_shared_gsum16);
             if (!ok) {
                 std::println(stderr, "fatal: the shared expert's native gate/up/down GEMV rejected a "
                                      "plane whose geometry passed the outer check");
@@ -873,7 +875,7 @@ const float* Model::forward_one(int id, int pos) {
                     gr_native_ptr = &gr_native;
                 }
             }
-            gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed,
+            gr::mix<DECODE_GEMV_THREADS, BACKBONE_Q8_FAST>(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed,
                                          gr_mixscr, gr_native_ptr, gr_probe);
             {
                 [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> gate_phase(prof::Phase::GrGate);
@@ -1397,7 +1399,7 @@ const float* Model::forward_one(int id, int pos) {
                 gr_top_native_ptr = &gr_top_native;
             }
         }
-        gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed,
+        gr::mix<DECODE_GEMV_THREADS, BACKBONE_Q8_FAST>(GR_DIMS, 1, gr_normed, gr_top_down->pdata, gr_top_up->pdata, gr_mixed,
                                      gr_mixscr, gr_top_native_ptr);
         for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = gr_mixed[j];
         // No final norm under GR -- the exit collapse's own hc_norm is it, so mixed_input feeds the

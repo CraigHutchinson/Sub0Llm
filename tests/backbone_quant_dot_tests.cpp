@@ -1047,6 +1047,182 @@ TEST_CASE("bbqd (O9): super_ok() is the exact conjunction of \"xs is non-null\" 
     }
 }
 
+// --- O12: the vector-accumulator Q8_0 kernel (docs/optimization/opportunities/O12_q8_fast.md) ---------
+//
+// The kernel is NOT bit-exact against the portable/per-block path (it reassociates the float sum and
+// rounds w_scale*x_scale first), so the reference here is an independent scalar DOUBLE-precision
+// evaluation of the defining formula on the SAME quantized activation, and the tolerance is stated
+// relative to the row's sum of |terms| (a dot's error scale) -- never relative to the possibly tiny signed
+// result. The integer byte dots are exact, so every Isa variant must agree with the others EXACTLY.
+
+namespace {
+
+struct Q8Ref { double value; double abs_sum; };
+
+/// Direct evaluation of sum_g d_g * xscale_g * (sum_j w_j x_j) for one Q8_0 row, in double.
+Q8Ref q8_reference(const std::uint8_t* row, int nblk, const bbqd::ActBlocks& x) {
+    Q8Ref r{0.0, 0.0};
+    for (int g = 0; g < nblk; ++g) {
+        const std::size_t gi = static_cast<std::size_t>(g);
+        std::uint16_t bits;
+        std::memcpy(&bits, row + gi * 34, sizeof bits);
+        const double d = gguf::f16_to_f32(bits);
+        long isum = 0;
+        for (std::size_t j = 0; j < 32; ++j)
+            isum += static_cast<long>(static_cast<std::int8_t>(row[gi * 34 + 2 + j])) * static_cast<long>(x.qs[gi * 32 + j]);
+        const double term = d * static_cast<double>(x.scale[gi]) * static_cast<double>(isum);
+        r.value += term;
+        r.abs_sum += std::fabs(term);
+    }
+    return r;
+}
+
+/// Runs every Q8_0 fast-kernel variant this target has over `rows` rows and checks each against the double
+/// reference (tolerance 1e-5 of the row's sum of |terms|: 4 float lanes over at most a few hundred blocks
+/// accumulate at most ~1e-6 relative; 1e-5 is a generous, stated bound, not a fitted one) and against each
+/// other (exact).
+void check_q8_fast_row_width(int row_elems, int rows, std::uint32_t seed) {
+    INFO("row_elems " << row_elems);
+    const int nblk = row_elems / 32;
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.f, 2.f);
+    std::vector<float> x(static_cast<std::size_t>(row_elems));
+    for (float& v : x) v = normal(rng);
+    bbqd::ActBlocks xq;
+    xq.quantize(x.data(), row_elems);
+    // make_blocks: fully random quants (including -128) with in-range f16 scales.
+    const std::vector<std::uint8_t> raw = make_blocks(
+        gguf::TensorType::Q8_0, static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(row_elems), seed + 1u);
+
+    std::vector<float> avx2(static_cast<std::size_t>(rows), -1.f);
+    bbqd::detail::gemv_q8_0_fast<bbqd::detail::Q8Isa::Avx2>(raw.data(), 0, rows, row_elems, xq, avx2.data());
+    for (int r = 0; r < rows; ++r) {
+        INFO("row " << r);
+        const Q8Ref ref = q8_reference(raw.data() + static_cast<std::size_t>(r) * static_cast<std::size_t>(nblk) * 34, nblk, xq);
+        REQUIRE(std::fabs(static_cast<double>(avx2[static_cast<std::size_t>(r)]) - ref.value) <= 1e-5 * ref.abs_sum);
+    }
+#if defined(SUB0_BBQD_VNNI)
+    std::vector<float> vnni(static_cast<std::size_t>(rows), -2.f);
+    bbqd::detail::gemv_q8_0_fast<bbqd::detail::Q8Isa::Vnni>(raw.data(), 0, rows, row_elems, xq, vnni.data());
+    REQUIRE(vnni == avx2);
+#endif
+#if defined(SUB0_BBQD_VNNI_INT8)
+    std::vector<float> vi8(static_cast<std::size_t>(rows), -3.f);
+    bbqd::detail::gemv_q8_0_fast<bbqd::detail::Q8Isa::VnniInt8>(raw.data(), 0, rows, row_elems, xq, vi8.data());
+    REQUIRE(vi8 == avx2);
+#endif
+}
+
+}  // namespace
+
+TEST_CASE("bbqd (O12): the Q8_0 fast kernel matches a scalar double reference at every tail shape and real widths",
+          "[backbonequant][q8fast]") {
+    // 1, 2, 3 blocks exercise the padded tail alone; 4 the exact fold; 5..7 fold + tail; 10 is the real
+    // GR up-projection width (320); 20 the shared expert's down (640); 320 the GR down's (10240).
+    for (const int nblk : {1, 2, 3, 4, 5, 6, 7, 8, 10, 20, 80, 320})
+        check_q8_fast_row_width(nblk * 32, 6, 5000u + static_cast<std::uint32_t>(nblk));
+}
+
+TEST_CASE("bbqd (O12): the Q8_0 fast kernel survives worst-case operands (all -128 weights vs +-127 activations)",
+          "[backbonequant][q8fast]") {
+    // The sign-transfer forms (|w| as u8, sign(x,w)) meet their limit at w = -128 (|w| = 128), and a
+    // saturating int16 pair-sum would corrupt a same-sign run. Weights all -128, activation +-127 (one sign per block): every
+    // product is +-16256, so a saturation or sign bug shows up as a gross error, not a rounding one.
+    constexpr int kBlocks = 12, kRows = 3;
+    std::vector<std::uint8_t> raw(static_cast<std::size_t>(kRows * kBlocks) * 34);
+    for (std::size_t b = 0; b < static_cast<std::size_t>(kRows * kBlocks); ++b) {
+        const std::uint16_t one = 0x3c00;   // f16 1.0
+        std::memcpy(&raw[b * 34], &one, sizeof one);
+        for (std::size_t j = 0; j < 32; ++j) raw[b * 34 + 2 + j] = static_cast<std::uint8_t>(std::int8_t{-128});
+    }
+    std::vector<float> x(kBlocks * 32);
+    for (int i = 0; i < kBlocks * 32; ++i)
+        x[static_cast<std::size_t>(i)] = ((i / 32) % 2 == 0) ? 1.f : -1.f;   // one sign per block
+    bbqd::ActBlocks xq;
+    xq.quantize(x.data(), kBlocks * 32);
+    std::vector<float> out(kRows, 0.f);
+    bbqd::detail::gemv_q8_0_fast<bbqd::detail::Q8Isa::Avx2>(raw.data(), 0, kRows, kBlocks * 32, xq, out.data());
+    for (int r = 0; r < kRows; ++r) {
+        const Q8Ref ref = q8_reference(raw.data() + static_cast<std::size_t>(r) * kBlocks * 34, kBlocks, xq);
+        REQUIRE(ref.abs_sum > 0.0);
+        REQUIRE(std::fabs(static_cast<double>(out[static_cast<std::size_t>(r)]) - ref.value) <= 1e-6 * ref.abs_sum);
+    }
+#if defined(SUB0_BBQD_VNNI_INT8)
+    std::vector<float> vi8(kRows, 0.f);
+    bbqd::detail::gemv_q8_0_fast<bbqd::detail::Q8Isa::VnniInt8>(raw.data(), 0, kRows, kBlocks * 32, xq, vi8.data());
+    REQUIRE(vi8 == out);
+#endif
+}
+
+TEST_CASE("bbqd (O12): gemv_plane<Threads, Q8Fast> -- off is the exact existing path, on is thread-count-invariant",
+          "[backbonequant][q8fast]") {
+    constexpr int kN = 768, kRows = 37;   // 768 = 3 K-quant superblocks; 37 rows: uneven split across 2/4 workers
+    std::mt19937 rng(77);
+    std::normal_distribution<float> normal(0.f, 1.5f);
+    std::vector<float> x(kN);
+    for (float& v : x) v = normal(rng);
+    bbqd::ActBlocks xq;
+    xq.quantize(x.data(), kN);
+
+    for (const gguf::TensorType type : kFormats) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        if (!bbqd::fusable(raw_t, kN)) continue;
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN, 909u + raw_t);
+        const std::span<const std::uint8_t> sp(raw);
+        std::vector<float> base(kRows, -1.f), off(kRows, -2.f), on1(kRows, -3.f), on2(kRows, -4.f), on4(kRows, -5.f);
+        REQUIRE(bbqd::gemv_plane<1>(raw_t, sp, kRows, kN, xq, base.data()));
+        REQUIRE(bbqd::gemv_plane<1, false>(raw_t, sp, kRows, kN, xq, off.data()));
+        REQUIRE(bbqd::gemv_plane<1, true>(raw_t, sp, kRows, kN, xq, on1.data()));
+        REQUIRE(bbqd::gemv_plane<2, true>(raw_t, sp, kRows, kN, xq, on2.data()));
+        REQUIRE(bbqd::gemv_plane<4, true>(raw_t, sp, kRows, kN, xq, on4.data()));
+        REQUIRE(off == base);                 // toggle off IS today's path, bit for bit
+        REQUIRE(on1 == on2);                  // threading by output row stays bit-exact with it on
+        REQUIRE(on1 == on4);
+        if (type != gguf::TensorType::Q8_0) REQUIRE(on1 == base);   // Q8Fast is inert for every other format
+    }
+
+    // The Plane overload (the one every *_math.hpp Native calls) forwards the flag.
+    const std::vector<std::uint8_t> q8 = make_blocks(gguf::TensorType::Q8_0, static_cast<std::uint64_t>(kRows) * kN, 4242u);
+    bbqd::Plane plane;
+    plane.type_raw  = static_cast<std::uint32_t>(gguf::TensorType::Q8_0);
+    plane.n_rows    = kRows;
+    plane.row_elems = kN;
+    plane.bytes     = std::span<const std::uint8_t>(q8);
+    std::vector<float> via_plane(kRows, 0.f), via_loose(kRows, 0.f);
+    REQUIRE(bbqd::gemv_plane<1, true>(plane, xq, via_plane.data()));
+    REQUIRE(bbqd::gemv_plane<1, true>(plane.type_raw, plane.bytes, kRows, kN, xq, via_loose.data()));
+    REQUIRE(via_plane == via_loose);
+}
+
+TEST_CASE("bbqd (O12, AGENTS.md S9): the Q8_0 fast kernel on REAL Q8_0 shard bytes matches the double reference",
+          "[backbonequant][q8fast]") {
+    const auto picks = find_real_picks();
+    bool ran = false;
+    for (const RealPick& pk : picks) {
+        if (pk.info.type_raw != static_cast<std::uint32_t>(gguf::TensorType::Q8_0)) continue;
+        const int row_elems = static_cast<int>(pk.info.dims[0]);
+        const std::vector<std::uint8_t> raw = read_tensor_bytes(pk);
+        REQUIRE_FALSE(raw.empty());
+        const int rows = std::min(64, static_cast<int>(pk.info.dims[1]));
+        std::mt19937 rng(20260929);
+        std::normal_distribution<float> normal(0.f, 1.f);
+        std::vector<float> x(static_cast<std::size_t>(row_elems));
+        for (float& v : x) v = normal(rng);
+        bbqd::ActBlocks xq;
+        xq.quantize(x.data(), row_elems);
+        std::vector<float> fast(static_cast<std::size_t>(rows));
+        REQUIRE(bbqd::gemv_plane<1, true>(pk.info.type_raw, std::span<const std::uint8_t>(raw), rows, row_elems, xq, fast.data()));
+        for (int r = 0; r < rows; ++r) {
+            const Q8Ref d = q8_reference(raw.data() + static_cast<std::size_t>(r) * static_cast<std::size_t>(row_elems / 32) * 34, row_elems / 32, xq);
+            INFO("tensor " << pk.info.name << " row " << r);
+            REQUIRE(std::fabs(static_cast<double>(fast[static_cast<std::size_t>(r)]) - d.value) <= 1e-5 * d.abs_sum);
+        }
+        ran = true;
+    }
+    if (!ran) WARN("no real Q8_0 shard tensor found (checked " << real_gguf_dir() << ") -- skipping the real-byte case");
+}
+
 // --- mutation check (documented here rather than left as a committed always-on case; see this file's ---
 // --- own header comment, and AGENTS.md's "regression test on a reproducible bug") ----------------------
 //

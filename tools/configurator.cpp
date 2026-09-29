@@ -661,6 +661,10 @@ int main(int argc, char** argv) {
     // per-256 ActSuper kernel (bbqd::gemv_plane_super) instead of the per-32 ActBlocks path. 0 = off
     // (default, today's per-32 path, bit-exact).
     int backbone_act_super = -1;   // -1 = auto
+    // O12 (docs/optimization/opportunities/O12_q8_fast.md): the Q8_0 roles (Gated Residual down/up, the
+    // shared expert's down projection) use the vector-accumulator Q8_0 kernel. NOT bit-exact (float sum
+    // reassociated), so it is gated on G-PPL. Auto currently resolves OFF -- see resolve_decode_defaults.
+    int backbone_q8_fast = -1;     // -1 = auto
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
     // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
@@ -854,6 +858,15 @@ int main(int argc, char** argv) {
                    "the existing bf16 path. Requires a valid <model_path>.bbq S0B1 sidecar when 1. "
                    "0 = off (existing decode behavior). -1 = auto (default): on for a "
                    "--moe-quant-experts 1 build with --tie-embeddings 0 (the real-model configuration).")
+       ->capture_default_str()->check(CLI::Range(-1, 1));
+    app.add_option("--backbone-q8-fast", backbone_q8_fast,
+                   "O12 (docs/optimization/opportunities/O12_q8_fast.md): every --backbone-quant-dot role "
+                   "whose real sidecar plane is Q8_0 (Gated Residual down/up, the shared expert's down "
+                   "projection) uses a vector-accumulator kernel that folds four 32-weight blocks per step "
+                   "and does one horizontal reduction per row, instead of one per block. NOT bit-exact "
+                   "(the float sum is reassociated) -- gated on end-to-end perplexity "
+                   "(docs/optimization/kpi_gates.json G-PPL). Requires --backbone-quant-dot 1. 0 = off "
+                   "(the per-block path, bit-exact). -1 = auto (default): currently off pending review.")
        ->capture_default_str()->check(CLI::Range(-1, 1));
     app.add_option("--backbone-act-super", backbone_act_super,
                    "O9 (docs/BACKBONE_NATIVE_QUANT.md S14): every --backbone-quant-dot role whose real "
@@ -1074,6 +1087,9 @@ int main(int argc, char** argv) {
         resolve(decode_omp_spin, quant_inference);
         resolve(backbone_quant_dot, quant_inference && tie_embeddings == 0);
         resolve(backbone_act_super, backbone_quant_dot != 0);
+        // O12: not yet promoted, so auto resolves OFF. To promote it once its G-PPL and throughput gates
+        // are reviewed, change `false` to `backbone_quant_dot != 0` (the same shape as act_super above).
+        resolve(backbone_q8_fast, false);
         // 8 = this host's P-core count, the measured best for both teams (O8 S8: 8 beat 12 and 16 once
         // E-cores join), capped at the machine's hardware threads on a smaller host.
         // TODO(decode-threads-topology): derive from the P-core count once Sub0Llm has a topology probe.
@@ -1101,6 +1117,12 @@ int main(int argc, char** argv) {
         std::println(stderr, "configure error: --backbone-act-super requires --backbone-quant-dot 1 -- "
                              "there is no native backbone plane to compute the fused super kernel "
                              "against otherwise");
+        return 1;
+    }
+    // O12: no Q8_0 native plane exists to run the fast kernel on without the backbone sidecar.
+    if (backbone_q8_fast && !backbone_quant_dot) {
+        std::println(stderr, "configure error: --backbone-q8-fast requires --backbone-quant-dot 1 -- "
+                             "there is no native Q8_0 backbone plane to run the fast kernel on otherwise");
         return 1;
     }
     // Tied embeddings: GPU support landed (launch_tied_head/launch_tied_head_bwd in backend_cuda.cu,
@@ -1927,6 +1949,11 @@ int main(int argc, char** argv) {
     // (to within the measured activation-quantization tolerance, docs/BACKBONE_NATIVE_QUANT.md S14e)
     // under either setting.
     cos << "constexpr bool BACKBONE_ACT_SUPER = " << (backbone_act_super ? "true" : "false") << ";\n";
+    // O12 (docs/optimization/opportunities/O12_q8_fast.md): the vector-accumulator Q8_0 kernel selector.
+    // Inference arithmetic only, same classification as BACKBONE_ACT_SUPER: no model shape or checkpoint
+    // identity changes, so it does NOT join ARCH_FINGERPRINT/PARAM_FLOATS (AGENTS.md S10) -- the same
+    // sidecar and model load and compute correctly (to within float reassociation) under either setting.
+    cos << "constexpr bool BACKBONE_Q8_FAST = " << (backbone_q8_fast ? "true" : "false") << ";\n";
     // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
     cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
     cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";
