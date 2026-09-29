@@ -321,4 +321,12 @@ if(SUB0_STORAGE_TIEREDCACHE)
   target_link_libraries(sub0_storage_tiered_cache_tests PRIVATE
     Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache Catch2::Catch2WithMain)
   catch_discover_tests(sub0_storage_tiered_cache_tests)
+
+  # tests/moe_io_mempage_tests.cpp: S1b step 4 (docs/STORAGE_STACK_PLAN.md) -- the MemPage routed-MoE
+  # plane adapter (include/sub0/moe_io_mempage.hpp) against positional reads and moeio::PlaneIo, before
+  # anything in src/ consumes it. MemPage only: variable plane shapes do not go through TieredCache.
+  add_executable(sub0_storage_moe_io_tests moe_io_mempage_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_mempage.cpp")
+  target_include_directories(sub0_storage_moe_io_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  target_link_libraries(sub0_storage_moe_io_tests PRIVATE Sub0MemPage::Sub0MemPage Catch2::Catch2WithMain)
+  catch_discover_tests(sub0_storage_moe_io_tests)
 endif()

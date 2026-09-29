@@ -958,3 +958,20 @@ for the neutral build/test, kernel bench and a real-artifact `--stage ppl` run (
 branches/PRs and exact-head lower CI. Updated `docs/STORAGE_STACK_PLAN.md` and sibling delivery plans:
 S1a fixture complete; next S1b CPU MoE byte adapter, S1c model wiring still open. No engine files,
 builds, measurements, merges or pushes. Unrelated performance-tool edits left untouched.
+
+**2026-09-29 Codex — S1b implementation, active.** Owns new MemPage MoE adapter/tests,
+`src/backends/cpu/{internal.hpp,backend.cpp,decode.cpp}`, `tools/configurator.cpp`,
+CMake storage wiring and storage-plan validation notes. Correctness builds in a separate S1b build
+folder; performance timing only after a fresh contention check. Existing dirty optimization scripts,
+KPI JSON and optimization-process notes are outside this package and remain untouched.
+
+**2026-09-29 Claude Code — S1b handoff (paused, NOT built/tested yet).** Continues the Codex S1b entry above.
+State: `include/sub0/moe_io_mempage.hpp` + `src/moe_io_mempage.cpp` (adapter, API checked against MemPage
+pin 213acdd; includes tidied); new `tests/moe_io_mempage_tests.cpp` (4 cases: exact bytes vs ifstream AND
+`PlaneIo` oracle with dups/reverse waits/EOF plane, retire-before-reuse, pre-submit validation, session
+repeat + close-with-batch-outstanding); new `sub0_storage_moe_io_tests` target inside the
+`SUB0_STORAGE_TIEREDCACHE` block of `tests/CMakeLists.txt`. Pinned detached worktrees made at
+`<scratchpad 4ad183c8…>/pins/{Sub0MemPage,Sub0TieredCache}` for FETCHCONTENT_SOURCE_DIR_*.
+Next: configure `out/build/s1b` (-DSUB0_STORAGE_TIEREDCACHE=ON, FETCHCONTENT_FULLY_DISCONNECTED=ON) and
+build/run that target; then real S0Q1 sidecar descriptors, cpp-review, decode wiring (plan step 5).
+No engine files (`src/backends/cpu/*`, configurator) touched yet.
