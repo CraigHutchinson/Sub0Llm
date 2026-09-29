@@ -953,3 +953,8 @@ overlap (AGENTS.md's own preamble).
 (`mix` template flag), `src/backends/cpu/decode.cpp` (GR + `compute_shared`), `tools/configurator.cpp` (new
 `--backbone-q8-fast`, auto-resolves OFF), bench, tests, new `opportunities/O12_q8_fast.md`. Will hold the CPU
 for the neutral build/test, kernel bench and a real-artifact `--stage ppl` run (perf-sensitive).
+
+**2026-09-29 Codex — storage coordination refresh, done.** Fetched all three projects, audited
+branches/PRs and exact-head lower CI. Updated `docs/STORAGE_STACK_PLAN.md` and sibling delivery plans:
+S1a fixture complete; next S1b CPU MoE byte adapter, S1c model wiring still open. No engine files,
+builds, measurements, merges or pushes. Unrelated performance-tool edits left untouched.

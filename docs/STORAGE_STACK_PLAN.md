@@ -129,7 +129,7 @@ work package. Dependency pins advance only after consumer CI is green.
 
 ## Current checkpoint
 
-Updated 2026-09-26. **S1 (Llm side) is done** -- see "S1 acceptance manifest (Llm side)" below. Llm's
+Updated 2026-09-29. **S1a (E1 adapter fixture) is done; S1b/E2 and S1c/model wiring remain** -- see "S1 acceptance manifest (Llm side)" below. Llm's
 adoption is still test-only: `tests/ngram_tiered_storage_tests.cpp` and its own
 `include/sub0/ngram_tiered_storage.hpp` adapter are the only things in the tree that depend on
 Sub0TieredCache/Sub0MemPage, gated behind the default-OFF `SUB0_STORAGE_TIEREDCACHE` CMake option --
@@ -153,85 +153,80 @@ supports plain HTTP only. No timing claim exists in any of the three repositorie
 
 | Slice | Status |
 |---|---|
-| S0 contract/fixtures | **Lower layers done**: MemPage M2 plus the fake backend, and the TieredCache T0 oracle. The Llm-side E1–E5 fixture shapes are still unwritten; E1 is being written first, in S1. |
-| S1 local CPU vertical slice | **Done**, both halves: MemPage M3 slice 1 and TieredCache T1 run on real MemPage at the pins above; Llm's E1 fixture, adapter (`include/sub0/ngram_tiered_storage.hpp`) and resident-reference comparison are merged behind `SUB0_STORAGE_TIEREDCACHE` (default OFF). See "S1 acceptance manifest (Llm side)" below. E2's byte adapter is not started -- E1 only. |
+| S0 contract/fixtures | **Lower layers done**: MemPage M2 plus the fake backend, and the TieredCache T0 oracle. Llm E1 is implemented in S1a; E2–E5 fixtures remain to be written. |
+| S1 local CPU vertical slice | **Partial: S1a E1 fixture done**: MemPage M3 slice 1 and TieredCache T1 run on real MemPage at the pins above; Llm's E1 fixture, adapter (`include/sub0/ngram_tiered_storage.hpp`) and resident-reference comparison are merged behind `SUB0_STORAGE_TIEREDCACHE` (default OFF). See "S1 acceptance manifest (Llm side)" below. E2's byte adapter is not started -- E1 only. |
 | S2–S5 | Not started. T3 remote code exists early; see above. |
 
-### Next: S1 on the Sub0Llm side (handoff for a local session)
+### Next: S1b routed-MoE byte adapter
 
-The steps are the "Joined-up development sequence" S1 row, applied to E1. None of it has landed in
-Sub0Llm yet: a cloud session studied the APIs and stopped before writing code.
+Refreshed 2026-09-29. The E1 row fixture is complete; the former instructions to implement it
+were stale. S1 is **partially complete against its original acceptance**: E2 is absent and E1 model
+output parity still needs engine wiring. Keep the historical E1 test evidence below, without treating
+17 assertions as end-to-end model acceptance.
 
-1. **Coordinate.** Check `docs/ACTIVE_WORK_LOG.md` and add a row for the files below. The 2026-09-26
-   entry released the host and lists no active storage/ngram work. Take no performance measurements
-   for S1; correctness only. Any later timing follows `OPTIMIZATION_PROCESS.md` on the dedicated machine.
-2. **E1 fixture (Llm owns it; see "Shared fixture and change protocol").** A small, deterministic,
-   generated external table, written to a temp file by the test:
-   - row count;
-   - source dtype bf16, output dtype f32 (width x2);
-   - row width in elements;
-   - an ordered request of row IDs with duplicates and non-monotonic order, including row 0 and the
-     last row;
-   - an out-of-range ID case that must fail as a whole (all-or-nothing);
-   - an expected-bytes oracle derived from the generator formula, never from the adapter;
-   - source hash, generation and extents.
+The next implementation package is **S1b: route the existing optional CPU MoE pipelined read path
+through MemPage**, first proving the adapter independently, then wiring the same adapter into decode.
+It needs no GPU, remote mirror or new cache policy. This exercises the real encoded-plane workload
+before adding GPU transport to an unconsumed interface.
 
-   Mirror the real Qwen4 shape in miniature, 16 rows per position with 160 elements per row (see
-   `NGRAM_TABLE_TIERED_STORAGE.md` §0 and `tests/fixtures/qwen4_preview/ngram_embedding_manifest.json`),
-   but keep the row count small.
-3. **Resident reference.** The existing resident path is the plain branch of `op_embed` in
-   `src/backends/cpu/backend.cpp`: `o[t, j] = tab[ids[t] * C + j]` over a row-major table. The
-   `ParamCPtr` read widens bf16 through `sub0::bf16_widen` in `include/sub0/bf16.hpp`. `op_embed` is a
-   `static` function inside the engine, so there are two options:
-   - re-express the plain gather engine-free, as `tests/ngram_qwen4_fixture_tests.cpp` already does for
-     the concat convention, and state that choice;
-   - or expose a small shared gather so the reference is the engine's own code. This option touches
-     `backend.cpp` (a shared file), so coordinate first.
+1. **Publishable baseline.** Llm's S1 merge is local, absent from origin/main. Review and publish the
+   intended local commit range through the normal integration workflow before advertising a remote
+   reproducible three-repository release. Do not push the entire ahead-of-origin stack merely to publish
+   storage work. Lower dependency pins already match their published main branches and need no bump.
+2. **Trace current consumers.** Use `moeio::PlaneIo` (`include/sub0/moe_io.hpp`),
+   `ParallelExperts::prefetch`, `g_moe_decode_io`, `g_moe_io_stage` and `resolve_from_bytes` in CPU
+   decode/internal headers as the wiring points. Check current O8 row-split behavior and native-quant
+   consumers before editing: the original 2026-09-25 seam has evolved. Coordinate shared files and CPU
+   time in ACTIVE_WORK_LOG first. Preserve the existing reader as the comparison implementation.
+3. **Prove the byte adapter.** Llm owns sidecar identity/descriptors, expert selection and plane extents.
+   Register a bounded `LocalFileBackend` and explicit-destination `TransferSet` once. Preallocate claims,
+   tickets and raw staging for the known selected-expert batch. Retain each claim through its last
+   dequantization or native-quant consumer, including parallel workers. Destruction drains before freeing
+   buffers/backend. MemPage never writes decoded `ExpertCache` storage. Do not route variable plane
+   shapes through TieredCache's fixed-width table contract just to force a three-layer dependency.
+4. **Acceptance before wiring.** Deterministic three-plane files plus real S0Q1 sidecar descriptors:
+   exact bytes versus independent positional reads; selected order/duplicates; extent/overflow and short
+   read failures; queue exhaustion; delayed/out-of-order completion; cancellation/drain; repeated sessions;
+   no request-time allocation or reuse before the last reader. Compare decoded and fused outputs with
+   current `moeq::Store`/reader oracles. Record real artifact identity/hash; synthetic-only does not close
+   interop. Raise a minimal lower test for any missing guarantee before changing the adapter.
+5. **Wire and qualify.** Consume the tested adapter in the existing optional pipelined CPU path;
+   follow the configurator for any evaluated transport choice and keep the old default until measured.
+   No speculative standalone CLI. Run default before/after exact counts, full enabled suite, Windows and
+   Linux correctness, real-model output/quality checks and C++ review. Measure current reader versus
+   adapter under equal raw/decoded budgets, warm/cold conditions and uncontended trials using the
+   optimization protocol. Treat portable workers versus IOCP as an implementation difference to measure,
+   not an assumed speedup. Proven recommendations become scoped AUTO defaults per AGENTS.md section 4.
+6. **Close the slice explicitly.** Record exact three SHAs, fixture hashes, counts/skips, output parity,
+   memory peaks and performance evidence. S1b completion does not imply E1 frozen-table model wiring.
+   The latter remains S1c, requiring a real frozen imported-table consumer while mutable tables stay in
+   engine arenas. M4/T2 staged CUDA is S2 after CPU consumer lifetime requirements are demonstrated.
 
-   Compare the adapter byte-for-byte against the reference and the generator oracle. Model-output
-   parity (E1's second acceptance clause) needs engine wiring and is a later step. Trainable ngram
-   tables (`ngram_tab`) stay in engine arenas and are not replaced.
-4. **Thin adapter.** Build it over `sub0tieredcache::Table`:
-   - `Representation::bf16_to_f32` with `source_row_bytes = width * 2` and
-     `output_row_bytes = width * 4`;
-   - `FlatFileResolver` plus `register_local_file_shard` on a caller-owned
-     `sub0mempage::LocalFileBackend`;
-   - `resolve_into(rows, leases)` in request order, then copy each lease's bytes into the caller's
-     preallocated output (AGENTS.md §1: size the lease and output buffers once, outside the per-call
-     path).
+TieredCache work for this package is contract regression/feedback, not a redundant MoE wrapper:
+re-run its pinned standalone row tests if MemPage semantics change. R18 overlap enforcement must account
+for TieredCache's retiring/current bindings sharing storage with exclusive per-range claims; do not add
+an allocation-wide rejection that breaks this existing invalidation pattern. A missing lower guarantee
+blocks its consumer, and is fixed/tested below before dependency pins advance.
 
-   Relevant API facts:
-   - `TableConfig` needs `output_storage` sized `budget_rows * output_row_bytes`, `scratch_storage`
-     sized `scratch_rows * source_row_bytes`, and nonzero `max_tickets` and `max_batch_rows`.
-   - `LocalFileBackend::create(LocalFileBackendConfig{.workers, .queue_capacity, .max_sources})`.
-   - Duplicate rows in one call get separate leases on one slot and cause exactly one fetch; check this
-     with `Table::stats().fetches` and `.coalesced`.
-5. **Default-off build toggle, no default dependency.** Add a CMake option, for example
-   `SUB0_STORAGE_TIEREDCACHE`, default OFF. It is a build-dependency switch and not a model capability,
-   so it follows the `SUB0_BUILD_SPIKE_TESTS` pattern rather than a configurator `constexpr`. When ON,
-   it `FetchContent`s both repositories at the full SHAs above and builds a separate test target; no
-   existing target changes. Integration pitfalls found while reading the lower `CMakeLists.txt` files:
-   - When Sub0TieredCache is a subproject, its `CMakeLists.txt` does **not** fetch or link Sub0MemPage.
-     Sub0Llm must bring in Sub0MemPage itself at `213acdd` and link `Sub0MemPage::Sub0MemPage`.
-   - Set `SUB0MEMPAGE_BUILD_TESTING=OFF` and `SUB0TIEREDCACHE_BUILD_TESTING=OFF` before
-     `FetchContent_MakeAvailable`. Sub0MemPage builds its tests even as a subproject when that option
-     is ON.
-   - For offline builds, support `FETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE`,
-     `FETCHCONTENT_SOURCE_DIR_SUB0TIEREDCACHE` and `FETCHCONTENT_FULLY_DISCONNECTED=ON`.
-   - Both libraries are C++23 header-only interface targets. On Windows, Sub0TieredCache links
-     `ws2_32`.
-6. **Gates** (AGENTS.md §4, §10, §12):
-   - Rebuild the unmodified default configuration and confirm `sub0_tests` and `sub0_frontend_tests`
-     assertion/case counts are identical. The latest recorded baselines are 29,510,661/147 and
-     208,910/293 (ACTIVE_WORK_LOG O5 2b-3). Re-record them on the local machine before the change.
-   - Run the new target with the toggle ON on Windows and Linux.
-   - Run a `cpp-review` pass over the diff.
-   - Write an S1 acceptance manifest recording the three SHAs, contract S1, fixture hash, compilers,
-     OS and test counts.
+### Remote, branches and evidence snapshot (2026-09-29)
+
+| Repository | Local / published state | PR and CI evidence |
+|---|---|---|
+| Sub0MemPage | main/origin main `213acdd`; `feature/usm-plan-groundwork` has two unmerged historical commits (`bd1fe75`, `b26b93a`), not an automatic merge candidate | [PR 1 merged](https://github.com/CraigHutchinson/Sub0MemPage/pull/1); [CI green at pinned head](https://github.com/CraigHutchinson/Sub0MemPage/actions/runs/36129269678) |
+| Sub0TieredCache | main/origin main `e4da6a7`; cloud branch equals main | [PR 1](https://github.com/CraigHutchinson/Sub0TieredCache/pull/1) and [PR 2](https://github.com/CraigHutchinson/Sub0TieredCache/pull/2) merged; [CI green at pinned head](https://github.com/CraigHutchinson/Sub0TieredCache/actions/runs/36132307886) |
+| Sub0Llm | local main `9ac5e05`, 46 commits ahead of origin/main `56ec59f` before this doc update; S1 merge `a320b06`, follow-up `7641aad` included locally | No open PRs or Actions runs returned; S1 evidence below is recorded local validation, not fresh remote CI |
+
+All remotes fetched with prune and open PRs checked again after the session interruption. No open PRs
+in any repository. No merge, push, branch deletion or worktree cleanup is part of this coordination pass.
+Llm's S1 worktree branch and remote storage handoff branch are already ancestors of local main. O12
+also landed locally during this audit. Remaining historical B39/O5/archive branches require their own
+owner review; branch divergence alone does not establish missing implementation. The Intel branch
+likewise needs a diff/evidence review against current M1/M5 before reuse; it does not block S1b.
+Unrelated dirty performance-tool files were present at the resumed snapshot and are excluded.
 
 ### S1 acceptance manifest (Llm side) -- DONE 2026-09-26
 
-Steps 1-6 above, completed. Adapter: `include/sub0/ngram_tiered_storage.hpp`
+Historical S1a fixture steps completed; this manifest does not certify the new S1b package above. Adapter: `include/sub0/ngram_tiered_storage.hpp`
 (`sub0::storage::NgramTieredAdapter`, isolated -- nothing in `src/`/`tools/` includes it). Test:
 `tests/ngram_tiered_storage_tests.cpp` (2 cases, 17 assertions). Build toggle:
 `SUB0_STORAGE_TIEREDCACHE` (default OFF), `tests/CMakeLists.txt`.
@@ -256,6 +251,6 @@ Steps 1-6 above, completed. Adapter: `include/sub0/ngram_tiered_storage.hpp`
 | Boy-scout fix (pre-existing, found while bringing up the Linux run) | Root `CMakeLists.txt` applied Clang's `-fconstexpr-steps` unconditionally under `if(NOT MSVC)`, which fails outright on GCC (`unrecognized command-line option`) for every TU in the tree. Scoped to `$<CXX_COMPILER_ID:Clang>`; verified a no-op for the existing Clang/Windows build (both suites reproduce exactly) and verified positively unblocking the WSL/GCC 15 configure+build |
 | Not verified this pass | E2 (routed-MoE byte adapter), model-output parity (E1's second acceptance clause -- needs engine wiring, a later step), macOS, any accelerator path |
 
-Slice status: **S1 done** (both halves). Next: E2's byte adapter, then Stage 3 engine wiring
+Slice status: **S1a fixture done; overall S1 partial**. Next: S1b E2's byte adapter, then S1c engine wiring
 (`docs/NGRAM_TABLE_TIERED_STORAGE.md` sec 5) once a real consumer is ready to depend on
 `ngram_tiered_storage.hpp` from `src/`.
