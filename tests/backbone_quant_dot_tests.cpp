@@ -989,6 +989,64 @@ TEST_CASE("bbqd (O5 phase 2b-3 phase B): gemv_plane's row-range selection reprod
     }
 }
 
+// --- O9 (docs/BACKBONE_NATIVE_QUANT.md, this pass; docs/optimization/opportunities/O9_act_super.md) ---
+// --- the Plane-overload seam every gdn::Native/qsa::Native consumer calls through, plus super_ok. -----
+
+TEST_CASE("bbqd (O9): gemv_plane_super(Plane, ...) agrees EXACTLY with the loose-parameter overload "
+          "on the same bytes",
+          "[backbonequant]") {
+    constexpr int kN = 2560, kRows = 11;
+    const std::vector<float> x = lossless_row(kN, 909090);
+    bbqd::ActSuper xq;
+    xq.quantize(x.data(), kN);
+
+    for (const gguf::TensorType type : kSuperFormats) {
+        INFO("format " << format_name(type));
+        const auto raw_t = static_cast<std::uint32_t>(type);
+        const std::vector<std::uint8_t> raw = make_blocks(type, static_cast<std::uint64_t>(kRows) * kN,
+                                                           7070u + raw_t);
+        std::vector<float> via_loose(kRows, -1.f), via_plane(kRows, -2.f);
+        REQUIRE(bbqd::gemv_plane_super<1>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
+                                          via_loose.data()));
+        const bbqd::Plane p{raw_t, kRows, kN, std::span<const std::uint8_t>(raw)};
+        REQUIRE(bbqd::gemv_plane_super<1>(p, xq, via_plane.data()));
+        for (int r = 0; r < kRows; ++r) {
+            INFO("row " << r);
+            REQUIRE(via_loose[static_cast<std::size_t>(r)] == via_plane[static_cast<std::size_t>(r)]);
+        }
+        // Row-range parameters carry through identically too.
+        std::vector<float> loose_range(kRows, -3.f), plane_range(kRows, -4.f);
+        REQUIRE(bbqd::gemv_plane_super<1>(raw_t, std::span<const std::uint8_t>(raw), kRows, kN, xq,
+                                          loose_range.data() + 3, 3, kRows));
+        REQUIRE(bbqd::gemv_plane_super<1>(p, xq, plane_range.data() + 3, 3, kRows));
+        for (int r = 3; r < kRows; ++r) {
+            INFO("row " << r);
+            REQUIRE(loose_range[static_cast<std::size_t>(r)] == plane_range[static_cast<std::size_t>(r)]);
+        }
+    }
+}
+
+TEST_CASE("bbqd (O9): super_ok() is the exact conjunction of \"xs is non-null\" and super_fusable(), "
+          "never assuming a format from the caller",
+          "[backbonequant]") {
+    bbqd::ActSuper xq;
+    xq.quantize(lossless_row(256, 42).data(), 256);
+
+    for (const gguf::TensorType type : kFormats) {
+        INFO("format " << format_name(type));
+        const bbqd::Plane p_aligned{static_cast<std::uint32_t>(type), 4, 256, {}};
+        const bbqd::Plane p_unaligned{static_cast<std::uint32_t>(type), 4, 96, {}};   // not a multiple of 256
+        const bool expect_aligned = (type != gguf::TensorType::Q8_0);   // super_fusable's own contract
+        REQUIRE(bbqd::super_ok(p_aligned, &xq) == expect_aligned);
+        REQUIRE_FALSE(bbqd::super_ok(p_unaligned, &xq));   // 96 % 256 != 0, refused regardless of format
+        // A null scratch pointer (the "BACKBONE_ACT_SUPER off, or this build never wired one" case,
+        // gdn::Native's/qsa::Native's own default) refuses unconditionally, even for an otherwise-
+        // eligible plane -- this is the exact mechanism that makes the O9 toggle's default-off state a
+        // no-op at every call site under this pass.
+        REQUIRE_FALSE(bbqd::super_ok(p_aligned, nullptr));
+    }
+}
+
 // --- mutation check (documented here rather than left as a committed always-on case; see this file's ---
 // --- own header comment, and AGENTS.md's "regression test on a reproducible bug") ----------------------
 //

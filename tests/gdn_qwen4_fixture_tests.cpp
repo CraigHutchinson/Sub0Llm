@@ -25,8 +25,11 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <random>
+#include <span>
 #include <vector>
 
 #ifdef SUB0_SOURCE_DIR
