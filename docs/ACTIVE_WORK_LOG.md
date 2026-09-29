@@ -930,7 +930,7 @@ next steps, not silently dropped.
 - Correction to the S1 dispatch note: the lower repos' checkouts were *behind* the pins at dispatch, not
   ahead. A fast-forward pull moved both to the pinned merge commits. Nothing was lost.
 
-**2026-09-29 Claude Code (subagent) -- O9 STARTED, status: active.** ISOLATED worktree
+**2026-09-29 Claude Code (subagent) -- O9 BUILT, status: done (awaiting primary-agent review/merge; G-PPL PASS, see opportunities/O9_act_super.md).** ISOLATED worktree
 (`.claude/worktrees/agent-a208ab6f13e379618`), branch `worktree-agent-a208ab6f13e379618`, ff-merged to
 `main` @ `155c6a7` at dispatch -- no shared-tree file contention. Files/areas: `include/sub0/
 backbone_quant_dot.hpp` (a small Plane-overload + `super_ok` helper, no kernel changes), `include/sub0/

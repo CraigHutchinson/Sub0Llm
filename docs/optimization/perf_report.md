@@ -1,13 +1,12 @@
 # Sub0Llm performance report
 
-Generated 2026-09-26T21:29:26Z -- label `O8-threads-2`
+Generated 2026-09-29T09:16:03Z -- label `O9`
 
 ## Gate panel
 
 | Gate | Detail | Value | Status |
 |---|---|---|---|
-| `G-PPL` | t12 vs t16, 2418 tokens | +0.0000 nats/token (95% CI +0.0000..+0.0000), ppl x1.0000, top-1 agree 100.0% | PASS |
-| `G-PPL` | t8 vs t16, 2418 tokens | +0.0000 nats/token (95% CI +0.0000..+0.0000), ppl x1.0000, top-1 agree 100.0% | PASS |
+| `G-PPL` | base vs super, 2418 tokens | +0.0098 nats/token (95% CI -0.0122..+0.0318), ppl x1.0099, top-1 agree 86.6% | inconclusive |
 | `G-HASH` | neutral-build decode fingerprint unchanged | n/a | n/a |
 | `G-SUITE-ENGINE` | sub0_tests assertion count | n/a | n/a |
 | `G-SUITE-FRONTEND` | sub0_frontend_tests assertion count | n/a | n/a |
@@ -19,8 +18,7 @@ Generated 2026-09-26T21:29:26Z -- label `O8-threads-2`
 
 | Arm | Perplexity | Mean NLL | Top-1 | Decode tok/s |
 |---|---:|---:|---:|---:|
-| t16 | 14.8488 | 2.6979 | 0.4864 | 4.85 |
-| t12 | 14.8488 | 2.6979 | 0.4864 | 5.49 |
-| t8 | 14.8488 | 2.6979 | 0.4864 | 5.15 |
+| super | 14.7035 | 2.6881 | 0.4876 | 7.13 |
+| base | 14.8488 | 2.6979 | 0.4864 | 5.34 |
 
 History: `perf_history.jsonl`. Policy: `docs/OPTIMIZATION_PROCESS.md`.
