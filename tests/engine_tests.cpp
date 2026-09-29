@@ -583,6 +583,7 @@ TEST_CASE("kv_decode_generate stops before pushing EOS (never emits <|endoftext|
 // check is the one that actually failed before the fix -- asserting only the text would have passed on any
 // renderer that happened to print something, while the ids stayed indistinguishable.
 TEST_CASE("vocab: the EOS marker renders as itself, not as a wrapped NUL byte", "[engine][tokenizer]") {
+    if (*sub0::default_tokenizer() == '\0') SKIP("external-vocabulary build: no tokenizer.tok emitted");
     REQUIRE(sub0::load_tokenizer(sub0::default_tokenizer()));
     const std::vector<sub0::TokenEntry> rows = sub0::vocab_entries();
     REQUIRE(rows.size() > static_cast<std::size_t>(sub0::casing::TOK_EOS));

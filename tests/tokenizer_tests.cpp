@@ -16,20 +16,24 @@
 
 namespace {
 
-// Load the generated tokenizer once for the whole suite.
-bool tokenizer_ready() {
+// Load the generated tokenizer once for the whole suite. An external-vocabulary build (--vocab-exact)
+// emits no tokenizer.tok and bakes an empty DEFAULT_TOKENIZER: there is no contract to test, so skip
+// rather than fail on "cannot open ''". A statement, not a bool for REQUIRE(...): SKIP throws, and a
+// throw inside a REQUIRE expression is reported as an unexpected exception under CATCH_CONFIG_FAST_COMPILE.
+void require_tokenizer() {
+    if (*sub0::default_tokenizer() == '\0') SKIP("external-vocabulary build: no tokenizer.tok emitted");
     static const bool ok = sub0::load_tokenizer(sub0::default_tokenizer());
-    return ok;
+    REQUIRE(ok);
 }
 
 }  // namespace
 
 TEST_CASE("tokenizer loads from the generated artifact", "[tokenizer]") {
-    REQUIRE(tokenizer_ready());
+    require_tokenizer();
 }
 
 TEST_CASE("encode emits in-range ids and detokenizes back to lowercase text", "[tokenizer]") {
-    REQUIRE(tokenizer_ready());
+    require_tokenizer();
     const std::string text = "the little cat sat on the mat.";
 
     const std::vector<int> ids = sub0::encode(text);
@@ -42,7 +46,7 @@ TEST_CASE("encode emits in-range ids and detokenizes back to lowercase text", "[
 }
 
 TEST_CASE("truecasing preserves capitalization through the round-trip", "[tokenizer]") {
-    REQUIRE(tokenizer_ready());
+    require_tokenizer();
     // A capitalized name, a sentence-initial capital and an all-caps word all
     // collapse to a lowercase base form plus a marker, then re-expand exactly.
     const std::string text = "Lily went to the park. SHE was very happy!";
@@ -50,7 +54,7 @@ TEST_CASE("truecasing preserves capitalization through the round-trip", "[tokeni
 }
 
 TEST_CASE("case markers stay atomic so the word token is case-shared", "[tokenizer]") {
-    REQUIRE(tokenizer_ready());
+    require_tokenizer();
     // The point of truecasing: "They" must encode as a standalone <|cap|> marker
     // followed by the *same* token sequence as lowercase "they". If BPE were allowed
     // to merge the marker into the word, "They" would get its own token and the tail
@@ -91,7 +95,7 @@ TEST_CASE("word_unit_end keeps contractions and accented words whole", "[casing]
 }
 
 TEST_CASE("typographic input round-trips through the build tokenizer", "[tokenizer]") {
-    REQUIRE(tokenizer_ready());
+    require_tokenizer();
     long r = 0;
     const std::string in = "\xE2\x80\x9C" "I don\xE2\x80\x99t\xE2\x80\x9D";  // “I don’t”
     REQUIRE(sub0::detokenize(sub0::encode(in)) == sub0::casing::normalize_text(in, r));
@@ -159,7 +163,7 @@ TEST_CASE("a name that shadows a noun still case-collapses, and stays distinguis
 }
 
 TEST_CASE("encode is deterministic", "[tokenizer]") {
-    REQUIRE(tokenizer_ready());
+    require_tokenizer();
     const std::string text = "the dog ran and the cat slept";
     REQUIRE(sub0::encode(text) == sub0::encode(text));
 }

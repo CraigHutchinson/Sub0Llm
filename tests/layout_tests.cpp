@@ -36,9 +36,10 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     constexpr int kQsaMixer   = 10;
     // Mixture of Experts (Stage 1, docs/MOE.md S3b): REPLACES the FFN's own kFfnSlots with MoeRouter (1)
     // + NUM_EXPERTS*(MoeGate,MoeUp,MoeDown) + the shared expert's own SwiGLU triple (3) + its gate
-    // projection (1), for EVERY layer (no per-layer schedule -- see USE_MOE's own comment). 0 at the
-    // neutral (NUM_EXPERTS < 2) setting, where kFfnSlots is used unchanged.
-    constexpr int kFfnSlots   = sub0::USE_MOE ? (1 + 3 * NUM_EXPERTS + 3 + 1) : (USE_GATED_FFN ? 3 : 4);
+    // projection (1), for EVERY layer (no per-layer schedule -- see USE_MOE's own comment).
+    // Quantized routed planes live in the sidecar and contribute no arena slots.
+    // At NUM_EXPERTS < 2 the dense kFfnSlots is used unchanged.
+    constexpr int kFfnSlots   = sub0::USE_MOE ? (1 + (sub0::USE_MOE_QUANT ? 0 : 3 * NUM_EXPERTS) + 3 + 1) : (USE_GATED_FFN ? 3 : 4);
     // Gated Residual (Stage 1, docs/GATED_RESIDUAL.md S3b): 4 slots per instance (GrHcNorm/MixDown/
     // MixUp/BlockInject), TWO full instances per layer (attn-wrapping, mlp-wrapping) plus one top-level
     // instance WITHOUT BlockInject (3 slots), appended once regardless of N_LAYERS. Zero at HC_COUNT==0.
@@ -386,13 +387,14 @@ TEST_CASE("Gated DeltaNet layer schedule is correct at two shapes, one of them o
 TEST_CASE("Gated DeltaNet head axes alias the attention axes at their neutral setting", "[layout][gdn]") {
     // (a) The alias identity, for THIS build. GDN_KEY_HEADS.. are emitted RESOLVED by the configurator,
     // so "neutral" is spelled as "the resolved value equals the attention axis it used to alias".
-    if constexpr (GDN_KEY_HEADS == N_KV_HEADS && GDN_VALUE_HEADS == N_HEADS &&
-                  GDN_KEY_HEAD_DIM == D_HEAD && GDN_VALUE_HEAD_DIM == D_HEAD) {
-        STATIC_REQUIRE(sub0::GDN_KEY_DIM   == sub0::D_KV);
-        STATIC_REQUIRE(sub0::GDN_VALUE_DIM == N_HEADS * D_HEAD);
-        // The exact expression layout.hpp carried before this axis existed.
-        STATIC_REQUIRE(sub0::GDN_CONV_DIM == 2 * sub0::D_KV + N_HEADS * D_HEAD);
-    }
+    // The condition is folded into each assertion, not an `if constexpr`: outside a template a discarded
+    // branch is still instantiated, so its static_asserts fired at the real axes (16/48/128/128).
+    constexpr bool kNeutral = GDN_KEY_HEADS == N_KV_HEADS && GDN_VALUE_HEADS == N_HEADS &&
+                              GDN_KEY_HEAD_DIM == D_HEAD && GDN_VALUE_HEAD_DIM == D_HEAD;
+    STATIC_REQUIRE((!kNeutral || sub0::GDN_KEY_DIM   == sub0::D_KV));
+    STATIC_REQUIRE((!kNeutral || sub0::GDN_VALUE_DIM == N_HEADS * D_HEAD));
+    // The exact expression layout.hpp carried before this axis existed.
+    STATIC_REQUIRE((!kNeutral || sub0::GDN_CONV_DIM == 2 * sub0::D_KV + N_HEADS * D_HEAD));
     // (b) GDN_DIMS is the single source of truth the math core consumes; the derived widths must agree
     // with gdn::Dims' own accessors, so a future edit cannot move one without the other.
     STATIC_REQUIRE(sub0::GDN_DIMS.key_dim()   == sub0::GDN_KEY_DIM);
@@ -911,7 +913,7 @@ TEST_CASE("QSA is off by default and inert at the neutral setting", "[layout][qs
     REQUIRE(sub0::QSA_DIMS.n_heads == N_HEADS);
     REQUIRE(sub0::QSA_DIMS.head_dim == D_HEAD);
     REQUIRE(sub0::QSA_DIMS.n_kv_heads == N_KV_HEADS);
-    REQUIRE(sub0::QSA_DIMS.rotary_dim == D_HEAD);
+    REQUIRE(sub0::QSA_DIMS.rotary_dim == ROTARY_DIM);   // == D_HEAD unless partial rotary (real axes: 64)
     // The _BUF forms are never degenerate, so decode-path scratch arrays are always valid bounds.
     REQUIRE(sub0::QSA_DIMS_BUF.idx_n_heads >= 1);
     REQUIRE(sub0::QSA_DIMS_BUF.idx_kv_heads >= 1);
