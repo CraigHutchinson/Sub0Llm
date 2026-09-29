@@ -43,6 +43,10 @@
 // on identical bytes. Q8_0 has no super arm (`bbqd::super_fusable` refuses it by design) and prints
 // "n/a" in those columns.
 //
+// O12 ADDITION (docs/optimization/opportunities/O12_q8_fast.md): for the Q8_0 entry the "super" columns
+// are replaced by `gemv_plane<Threads, /*Q8Fast=*/true>` (the vector-accumulator Q8_0 kernel), timed over
+// the SAME real pool; plus a 1-thread isolation of {old per-block path, fast AVX2, fast VNNI}.
+//
 // Usage: sub0_backbone_quant_dot_bench --gguf <dir> [--seconds N]
 
 #include "sub0/backbone_quant_dot.hpp"
@@ -157,7 +161,7 @@ std::vector<Candidate> find_candidates(const std::vector<Shard>& shards, gguf::T
 /// <= kMaxRowsPerEntry row chunks (possibly several disjoint chunks of the SAME huge tensor) until the
 /// pool's total byte size clears kPoolTargetBytes or candidates run out.
 struct Pool { int row_elems = 0; std::vector<PoolEntry> entries; double total_bytes = 0.0; };
-Pool build_pool(const std::vector<Shard>& shards, gguf::TensorType type) {
+Pool build_pool(const std::vector<Shard>& shards, gguf::TensorType type, std::uint64_t force_row_elems = 0) {
     Pool pool;
     auto cands = find_candidates(shards, type);
     if (cands.empty()) return pool;
@@ -168,6 +172,7 @@ Pool build_pool(const std::vector<Shard>& shards, gguf::TensorType type) {
     int best_votes = 0;
     for (auto& [re, votes] : row_elems_votes)
         if (votes > best_votes) { best_votes = votes; modal_row_elems = re; }
+    if (force_row_elems != 0) modal_row_elems = force_row_elems;   // O12: pick a specific real row width
     pool.row_elems = static_cast<int>(modal_row_elems);
 
     const gguf::BlockSpec spec = gguf::block_spec(static_cast<std::uint32_t>(type));
@@ -246,6 +251,55 @@ double time_native_super_pool(const Pool& pool, std::uint32_t type_raw, const bb
     return el / total_bytes_read;   // seconds per byte -- caller turns this into GB/s and us/row-call
 }
 
+/// O12: the Q8_0 pool timed through `gemv_plane<Threads, true>` (the vector-accumulator kernel).
+template <int Threads>
+double time_native_q8fast_pool(const Pool& pool, std::uint32_t type_raw, const bbqd::ActBlocks& x,
+                               std::vector<float>& out, double min_seconds) {
+    double total_bytes_read = 0.0;
+    const auto t0 = Clock::now();
+    double el = 0.0;
+    do {
+        for (const auto& entry : pool.entries) {
+            const bool ok = bbqd::gemv_plane<Threads, true>(type_raw, entry.bytes, entry.n_rows,
+                                                             pool.row_elems, x, out.data());
+            if (!ok) { std::fprintf(stderr, "error: gemv_plane<,true> refused a real pool entry\n"); std::exit(5); }
+            total_bytes_read += static_cast<double>(entry.bytes.size());
+        }
+        el = secs(t0, Clock::now());
+    } while (el < min_seconds);
+    return el / total_bytes_read;
+}
+
+/// O12, single-thread ONLY: which Q8_0 row kernel -- 0 = the old per-block `gemv_rows<Q8_0Plane,true>`,
+/// 1 = fast AVX2 (`maddubs`), 2 = fast AVX-VNNI (`dpbusd`), 3 = fast AVX-VNNI-INT8 (`dpbssd`) -- called
+/// directly on the pool.
+double time_q8_kernel_1t(int which, const Pool& pool, const bbqd::ActBlocks& x, std::vector<float>& out,
+                         double min_seconds) {
+    double total_bytes_read = 0.0;
+    const auto t0 = Clock::now();
+    double el = 0.0;
+    do {
+        for (const auto& entry : pool.entries) {
+            const std::uint8_t* raw = entry.bytes.data();
+            if (which == 0)
+                bbqd::gemv_rows<bbqd::Q8_0Plane, true>(bbqd::Q8_0Plane{raw}, 0, entry.n_rows, pool.row_elems, x, out.data());
+            else if (which == 1)
+                bbqd::detail::gemv_q8_0_fast<bbqd::detail::Q8Isa::Avx2>(raw, 0, entry.n_rows, pool.row_elems, x, out.data());
+#if defined(SUB0_BBQD_VNNI)
+            else if (which == 2)
+                bbqd::detail::gemv_q8_0_fast<bbqd::detail::Q8Isa::Vnni>(raw, 0, entry.n_rows, pool.row_elems, x, out.data());
+#endif
+#if defined(SUB0_BBQD_VNNI_INT8)
+            else if (which == 3)
+                bbqd::detail::gemv_q8_0_fast<bbqd::detail::Q8Isa::VnniInt8>(raw, 0, entry.n_rows, pool.row_elems, x, out.data());
+#endif
+            total_bytes_read += static_cast<double>(entry.bytes.size());
+        }
+        el = secs(t0, Clock::now());
+    } while (el < min_seconds);
+    return el / total_bytes_read;
+}
+
 /// Pass 4, single-thread ONLY: isolates whether AVX-VNNI (`dot_row_q{4,5,6}_k_super_vnni`) actually beats
 /// plain AVX2 (`dot_row_q{4,5,6}_k_super_avx2`, `maddubs_epi16`+`madd_epi16`) by calling the internal
 /// `detail::gemv_plane_super_avx2`/`_vnni` entry points DIRECTLY -- `gemv_plane_super<Threads>` itself
@@ -299,15 +353,19 @@ double time_axpy_pool(const std::vector<std::vector<bf16>>& pool, int in, int ou
 int main(int argc, char** argv) {
     std::string gguf_dir;
     double min_seconds = 0.4;
+    bool only_q8 = false;                 // O12: skip the K-quant formats
+    std::uint64_t q8_row_elems = 0;       // O12: Q8_0 pool row width (0 = the modal one)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--gguf") gguf_dir = next();
         else if (a == "--seconds") min_seconds = std::atof(next());
+        else if (a == "--only-q8") only_q8 = true;
+        else if (a == "--q8-row-elems") q8_row_elems = static_cast<std::uint64_t>(std::atoll(next()));
         else { std::fprintf(stderr, "unknown argument '%s'\n", a.c_str()); return 2; }
     }
     if (gguf_dir.empty()) {
-        std::fprintf(stderr, "usage: sub0_backbone_quant_dot_bench --gguf <dir> [--seconds N]\n");
+        std::fprintf(stderr, "usage: sub0_backbone_quant_dot_bench --gguf <dir> [--seconds N] [--only-q8] [--q8-row-elems N]\n");
         return 2;
     }
 
@@ -317,7 +375,8 @@ int main(int argc, char** argv) {
     constexpr int kThreadCounts[5] = {1, 2, 4, 8, 16};
 
     for (auto type : kFormats) {
-        const Pool pool = build_pool(shards, type);
+        if (only_q8 && type != gguf::TensorType::Q8_0) continue;
+        const Pool pool = build_pool(shards, type, type == gguf::TensorType::Q8_0 ? q8_row_elems : 0);
         if (pool.entries.empty()) {
             std::fprintf(stderr, "error: no real backbone tensor of type %s found\n", type_name(static_cast<std::uint32_t>(type)));
             return 3;
@@ -358,8 +417,9 @@ int main(int argc, char** argv) {
             for (auto& v : m) v.bits = static_cast<std::uint16_t>(bits(rng));
         std::vector<float> bf16_y(static_cast<std::size_t>(out_dim));
 
+        const bool is_q8 = type == gguf::TensorType::Q8_0;
         std::printf("%-8s %14s %14s %10s %14s %14s\n", "threads", "native us/row", "native GB/s",
-                    "bf16 GB/s", "super us/row", "super GB/s");
+                    "bf16 GB/s", is_q8 ? "q8fast us/row" : "super us/row", is_q8 ? "q8fast GB/s" : "super GB/s");
         for (int threads : kThreadCounts) {
             double sec_per_byte = 0.0;
             switch (threads) {
@@ -401,7 +461,20 @@ int main(int argc, char** argv) {
                 super_us_row = super_sec_per_byte * bytes_per_row * 1e6;
             }
 
-            if (has_super)
+            if (is_q8) {
+                double q8_spb = 0.0;
+                const auto tr = static_cast<std::uint32_t>(type);
+                switch (threads) {
+                    case 1:  q8_spb = time_native_q8fast_pool<1>(pool, tr, xq, super_out, min_seconds); break;
+                    case 2:  q8_spb = time_native_q8fast_pool<2>(pool, tr, xq, super_out, min_seconds); break;
+                    case 4:  q8_spb = time_native_q8fast_pool<4>(pool, tr, xq, super_out, min_seconds); break;
+                    case 8:  q8_spb = time_native_q8fast_pool<8>(pool, tr, xq, super_out, min_seconds); break;
+                    case 16: q8_spb = time_native_q8fast_pool<16>(pool, tr, xq, super_out, min_seconds); break;
+                    default: break;
+                }
+                std::printf("%-8d %14.3f %14.2f %10.2f %14.3f %14.2f\n", threads, native_us_row, native_gbs,
+                            axpy_gbs, q8_spb * bytes_per_row * 1e6, 1.0 / q8_spb / 1e9);
+            } else if (has_super)
                 std::printf("%-8d %14.3f %14.2f %10.2f %14.3f %14.2f\n", threads, native_us_row, native_gbs,
                             axpy_gbs, super_us_row, super_gbs);
             else
@@ -409,6 +482,23 @@ int main(int argc, char** argv) {
                             axpy_gbs, "n/a", "n/a");
         }
 
+        if (is_q8) {
+            const double bytes_per_row = pool.total_bytes / std::accumulate(pool.entries.begin(), pool.entries.end(), 0.0,
+                                                                             [](double s, const PoolEntry& e) { return s + e.n_rows; });
+            const double old_spb = time_q8_kernel_1t(0, pool, xq, super_out, min_seconds);
+            const double avx2_spb = time_q8_kernel_1t(1, pool, xq, super_out, min_seconds);
+            std::printf("1-thread Q8_0 kernel isolation: old %.3f us/row (%.2f GB/s)  fast-AVX2 %.3f us/row (%.2f GB/s)",
+                        old_spb * bytes_per_row * 1e6, 1.0 / old_spb / 1e9, avx2_spb * bytes_per_row * 1e6, 1.0 / avx2_spb / 1e9);
+#if defined(SUB0_BBQD_VNNI)
+            const double vnni_spb = time_q8_kernel_1t(2, pool, xq, super_out, min_seconds);
+            std::printf("  fast-VNNI %.3f us/row (%.2f GB/s)", vnni_spb * bytes_per_row * 1e6, 1.0 / vnni_spb / 1e9);
+#endif
+#if defined(SUB0_BBQD_VNNI_INT8)
+            const double vi8_spb = time_q8_kernel_1t(3, pool, xq, super_out, min_seconds);
+            std::printf("  fast-VNNI-INT8 %.3f us/row (%.2f GB/s)", vi8_spb * bytes_per_row * 1e6, 1.0 / vi8_spb / 1e9);
+#endif
+            std::printf("\n");
+        }
 #if defined(SUB0_BBQD_VNNI)
         if (has_super) {
             const double bytes_per_row = pool.total_bytes / std::accumulate(pool.entries.begin(), pool.entries.end(), 0.0,

@@ -130,6 +130,12 @@ struct Plane {
 #if defined(__AVX2__) && defined(__AVXVNNI__)
 #define SUB0_BBQD_VNNI 1
 #endif
+// AVX-VNNI-INT8 (`vpdpbssd`, signed x signed bytes straight to int32 -- Arrow Lake and newer, O12): the
+// only form of the byte dot that needs no |w|/sign(x,w) sign-transfer step, since it multiplies two SIGNED
+// operands natively. Same `__AVXVNNIINT8__` target-feature macro convention as SUB0_BBQD_VNNI above.
+#if defined(__AVX2__) && defined(__AVXVNNIINT8__)
+#define SUB0_BBQD_VNNI_INT8 1
+#endif
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -1711,6 +1717,155 @@ template <int Threads = 1>
 
 namespace detail {
 
+#if defined(SUB0_BBQD_AVX2)
+// --- O12: the "q8 fast" Q8_0 row kernel (docs/optimization/opportunities/O12_q8_fast.md) --------------
+//
+// WHY THE OLD Q8_0 PATH (`gemv_rows<Q8_0Plane,true>`) LEAVES BANDWIDTH ON THE TABLE (verified against the
+// code above, not taken from the O10 note): per 32-weight block it (1) `memcpy`s the 32 quants into a
+// `WeightGroup` on the stack, (2) runs `dot32_avx2`, which widens both operands to int16 and ends in a
+// full `hsum256_epi32` (extract/shuffle/add chain, ~6 dependent ops), and (3) folds the result into ONE
+// scalar float `acc` -- a loop-carried float-add chain that runs once per block. The K-quant super
+// kernels instead keep a vector accumulator across a whole superblock and reduce once per row.
+//
+// WHAT THE O12 BENCH FOUND (cache-resident, one thread; O12 doc S3): the byte dot itself is NOT the
+// bottleneck -- with the per-block scale removed the same loop runs ~2x faster. The cost is the per-block
+// SCALE path (f16 -> f32 convert, multiply by the activation scale, broadcast to 8 lanes, all on the
+// shuffle-limited vector ports). So the kernel batches FOUR blocks: their four 8-lane int32 dots are
+// merged into ONE 4-lane vector of per-block sums with two levels of `vphaddd`, the four weight scales are
+// converted with ONE `vcvtph2ps` and multiplied with ONE 4-wide load of the activation scales, and a
+// single 4-lane FMA folds all four blocks into a float accumulator. One horizontal reduction per ROW.
+// The per-block weight scale is still applied per block, as Q8_0 requires.
+//
+// NOT BIT-EXACT against `gemv_rows<Q8_0Plane,*>`: (w_scale * x_scale) is rounded first and the float sum is
+// reassociated across 4 lanes instead of a serial scalar chain. The integer dots are exact, so the
+// difference is pure float reassociation (a few ulp of the row's sum of |terms|); it therefore needs G-PPL,
+// not just a per-dot bound (tests/backbone_quant_dot_tests.cpp states the tolerance).
+
+/** Which int8 x int8 -> int32 byte-dot instruction sequence the Q8_0 fast kernel uses. All three produce
+ * the SAME exact int32 lanes (an integer dot has no rounding); they differ only in uop count:
+ * `Avx2` = |w|/sign(x,w) then `vpmaddubsw`+`vpmaddwd` (4 uops), `Vnni` = the same sign-transfer then one
+ * `vpdpbusd` (3), `VnniInt8` = one `vpdpbssd` on the raw signed operands (1).
+ */
+enum class Q8Isa : unsigned char { Avx2, Vnni, VnniInt8 };
+
+/** One Q8_0 block's dot with the activation quants: 8 int32 lanes whose sum is `sum_j w_j * x_j`. `blk`
+ * is the 34-byte block (f16 scale, 32 int8 quants); the scale is NOT applied here.
+ */
+template <Q8Isa Isa>
+[[nodiscard]] inline __m256i q8_0_block_dot(const std::uint8_t* blk, const std::int8_t* xq) noexcept {
+    const __m256i vw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 2));
+    const __m256i vx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq));
+#if defined(SUB0_BBQD_VNNI_INT8)
+    if constexpr (Isa == Q8Isa::VnniInt8)
+        return _mm256_dpbssd_epi32(_mm256_setzero_si256(), vw, vx);
+#endif
+    const __m256i aw = _mm256_sign_epi8(vw, vw);    // |w| as unsigned bytes (|-128| = 128 fits u8)
+    const __m256i sx = _mm256_sign_epi8(vx, vw);    // x with w's sign applied (0 where w == 0)
+#if defined(SUB0_BBQD_VNNI)
+    if constexpr (Isa == Q8Isa::Vnni)
+        return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sx);
+#endif
+    (void)Isa;
+    // 128*127*2 = 32512 < 32767: the int16 pair-sum cannot saturate (x is quantized to +-127).
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sx), _mm256_set1_epi16(1));
+}
+
+/// The f16 scale (first two bytes) of the Q8_0 block at `blk`, as raw bits.
+[[nodiscard]] inline std::uint16_t q8_0_scale_bits(const std::uint8_t* blk) noexcept {
+    std::uint16_t bits;
+    std::memcpy(&bits, blk, sizeof bits);
+    return bits;
+}
+
+/// Four f16 scale bit patterns -> four floats (lane i = `b_i`).
+[[nodiscard]] inline __m128 q8_0_scales4(std::uint16_t b0, std::uint16_t b1, std::uint16_t b2,
+                                         std::uint16_t b3) noexcept {
+#if defined(__F16C__)
+    __m128i h = _mm_cvtsi32_si128(b0);
+    h = _mm_insert_epi16(h, b1, 1);
+    h = _mm_insert_epi16(h, b2, 2);
+    h = _mm_insert_epi16(h, b3, 3);
+    return _mm_cvtph_ps(h);
+#else
+    return _mm_set_ps(gguf::f16_to_f32(b3), gguf::f16_to_f32(b2), gguf::f16_to_f32(b1), gguf::f16_to_f32(b0));
+#endif
+}
+
+/** Horizontal sum of the 4 float lanes of `v`. */
+[[nodiscard]] inline float hsum128_ps(__m128 v) noexcept {
+    v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+    v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+    return _mm_cvtss_f32(v);
+}
+
+/** One Q8_0 row: `nblk` blocks starting at `row`, against `xq`/`xscale` (the activation's per-32 quants and
+ * scales). Blocks are folded four at a time (see the header comment); a 1..3-block tail reuses the same
+ * 4-lane shape with the missing lanes' scale forced to zero, so every lane is an exact zero contribution.
+ */
+template <Q8Isa Isa>
+[[nodiscard]] inline float dot_row_q8_0_fast(const std::uint8_t* row, int nblk, const std::int8_t* xq,
+                                             const float* xscale) noexcept {
+    __m128 acc = _mm_setzero_ps();
+    int g = 0;
+    for (; g + 4 <= nblk; g += 4) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(g) * 34;
+        const std::int8_t* q = xq + static_cast<std::size_t>(g) * 32;
+        const __m256i d0 = q8_0_block_dot<Isa>(b, q);
+        const __m256i d1 = q8_0_block_dot<Isa>(b + 34, q + 32);
+        const __m256i d2 = q8_0_block_dot<Isa>(b + 68, q + 64);
+        const __m256i d3 = q8_0_block_dot<Isa>(b + 102, q + 96);
+        // [d0,d1,d2,d3] per-block sums, each block's 8 lanes reduced to one.
+        const __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
+        const __m128i sums = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+        const __m128 sc = _mm_mul_ps(
+            q8_0_scales4(q8_0_scale_bits(b), q8_0_scale_bits(b + 34), q8_0_scale_bits(b + 68),
+                         q8_0_scale_bits(b + 102)),
+            _mm_loadu_ps(xscale + g));
+        acc = _mm_fmadd_ps(_mm_cvtepi32_ps(sums), sc, acc);
+    }
+    if (g < nblk) {
+        // 1..3 blocks left: pad to four with zero dots and zero scales.
+        const int rem = nblk - g;
+        const std::uint8_t* b = row + static_cast<std::size_t>(g) * 34;
+        const std::int8_t* q = xq + static_cast<std::size_t>(g) * 32;
+        const __m256i z = _mm256_setzero_si256();
+        const __m256i d0 = q8_0_block_dot<Isa>(b, q);
+        const __m256i d1 = rem > 1 ? q8_0_block_dot<Isa>(b + 34, q + 32) : z;
+        const __m256i d2 = rem > 2 ? q8_0_block_dot<Isa>(b + 68, q + 64) : z;
+        const __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, z));
+        const __m128i sums = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+        const __m128 sc = _mm_mul_ps(
+            q8_0_scales4(q8_0_scale_bits(b), rem > 1 ? q8_0_scale_bits(b + 34) : std::uint16_t{0},
+                         rem > 2 ? q8_0_scale_bits(b + 68) : std::uint16_t{0}, std::uint16_t{0}),
+            _mm_set_ps(0.f, rem > 2 ? xscale[g + 2] : 0.f, rem > 1 ? xscale[g + 1] : 0.f, xscale[g]));
+        acc = _mm_fmadd_ps(_mm_cvtepi32_ps(sums), sc, acc);
+    }
+    return hsum128_ps(acc);
+}
+
+/// Which variant `gemv_plane<..., Q8Fast=true>` runs: the fewest-uop sequence this target has. Chosen by
+/// the O12 bench (O12 doc S3), not assumed -- see there for the measured AVX2/VNNI/VNNI-INT8 comparison.
+inline constexpr Q8Isa kQ8FastIsa =
+#if defined(SUB0_BBQD_VNNI_INT8)
+    Q8Isa::VnniInt8;
+#else
+    Q8Isa::Avx2;
+#endif
+
+/** Q8_0 rows [row_lo, row_hi) via `dot_row_q8_0_fast`. Same row-range contract as `gemv_rows`: `out` is
+ * indexed `r - row_lo`, and the caller has already validated the plane geometry.
+ */
+template <Q8Isa Isa>
+inline void gemv_q8_0_fast(const std::uint8_t* plane, int row_lo, int row_hi, int row_elems,
+                           const ActBlocks& x, float* out) noexcept {
+    const int nblk = row_elems / GROUP;
+    const std::size_t row_bytes = static_cast<std::size_t>(nblk) * 34;
+    for (int r = row_lo; r < row_hi; ++r)
+        out[static_cast<std::size_t>(r - row_lo)] = dot_row_q8_0_fast<Isa>(
+            plane + static_cast<std::size_t>(r) * row_bytes, nblk, x.qs.data(), x.scale.data());
+}
+#endif  // SUB0_BBQD_AVX2
+
 /** The fully-portable entry point: `gemv_rows<Plane,false>` for every format, unconditionally -- the
  * correctness reference every other path here is checked against (tests/backbone_quant_dot_tests.cpp),
  * and the only path available on a non-AVX2 build.
@@ -1749,13 +1904,17 @@ namespace detail {
 // exactly once, before any thread starts -- see that function's comment). nullptr means "build a local,
 // one-call one" -- the pre-O5-2b-2b behavior, kept for callers with no persistent scratch to hand in
 // (tests, the microbenchmark).
+template <bool Q8Fast = false>
 [[nodiscard]] inline bool gemv_plane_avx2(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
                                           int n_rows, int row_elems, const ActBlocks& x, float* out,
                                           int row_lo, int row_hi, const Gsum16* gsum16_hint = nullptr) {
     if (!plane_geometry_ok(type_raw, raw, n_rows, row_elems, row_lo, row_hi)) return false;
     const auto type = static_cast<gguf::TensorType>(type_raw);
     if (type == gguf::TensorType::Q8_0) {
-        gemv_rows<Q8_0Plane, true>(Q8_0Plane{raw.data()}, row_lo, row_hi, row_elems, x, out);
+        if constexpr (Q8Fast)   // O12: one horizontal reduction per row, not per 32-weight block
+            gemv_q8_0_fast<kQ8FastIsa>(raw.data(), row_lo, row_hi, row_elems, x, out);
+        else
+            gemv_rows<Q8_0Plane, true>(Q8_0Plane{raw.data()}, row_lo, row_hi, row_elems, x, out);
         return true;
     }
     if (row_elems % 256 != 0) {
@@ -1813,12 +1972,14 @@ namespace detail {
 /// uses Gsum16 at all (its Q6_K path is the group()-based one, not the streaming one), so this parameter
 /// is simply unused on that arm -- [[maybe_unused]] would be redundant here since it is still named and
 /// read on the AVX2 arm.
+template <bool Q8Fast = false>
 [[nodiscard]] inline bool gemv_plane_dispatch(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
                                               int n_rows, int row_elems, const ActBlocks& x, float* out,
                                               int row_lo, int row_hi, const Gsum16* gsum16_hint = nullptr) {
 #if defined(SUB0_BBQD_AVX2)
     if constexpr (kAvx2Kernels)
-        return gemv_plane_avx2(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi, gsum16_hint);
+        return gemv_plane_avx2<Q8Fast>(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi,
+                                       gsum16_hint);
 #endif
     (void)gsum16_hint;
     return gemv_plane_portable(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi);
@@ -1856,7 +2017,7 @@ namespace detail {
  *        unused work downstream, not incorrect) -- cheap enough (O(row_elems/16)) that the caller need
  *        not special-case which roles are Q6_K before deciding whether to pass one.
  */
-template <int Threads = 1>
+template <int Threads = 1, bool Q8Fast = false>
 [[nodiscard]] inline bool gemv_plane(std::uint32_t type_raw, std::span<const std::uint8_t> raw,
                                      int n_rows, int row_elems, const ActBlocks& x, float* out,
                                      int row_lo = 0, int row_hi = -1, Gsum16* gsum16 = nullptr) {
@@ -1866,8 +2027,8 @@ template <int Threads = 1>
     if (gsum16) gsum16->build(x);   // once, serially, before any thread below can read it
     const Gsum16* gsum16_hint = gsum16;
     if constexpr (Threads == 1) {
-        return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi,
-                                           gsum16_hint);
+        return detail::gemv_plane_dispatch<Q8Fast>(type_raw, raw, n_rows, row_elems, x, out, row_lo,
+                                                    row_hi, gsum16_hint);
     } else {
 #if defined(_OPENMP)
         if (!omp_in_parallel()) {
@@ -1884,7 +2045,7 @@ template <int Threads = 1>
                     // single-threaded call would have used, since every thread shares one `out` buffer.
                     // gsum16_hint is read-only here (its own build() above already finished before this
                     // parallel region opened), so every thread sharing the one pointer is safe.
-                    const bool arm_ok = detail::gemv_plane_dispatch(
+                    const bool arm_ok = detail::gemv_plane_dispatch<Q8Fast>(
                         type_raw, raw, n_rows, row_elems, x, out + (lo - row_lo), lo, hi, gsum16_hint);
                     if (!arm_ok) {
                         #pragma omp atomic write
@@ -1895,8 +2056,8 @@ template <int Threads = 1>
             return ok;
         }
 #endif
-        return detail::gemv_plane_dispatch(type_raw, raw, n_rows, row_elems, x, out, row_lo, row_hi,
-                                           gsum16_hint);
+        return detail::gemv_plane_dispatch<Q8Fast>(type_raw, raw, n_rows, row_elems, x, out, row_lo,
+                                                    row_hi, gsum16_hint);
     }
 }
 
@@ -1925,10 +2086,10 @@ template <int Threads = 1>
  * full behavior. This is the ONE overload every `*_math.hpp` Native struct calls; the loose-parameter form
  * stays available for existing test/benchmark callers.
  */
-template <int Threads = 1>
+template <int Threads = 1, bool Q8Fast = false>
 [[nodiscard]] inline bool gemv_plane(const Plane& p, const ActBlocks& x, float* out,
                                      int row_lo = 0, int row_hi = -1, Gsum16* gsum16 = nullptr) {
-    return gemv_plane<Threads>(p.type_raw, p.bytes, p.n_rows, p.row_elems, x, out, row_lo, row_hi, gsum16);
+    return gemv_plane<Threads, Q8Fast>(p.type_raw, p.bytes, p.n_rows, p.row_elems, x, out, row_lo, row_hi, gsum16);
 }
 
 // --- O9 (docs/BACKBONE_NATIVE_QUANT.md, this pass): the Plane-overload counterpart of gemv_plane_super ---
