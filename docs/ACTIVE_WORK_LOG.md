@@ -946,3 +946,10 @@ and, if the wiring lands cleanly, a real-artifact `--stage ppl` run against
 perf-sensitive workload other agents' own throughput numbers could be confounded by, even with zero file
 overlap (AGENTS.md's own preamble).
 
+
+**2026-09-29 Claude Code (subagent) -- O12 IN PROGRESS: native Q8_0 fast GEMV kernel.** ISOLATED worktree
+(`.claude/worktrees/agent-ae6c9cfbf6eed2ec0`), branch `worktree-agent-ae6c9cfbf6eed2ec0`, ff-merged to `main`
+@ `63a6b3c`. Files: `include/sub0/backbone_quant_dot.hpp` (new Q8_0 kernel + dispatch), `gated_residual_math.hpp`
+(`mix` template flag), `src/backends/cpu/decode.cpp` (GR + `compute_shared`), `tools/configurator.cpp` (new
+`--backbone-q8-fast`, auto-resolves OFF), bench, tests, new `opportunities/O12_q8_fast.md`. Will hold the CPU
+for the neutral build/test, kernel bench and a real-artifact `--stage ppl` run (perf-sensitive).
