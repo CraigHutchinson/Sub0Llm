@@ -147,3 +147,22 @@ Down: roughly -25% to -30% warm. Up: -10% to -15%. Both stay below the ~79 GB/s 
   hadd fold; ISA variants; prefetch). Two-rows-at-a-time (sharing the activation loads) was not tried: the DRAM
   numbers show all forms already tie at the stream ceiling.
 - Promotion: change `resolve(backbone_q8_fast, false)` to `backbone_quant_dot != 0` in `resolve_decode_defaults`.
+
+## G-PPL on the larger fixture (primary agent, 2026-09-29)
+
+`ppl_blend_v1` could not decide this change: its CI half-width (~0.02 nats) is mostly rounding noise (the control
+run above). Re-scored on the new `ppl_blend_v2` (9,631 tokens) through the real-axes default build:
+
+| arm | ppl |
+|---|---:|
+| base (current defaults) | 11.2956 |
+| q8fast | 11.3589 |
+
+Paired dNLL q8fast - base **+0.0056 nats/token, 95% CI -0.0041..+0.0153**, std 0.487, top-1 agreement 88.1%:
+**PASS**, with the upper bound well inside +0.03.
+
+The run was interrupted by a host reboot after these two arms. Its third arm (`--backbone-act-super 0`, to
+re-check O9 on v2) and the script's history rows were lost, and the numbers above were computed from the two
+complete per-token dumps. **Default still OFF:** the only throughput evidence is the authoring agent's own
++6-7%, and O9's agent-reported gain halved when re-measured. Flip `resolve(backbone_q8_fast, false)` once a
+primary-agent long-run A/B confirms the speed.

@@ -207,7 +207,8 @@ def qwen_tokenizer_dir() -> pathlib.Path:
 PPL_GATE_NATS = 0.03   # per token; ~3% perplexity. See the G-PPL entry in kpi_gates.json.
 
 
-def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens: int) -> dict:
+def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens: int,
+              version: str) -> dict:
     """Score the pinned fixture through forward_one per arm, then compare each arm with the first.
 
     Perplexity is deterministic for a given build and text, so one run per arm suffices; contention
@@ -216,7 +217,7 @@ def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens
     than comparing two perplexities.
     """
     import make_ppl_fixture
-    fixture = make_ppl_fixture.ensure(ROOT / "out" / "quality" / f"{make_ppl_fixture.VERSION}.txt")
+    fixture = make_ppl_fixture.ensure(make_ppl_fixture.default_path(version), version)
     tok = qwen_tokenizer_dir()
     per_arm: dict = {}
     nll: dict[str, list[float]] = {}
@@ -246,7 +247,7 @@ def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens
                          "ci95": [mean - 1.96 * se, mean + 1.96 * se],
                          "ppl_ratio": per_arm[other]["ppl"] / per_arm[base]["ppl"],
                          "top1_agreement": sum(x == y for x, y in zip(argmax[base], argmax[other])) / len(d)}
-    return {"fixture": make_ppl_fixture.VERSION, "arms": per_arm, "paired": paired}
+    return {"fixture": version, "arms": per_arm, "paired": paired}
 
 
 def evaluate_gates(results: dict, gates: dict) -> list[dict]:
@@ -363,8 +364,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", action="append", choices=["suites", "quality", "perf", "compete", "vtune", "ppl"],
                     help="repeatable; default is perf only")
-    ap.add_argument("--ppl-tokens", type=int, default=5000,
-                    help="ppl stage: cap on scored tokens (the v1 fixture has ~2,400)")
+    ap.add_argument("--ppl-tokens", type=int, default=12000,
+                    help="ppl stage: cap on scored tokens (v2 has ~9,400, v1 ~2,400)")
+    ap.add_argument("--ppl-fixture", choices=["ppl_blend_v1", "ppl_blend_v2"], default="ppl_blend_v2",
+                    help="ppl stage: pinned text (scripts/make_ppl_fixture.py); v1 only to compare with old history")
     ap.add_argument("--arm", action="append", default=[],
                     help='"name:flags", e.g. "fused:--moe-quant-dot 1". First arm is the baseline.')
     ap.add_argument("--build", default="out/build/wp5c_full48", help="build dir for real-artifact stages")
@@ -434,7 +437,7 @@ def run_suite(args, sb) -> int:
         results["cache"] = "cold" if args.cold else "warm"
 
     if "ppl" in stages:
-        results["ppl"] = stage_ppl(build, arms, args.ppl_tokens)
+        results["ppl"] = stage_ppl(build, arms, args.ppl_tokens, args.ppl_fixture)
 
     if "vtune" in stages:
         # Profiles the LAST arm -- normally the one under investigation, since profiling the baseline

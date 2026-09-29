@@ -145,8 +145,13 @@ backbone scored argmax 3/6 there, and then proved quality-neutral over 2,418 tok
 
     python scripts/run_perf_suite.py --stage ppl --label <id> --arm "base:<flags>" --arm "new:<flags>"
 
-- **Text.** `scripts/make_ppl_fixture.py` builds `ppl_blend_v1` (~2,400 tokens: educational prose,
-  textbook prose, mixed web text, math word problems) from the local corpora, pinned by SHA-256. It is not
+- **Text.** `scripts/make_ppl_fixture.py` builds `ppl_blend_v2` (the default: ~9,400 tokens, four
+  excerpts each of educational prose, textbook prose, mixed web text and math word problems) from the
+  local corpora, pinned by SHA-256. `ppl_blend_v1` (~2,400 tokens) remains reproducible with
+  `--ppl-fixture ppl_blend_v1`, for comparison with older history only. **v1 is too small for this gate:**
+  O12's control arm changed only the float rounding order and still moved perplexity 14.70 -> 14.90. Its
+  per-token spread (std ~0.5 nats, from MoE expert flips) gives a CI half-width of ~0.02 nats, most of the
+  0.03 margin. v2 halves that. It is not
   committed, because the corpora's redistribution terms are unverified. A machine whose corpora differ
   fails loudly rather than scoring different text.
 - **What is scored.** `sub0llm-qwen4-gen --ppl` teacher-forces `forward_one`, which is the path precision

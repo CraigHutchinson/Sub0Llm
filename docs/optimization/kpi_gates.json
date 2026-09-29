@@ -57,7 +57,7 @@
     {
       "id": "G-PPL",
       "label": "decode-path perplexity vs the baseline arm, paired per token",
-      "stage": "run_perf_suite.py --stage ppl (sub0llm-qwen4-gen --ppl) @ real 48-layer, fixture ppl_blend_v1",
+      "stage": "run_perf_suite.py --stage ppl (sub0llm-qwen4-gen --ppl) @ real 48-layer, fixture ppl_blend_v2 (~9,400 tokens; v1 was too small, see OPTIMIZATION_PROCESS.md S2a)",
       "metric": "mean per-token NLL difference vs the first arm, nats/token, with 95% CI",
       "op": "lte",
       "threshold": 0.03,

@@ -10,7 +10,13 @@ repo has not verified. Instead the excerpt positions are fixed here and the resu
 so any machine holding the same corpora reproduces the identical fixture, and a machine whose corpora
 differ fails loudly instead of silently scoring different text.
 
-Usage:  python scripts/make_ppl_fixture.py [--out PATH]      (default: out/quality/ppl_blend_v1.txt)
+Versions (each pinned by SHA-256; history rows name the version they were scored on):
+  ppl_blend_v1 -- one excerpt per corpus, ~2,400 tokens. Its 95% CI half-width is ~0.02 nats/token,
+                  which a pure float-reassociation change already fills (O12 control run), so it cannot
+                  resolve changes near the 0.03 gate.
+  ppl_blend_v2 -- four excerpts per corpus, ~4x the tokens: half-width ~0.01. The default.
+
+Usage:  python scripts/make_ppl_fixture.py [--version V] [--out PATH]   (default: out/quality/<V>.txt)
 """
 from __future__ import annotations
 
@@ -23,14 +29,18 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # (corpus, fraction of the file to seek to). Each excerpt starts at the first line break after that
 # point, reads 2600 bytes, and is cut back to the last line break after byte 1200.
-SOURCES = [
-    ("data/fineweb_edu.txt", 0.37),
-    ("data/cosmopedia.txt", 0.53),
-    ("data/minipile.txt", 0.61),
-    ("data/gsm8k.txt", 0.29),
-]
-VERSION = "ppl_blend_v1"
-EXPECTED_SHA256 = "8e2bfd02c2a055b1f1656af11de8593808ef79cf64b7219b4d398fad052e63ff"
+CORPORA = ["data/fineweb_edu.txt", "data/cosmopedia.txt", "data/minipile.txt", "data/gsm8k.txt"]
+FIXTURES: dict[str, tuple[list[tuple[str, float]], str]] = {
+    "ppl_blend_v1": (
+        [("data/fineweb_edu.txt", 0.37), ("data/cosmopedia.txt", 0.53),
+         ("data/minipile.txt", 0.61), ("data/gsm8k.txt", 0.29)],
+        "8e2bfd02c2a055b1f1656af11de8593808ef79cf64b7219b4d398fad052e63ff"),
+    # Corpus-interleaved so a --ppl-tokens cap still samples every kind of text.
+    "ppl_blend_v2": (
+        [(c, f) for f in (0.14, 0.39, 0.64, 0.89) for c in CORPORA],
+        "54028b9fc85f78af2b85a8f7558b09d575bf0b5a254eb9bd0a570b1c356df422"),
+}
+VERSION = "ppl_blend_v2"
 
 
 def excerpt(path: pathlib.Path, frac: float) -> str:
@@ -44,21 +54,26 @@ def excerpt(path: pathlib.Path, frac: float) -> str:
     return chunk.decode("utf-8", errors="ignore").strip()
 
 
-def build() -> str:
-    return "\n\n".join(excerpt(ROOT / p, frac) for p, frac in SOURCES) + "\n"
+def build(version: str) -> str:
+    return "\n\n".join(excerpt(ROOT / p, frac) for p, frac in FIXTURES[version][0]) + "\n"
 
 
-def ensure(out: pathlib.Path) -> pathlib.Path:
+def default_path(version: str = VERSION) -> pathlib.Path:
+    return ROOT / "out" / "quality" / f"{version}.txt"
+
+
+def ensure(out: pathlib.Path, version: str = VERSION) -> pathlib.Path:
     """Write the fixture to `out` if absent or stale; raise if the corpora no longer reproduce it."""
-    if out.exists() and hashlib.sha256(out.read_bytes()).hexdigest() == EXPECTED_SHA256:
+    sources, expected = FIXTURES[version]
+    if out.exists() and hashlib.sha256(out.read_bytes()).hexdigest() == expected:
         return out
-    missing = [p for p, _ in SOURCES if not (ROOT / p).exists()]
+    missing = [p for p, _ in sources if not (ROOT / p).exists()]
     if missing:
-        raise FileNotFoundError(f"{VERSION}: corpora missing: {', '.join(missing)}")
-    data = build().encode("utf-8")
+        raise FileNotFoundError(f"{version}: corpora missing: {', '.join(missing)}")
+    data = build(version).encode("utf-8")
     digest = hashlib.sha256(data).hexdigest()
-    if digest != EXPECTED_SHA256:
-        raise ValueError(f"{VERSION}: corpora produce sha256 {digest}, expected {EXPECTED_SHA256}. "
+    if digest != expected:
+        raise ValueError(f"{version}: corpora produce sha256 {digest}, expected {expected}. "
                          "The local corpora differ from the ones this fixture was pinned against, so "
                          "scores would not be comparable with recorded history.")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -68,10 +83,11 @@ def ensure(out: pathlib.Path) -> pathlib.Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", type=pathlib.Path, default=ROOT / "out" / "quality" / f"{VERSION}.txt")
+    ap.add_argument("--version", choices=sorted(FIXTURES), default=VERSION)
+    ap.add_argument("--out", type=pathlib.Path, default=None)
     args = ap.parse_args()
-    path = ensure(args.out)
-    print(f"{VERSION}: {path} ({path.stat().st_size} bytes, sha256 {EXPECTED_SHA256})")
+    path = ensure(args.out or default_path(args.version), args.version)
+    print(f"{args.version}: {path} ({path.stat().st_size} bytes, sha256 {FIXTURES[args.version][1]})")
     return 0
 
 
