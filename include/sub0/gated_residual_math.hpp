@@ -33,6 +33,7 @@
                                          // mix()'s optional native-quant down/up path -- storage-agnostic,
                                          // see that header's own "format-agnostic plane view" comment.
 #include "sub0/gemv.hpp"
+#include "sub0/stage_probe.hpp"  // O10: NoStageProbe, the default no-op sub-phase probe
 #include "sub0/simd_reduce.hpp"  // B34/B38: sumsq_choice<UseSimd>() for this file's real scalar-reduction
                                   // hot loop, hc_norm's `ms` (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
 
@@ -150,9 +151,12 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float
 // simplification, not an oversight; see that section for why the duplicated cost is bounded and cheap).
 // down_w: [wide, hc_lowrank], up_w: [hc_lowrank, wide], this project's own [in,out] convention.
 // out_mixed: [T, hidden_size]. scratch: >= T*hc_lowrank floats (the down-projection's pre-activation).
-template <int Threads = 1, class WP>
+/// Stage marks mix() reports to its Probe (O10 sub-phase profiling); each marks a stage's START.
+enum class MixStage : unsigned char { Down, Elementwise, Up };
+
+template <int Threads = 1, class WP, class Probe = NoStageProbe>
 inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
-                 float* out_mixed, float* scratch, const Native* native = nullptr) {
+                 float* out_mixed, float* scratch, const Native* native = nullptr, Probe probe = {}) {
     const int hs = d.hidden_size, hc = d.hc_count, wide = d.wide(), lr = d.hc_lowrank;
     // O5 phase 2b-3 phase B: only trusted at T==1 (this struct's own header comment), and geometry
     // re-validated here rather than trusted from the caller (AGENTS.md S10) -- a mismatch falls back to
@@ -165,6 +169,7 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
     for (int t = 0; t < T; ++t) {
         const float* xr = normed + static_cast<std::size_t>(t) * wide;
         float* dr = down_pre + static_cast<std::size_t>(t) * lr;
+        probe(MixStage::Down);
         if (native_ok) {
             native->wide_q->quantize(xr, wide);
             if (!bbqd::gemv_plane<Threads>(*native->down, *native->wide_q, dr)) {
@@ -175,6 +180,7 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
         } else {
             gemv::axpy<Threads>(xr, down_w, wide, lr, dr);   // O3: include/sub0/gemv.hpp, same per-output order
         }
+        probe(MixStage::Elementwise);
         for (int o = 0; o < lr; ++o) dr[o] = detail::silu(dr[o] / static_cast<float>(hc));
     }
     const float inv_hc = 1.f / static_cast<float>(hc);
@@ -191,6 +197,7 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
         // any cache line) found in a post-merge performance review, not present at this stage's own
         // small test scale. Purely a summation-ORDER change -- same terms, same result within float32
         // rounding (gated by this test file's own 5e-5 tolerance, comfortably wider than reordering noise).
+        probe(MixStage::Up);
         if (native_ok) {
             // down's OUTPUT feeds up's INPUT -- a genuinely different activation vector from `xr`, so
             // this is its OWN quantize call, not a reuse of wide_q (see Native's own comment).
@@ -203,6 +210,7 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
         } else {
             gemv::axpy<Threads>(dr, up_w, lr, wide, up_val);   // O3: see the down projection above
         }
+        probe(MixStage::Elementwise);
         for (int j = 0; j < hs; ++j) out[j] = 0.f;
         for (int s = 0; s < hc; ++s) {
             for (int j = 0; j < hs; ++j) {

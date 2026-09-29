@@ -55,6 +55,7 @@
                                          // caller (decode.cpp) converts whatever storage format it reads
                                          // from (today: the S0B1 sidecar, bbq::Store) into a Plane.
 #include "sub0/gemv.hpp"
+#include "sub0/stage_probe.hpp"  // O10: NoStageProbe, the default no-op sub-phase probe
 #include "sub0/simd_reduce.hpp"  // B34/B38: sumsq_choice<UseSimd>() for this file's real contiguous
                                   // self-dot hot loops in forward()/backward()
                                   // (docs/INDEPENDENT_REVIEW_BACKLOG.md B38).
@@ -235,6 +236,9 @@ inline void recurrence_step(int dk, int dv, float g_t, float beta_t,
     }
 }
 
+/// Stage marks forward() reports to its Probe (O10 sub-phase profiling); each marks a stage's START.
+enum class Stage : unsigned char { InProj, BaProj, Conv, Recurrence, GateNorm, OutProj };
+
 // The real forward, per S1b/S1c/the class's own forward() (quoted/re-derived in this file's header
 // comment): in_proj_qkv -> causal depthwise conv1d + SiLU -> split Q/K/V -> beta=sigmoid(b),
 // g=-exp(A_log)*softplus(a+dt_bias) -> repeat_interleave Q/K to num_v_heads -> L2-norm Q/K ->
@@ -259,7 +263,7 @@ inline void recurrence_step(int dk, int dv, float g_t, float beta_t,
 // reduction strategy for qss/kss/ms below -- explicit template argument at the call site
 // (src/backends/cpu/{backend,decode}.cpp), not a global read, matching this file's own "explicit Dims"
 // convention. src/backends/cuda/backend.cu's CPU-reference call takes the default (false), unaffected.
-template <bool UseSimd = false, int Threads = 1, class WP>
+template <bool UseSimd = false, int Threads = 1, class WP, class Probe = NoStageProbe>
 inline void forward(const Dims& d, int T,
                      const float* x,
                      WP w_qkv, WP w_z, WP w_b, WP w_a,
@@ -268,7 +272,8 @@ inline void forward(const Dims& d, int T,
                      float* state, float* conv_hist,
                      float* out,
                      float* scratch,
-                     const Native* native = nullptr) {
+                     const Native* native = nullptr,
+                     Probe probe = {}) {
     // O5 phase 2b-2b: only trusted at T==1 (this struct's own header comment) -- every batched/training
     // call (T possibly > 1) silently ignores a non-null `native` rather than mis-happening to use it.
     const bool use_native_in  = native != nullptr && T == 1 && native->in_ready();
@@ -320,6 +325,7 @@ inline void forward(const Dims& d, int T,
         float* zr = zb + static_cast<std::size_t>(t) * value_dim;
         float* br = beta + static_cast<std::size_t>(t) * Hv;
         float* gr = gg   + static_cast<std::size_t>(t) * Hv;
+        probe(Stage::InProj);
         if (native_in_ok) {
             // O9: each of in_qkv/in_z independently decides super-vs-per-32 from its OWN plane's real
             // format (bbqd::super_ok, never assumed shared) -- see this struct's own x_q_super comment.
@@ -350,6 +356,7 @@ inline void forward(const Dims& d, int T,
             gemv::axpy<Threads>(xt, w_qkv, hs, conv_dim, qkvr);   // O2: include/sub0/gemv.hpp
             gemv::axpy<Threads>(xt, w_z, hs, value_dim, zr);
         }
+        probe(Stage::BaProj);
         gemv::axpy<Threads>(xt, w_b, hs, Hv, br);             // O4: raw b_logit, transformed below
         gemv::axpy<Threads>(xt, w_a, hs, Hv, gr);             // O4: raw a_logit, transformed below
         for (int hh = 0; hh < Hv; ++hh) {
@@ -374,6 +381,7 @@ inline void forward(const Dims& d, int T,
     // only the relative order BETWEEN channels changes, which cannot matter since no channel reads
     // another's data. `tmp` is a per-iteration stack local, so this is thread-safe with no extra scratch.
     constexpr int MAX_K = 32;   // generous bound on conv_kernel; GDN_CONV_KERNEL is 4 in this project
+    probe(Stage::Conv);
     detail::parallel_for<Threads>(conv_dim, [&](int c) {
         for (int t = 0; t < T; ++t) {
             float s = 0.f;
@@ -396,6 +404,7 @@ inline void forward(const Dims& d, int T,
 
     // Split into Q/K/V column ranges of qkv_post: Q [0,key_dim), K [key_dim,2*key_dim), V [2*key_dim,conv_dim).
     const int q_off = 0, k_off = key_dim, v_off = 2 * key_dim;
+    probe(Stage::Recurrence);
 
     // Sequential delta-rule recurrence, per S1b's exact form (verified against the real installed
     // reference, see this file's header comment for the one real correction found doing so).
@@ -451,6 +460,7 @@ inline void forward(const Dims& d, int T,
     for (int t = 0; t < T; ++t) {
         const float* core_row = qkv_post + static_cast<std::size_t>(t) * conv_dim + v_off;
         const float* z_row = zb + static_cast<std::size_t>(t) * value_dim;
+        probe(Stage::GateNorm);
         detail::parallel_for<Threads>(Hv, [&](int hh) {
             const float* cv = core_row + hh * dv;
             const float* zv = z_row + hh * dv;
@@ -462,6 +472,7 @@ inline void forward(const Dims& d, int T,
                 gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
         });
         float* ot = out + static_cast<std::size_t>(t) * hs;
+        probe(Stage::OutProj);
         if (native_out_ok) {
             // O5 phase 2b-2b: GdnOutProj's sidecar bytes are raw, GGUF/tiled column order (backbone_
             // quant.hpp's own header comment -- the value-head permutation is on the WITHIN-ROW axis and

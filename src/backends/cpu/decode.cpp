@@ -842,11 +842,21 @@ const float* Model::forward_one(int id, int pos) {
     // `l`), GrExitDown/Up (the model-level exit collapse below, which does NOT go through this lambda)
     // are not. A role absent at this build (no sidecar, or this specific role missing) leaves
     // gr_native_ptr null and gr::mix falls back to the ordinary axpy path exactly as before this pass.
+    // O10: the mix() stage marks charged to GR sub-phases -- NoStageProbe (empty, no code) unless PROFILE_PHASES.
+    [[maybe_unused]] const auto gr_probe = [] {
+        if constexpr (PROFILE_PHASES)
+            return prof::StageProbe<gr::MixStage, 3>{{prof::Phase::GrDown, prof::Phase::GrMixEw, prof::Phase::GrUp}};
+        else
+            return NoStageProbe{};
+    }();
     auto gr_read_row = [&](const float* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w,
                             Node* ln, float* out_a, bbq::Role down_role, bbq::Role up_role, int layer) {
         [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> phase(prof::Phase::GatedResidual);
         if constexpr (USE_GATED_RESIDUAL) {
-            gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, wide, norm_w->pdata, gr_normed);
+            {
+                [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> norm_phase(prof::Phase::GrNorm);
+                gr::hc_norm<USE_SIMD_REDUCE>(GR_DIMS, 1, wide, norm_w->pdata, gr_normed);
+            }
             gr::Native gr_native{};
             const gr::Native* gr_native_ptr = nullptr;
             if constexpr (BACKBONE_QUANT_DOT) {
@@ -861,8 +871,11 @@ const float* Model::forward_one(int id, int pos) {
                 }
             }
             gr::mix<DECODE_GEMV_THREADS>(GR_DIMS, 1, gr_normed, down_w->pdata, up_w->pdata, gr_mixed,
-                                         gr_mixscr, gr_native_ptr);
-            gr::gate(GR_DIMS, 1, gr_normed, inject_w->pdata, gr_inj);
+                                         gr_mixscr, gr_native_ptr, gr_probe);
+            {
+                [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> gate_phase(prof::Phase::GrGate);
+                gr::gate(GR_DIMS, 1, gr_normed, inject_w->pdata, gr_inj);
+            }
             // WP4b blocker D: the mixer reads mixed_input DIRECTLY -- no Ln1/Ln2 exists under GR
             // (`ln` is nullptr), and gr::hc_norm above already applied the real model's own
             // pre-block norm at its own 1e-6 eps. Mirrors forward()'s gr_read exactly; the
@@ -875,6 +888,7 @@ const float* Model::forward_one(int id, int pos) {
     };
     auto gr_write_row = [&](float* wide, const float* mixer_out) {
         [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> phase(prof::Phase::GatedResidual);
+        [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> combine_phase(prof::Phase::GrCombine);
         if constexpr (USE_GATED_RESIDUAL) gr::combine(GR_DIMS, 1, wide, mixer_out, gr_inj, wide);
         else                              for (int j = 0; j < C; ++j) wide[j] += mixer_out[j];
     };
@@ -1047,10 +1061,13 @@ const float* Model::forward_one(int id, int pos) {
             // QsaRopeTables (internal.hpp); it was D_HEAD before --rotary-dim became an axis.
             const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * ROTARY_DIM;
             const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * ROTARY_DIM;
+            {
+            [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> idx_phase(prof::Phase::QsaIndexer);
             qsa::indexer_project_row<USE_SIMD_REDUCE>(QSA_DIMS, a, L.qsa_idx_qk->pdata,
                                       L.qsa_idx_qnorm->pdata, cos_pos, sin_pos, qsa::RMS_EPS,
                                       qsa_idx_q,
                                       raw_k_base + static_cast<size_t>(pos) * QSA_INDEXER_HEAD_DIM);
+            }
             // O5 phase 2b-3 phase B: QsaQGateProj/QsaKProj/QsaVProj/QsaOProj -- the indexer's own
             // projection (above) is BF16 (already the resident target format, backbone_quant.hpp's own
             // exclusion list), so only the attention sublayer's four projections are native-quant
@@ -1082,21 +1099,30 @@ const float* Model::forward_one(int id, int pos) {
                 }
                 if (qsa_native.proj_ready() || qsa_native.o_ready()) qsa_native_ptr = &qsa_native;
             }
+            {
+            [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> proj_phase(prof::Phase::QsaProj);
             qsa::attn_project_row<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(QSA_DIMS, a, L.qsa_q->pdata, L.qsa_gate->pdata,
                                    L.qsa_k->pdata, L.qsa_v->pdata,
                                    L.qsa_qnorm->pdata, L.qsa_knorm->pdata,
                                    cos_pos, sin_pos, qsa::RMS_EPS,
                                    qn, qsa_gate_row, g_kv.krow(e, pos), g_kv.vrow(e, pos), qsa_native_ptr);
+            }
             // The pooled block keys persist across decode steps in this execution's own QsaCache
             // slot, exactly as the raw keys above already do -- the decode counterpart of the
             // batched path's in-scratch cache, filled by the SAME primitive (docs/QSA.md S11).
+            {
+            [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> sel_phase(prof::Phase::QsaIndexer);
             qsa::indexer_select_row<USE_SIMD_REDUCE>(QSA_DIMS, qsa_idx_q, raw_k_base, pos + 1,
                                      L.qsa_idx_knorm->pdata, g_qsa_rope.cos.data(),
                                      g_qsa_rope.sin.data(), qsa::RMS_EPS,
                                      g_qsa_cache.block_base(e), g_qsa_cache.n_cached_of(e),
                                      qsa_mask, qsa_sel_scr);
+            }
+            {
+            [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> attn_phase(prof::Phase::QsaAttn);
             qsa::attn_row<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
                            qsa_mask, L.qsa_o->pdata, proj, qsa_att_scr, qsa_native_ptr);
+            }
             gr_write_row(h, proj);                                           // residual (write step)
         };
         // Which of the two full-attention forms this build uses, decided ONCE at compile time. This
@@ -1158,6 +1184,14 @@ const float* Model::forward_one(int id, int pos) {
                     }
                     if (gdn_native.in_ready() || gdn_native.out_ready()) gdn_native_ptr = &gdn_native;
                 }
+                constexpr auto gdn_probe = [] {
+                    if constexpr (PROFILE_PHASES)
+                        return prof::StageProbe<gdn::Stage, 6>{{prof::Phase::GdnInProj, prof::Phase::GdnBaProj,
+                            prof::Phase::GdnConv, prof::Phase::GdnRecur, prof::Phase::GdnGateNorm,
+                            prof::Phase::GdnOutProj}};
+                    else
+                        return NoStageProbe{};
+                }();
                 gdn::forward<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(GDN_DIMS, 1, a,
                              L.gdn_in_qkv->pdata, L.gdn_in_z->pdata,
                              L.gdn_in_b->pdata, L.gdn_in_a->pdata,
@@ -1165,7 +1199,7 @@ const float* Model::forward_one(int id, int pos) {
                              L.gdn_a_log->pdata, L.gdn_norm->pdata,
                              L.gdn_out_proj->pdata,
                              g_gdn_cache.state_of(e), g_gdn_cache.conv_of(e), proj, gdn_scratch,
-                             gdn_native_ptr);
+                             gdn_native_ptr, gdn_probe);
                 gr_write_row(h, proj);                                       // residual (write step)
             }
         } else {
