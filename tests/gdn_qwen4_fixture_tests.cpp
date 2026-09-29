@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -455,4 +456,160 @@ TEST_CASE("Gated DeltaNet recurrence at beta=0, g=1 never updates the state (pro
         for (std::size_t i = 0; i < S.size(); ++i) REQUIRE(S[i] == S0[i]);
         for (int j = 0; j < dv; ++j) REQUIRE(o[j] == o_ref[j]);
     }
+}
+
+// --- O9 (docs/BACKBONE_NATIVE_QUANT.md; docs/optimization/opportunities/O9_act_super.md) -----------
+// gdn::Native's ActSuper seam: the per-256 kernel through forward() must equal a direct
+// bbqd::gemv_plane_super call on the SAME bytes, and a plane that is not super-fusable must fall back to
+// the ordinary per-32 ActBlocks path exactly. Engine-free, synthetic shape.
+
+namespace {
+
+// Deterministic pseudo-random block bytes with a small positive scale field (no inf/NaN weights), the
+// same idea as backbone_quant_dot_tests.cpp's make_blocks (that one is file-local, so duplicated here).
+std::vector<std::uint8_t> make_super_blocks(sub0::gguf::TensorType type, std::uint64_t n_elements,
+                                             std::uint32_t seed) {
+    const sub0::gguf::BlockSpec spec = sub0::gguf::block_spec(static_cast<std::uint32_t>(type));
+    REQUIRE(spec.elems != 0);
+    REQUIRE(n_elements % spec.elems == 0);
+    std::mt19937 rng(seed);
+    const std::uint64_t blocks = n_elements / spec.elems;
+    std::vector<std::uint8_t> raw(static_cast<std::size_t>(blocks * spec.bytes));
+    for (auto& b : raw) b = static_cast<std::uint8_t>(rng() & 0xFFu);
+    for (std::uint64_t b = 0; b < blocks; ++b) {
+        std::uint8_t* blk = raw.data() + b * spec.bytes;
+        auto patch = [&](std::size_t off) {
+            const auto d_bits = static_cast<std::uint16_t>(0x3000u + (rng() & 0x0FFFu));
+            std::memcpy(blk + off, &d_bits, sizeof d_bits);
+        };
+        switch (type) {
+            case sub0::gguf::TensorType::Q8_0: patch(0); break;
+            case sub0::gguf::TensorType::Q4_K:
+            case sub0::gguf::TensorType::Q5_K: patch(0); patch(2); break;
+            case sub0::gguf::TensorType::Q6_K: patch(208); break;
+            default: break;
+        }
+    }
+    return raw;
+}
+
+struct O9GdnRig {
+    static constexpr int hidden_size = 256, num_k_heads = 2, num_v_heads = 8, head_dim = 32, conv_kernel = 2;
+    static constexpr int T = 1;
+    sub0::gdn::Dims dims{hidden_size, num_k_heads, num_v_heads, head_dim, head_dim, conv_kernel};
+    int value_dim = dims.value_dim(), conv_dim = dims.conv_dim();
+    std::vector<float> x, w_out, w_b, w_a, conv_w, dt_bias, a_log, norm_w, state, conv_hist, scratch, out;
+
+    O9GdnRig() {
+        std::mt19937 rng(90909);
+        std::normal_distribution<float> normal(0.f, 1.2f);
+        x.resize(hidden_size);
+        for (float& v : x) v = normal(rng);
+        w_out.assign(static_cast<std::size_t>(hidden_size) * dims.value_dim(), 0.01f);
+        w_b.assign(static_cast<std::size_t>(hidden_size) * num_v_heads, 0.01f);
+        w_a.assign(static_cast<std::size_t>(hidden_size) * num_v_heads, 0.01f);
+        conv_w.assign(static_cast<std::size_t>(conv_dim) * conv_kernel, 0.1f);
+        dt_bias.assign(num_v_heads, 0.1f);
+        a_log.assign(num_v_heads, 0.2f);
+        norm_w.assign(head_dim, 1.f);
+        state.assign(sub0::gdn::state_floats(dims), 0.f);
+        conv_hist.assign(sub0::gdn::conv_hist_floats(dims), 0.f);
+        scratch.assign(sub0::gdn::scratch_floats(dims, T), 0.f);
+        out.assign(hidden_size, 0.f);
+    }
+    void run(const sub0::gdn::Native& n) {
+        const float* np = nullptr;
+        sub0::gdn::forward<false, 1, const float*>(dims, T, x.data(), np, np, w_b.data(), w_a.data(),
+                                     conv_w.data(), dt_bias.data(), a_log.data(), norm_w.data(), w_out.data(),
+                                     state.data(), conv_hist.data(), out.data(), scratch.data(), &n);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("gdn::Native's O9 ActSuper path equals a direct bbqd::gemv_plane_super call on the same bytes",
+          "[gdn][backbonequant]") {
+    using sub0::gguf::TensorType;
+    O9GdnRig r;
+    const auto raw_qkv = make_super_blocks(TensorType::Q5_K, std::uint64_t(r.conv_dim) * r.hidden_size, 1001);
+    const auto raw_z   = make_super_blocks(TensorType::Q5_K, std::uint64_t(r.value_dim) * r.hidden_size, 1002);
+    const auto raw_out = make_super_blocks(TensorType::Q6_K, std::uint64_t(r.hidden_size) * r.value_dim, 1003);
+    const sub0::bbqd::Plane p_qkv{static_cast<std::uint32_t>(TensorType::Q5_K), r.conv_dim, r.hidden_size,
+                                  std::span<const std::uint8_t>(raw_qkv)};
+    const sub0::bbqd::Plane p_z{static_cast<std::uint32_t>(TensorType::Q5_K), r.value_dim, r.hidden_size,
+                                std::span<const std::uint8_t>(raw_z)};
+    const sub0::bbqd::Plane p_out{static_cast<std::uint32_t>(TensorType::Q6_K), r.hidden_size, r.value_dim,
+                                  std::span<const std::uint8_t>(raw_out)};
+
+    sub0::bbqd::ActBlocks x_q, gated_q;
+    sub0::bbqd::ActSuper x_q_super, gated_q_super;
+    // Identity gather: the gather formula is proven elsewhere; here it makes gather_buf == gated.
+    std::vector<std::uint32_t> gather_idx(static_cast<std::size_t>(r.value_dim));
+    for (std::size_t i = 0; i < gather_idx.size(); ++i) gather_idx[i] = static_cast<std::uint32_t>(i);
+    std::vector<float> gather_buf(static_cast<std::size_t>(r.value_dim));
+
+    sub0::gdn::Native native{};
+    native.in_qkv = &p_qkv; native.in_z = &p_z; native.x_q = &x_q; native.x_q_super = &x_q_super;
+    native.out = &p_out; native.gated_q = &gated_q; native.gated_q_super = &gated_q_super;
+    native.out_gather_idx = gather_idx.data(); native.out_gather_buf = gather_buf.data();
+    REQUIRE(native.in_ready());
+    REQUIRE(native.out_ready());
+    r.run(native);
+
+    // forward()'s scratch layout at T=1: qkv_pre = [0,conv_dim), zb = [2*conv_dim, +value_dim), and
+    // `gated` = the last value_dim floats (white-box: forward() exposes none of these).
+    const float* qkv_pre = r.scratch.data();
+    const float* zb = r.scratch.data() + 2 * r.conv_dim;
+    const float* gated = r.scratch.data() + r.scratch.size() - static_cast<std::size_t>(r.value_dim);
+
+    sub0::bbqd::ActSuper xs;
+    xs.quantize(r.x.data(), r.hidden_size);
+    std::vector<float> ref_qkv(r.conv_dim), ref_z(r.value_dim), ref_out(r.hidden_size);
+    REQUIRE(sub0::bbqd::gemv_plane_super<1>(p_qkv, xs, ref_qkv.data()));
+    REQUIRE(sub0::bbqd::gemv_plane_super<1>(p_z, xs, ref_z.data()));
+    for (int i = 0; i < r.conv_dim; ++i) REQUIRE(qkv_pre[i] == ref_qkv[static_cast<std::size_t>(i)]);
+    for (int i = 0; i < r.value_dim; ++i) REQUIRE(zb[i] == ref_z[static_cast<std::size_t>(i)]);
+
+    sub0::bbqd::ActSuper gs;
+    gs.quantize(gated, r.value_dim);
+    REQUIRE(sub0::bbqd::gemv_plane_super<1>(p_out, gs, ref_out.data()));
+    for (int i = 0; i < r.hidden_size; ++i) REQUIRE(r.out[static_cast<std::size_t>(i)] == ref_out[static_cast<std::size_t>(i)]);
+}
+
+TEST_CASE("gdn::Native's O9 dispatch checks each plane independently: a Q8_0 in_z falls back to the "
+          "per-32 path while a Q5_K in_qkv takes the super path, in one forward() call",
+          "[gdn][backbonequant]") {
+    using sub0::gguf::TensorType;
+    O9GdnRig r;
+    const auto raw_qkv = make_super_blocks(TensorType::Q5_K, std::uint64_t(r.conv_dim) * r.hidden_size, 2001);
+    const auto raw_z   = make_super_blocks(TensorType::Q8_0, std::uint64_t(r.value_dim) * r.hidden_size, 2002);
+    const sub0::bbqd::Plane p_qkv{static_cast<std::uint32_t>(TensorType::Q5_K), r.conv_dim, r.hidden_size,
+                                  std::span<const std::uint8_t>(raw_qkv)};
+    const sub0::bbqd::Plane p_z{static_cast<std::uint32_t>(TensorType::Q8_0), r.value_dim, r.hidden_size,
+                                std::span<const std::uint8_t>(raw_z)};
+    sub0::bbqd::ActBlocks x_q;
+    sub0::bbqd::ActSuper x_q_super;
+    sub0::gdn::Native native{};
+    native.in_qkv = &p_qkv; native.in_z = &p_z; native.x_q = &x_q; native.x_q_super = &x_q_super;
+    r.run(native);
+
+    const float* qkv_pre = r.scratch.data();
+    const float* zb = r.scratch.data() + 2 * r.conv_dim;
+    sub0::bbqd::ActSuper xs;
+    xs.quantize(r.x.data(), r.hidden_size);
+    std::vector<float> ref_qkv(r.conv_dim), ref_z(r.value_dim);
+    REQUIRE(sub0::bbqd::gemv_plane_super<1>(p_qkv, xs, ref_qkv.data()));
+    for (int i = 0; i < r.conv_dim; ++i) REQUIRE(qkv_pre[i] == ref_qkv[static_cast<std::size_t>(i)]);
+
+    sub0::bbqd::ActBlocks xb;
+    xb.quantize(r.x.data(), r.hidden_size);
+    REQUIRE(sub0::bbqd::gemv_plane<1>(p_z, xb, ref_z.data()));
+    for (int i = 0; i < r.value_dim; ++i) REQUIRE(zb[i] == ref_z[static_cast<std::size_t>(i)]);
+
+    // Toggle-off equivalence: with no super scratch wired at all, the Q8_0 plane is unchanged.
+    O9GdnRig r2;
+    sub0::gdn::Native off = native;
+    off.x_q_super = nullptr;
+    r2.run(off);
+    for (int i = 0; i < r.value_dim; ++i) REQUIRE(r2.scratch[static_cast<std::size_t>(2 * r.conv_dim + i)] == zb[i]);
 }
