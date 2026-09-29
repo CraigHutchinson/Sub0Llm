@@ -21,10 +21,12 @@ Stages (each skippable, so iteration stays fast):
 
   # Does a precision change cost quality? (fixture: scripts/make_ppl_fixture.py)
   python scripts/run_perf_suite.py --stage ppl --label O5 \
-      --arm "bf16:--moe-quant-dot 1" --arm "native:--moe-quant-dot 1 --backbone-quant-dot 1"
+      --arm "bf16:--backbone-quant-dot 0" --arm "native:"
 
 Typical invocations:
 
+  # REAL_AXES configures the recommended decode options by default (auto), so an arm names only
+  # what it changes from that best build -- e.g. "--backbone-act-super 0" to measure O9 off.
   # Measure two toggle arms against each other, 3 interleaved runs each, tagged for history:
   python scripts/run_perf_suite.py --stage perf --label B35 \
       --arm "base:" --arm "fused:--moe-quant-dot 1"

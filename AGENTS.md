@@ -97,6 +97,14 @@ test suite's pass/fail counts match exactly what they were before your change (n
 failures" — check the actual assertion counts). If they don't match exactly, something leaked into the
 default path that shouldn't have.
 
+**Off while evaluated; the default once proven.** Standing user direction (2026-09-29): "the defaults
+should be the best options". An option that has passed its gates and been recommended must not stay
+opt-in, because nobody should need to remember a list of recommended flags. Promote it to an AUTO default
+(`-1`/`0` = auto in the configurator, resolved in ONE place after parsing — see
+`resolve_decode_defaults` in `tools/configurator.cpp`). Auto turns the option on for the build class it
+was measured on, and everywhere else resolves to the old value. That keeps the rule above intact: other
+builds' generated headers stay byte-identical. An explicit flag always overrides.
+
 ## 5. Verify precise algorithms against their actual reference source — never from recall alone
 
 Newton-Schulz's exact coefficients, the momentum-EMA formula, and the Nesterov default were fetched

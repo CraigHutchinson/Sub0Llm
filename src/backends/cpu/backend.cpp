@@ -2070,8 +2070,9 @@ bool load_backbone_quant_sidecar(const char* model_path) {
         const std::string path = std::string(model_path) + ".bbq";
         std::string err;
         if (!g_backbone_quant.open(path, err, PARAM_FLOATS)) {
-            std::println(stderr, "error: BACKBONE_QUANT_DOT requires an S0B1 sidecar beside the model: {}",
-                         err);
+            std::println(stderr, "error: BACKBONE_QUANT_DOT requires an S0B1 sidecar beside the model: {}. "
+                                 "It is on by default for --moe-quant-experts 1 builds; write the sidecar "
+                                 "(sub0llm-transplant) or reconfigure with --backbone-quant-dot 0.", err);
             return false;
         }
         if (g_backbone_quant.header().n_layers != N_LAYERS) {

@@ -653,14 +653,14 @@ int main(int argc, char** argv) {
     // against the sidecar's native IQ1_S/IQ2_XXS/IQ4_NL bytes instead of dequantizing each selected
     // expert to f32 first. 0 = off (default, today's dequantize-then-f32-dot path, bit-exact). See the
     // --moe-quant-dot CLI option below for the measured accuracy and throughput tradeoff.
-    int moe_quant_dot     = 0;
+    int moe_quant_dot     = -1;   // -1 = auto, see resolve_decode_defaults
     // O5: selected decode roles can use native backbone bytes from the S0B1 sidecar.
-    int backbone_quant_dot = 0;
+    int backbone_quant_dot = -1;   // -1 = auto
     // O9 (docs/BACKBONE_NATIVE_QUANT.md S14, docs/optimization/opportunities/O9_act_super.md): every
     // BACKBONE_QUANT_DOT role whose plane is Q4_K/Q5_K/Q6_K and passes bbqd::super_fusable uses the
     // per-256 ActSuper kernel (bbqd::gemv_plane_super) instead of the per-32 ActBlocks path. 0 = off
     // (default, today's per-32 path, bit-exact).
-    int backbone_act_super = 0;
+    int backbone_act_super = -1;   // -1 = auto
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
     // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
@@ -689,14 +689,14 @@ int main(int argc, char** argv) {
     int d_ff_pin     = 0;
     int ternary      = 0;
     int profile_phases = 0;     // 1 = exclusive-time decode phase profiler (include/sub0/phase_profile.hpp)
-    int moe_decode_threads = 1; // decode's routed-expert fan-out width (src/backends/cpu/internal.hpp)
-    int decode_gemv_threads = 1; // O2: decode's backbone GEMV fan-out (include/sub0/gemv.hpp)
-    int decode_omp_spin = 0;     // O3: keep decode's OpenMP workers spinning between regions (decode.cpp kv_reset)
+    int moe_decode_threads = 0; // 0 = auto; decode's routed-expert fan-out width (src/backends/cpu/internal.hpp)
+    int decode_gemv_threads = 0; // 0 = auto; O2: decode's backbone GEMV fan-out (include/sub0/gemv.hpp)
+    int decode_omp_spin = -1;    // -1 = auto; O3: keep decode's OpenMP workers spinning between regions (decode.cpp kv_reset)
     int simd_reduce  = 0;       // B34/B38: multi-accumulator SIMD restructuring of the hot reduction
                                  // loops (moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp).
                                  // 0 = off (default, today's plain scalar reduction, bit-exact). See the
                                  // --simd-reduce CLI option below for the real measured tradeoff.
-    int moe_row_split = 0;      // O8: split the routed-expert GEMVs by ROW RANGE across MOE_DECODE_THREADS
+    int moe_row_split = -1;     // -1 = auto; O8: split the routed-expert GEMVs by ROW RANGE across MOE_DECODE_THREADS
                                  // instead of handing whole experts to whole threads. 0 = off (default,
                                  // today's ParallelExperts fan-out, bit-exact). See --moe-row-split's own
                                  // CLI help below for the measured tradeoff.
@@ -845,15 +845,16 @@ int main(int argc, char** argv) {
                    "activation is a real (small) new error source with no precedent in this engine -- "
                    "see docs/INDEPENDENT_REVIEW_BACKLOG.md B35 for the isolated per-dot error and the "
                    "measured end-to-end logit diff against the existing path. Requires "
-                   "--moe-quant-experts 1. 0 = off (default, today's exact behavior, bit-exact decode "
-                   "hash).")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "--moe-quant-experts 1. 0 = off (today's exact behavior, bit-exact decode hash). "
+                   "-1 = auto (default): on whenever --moe-quant-experts 1.")
+       ->capture_default_str()->check(CLI::Range(-1, 1));
     app.add_option("--backbone-quant-dot", backbone_quant_dot,
                    "Experimental native-quant decode for selected backbone roles (starting with LM "
                    "head dot and token-embedding gather); roles without supported sidecar planes use "
                    "the existing bf16 path. Requires a valid <model_path>.bbq S0B1 sidecar when 1. "
-                   "0 = off (default, existing decode behavior).")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "0 = off (existing decode behavior). -1 = auto (default): on for a "
+                   "--moe-quant-experts 1 build with --tie-embeddings 0 (the real-model configuration).")
+       ->capture_default_str()->check(CLI::Range(-1, 1));
     app.add_option("--backbone-act-super", backbone_act_super,
                    "O9 (docs/BACKBONE_NATIVE_QUANT.md S14): every --backbone-quant-dot role whose real "
                    "sidecar plane is Q4_K/Q5_K/Q6_K and satisfies bbqd::super_fusable (256-element-"
@@ -865,8 +866,9 @@ int main(int argc, char** argv) {
                    "measured 2.17x-3.48x the per-32 path's own activation-quantization error on real "
                    "weights (docs/BACKBONE_NATIVE_QUANT.md S14e) -- gated on end-to-end perplexity "
                    "(docs/optimization/kpi_gates.json G-PPL), not merely a per-dot error bound. Requires "
-                   "--backbone-quant-dot 1. 0 = off (default, today's per-32 path, bit-exact).")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "--backbone-quant-dot 1. 0 = off (the per-32 path, bit-exact). -1 = auto "
+                   "(default): on whenever --backbone-quant-dot resolves on (G-PPL PASS, +14% long-run decode).")
+       ->capture_default_str()->check(CLI::Range(-1, 1));
     // Qwen Sparse Attention (docs/QSA.md): Stage 0 -- every axis hard-clamped to 0. All five must be
     // set together; a half-configured QSA build is refused both here and by layout.hpp's static_assert.
     app.add_option("--qsa-indexer-n-heads", qsa_idx_n_heads,
@@ -920,21 +922,21 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--decode-gemv-threads", decode_gemv_threads,
                    "O2: threads decode splits each backbone GEMV across, by output column (include/sub0/gemv.hpp) "
-                   "-- mixer projections, shared expert, router, lm_head. 1 (default) = serial. Bit-exact at "
+                   "-- mixer projections, shared expert, router, lm_head. 1 = serial. 0 = auto (default): 8 for a --moe-quant-experts 1 build, else 1. Bit-exact at "
                    "every value: each output keeps its own sequential sum; threads split only across outputs.")
-       ->capture_default_str()->check(CLI::Range(1, 64));
+       ->capture_default_str()->check(CLI::Range(0, 64));
     app.add_option("--decode-omp-spin", decode_omp_spin,
                    "1 = decode keeps its OpenMP workers spinning between parallel regions instead of sleeping "
                    "(kmp_set_blocktime, set in kv_reset). Decode forks ~600 short regions per token, so a "
                    "sleeping worker pays an OS wake-up each time: measured 0.267-0.336 -> 0.223-0.238 s/token. "
-                   "Costs idle workers' cores for the duration of a generation. 0 = libomp default (off).")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "Costs idle workers' cores for the duration of a generation. 0 = libomp default (off). -1 = auto (default): on for a --moe-quant-experts 1 build.")
+       ->capture_default_str()->check(CLI::Range(-1, 1));
     app.add_option("--moe-decode-threads", moe_decode_threads,
                    "threads decode fans a row's routed experts across (internal.hpp MOE_DECODE_THREADS). "
-                   "Default 1. B29's '1 is fastest' was an artefact of every decode team being confined to one "
+                   "0 = auto (default): 8 for a --moe-quant-experts 1 build, else 1. B29's '1 is fastest' was an artefact of every decode team being confined to one "
                    "core (B40, fixed); measured since: 10 threads cut the routed-expert phase 185 -> 39 ms. "
                    "Scheduling only: the combine order is fixed, so the answer is bit-identical at any value.")
-       ->capture_default_str()->check(CLI::Range(1, 64));
+       ->capture_default_str()->check(CLI::Range(0, 64));
     app.add_option("--moe-row-split", moe_row_split,
                    "O8 (docs/optimization/opportunities/O8_moe_row_split.md): 1 = split each selected "
                    "expert's gate/up/down GEMVs by ROW RANGE and schedule the ranges dynamically across "
@@ -946,9 +948,9 @@ int main(int argc, char** argv) {
                    "computed whole either way -- bit-exact by construction regardless: every row is still "
                    "produced by the same gemv_plane kernel on the same bytes in the same per-row order, "
                    "only WHICH thread computes which row range changes. Requires --moe-quant-dot 1 (there "
-                   "is nothing to row-split in the dequantize-then-f32-FFN path). 0 = off (default, "
-                   "today's ParallelExperts behavior, bit-exact decode hash).")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "is nothing to row-split in the dequantize-then-f32-FFN path). 0 = off (ParallelExperts' whole-expert "
+                   "fan-out). -1 = auto (default): on whenever --moe-quant-dot resolves on.")
+       ->capture_default_str()->check(CLI::Range(-1, 1));
     app.add_option("--simd-reduce", simd_reduce,
                    "1 = multi-accumulator SIMD restructuring (include/sub0/simd_reduce.hpp) of the hot "
                    "reduction loops in moe_math.hpp/gdn_math.hpp/qsa_math.hpp/gated_residual_math.hpp -- "
@@ -1057,6 +1059,28 @@ int main(int argc, char** argv) {
             std::println(stderr, "configure error: --dump-vocab requires --corpus and cannot be used with --vocab-exact");
             return 2;
         }
+    }
+
+    // resolve_decode_defaults: the decode-performance options default to AUTO so that the default build
+    // IS the best measured build (docs/optimization/opportunities/README.md, "Recommended flags"). They
+    // only apply to a quantized-resident MoE inference build (--moe-quant-experts 1, the real-model
+    // configuration), so auto resolves ON there and to the old off/serial values everywhere else -- every
+    // other build's generated header is byte-identical to before. An explicit value always wins.
+    {
+        const bool quant_inference = moe_quant_experts != 0;
+        const auto resolve = [](int& v, bool on) { if (v < 0) v = on ? 1 : 0; };
+        resolve(moe_quant_dot, quant_inference);
+        resolve(moe_row_split, moe_quant_dot != 0);
+        resolve(decode_omp_spin, quant_inference);
+        resolve(backbone_quant_dot, quant_inference && tie_embeddings == 0);
+        resolve(backbone_act_super, backbone_quant_dot != 0);
+        // 8 = this host's P-core count, the measured best for both teams (O8 S8: 8 beat 12 and 16 once
+        // E-cores join), capped at the machine's hardware threads on a smaller host.
+        // TODO(decode-threads-topology): derive from the P-core count once Sub0Llm has a topology probe.
+        const int best_threads =
+            static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
+        if (decode_gemv_threads == 0) decode_gemv_threads = quant_inference ? best_threads : 1;
+        if (moe_decode_threads == 0) moe_decode_threads = quant_inference ? best_threads : 1;
     }
 
     // The configurator DECIDES whether to USE CUDA: default the compute backend to GPU when the CUDA

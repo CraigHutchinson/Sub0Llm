@@ -58,12 +58,16 @@ re-run it, rather than something noticed months later.
 operating point). MoE **68.7%**, mixer GDN/QSA **21.2%**, lm_head 5.4%, gated-residual 4.6%. Lever
 selection must cite this, not the pre-B35 numbers.
 
-### Current recommended real-axes decode flags (2026-09-26)
+### Decode defaults: the best options, no flags needed (2026-09-29)
 
-`--moe-quant-dot 1 --decode-gemv-threads 8 --moe-decode-threads 8 --decode-omp-spin 1 --backbone-quant-dot 1 --moe-row-split 1 --backbone-act-super 1`
-(the last needs the paired `.bbq` sidecar beside the model; quality-neutral by the perplexity gate,
-`../../BACKBONE_NATIVE_QUANT.md` §19). With all of them: ~5.7 tok/s over the long `--stage ppl` run (the short six-token A/B reads higher, ~6.6-7, because attention cost grows with position). Older
-opportunity docs quote the flags of their own day; they are records, not the current recipe.
+The real-axes configure recipe alone (`--moe-quant-experts 1` + `--tie-embeddings 0`) now builds the best
+measured decode. The configurator's auto defaults (`resolve_decode_defaults`, AGENTS.md §4) resolve to
+`--moe-quant-dot 1 --decode-gemv-threads 8 --moe-decode-threads 8 --decode-omp-spin 1 --backbone-quant-dot 1
+--moe-row-split 1 --backbone-act-super 1`. Every other build class resolves each option to its old off/serial
+value, so the neutral build's generated header is byte-identical. Pass an explicit value to override: for
+example `--backbone-quant-dot 0` for a model without a `.bbq` sidecar, or `--backbone-act-super 0` to A/B O9.
+Expected: ~6.5 tok/s over the long `--stage ppl` run (~8 short-run). Older opportunity docs quote the flags of
+their own day; they are records, not the current recipe.
 
 ### Briefed and ready
 
@@ -75,8 +79,8 @@ opportunity docs quote the flags of their own day; they are records, not the cur
 | [O4](O4_gdn_threads_and_moe_schedule.md) | Thread GDN across heads/channels; `schedule(dynamic)` for routed experts | **merged** | **0.236 → 0.211 s/token**; GDN phase −18.5%, bit-exact. MoE lever did NOT reproduce (−2.4%, in noise) | 1 |
 | [O5](../../BACKBONE_NATIVE_QUANT.md) | Native-quant backbone: keep the unsloth GGUF's Q8_0/Q4_K/Q5_K/Q6_K bytes resident, fused int8-activation dot | **all roles wired; quality-neutral** (G-PPL, §19); configure flag `--backbone-quant-dot 1` (needs the paired sidecar) | **~4.6 → ~6.6 tok/s** short-run (6.9 clean); long-run 3.79 → 5.14 tok/s. Perplexity 15.03 → 14.85, paired ΔNLL −0.012 (CI −0.035..+0.011) | 3 |
 | [O7](O7_expert_kernels.md) | IQ1_S/IQ2_XXS expert kernels: per-superblock scale hoist + vector gather | **parked**, default off (`kO7Kernels`) | Bit-exact; 14–26% faster per plane in the 1-thread bench, but slower in real decode at both 10 and 8 expert threads (§10–§11). Found on the way: 8 expert threads beat 10 (−3 ms) | 2 |
-| [O8](O8_moe_row_split.md) | Routed experts split by ROW across the decode team, not whole experts per thread | **merged**, default off, recommended on (`--moe-row-split 1`) | Bit-exact (ppl identical, per-token dNLL exactly 0); long-run decode **5.16 -> 5.71 tok/s (+11%)**, both arm orders | 1 |
-| [O9](O9_act_super.md) | Per-256 `ActSuper` activation kernels for the Q4_K/Q5_K/Q6_K native backbone roles | **merged**, default off, recommended on (`--backbone-act-super 1`) | G-PPL PASS (dNLL -0.0098, CI -0.032..+0.012); long-run decode **+14%** (primary-agent passes, 5.72 -> 6.53 tok/s) | 1 |
+| [O8](O8_moe_row_split.md) | Routed experts split by ROW across the decode team, not whole experts per thread | **merged**, default ON (auto) for real-axes builds | Bit-exact (ppl identical, per-token dNLL exactly 0); long-run decode **5.16 -> 5.71 tok/s (+11%)**, both arm orders | 1 |
+| [O9](O9_act_super.md) | Per-256 `ActSuper` activation kernels for the Q4_K/Q5_K/Q6_K native backbone roles | **merged**, default ON (auto) for real-axes builds | G-PPL PASS (dNLL -0.0098, CI -0.032..+0.012); long-run decode **+14%** (primary-agent passes, 5.72 -> 6.53 tok/s) | 1 |
 
 **Candidates, not yet briefed — ordered and costed in [`../../SPECULATION_NGRAM_MOE_DESIGN.md`](../../SPECULATION_NGRAM_MOE_DESIGN.md).**
 
