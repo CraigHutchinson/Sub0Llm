@@ -1,6 +1,6 @@
 # Sub0Llm performance report
 
-Generated 2026-09-29T10:17:17Z -- label `defaults-best`
+Generated 2026-09-29T10:50:59Z -- label `O10-prof`
 
 ## Gate panel
 
@@ -17,6 +17,6 @@ Generated 2026-09-29T10:17:17Z -- label `defaults-best`
 
 | Arm | Perplexity | Mean NLL | Top-1 | Decode tok/s |
 |---|---:|---:|---:|---:|
-| default | 14.7035 | 2.6881 | 0.4876 | 6.98 |
+| prof | 14.7035 | 2.6881 | 0.4876 | 6.95 |
 
 History: `perf_history.jsonl`. Policy: `docs/OPTIMIZATION_PROCESS.md`.
