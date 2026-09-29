@@ -156,25 +156,64 @@ def decode_s_per_token(build: pathlib.Path, tokens: int = 3, cold: bool = False)
     return float(m.group(1)) if m else None
 
 
-def parity(build: pathlib.Path, tokens: int = 6) -> float | None:
-    out = run([str(build / "sub0llm-qwen4-forward.exe"), "--model", ARTIFACT, "--tokens", str(tokens)])
-    m = re.search(r"max \|forward - forward_one\| = ([\d.eE+-]+)", out)
-    return float(m.group(1)) if m else None
+def stage_arm_binaries(build: pathlib.Path, arms: list[tuple[str, list[str]]]) -> dict[str, pathlib.Path]:
+    """Configure + build every arm ONCE, copying its executable and DLLs into build/arms/<name>/.
+
+    Timing then never follows a compile. The old loop rebuilt before every sample, so each arm was
+    measured on a CPU a compile had just heated, a thermal confound that tracked the arm schedule
+    (S1b 2026-09-29: one reactive arm spanned 0.111-0.170 s/token over three runs). The generated-config
+    hash proves the arms really are different builds (AGENTS.md S10.2), since their banners can be identical.
+    """
+    import hashlib
+    import shutil
+    staged: dict[str, pathlib.Path] = {}
+    hashes: dict[str, str] = {}
+    for name, flags in arms:
+        configure(build, flags)
+        build_target(build, "sub0llm-qwen4-forward")
+        dst = build / "arms" / name
+        shutil.rmtree(dst, ignore_errors=True)
+        dst.mkdir(parents=True)
+        for f in [build / "sub0llm-qwen4-forward.exe", *build.glob("*.dll")]:
+            shutil.copy2(f, dst / f.name)
+        # The generated headers ARE the build's compile-time identity. The DLL is not: the linker stamps
+        # it, so identical flags hash differently on every build and a DLL comparison can never fire.
+        h = hashlib.sha256()
+        for header in sorted((build / "generated").glob("*.hpp")):
+            h.update(header.name.encode())
+            h.update(header.read_bytes())
+        digest = h.hexdigest()
+        clash = [other for other, d in hashes.items() if d == digest]
+        if clash:
+            raise RuntimeError(f"arm {name!r} generated the same configuration as {clash[0]!r}: "
+                               "the flags did not change the build, so the A/B would compare a build with itself")
+        hashes[name] = digest
+        staged[name] = dst
+        print(f"  staged {name}: generated-config sha256 {digest[:12]}", flush=True)
+    return staged
 
 
 def stage_perf(build: pathlib.Path, arms: list[tuple[str, list[str]]], runs: int, tokens: int,
-               cold: bool = False) -> dict:
-    """Interleaved A/B/A/B across arms -- never batched, per OPTIMIZATION_PROCESS.md S1.
+               cold: bool = False, cooldown_s: float = 20.0) -> dict:
+    """Interleaved across arms -- never batched, per OPTIMIZATION_PROCESS.md S1.
 
-    Reconfigures + rebuilds between arms in ONE build dir rather than using N sibling dirs, because a
-    stale sibling dir silently compares the wrong source tree.
+    Every arm is built once up front (stage_arm_binaries), in ONE build dir rather than N sibling dirs,
+    because a stale sibling dir silently compares the wrong source tree. Round r then runs the arms
+    starting from arm r % n, so no arm always takes the first, coolest slot, and a fixed cooldown
+    precedes every sample so thermal state does not accumulate along the schedule.
     """
+    staged = stage_arm_binaries(build, arms)
     samples: dict[str, list[float]] = {name: [] for name, _ in arms}
     for i in range(runs):
-        for name, flags in arms:
-            configure(build, flags)
-            build_target(build, "sub0llm-qwen4-forward")
-            v = decode_s_per_token(build, tokens, cold)
+        order = arms[i % len(arms):] + arms[:i % len(arms)]
+        for name, _ in order:
+            time.sleep(cooldown_s)
+            # The start-of-run gate cannot see a sibling build that begins mid-run; a cheap named-process
+            # check before EVERY sample does, and holds the schedule rather than record a contended number.
+            while (n := contention_count()) > 0:
+                print(f"  paused before {name}: {n} named competing process(es) running", flush=True)
+                time.sleep(30)
+            v = decode_s_per_token(staged[name], tokens, cold)
             if v is not None:
                 samples[name].append(v)
             print(f"  [{i+1}/{runs}] {name}: {v} s/token", flush=True)
@@ -377,6 +416,8 @@ def main() -> int:
                          "label and compare them separately")
     ap.add_argument("--runs", type=int, default=3, help="runs per arm (minimum 3 by policy)")
     ap.add_argument("--tokens", type=int, default=3)
+    ap.add_argument("--cooldown", type=float, default=20.0, metavar="S",
+                    help="perf stage: idle seconds before every timed run, so heat does not build up along the schedule")
     ap.add_argument("--label", default="", help="opportunity ID, tags the history row (e.g. B35)")
     ap.add_argument("--allow-contention", action="store_true",
                     help="measure anyway. Produces a number that policy says is not evidence.")
@@ -433,7 +474,7 @@ def run_suite(args, sb) -> int:
     if "perf" in stages:
         if args.runs < 3:
             print("warning: policy minimum is 3 runs per arm", file=sys.stderr)
-        results["perf"] = stage_perf(build, arms, args.runs, args.tokens, args.cold)
+        results["perf"] = stage_perf(build, arms, args.runs, args.tokens, args.cold, args.cooldown)
         results["cache"] = "cold" if args.cold else "warm"
 
     if "ppl" in stages:
