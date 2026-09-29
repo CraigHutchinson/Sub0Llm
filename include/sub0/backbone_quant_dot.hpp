@@ -1999,6 +1999,10 @@ template <bool Q8Fast = false>
  *         existing OpenMP team runs serially rather than nesting). Each range reads disjoint plane bytes
  *         and writes a disjoint `out` slice with no shared mutable state, so the result is bit-identical
  *         regardless of thread count (tests/backbone_quant_dot_tests.cpp's own "threading" case).
+ * @tparam Q8Fast  O12 (default false = today's exact per-block Q8_0 path, bit-exact): when true, Q8_0 planes
+ *         run the vector-accumulator kernel (`detail::gemv_q8_0_fast`; NOT bit-exact, float reassociation --
+ *         see its header comment). Inert for every other format, and on a non-AVX2 build (which has no fast
+ *         kernel). Callers bake it from `BACKBONE_Q8_FAST`; bit-exact across thread counts either way.
  * @return false if the format is unfusable, `raw` is shorter than the geometry requires, or the row range
  *         is out of bounds -- `out` is left completely untouched in every refusal case, checked BEFORE
  *         any thread starts (plane_geometry_ok), not merely before this thread's own portion.

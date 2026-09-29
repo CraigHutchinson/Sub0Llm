@@ -947,7 +947,7 @@ perf-sensitive workload other agents' own throughput numbers could be confounded
 overlap (AGENTS.md's own preamble).
 
 
-**2026-09-29 Claude Code (subagent) -- O12 IN PROGRESS: native Q8_0 fast GEMV kernel.** ISOLATED worktree
+**2026-09-29 Claude Code (subagent) -- O12 BUILT, status: done (awaiting primary-agent review; G-PPL inconclusive by 0.0002, see opportunities/O12_q8_fast.md): native Q8_0 fast GEMV kernel.** ISOLATED worktree
 (`.claude/worktrees/agent-ae6c9cfbf6eed2ec0`), branch `worktree-agent-ae6c9cfbf6eed2ec0`, ff-merged to `main`
 @ `63a6b3c`. Files: `include/sub0/backbone_quant_dot.hpp` (new Q8_0 kernel + dispatch), `gated_residual_math.hpp`
 (`mix` template flag), `src/backends/cpu/decode.cpp` (GR + `compute_shared`), `tools/configurator.cpp` (new
