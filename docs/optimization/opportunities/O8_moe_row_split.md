@@ -271,11 +271,23 @@ ended. The end-to-end +11% is the measured claim.
 
 ## 8. Thread-count findings
 
-**Not measured.** The sweep the brief asked for (`--moe-decode-threads` 8 against 12 or 16) was not run
-before the authoring agent's session ended. It is the natural next pass: whole experts could not use
-E-cores well (one E-core expert cost ~2.1x a P-core one), but row chunks are small and dynamically
-scheduled, so a larger team that includes E-cores might now pay. Measure it with the same long-run
-method as §7.
+Measured 2026-09-29, after the merge: row-split on, `--moe-decode-threads` 8, 12 and 16, two long-run
+`--stage ppl` passes with the order reversed. Background load was ~11%, above the usual 5% bar, so only
+within-pass comparisons are read.
+
+| long-run tok/s | 8 | 12 | 16 |
+|---|---:|---:|---:|
+| pass 1 (8, 12, 16) | **5.31** | 4.88 | 5.13 |
+| pass 2 (16, 12, 8) | 5.15 | **5.49** | 4.85 |
+| mean | 5.23 | 5.19 | 4.99 |
+
+- **No gain from a larger team.** The best arm flips with the order, and the ~0.3 tok/s spread is as large
+  as any difference between arms. Sixteen is, if anything, worse.
+- Row chunks let E-cores take work without holding a whole expert hostage, but that does not turn into
+  measurable speed at this chunk size. Eight threads, all P-cores, stays the recommendation: it is the
+  simplest option and none of the alternatives beats it.
+- **Bit-exact across thread counts:** perplexity 14.8488 in every arm, paired dNLL exactly 0, top-1
+  agreement 100%.
 
 ## 9. `cpp-review` pass
 
