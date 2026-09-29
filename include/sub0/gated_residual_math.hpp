@@ -152,7 +152,7 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float
 // down_w: [wide, hc_lowrank], up_w: [hc_lowrank, wide], this project's own [in,out] convention.
 // out_mixed: [T, hidden_size]. scratch: >= T*hc_lowrank floats (the down-projection's pre-activation).
 /// Stage marks mix() reports to its Probe (O10 sub-phase profiling); each marks a stage's START.
-enum class MixStage : unsigned char { Down, Elementwise, Up };
+enum class MixStage : unsigned char { Quantize, Down, Elementwise, Up };
 
 template <int Threads = 1, class WP, class Probe = NoStageProbe>
 inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
@@ -169,15 +169,17 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
     for (int t = 0; t < T; ++t) {
         const float* xr = normed + static_cast<std::size_t>(t) * wide;
         float* dr = down_pre + static_cast<std::size_t>(t) * lr;
-        probe(MixStage::Down);
+        probe(MixStage::Quantize);
         if (native_ok) {
             native->wide_q->quantize(xr, wide);
+            probe(MixStage::Down);
             if (!bbqd::gemv_plane<Threads>(*native->down, *native->wide_q, dr)) {
                 std::fprintf(stderr, "fatal: gr::mix's native down-projection GEMV rejected a plane whose "
                                      "geometry passed the outer check\n");
                 std::abort();
             }
         } else {
+            probe(MixStage::Down);
             gemv::axpy<Threads>(xr, down_w, wide, lr, dr);   // O3: include/sub0/gemv.hpp, same per-output order
         }
         probe(MixStage::Elementwise);
@@ -197,17 +199,19 @@ inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
         // any cache line) found in a post-merge performance review, not present at this stage's own
         // small test scale. Purely a summation-ORDER change -- same terms, same result within float32
         // rounding (gated by this test file's own 5e-5 tolerance, comfortably wider than reordering noise).
-        probe(MixStage::Up);
+        probe(MixStage::Quantize);
         if (native_ok) {
             // down's OUTPUT feeds up's INPUT -- a genuinely different activation vector from `xr`, so
             // this is its OWN quantize call, not a reuse of wide_q (see Native's own comment).
             native->lr_q->quantize(dr, lr);
+            probe(MixStage::Up);
             if (!bbqd::gemv_plane<Threads>(*native->up, *native->lr_q, up_val)) {
                 std::fprintf(stderr, "fatal: gr::mix's native up-projection GEMV rejected a plane whose "
                                      "geometry passed the outer check\n");
                 std::abort();
             }
         } else {
+            probe(MixStage::Up);
             gemv::axpy<Threads>(dr, up_w, lr, wide, up_val);   // O3: see the down projection above
         }
         probe(MixStage::Elementwise);

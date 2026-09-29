@@ -40,24 +40,25 @@ namespace sub0::prof {
 /// Mixer is the full-attention mixer (QSA, or softmax attention); MixerGdn is the Gated DeltaNet mixer.
 ///
 /// O10 sub-phases (each nests inside one parent above and is charged INSTEAD of it, exclusive-time):
-///   inside MixerGdn:       GdnInProj .. GdnOutProj  (gdn::forward's stages, via gdn::Stage marks)
-///   inside GatedResidual:  GrNorm, GrDown, GrUp, GrMixEw, GrGate, GrCombine (gr::mix's stages via
+///   inside MixerGdn:       GdnInQuant .. GdnOutProj  (gdn::forward's stages, via gdn::Stage marks)
+///   inside GatedResidual:  GrNorm, GrQuant, GrDown, GrUp, GrMixEw, GrGate, GrCombine (gr::mix's stages via
 ///                          gr::MixStage marks; the rest at decode.cpp's call boundaries). What is left
 ///                          on GatedResidual itself is the read/write lambda glue.
 ///   inside Mixer:          QsaIndexer, QsaProj, QsaAttn (call boundaries in decode.cpp)
 enum class Phase : std::uint8_t {
     Other, Mixer, MixerGdn, Moe, MoeRouted, GatedResidual, LmHead,
-    GdnInProj, GdnBaProj, GdnConv, GdnRecur, GdnGateNorm, GdnOutProj,
-    GrNorm, GrDown, GrUp, GrMixEw, GrGate, GrCombine,
+    GdnInQuant, GdnInProj, GdnBaProj, GdnConv, GdnRecur, GdnGateNorm, GdnOutQuant, GdnOutProj,
+    GrNorm, GrQuant, GrDown, GrUp, GrMixEw, GrGate, GrCombine,
     QsaIndexer, QsaProj, QsaAttn,
     Count };
 
 inline constexpr std::array<std::string_view, static_cast<std::size_t>(Phase::Count)> kPhaseNames{
     "unattributed", "mixer: QSA/attention", "mixer: GDN", "MoE: router + shared + combine",
     "MoE: routed experts", "Gated Residual: glue", "lm_head (+ final norm)",
-    "GDN: in-proj qkv+z (quant+GEMV)", "GDN: in-proj b,a (+ sigmoid/softplus)", "GDN: conv1d + SiLU",
-    "GDN: recurrence (state update)", "GDN: gated RMSNorm", "GDN: out-proj (gather+quant+GEMV)",
-    "GR: hc_norm", "GR: down (quant+GEMV)", "GR: up (quant+GEMV)", "GR: mix elementwise",
+    "GDN: in-proj act quantize", "GDN: in-proj qkv+z GEMV", "GDN: in-proj b,a (+ sigmoid/softplus)",
+    "GDN: conv1d + SiLU", "GDN: recurrence (state update)", "GDN: gated RMSNorm",
+    "GDN: out-proj gather+quantize", "GDN: out-proj GEMV",
+    "GR: hc_norm", "GR: act quantize (down+up)", "GR: down GEMV", "GR: up GEMV", "GR: mix elementwise",
     "GR: inject gate", "GR: combine (write)",
     "QSA: indexer (project+select)", "QSA: q/k/v projections", "QSA: attention + o-proj"};
 

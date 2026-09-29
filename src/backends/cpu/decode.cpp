@@ -845,7 +845,8 @@ const float* Model::forward_one(int id, int pos) {
     // O10: the mix() stage marks charged to GR sub-phases -- NoStageProbe (empty, no code) unless PROFILE_PHASES.
     [[maybe_unused]] const auto gr_probe = [] {
         if constexpr (PROFILE_PHASES)
-            return prof::StageProbe<gr::MixStage, 3>{{prof::Phase::GrDown, prof::Phase::GrMixEw, prof::Phase::GrUp}};
+            return prof::StageProbe<gr::MixStage, 4>{{prof::Phase::GrQuant, prof::Phase::GrDown, prof::Phase::GrMixEw,
+                                                 prof::Phase::GrUp}};
         else
             return NoStageProbe{};
     }();
@@ -1186,9 +1187,9 @@ const float* Model::forward_one(int id, int pos) {
                 }
                 constexpr auto gdn_probe = [] {
                     if constexpr (PROFILE_PHASES)
-                        return prof::StageProbe<gdn::Stage, 6>{{prof::Phase::GdnInProj, prof::Phase::GdnBaProj,
-                            prof::Phase::GdnConv, prof::Phase::GdnRecur, prof::Phase::GdnGateNorm,
-                            prof::Phase::GdnOutProj}};
+                        return prof::StageProbe<gdn::Stage, 8>{{prof::Phase::GdnInQuant, prof::Phase::GdnInProj,
+                            prof::Phase::GdnBaProj, prof::Phase::GdnConv, prof::Phase::GdnRecur,
+                            prof::Phase::GdnGateNorm, prof::Phase::GdnOutQuant, prof::Phase::GdnOutProj}};
                     else
                         return NoStageProbe{};
                 }();

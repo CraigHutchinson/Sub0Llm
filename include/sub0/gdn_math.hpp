@@ -237,7 +237,7 @@ inline void recurrence_step(int dk, int dv, float g_t, float beta_t,
 }
 
 /// Stage marks forward() reports to its Probe (O10 sub-phase profiling); each marks a stage's START.
-enum class Stage : unsigned char { InProj, BaProj, Conv, Recurrence, GateNorm, OutProj };
+enum class Stage : unsigned char { InQuant, InProj, BaProj, Conv, Recurrence, GateNorm, OutQuant, OutProj };
 
 // The real forward, per S1b/S1c/the class's own forward() (quoted/re-derived in this file's header
 // comment): in_proj_qkv -> causal depthwise conv1d + SiLU -> split Q/K/V -> beta=sigmoid(b),
@@ -325,7 +325,7 @@ inline void forward(const Dims& d, int T,
         float* zr = zb + static_cast<std::size_t>(t) * value_dim;
         float* br = beta + static_cast<std::size_t>(t) * Hv;
         float* gr = gg   + static_cast<std::size_t>(t) * Hv;
-        probe(Stage::InProj);
+        probe(Stage::InQuant);   // the axpy fallback has no quantize; InProj follows immediately
         if (native_in_ok) {
             // O9: each of in_qkv/in_z independently decides super-vs-per-32 from its OWN plane's real
             // format (bbqd::super_ok, never assumed shared) -- see this struct's own x_q_super comment.
@@ -340,6 +340,7 @@ inline void forward(const Dims& d, int T,
             // runtime gather, under either representation.
             if (!qkv_super || !z_super) native->x_q->quantize(xt, hs);
             if (qkv_super || z_super) native->x_q_super->quantize(xt, hs);
+            probe(Stage::InProj);
             const bool ok_qkv = qkv_super
                 ? bbqd::gemv_plane_super<Threads>(*native->in_qkv, *native->x_q_super, qkvr)
                 : bbqd::gemv_plane<Threads>(*native->in_qkv, *native->x_q, qkvr);
@@ -353,6 +354,7 @@ inline void forward(const Dims& d, int T,
                 std::abort();
             }
         } else {
+            probe(Stage::InProj);
             gemv::axpy<Threads>(xt, w_qkv, hs, conv_dim, qkvr);   // O2: include/sub0/gemv.hpp
             gemv::axpy<Threads>(xt, w_z, hs, value_dim, zr);
         }
@@ -472,7 +474,7 @@ inline void forward(const Dims& d, int T,
                 gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
         });
         float* ot = out + static_cast<std::size_t>(t) * hs;
-        probe(Stage::OutProj);
+        probe(Stage::OutQuant);   // native path: gather + quantize; the axpy fallback has neither
         if (native_out_ok) {
             // O5 phase 2b-2b: GdnOutProj's sidecar bytes are raw, GGUF/tiled column order (backbone_
             // quant.hpp's own header comment -- the value-head permutation is on the WITHIN-ROW axis and
@@ -489,9 +491,11 @@ inline void forward(const Dims& d, int T,
             bool ok;
             if (out_super) {
                 native->gated_q_super->quantize(native->out_gather_buf, value_dim);
+                probe(Stage::OutProj);
                 ok = bbqd::gemv_plane_super<Threads>(*native->out, *native->gated_q_super, ot);
             } else {
                 native->gated_q->quantize(native->out_gather_buf, value_dim);
+                probe(Stage::OutProj);
                 ok = bbqd::gemv_plane<Threads>(*native->out, *native->gated_q, ot,
                     /*row_lo=*/0, /*row_hi=*/-1, native->out_gsum16);
             }
@@ -501,6 +505,7 @@ inline void forward(const Dims& d, int T,
                 std::abort();
             }
         } else {
+            probe(Stage::OutProj);
             gemv::axpy<Threads>(gated, w_out, value_dim, hs, ot);
         }
     }
