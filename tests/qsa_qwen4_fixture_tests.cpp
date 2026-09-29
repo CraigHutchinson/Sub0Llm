@@ -399,3 +399,100 @@ TEST_CASE("QSA pools each block key exactly once per run, not once per query", "
     REQUIRE(sub0::qsa::stats::pool_block_key_calls == naive);
     for (std::size_t i = 0; i < out_cold.size(); ++i) REQUIRE(out_cold[i] == out[i]);
 }
+
+// --- O9 (docs/optimization/opportunities/O9_act_super.md): qsa::Native's ActSuper seam. Every wired
+// projection (q|gate, k, v via attn_project_row; o via attn_row) must equal a direct
+// bbqd::gemv_plane_super call on the same bytes, and a non-super-fusable plane keeps the per-32 path.
+#include <cstdint>
+#include <cstring>
+#include <random>
+#include <span>
+
+namespace {
+
+std::vector<std::uint8_t> make_o9_blocks(sub0::gguf::TensorType type, std::uint64_t n, std::uint32_t seed) {
+    const sub0::gguf::BlockSpec spec = sub0::gguf::block_spec(static_cast<std::uint32_t>(type));
+    REQUIRE(spec.elems != 0);
+    REQUIRE(n % spec.elems == 0);
+    std::mt19937 rng(seed);
+    const std::uint64_t blocks = n / spec.elems;
+    std::vector<std::uint8_t> raw(static_cast<std::size_t>(blocks * spec.bytes));
+    for (auto& b : raw) b = static_cast<std::uint8_t>(rng() & 0xFFu);
+    for (std::uint64_t b = 0; b < blocks; ++b) {
+        std::uint8_t* blk = raw.data() + b * spec.bytes;
+        auto patch = [&](std::size_t off) {
+            const auto bits = static_cast<std::uint16_t>(0x3000u + (rng() & 0x0FFFu));
+            std::memcpy(blk + off, &bits, sizeof bits);
+        };
+        switch (type) {
+            case sub0::gguf::TensorType::Q8_0: patch(0); break;
+            case sub0::gguf::TensorType::Q5_K: patch(0); patch(2); break;
+            default: break;
+        }
+    }
+    return raw;
+}
+
+}  // namespace
+
+TEST_CASE("qsa::Native's O9 ActSuper path equals direct bbqd::gemv_plane_super calls; a Q8_0 v falls back "
+          "to the per-32 path in the same call",
+          "[qsa][backbonequant]") {
+    using sub0::gguf::TensorType;
+    namespace bbqd = sub0::bbqd;
+    const sub0::qsa::Dims d{256, 8, 32, 2, 2, 1, 8, 8, 4, 16};   // q_width 256, kv_width 64
+    const int qw = d.q_width(), kvw = d.kv_width(), hs = d.hidden_size;
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    std::vector<float> x(hs);
+    for (float& v : x) v = normal(rng);
+
+    const auto raw_qg = make_o9_blocks(TensorType::Q5_K, std::uint64_t(2 * qw) * hs, 1);
+    const auto raw_k  = make_o9_blocks(TensorType::Q5_K, std::uint64_t(kvw) * hs, 2);
+    const auto raw_v  = make_o9_blocks(TensorType::Q8_0, std::uint64_t(kvw) * hs, 3);   // never super
+    const auto raw_o  = make_o9_blocks(TensorType::Q5_K, std::uint64_t(hs) * qw, 4);
+    const bbqd::Plane p_qg{static_cast<std::uint32_t>(TensorType::Q5_K), 2 * qw, hs, std::span<const std::uint8_t>(raw_qg)};
+    const bbqd::Plane p_k{static_cast<std::uint32_t>(TensorType::Q5_K), kvw, hs, std::span<const std::uint8_t>(raw_k)};
+    const bbqd::Plane p_v{static_cast<std::uint32_t>(TensorType::Q8_0), kvw, hs, std::span<const std::uint8_t>(raw_v)};
+    const bbqd::Plane p_o{static_cast<std::uint32_t>(TensorType::Q5_K), hs, qw, std::span<const std::uint8_t>(raw_o)};
+
+    bbqd::ActBlocks x_q, ao_q;
+    bbqd::ActSuper x_q_super, ao_q_super;
+    std::vector<float> qg_buf(static_cast<std::size_t>(2 * qw));
+    sub0::qsa::Native native{};
+    native.q_gate = &p_qg; native.k = &p_k; native.v = &p_v; native.o = &p_o;
+    native.x_q = &x_q; native.ao_q = &ao_q;
+    native.x_q_super = &x_q_super; native.ao_q_super = &ao_q_super;
+    native.qg_buf = qg_buf.data();
+    REQUIRE(native.proj_ready());
+    REQUIRE(native.o_ready());
+
+    const float* np = nullptr;
+    std::vector<float> qnorm(d.head_dim, 1.f), knorm(d.head_dim, 1.f), cosv(d.rotary_dim, 1.f), sinv(d.rotary_dim, 0.f);
+    std::vector<float> oq(qw), og(qw), ok(kvw), ov(kvw);
+    sub0::qsa::attn_project_row<false, 1, const float*>(d, x.data(), np, np, np, np, qnorm.data(), knorm.data(),
+                                                        cosv.data(), sinv.data(), 1e-6f,
+                                                        oq.data(), og.data(), ok.data(), ov.data(), &native);
+
+    bbqd::ActSuper xs;
+    xs.quantize(x.data(), hs);
+    std::vector<float> ref_qg(2 * qw), ref_v(kvw);
+    REQUIRE(bbqd::gemv_plane_super<1>(p_qg, xs, ref_qg.data()));
+    for (int i = 0; i < 2 * qw; ++i) REQUIRE(qg_buf[static_cast<std::size_t>(i)] == ref_qg[static_cast<std::size_t>(i)]);
+    bbqd::ActBlocks xb;
+    xb.quantize(x.data(), hs);
+    REQUIRE(bbqd::gemv_plane<1>(p_v, xb, ref_v.data()));   // v is Q8_0: per-32 path, exactly
+    for (int i = 0; i < kvw; ++i) REQUIRE(ov[static_cast<std::size_t>(i)] == ref_v[static_cast<std::size_t>(i)]);
+
+    // o projection through attn_row at kv_len 1.
+    std::vector<float> kc(kvw, 0.5f), vc(kvw, 0.25f), mask(1, 1.f), out(hs);
+    std::vector<float> scratch(sub0::qsa::attn_scratch_floats(d, 1));
+    sub0::qsa::attn_row<false, 1, const float*>(d, oq.data(), og.data(), kc.data(), vc.data(), 1, mask.data(),
+                                                np, out.data(), scratch.data(), &native);
+    const float* ao = scratch.data() + 1;   // scratch layout: [kv_len] scores, then [q_width] ao
+    bbqd::ActSuper as;
+    as.quantize(ao, qw);
+    std::vector<float> ref_out(hs);
+    REQUIRE(bbqd::gemv_plane_super<1>(p_o, as, ref_out.data()));
+    for (int i = 0; i < hs; ++i) REQUIRE(out[static_cast<std::size_t>(i)] == ref_out[static_cast<std::size_t>(i)]);
+}
