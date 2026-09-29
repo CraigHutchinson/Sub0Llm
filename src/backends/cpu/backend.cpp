@@ -154,7 +154,7 @@ moeq::Store g_moe_quant;
 bbq::Store g_backbone_quant;
 BackboneRoleTable g_backbone_roles;   // O5 phase 2b-3 phase A: built once in load_backbone_quant_sidecar
 MoeIoStage g_moe_io_stage;                              // B36 -- sized once, beside the open below
-moeio::PlaneIo<MOE_IO_MAX_INFLIGHT> g_moe_decode_io;   // B36 -- opened alongside g_moe_quant below, only
+MoePlaneIo g_moe_decode_io;   // B36 -- opened alongside g_moe_quant below, only
                                                         // under MOE_IO_PIPELINED
 
 std::array<std::unique_ptr<Worker>, MAX_WORKERS> g_workers{};
@@ -2050,8 +2050,27 @@ bool load_moe_quant_sidecar(const char* model_path) {
             // prefetch() runs once per layer per token, so sizing there would put the first
             // token's heap allocation inside decode's hot path. max_desc_bytes() is final the
             // moment the descriptor table is parsed, which g_moe_quant.open() above just did.
+            // Both explicit readers carry a plane's size in moeio::Request's 32-bit byte count; a larger
+            // plane would be silently truncated into a short, wrong read rather than refused.
+            if (g_moe_quant.max_desc_bytes() > UINT32_MAX) {
+                std::println(stderr, "error: an encoded MoE plane exceeds moeio::Request's 32-bit byte count");
+                return false;
+            }
+#ifdef SUB0_MOE_IO_MEMPAGE
+            // Old registrations borrow the stage: drain them before a reload can resize buffers.
+            g_moe_decode_io.close();
+#endif
             g_moe_io_stage.reserve(static_cast<std::size_t>(g_moe_quant.max_desc_bytes()));
+#ifdef SUB0_MOE_IO_MEMPAGE
+            std::array<std::span<std::byte>, MOE_IO_MAX_INFLIGHT> destinations{};
+            for (std::size_t i = 0; i < destinations.size(); ++i)
+                destinations[i] = std::as_writable_bytes(std::span(g_moe_io_stage.buf[i]));
+            const auto status = g_moe_decode_io.open(path, destinations);
+            if (status != sub0mempage::Status::ok) {
+                err = std::string("MemPage registration failed: ") + std::string(moeio::status_name(status));
+#else
             if (!g_moe_decode_io.open(path, err)) {
+#endif
                 std::println(stderr,
                              "error: B36 pipelined-I/O handle failed to open beside the S0Q1 sidecar: {}",
                              err);
@@ -2143,7 +2162,11 @@ void sync_params_to_device() {}
 // thread_local W. Idempotent -- cheap to call even when W is already built.
 void graph_reset() { ensure_thread_built(); W->pool_used = 0; W->act_used = 0; }
 
-Node* forward(const int* ids, int T) { ensure_thread_built(); return g_model.forward(ids, T); }
+Node* forward(const int* ids, int T) {
+    require_moe_sidecar();
+    ensure_thread_built();
+    return g_model.forward(ids, T);
+}
 // Per-execution residual-stream diagnostic -- see Model::pass_delta. Both outputs are
 // [LOOP_EXEC_COUNT] and either may be null. Runs ONE forward over the given window; the caller owns
 // graph_reset() around it, exactly like a plain forward().

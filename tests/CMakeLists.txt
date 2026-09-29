@@ -289,22 +289,12 @@ if(SUB0_STORAGE_TIEREDCACHE)
   # revision (a detached worktree, e.g. `git worktree add --detach <dir> <sha>` -- never point this at
   # a shared checkout's live working tree, which another session may be advancing past the pin) plus
   # -DFETCHCONTENT_FULLY_DISCONNECTED=ON to guarantee no network access is attempted.
-  set(SUB0_STORAGE_SUB0MEMPAGE_REVISION "213acdd2121cec369c6b9606c514db2231e94f27")
+  # MemPage is made available FIRST, by Sub0Llm itself: at the pinned TieredCache revision its
+  # CMakeLists.txt only fetches and links MemPage when it is the top-level project, never as a
+  # subproject. The 2026-09-29 TieredCache packaging fix makes its target link MemPage transitively;
+  # this stays until the pin advances past that fix.
+  include("${CMAKE_SOURCE_DIR}/cmake/MemPage.cmake")
   set(SUB0_STORAGE_SUB0TIEREDCACHE_REVISION "e4da6a7e87bcbc65f79257bef9843d41adbec66d")
-
-  # Sub0Llm must fetch+link Sub0MemPage itself: Sub0TieredCache's own CMakeLists.txt only fetches
-  # Sub0MemPage when it is the TOP-level project (`if(NOT IS_SUBPROJECT)`), and here it is always a
-  # subproject of sub0llm's own project() -- so its target_link_libraries(Sub0TieredCache INTERFACE
-  # Sub0MemPage::Sub0MemPage) call never runs either. Declared and made available BEFORE
-  # Sub0TieredCache so Sub0TieredCache's own (skipped) fetch of the same package name never races it.
-  set(SUB0MEMPAGE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-  set(SUB0MEMPAGE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  set(SUB0MEMPAGE_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-  set(SUB0MEMPAGE_BUILD_INTEL_USM_PROBE OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(Sub0MemPage
-    GIT_REPOSITORY https://github.com/CraigHutchinson/Sub0MemPage.git
-    GIT_TAG ${SUB0_STORAGE_SUB0MEMPAGE_REVISION})
-  FetchContent_MakeAvailable(Sub0MemPage)
 
   set(SUB0TIEREDCACHE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
   set(SUB0TIEREDCACHE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -321,10 +311,13 @@ if(SUB0_STORAGE_TIEREDCACHE)
   target_link_libraries(sub0_storage_tiered_cache_tests PRIVATE
     Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache Catch2::Catch2WithMain)
   catch_discover_tests(sub0_storage_tiered_cache_tests)
+endif()
 
-  # tests/moe_io_mempage_tests.cpp: S1b step 4 (docs/STORAGE_STACK_PLAN.md) -- the MemPage routed-MoE
-  # plane adapter (include/sub0/moe_io_mempage.hpp) against positional reads and moeio::PlaneIo, before
-  # anything in src/ consumes it. MemPage only: variable plane shapes do not go through TieredCache.
+# tests/moe_io_mempage_tests.cpp: S1b (docs/STORAGE_STACK_PLAN.md) -- the MemPage routed-MoE plane
+# adapter against positional reads and moeio::PlaneIo, plus a real S0Q1 sidecar case gated on
+# SUB0_QWEN4_MOEQ_PATH. MemPage only: variable plane shapes do not go through TieredCache. Built with
+# the storage tests, and in any engine build configured --moe-io-mode mempage (root CMakeLists.txt).
+if(SUB0_STORAGE_TIEREDCACHE OR SUB0_MOE_MEMPAGE_ENABLED)
   add_executable(sub0_storage_moe_io_tests moe_io_mempage_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_mempage.cpp")
   target_include_directories(sub0_storage_moe_io_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
   target_link_libraries(sub0_storage_moe_io_tests PRIVATE Sub0MemPage::Sub0MemPage Catch2::Catch2WithMain)

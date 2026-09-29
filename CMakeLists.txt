@@ -321,6 +321,23 @@ target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN
 # The runtime tokenizer (encode/detokenize/load) is the same sub0_frontend used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
 target_link_libraries(sub0_core PRIVATE sub0_frontend)
+# The configurator owns transport selection. Discover the generated marker after stage 1, and
+# reconfigure when its header changes; existing reactive/pipelined builds acquire no dependency.
+file(GLOB _sub0_storage_headers CONFIGURE_DEPENDS "${GEN_DIR}/sub0_corpus.hpp")
+set(SUB0_MOE_MEMPAGE_ENABLED OFF)
+if(_sub0_storage_headers)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GEN_DIR}/sub0_corpus.hpp")
+  file(STRINGS "${GEN_DIR}/sub0_corpus.hpp" _sub0_mempage_marker REGEX "^#define SUB0_MOE_IO_MEMPAGE 1$")
+  if(_sub0_mempage_marker)
+    if(NOT SUB0_COMPUTE STREQUAL "CPU")
+      message(FATAL_ERROR "--moe-io-mode mempage currently requires SUB0_COMPUTE=CPU")
+    endif()
+    set(SUB0_MOE_MEMPAGE_ENABLED ON)
+    include(cmake/MemPage.cmake)
+    target_sources(sub0_core PRIVATE src/moe_io_mempage.cpp)
+    target_link_libraries(sub0_core PRIVATE Sub0MemPage::Sub0MemPage)
+  endif()
+endif()
 # blend_schedule.cpp's parse_blend_schedule_json (blend_schedule.hpp's ScheduleSpec) uses simdjson to
 # parse blend_schedule.json. PRIVATE: consumers (train_stage.cpp etc.) only ever call the plain
 # std::-typed functions declared in their headers -- simdjson's own types never leak across that boundary.

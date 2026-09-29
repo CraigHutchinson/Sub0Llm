@@ -835,8 +835,9 @@ int main(int argc, char** argv) {
                    "overlap each other and compute (docs/INDEPENDENT_REVIEW_BACKLOG.md B25/B36). "
                    "Measured ~1.4% WORSE on this host's current warm-page-cache state -- pipelined wins "
                    "only when the sidecar is NOT already resident in the OS page cache (a cold boot, "
-                   "memory pressure evicting it, or a host too small to cache it at all). Windows-only.")
-       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"reactive", 0}, {"pipelined", 1}},
+                   "memory pressure evicting it, or a host too small to cache it at all). "
+                   "mempage (2) = bounded portable MemPage worker reads; experimental.")
+       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"reactive", 0}, {"pipelined", 1}, {"mempage", 2}},
                                            CLI::ignore_case))
        ->default_str("reactive");
     app.add_option("--moe-quant-dot", moe_quant_dot,
@@ -1923,8 +1924,12 @@ int main(int argc, char** argv) {
     cos << "constexpr bool MOE_QUANT_EXPERTS = " << (moe_quant_experts ? "true" : "false") << ";\n";
     // B36: decode's I/O strategy for the S0Q1 sidecar -- see --moe-io-mode's own help text for the
     // measured result and when each mode is expected to win. false (reactive) reproduces today's
-    // behaviour bit-for-bit; true (pipelined) is include/sub0/moe_io.hpp's explicit overlapped I/O.
+    // behaviour bit-for-bit; true is explicit batched I/O -- include/sub0/moe_io.hpp's overlapped reader
+    // (pipelined), or include/sub0/moe_io_mempage.hpp's MemPage reader (mempage) via the marker below.
     cos << "constexpr bool MOE_IO_PIPELINED = " << (moe_io_pipelined ? "true" : "false") << ";\n";
+    // A transport/build dependency, not model math: excluded from ARCH_FINGERPRINT.
+    // Emit only for the opt-in mode so existing generated configurations stay byte-identical.
+    if (moe_io_pipelined == 2) cos << "#define SUB0_MOE_IO_MEMPAGE 1\n";
     // B35: fused quantized dot products against the sidecar's native bytes -- see --moe-quant-dot's own
     // help text for the measured accuracy/throughput tradeoff. false reproduces today's
     // dequantize-then-f32-dot resolve bit-for-bit.

@@ -11,6 +11,8 @@
 
 #include <sub0/moe_io.hpp>
 #include <sub0/moe_io_mempage.hpp>
+#include <sub0/moe_quant.hpp>
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -220,4 +222,58 @@ TEST_CASE("MemPagePlaneIo: open validates registrations and sessions repeat", "[
     io.close();
     io.close(); // idempotent
     CHECK(io.retire_batch() == Status::ok);
+}
+
+TEST_CASE("MemPagePlaneIo: real S0Q1 planes preserve encoded and decoded values", "[moeio][mempage][real]") {
+    // Local deprecation silencing, as tests/backbone_quant_dot_tests.cpp's real_gguf_dir() does.
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    const char* path = std::getenv("SUB0_QWEN4_MOEQ_PATH");
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    if (!path || !*path) SKIP("Set SUB0_QWEN4_MOEQ_PATH to qualify a real S0Q1 sidecar");
+    sub0::moeq::Store store;
+    std::string error;
+    REQUIRE(store.open(path, error));
+    const auto& header = store.header();
+    REQUIRE(header.num_experts >= 2);
+    const std::array<int, 3> experts{header.num_experts - 1, 0, header.num_experts - 1};
+    constexpr std::size_t tags = experts.size() * sub0::moeq::PerExpert;
+    std::array<std::vector<std::byte>, tags> buffers;
+    std::array<std::span<std::byte>, tags> destinations;
+    std::array<Request, tags> requests;
+    for (std::size_t k = 0; k < experts.size(); ++k) {
+        for (int plane = 0; plane < sub0::moeq::PerExpert; ++plane) {
+            const auto& desc = store.desc(0, experts[k], plane);
+            REQUIRE(desc.bytes <= UINT32_MAX);
+            const auto tag = k * sub0::moeq::PerExpert + plane;
+            buffers[tag].resize(static_cast<std::size_t>(desc.bytes));
+            destinations[tag] = buffers[tag];
+            requests[tag] = {header.data_off + desc.off, static_cast<std::uint32_t>(desc.bytes),
+                             reinterpret_cast<std::uint8_t*>(buffers[tag].data())};
+        }
+    }
+    MemPagePlaneIo io;
+    REQUIRE(io.open(path, destinations) == Status::ok);
+    REQUIRE(io.submit(requests) == Status::ok);
+    for (std::size_t i = tags; i-- > 0;) REQUIRE(io.wait(static_cast<int>(i)) == Status::ok);
+    for (std::size_t k = 0; k < experts.size(); ++k) {
+        for (int plane = 0; plane < sub0::moeq::PerExpert; ++plane) {
+            const auto tag = k * sub0::moeq::PerExpert + plane;
+            const auto& desc = store.desc(0, experts[k], plane);
+            const auto reference = positional_read(path, requests[tag].abs_off, requests[tag].bytes);
+            REQUIRE(equal_bytes(destinations[tag], reference));
+            const auto mapped = store.raw(desc);
+            REQUIRE(std::equal(reference.begin(), reference.end(), mapped.begin(), mapped.end()));
+            const std::span<const std::uint8_t> staged(requests[tag].dst, requests[tag].bytes);
+            std::vector<float> want, got;
+            REQUIRE(sub0::moeq::dequantize_expert_source(desc, mapped, want));
+            REQUIRE(sub0::moeq::dequantize_expert_source(desc, staged, got));
+            REQUIRE(got == want);
+        }
+    }
+    REQUIRE(io.retire_batch() == Status::ok);
 }

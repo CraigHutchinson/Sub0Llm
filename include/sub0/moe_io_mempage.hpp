@@ -7,11 +7,38 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace sub0::moeio {
 
+/// Diagnostic name for a MemPage status (the pinned MemPage revision provides none of its own).
+[[nodiscard]] constexpr std::string_view status_name(sub0mempage::Status status) noexcept {
+    using enum sub0mempage::Status;
+    switch (status) {
+    case ok:               return "ok";
+    case pending:          return "pending";
+    case not_resident:     return "not_resident";
+    case pool_exhausted:   return "pool_exhausted";
+    case batch_too_large:  return "batch_too_large";
+    case queue_exhausted:  return "queue_exhausted";
+    case ticket_exhausted: return "ticket_exhausted";
+    case out_of_range:     return "out_of_range";
+    case empty_range:      return "empty_range";
+    case invalid_argument: return "invalid_argument";
+    case busy:             return "busy";
+    case short_read:       return "short_read";
+    case io_error:         return "io_error";
+    case cancelled:        return "cancelled";
+    case timeout:          return "timeout";
+    case declined:         return "declined";
+    }
+    return "unknown";
+}
+
 /** Moves one selected-expert batch into registered raw plane buffers using MemPage.
+ *  One backend worker per registered destination: each worker performs one blocking positional read at
+ *  a time, so the worker count is the I/O queue depth, matching PlaneIo's whole-batch IOCP submission.
  *  The caller owns the buffers and keeps them alive until close/destruction finishes. Claims remain
  *  held after wait: retire_batch is called only after all compute readers have joined. open, close,
  *  submit and retire_batch require exclusive caller access; wait may run concurrently on live tags.
@@ -32,7 +59,9 @@ public:
      */
     [[nodiscard]] sub0mempage::Status open(const std::filesystem::path& path,
                                           std::span<const std::span<std::byte>> destinations);
-    /// Administrative drain, including a partially submitted failed batch; leaves the reader closed.
+    /** Administrative drain, including a partially submitted failed batch; leaves the reader closed.
+     *  A worker-join or mutex failure terminates: freeing live destinations after failed drain is unsafe.
+     */
     void close() noexcept;
     /** Submits a prevalidated batch with each request writing to its registered tag's destination.
      *  A failed partial submission retains accepted claims until close or successful retire_batch.

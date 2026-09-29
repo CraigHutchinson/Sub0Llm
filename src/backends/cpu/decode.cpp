@@ -184,9 +184,15 @@ std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
 // returning. Shared by the resolve path and B35's fused path: the wait is identical at both, only what
 // consumes the bytes afterwards differs. [[maybe_unused]] because a reactive build never calls it.
 [[maybe_unused]] void moe_io_wait_expert(int k, int layer, int expert) {
-    std::string err;
     for (int w = 0; w < moeq::PerExpert; ++w) {
+#ifdef SUB0_MOE_IO_MEMPAGE
+        const auto status = g_moe_decode_io.wait(k * moeq::PerExpert + w);
+        const auto err = moeio::status_name(status);
+        if (status != sub0mempage::Status::ok) {
+#else
+        std::string err;
         if (!g_moe_decode_io.wait(k * moeq::PerExpert + w, err)) {
+#endif
             std::println(stderr,
                          "fatal: B36 pipelined-I/O read failed (layer {} expert {} plane {}): {}",
                          layer, expert, w, err);
@@ -310,9 +316,20 @@ struct ParallelExperts {
                         g_moe_io_stage.buf[static_cast<std::size_t>(slot)].data()};
                 }
             }
+#ifdef SUB0_MOE_IO_MEMPAGE
+            // The preceding layer's OpenMP region joined all readers before this prefetch, and every
+            // consumer (resolve, B35 fused, O8 row-split) waits on all k*3 tags it was given, so no
+            // claim can still be pending here: busy would mean a new consumer skipped a wait.
+            auto status = g_moe_decode_io.retire_batch();
+            if (status == sub0mempage::Status::ok)
+                status = g_moe_decode_io.submit(std::span(reqs).first(static_cast<std::size_t>(nr)));
+            const auto err = moeio::status_name(status);
+            if (status != sub0mempage::Status::ok) {
+#else
             std::string err;
             if (!g_moe_decode_io.submit(std::span<const moeio::Request>(reqs.data(), static_cast<std::size_t>(nr)),
                                         err)) {
+#endif
                 std::println(stderr, "fatal: B36 pipelined-I/O prefetch submit failed at layer {}: {}",
                              layer_index, err);
                 std::abort();
@@ -1572,7 +1589,11 @@ void kv_reset() {
     if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset();
     if constexpr (USE_QSA) g_qsa_cache.reset();   // the indexer's own raw-key store -- docs/QSA.md S6
 }
-const float* forward_one(int id, int pos) { ensure_thread_built(); return g_model.forward_one(id, pos); }
+const float* forward_one(int id, int pos) {
+    require_moe_sidecar();
+    ensure_thread_built();
+    return g_model.forward_one(id, pos);
+}
 const float* last_hidden_ptr() { return g_model.last_hidden.data(); }   // see Model::last_hidden's comment
 
 // KV-trace memoization primitives (spike, see core.hpp's declarations for the full design comment).

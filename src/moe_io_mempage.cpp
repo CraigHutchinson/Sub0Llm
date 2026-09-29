@@ -1,6 +1,7 @@
 #include "sub0/moe_io_mempage.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <system_error>
 
 namespace sub0::moeio {
@@ -28,8 +29,15 @@ Status MemPagePlaneIo::open(const std::filesystem::path& path,
     if (bytes == 0) return Status::empty_range;
     // Build a temporary session so exceptions or registration failures leave this instance closed.
     MemPagePlaneIo next;
+    // Each LocalFileBackend worker performs one blocking positional read at a time, so the worker count
+    // IS the I/O queue depth. One worker per destination matches moeio::PlaneIo's IOCP path, which
+    // issues the whole selected-expert batch at once; fewer workers serialize a cold batch.
+    auto workers = static_cast<std::uint32_t>(destinations.size());
+    // TODO(S1b-measure): temporary A/B override, removed once the worker-count measurement is recorded.
+    if (const char* override_workers = std::getenv("SUB0_S1B_MEMPAGE_WORKERS"))
+        workers = static_cast<std::uint32_t>(std::strtoul(override_workers, nullptr, 10));
     auto backend = sub0mempage::LocalFileBackend::create({
-        .workers = 2, .queue_capacity = static_cast<std::uint32_t>(destinations.size()), .max_sources = 1});
+        .workers = workers, .queue_capacity = static_cast<std::uint32_t>(destinations.size()), .max_sources = 1});
     if (!backend) return backend.error();
     next.backend_ = std::move(*backend);
     const auto source = static_cast<sub0mempage::SourceId>(1);

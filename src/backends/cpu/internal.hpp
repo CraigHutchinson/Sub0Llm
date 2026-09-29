@@ -22,6 +22,9 @@
 #include "sub0/core.hpp"
 #include "sub0/backbone_quant.hpp" // O5: mapped native backbone planes for decode
 #include "sub0/gdn_math.hpp"        // Gated DeltaNet dims/scratch sizing (calc_act_cap)
+#ifdef SUB0_MOE_IO_MEMPAGE
+#include "sub0/moe_io_mempage.hpp"
+#endif
 #include "sub0/moe_io.hpp"          // B36: explicit overlapped I/O for decode's resolve path
 #include "sub0/moe_math.hpp"        // moe::ExpertWeights (moe_resolve) + scratch sizing
 #include "sub0/moe_quant.hpp"       // WP4e: the quantized-resident routed-expert store + pool
@@ -399,7 +402,12 @@ extern BackboneRoleTable g_backbone_roles;
 // against EXPERTS_PER_TOK == 0 in a MoE-off build, where this is declared but never opened or submitted
 // to (see backend.cpp's load_moe_quant_sidecar and decode.cpp's ParallelExperts::prefetch).
 inline constexpr int MOE_IO_MAX_INFLIGHT = (EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1) * moeq::PerExpert;
-extern moeio::PlaneIo<MOE_IO_MAX_INFLIGHT> g_moe_decode_io;
+#ifdef SUB0_MOE_IO_MEMPAGE
+using MoePlaneIo = moeio::MemPagePlaneIo;
+#else
+using MoePlaneIo = moeio::PlaneIo<MOE_IO_MAX_INFLIGHT>;
+#endif
+extern MoePlaneIo g_moe_decode_io;
 
 // B36: staging buffers pipelined I/O reads into -- one gate/up/down triple PER SELECTED EXPERT, indexed
 // by the router's own top-k selection order k (NOT by decode thread: MOE_DECODE_THREADS is 1 since B29,
@@ -612,6 +620,21 @@ struct Layer {
          *qsa_qnorm = nullptr, *qsa_knorm = nullptr,
          *qsa_idx_qk = nullptr, *qsa_idx_qnorm = nullptr, *qsa_idx_knorm = nullptr;
 };
+
+// A MOE_QUANT_EXPERTS build's routed experts exist ONLY in the S0Q1 sidecar, which load_model() opens
+// beside the model blob; build_model() alone never does. Without it, resolve indexes an empty descriptor
+// table and the process dies with a bare SIGSEGV. Checked once per forward()/forward_one() call, not per
+// expert, so the refusal names its cause for the price of one predictable branch.
+inline void require_moe_sidecar() {
+    if constexpr (USE_MOE_QUANT) {
+        if (g_moe_quant.header().num_experts == 0) {
+            std::println(stderr, "fatal: this build keeps its routed experts in the S0Q1 sidecar "
+                                 "(MOE_QUANT_EXPERTS), and none is loaded -- use load_model(), not "
+                                 "build_model() alone");
+            std::abort();
+        }
+    }
+}
 
 // --- Mixture of Experts: the expert resolver BOTH call sites share (docs/MOE.md) ---------------
 //

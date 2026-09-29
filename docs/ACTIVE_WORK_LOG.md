@@ -975,3 +975,22 @@ repeat + close-with-batch-outstanding); new `sub0_storage_moe_io_tests` target i
 Next: configure `out/build/s1b` (-DSUB0_STORAGE_TIEREDCACHE=ON, FETCHCONTENT_FULLY_DISCONNECTED=ON) and
 build/run that target; then real S0Q1 sidecar descriptors, cpp-review, decode wiring (plan step 5).
 No engine files (`src/backends/cpu/*`, configurator) touched yet.
+
+**2026-09-29 Claude Code — S1b real-model parity, done.** Real Qwen4 full48 artifact
+(`qwen4_full48_q_bf16.bin`, 512 experts/top-10 S0Q1 sidecar), 6-token `forward_one` harness
+(`out/build/s1b/decode_parity.cpp`, OMP 8): `--moe-io-mode` reactive, pipelined and mempage logits are
+**byte-identical** (5,959,680 bytes each, SHA-256 99BFC58A…95FB5F). The unfiltered `sub0_tests`
+failures (7/10 cases, 18/25 assertions) occur identically in reactive and in mempage mode: tokenizer "cannot open ''" (ad-hoc
+configure emits no tokenizer) + engine_tests `build_model()` SIGSEGV with no sidecar loaded, so they
+pre-date this integration. Default build unchanged: 29,510,661 assertions / 147 cases before and after.
+Note: `out/build/s1b` is currently configured for pipelined mode (last parity arm).
+Still open: cpp-review of the Sub0Llm diff, commit, performance comparison (optimization protocol,
+uncontended), STORAGE_STACK_PLAN.md S1b closure record.
+
+**2026-09-29 Claude Code — S1b performance qualification, active (holds the CPU).** `run_perf_suite.py --stage perf`
+in `out/build/s1b`: arms reactive / pipelined / mempage, warm then `--cold`, 3 interleaved runs each.
+MemPage worker count changed 2 -> one per destination (the 2-worker cap meant queue depth 2 vs IOCP's ~30).
+
+**2026-09-29 Claude Code — S1b perf re-run (holds the CPU, ~1-2 h).** Protocol fixed in `run_perf_suite.py`: arms built
+once (DLL hash proves distinct), rotated interleave, 20 s cooldown, 16 tokens warm / 8 cold. Then a MemPage worker sweep
+(2/8/30). The earlier S1b perf pass is superseded (rebuild-before-every-sample thermal confound).
