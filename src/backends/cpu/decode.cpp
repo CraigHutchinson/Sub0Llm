@@ -843,7 +843,7 @@ const float* Model::forward_one(int id, int pos) {
     // are not. A role absent at this build (no sidecar, or this specific role missing) leaves
     // gr_native_ptr null and gr::mix falls back to the ordinary axpy path exactly as before this pass.
     // O10: the mix() stage marks charged to GR sub-phases -- NoStageProbe (empty, no code) unless PROFILE_PHASES.
-    [[maybe_unused]] const auto gr_probe = [] {
+    [[maybe_unused]] constexpr auto gr_probe = [] {
         if constexpr (PROFILE_PHASES)
             return prof::StageProbe<gr::MixStage, 4>{{prof::Phase::GrQuant, prof::Phase::GrDown, prof::Phase::GrMixEw,
                                                  prof::Phase::GrUp}};

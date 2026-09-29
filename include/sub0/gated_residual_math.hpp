@@ -144,6 +144,9 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float
     }
 }
 
+/// Stage marks mix() reports to its Probe (O10 sub-phase profiling); each marks a stage's START.
+enum class MixStage : unsigned char { Quantize, Down, Elementwise, Up };
+
 // The READ step's "mixed_input" half (docs/GATED_RESIDUAL.md S1a/S4b): mixed = mean_over_streams(
 // sigmoid(up(silu(down(normed)/hc_count))) * normed ). `normed` is the hc_norm() output for THIS call's
 // own weights (docs/GATED_RESIDUAL.md S4c: op_gr_mix and op_gr_gate each call hc_norm() independently on
@@ -151,9 +154,6 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, WP norm_w, float
 // simplification, not an oversight; see that section for why the duplicated cost is bounded and cheap).
 // down_w: [wide, hc_lowrank], up_w: [hc_lowrank, wide], this project's own [in,out] convention.
 // out_mixed: [T, hidden_size]. scratch: >= T*hc_lowrank floats (the down-projection's pre-activation).
-/// Stage marks mix() reports to its Probe (O10 sub-phase profiling); each marks a stage's START.
-enum class MixStage : unsigned char { Quantize, Down, Elementwise, Up };
-
 template <int Threads = 1, class WP, class Probe = NoStageProbe>
 inline void mix(const Dims& d, int T, const float* normed, WP down_w, WP up_w,
                  float* out_mixed, float* scratch, const Native* native = nullptr, Probe probe = {}) {
