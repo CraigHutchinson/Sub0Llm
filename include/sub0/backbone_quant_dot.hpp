@@ -1765,7 +1765,6 @@ template <Q8Isa Isa>
     if constexpr (Isa == Q8Isa::Vnni)
         return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sx);
 #endif
-    (void)Isa;
     // 128*127*2 = 32512 < 32767: the int16 pair-sum cannot saturate (x is quantized to +-127).
     return _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sx), _mm256_set1_epi16(1));
 }
