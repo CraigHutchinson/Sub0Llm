@@ -129,11 +129,12 @@ work package. Dependency pins advance only after consumer CI is green.
 
 ## Current checkpoint
 
-Updated 2026-09-29. **S1a (E1 adapter fixture) is done; S1b/E2 and S1c/model wiring remain** -- see "S1 acceptance manifest (Llm side)" below. Llm's
-adoption is still test-only: `tests/ngram_tiered_storage_tests.cpp` and its own
-`include/sub0/ngram_tiered_storage.hpp` adapter are the only things in the tree that depend on
-Sub0TieredCache/Sub0MemPage, gated behind the default-OFF `SUB0_STORAGE_TIEREDCACHE` CMake option --
-no `src/`, `tools/` or default-build file depends on either library. This plan authorizes staged
+Updated 2026-09-29. **S1a (E1 adapter fixture) and S1b (E2 routed-MoE byte transport) are done; S1c
+(E1 frozen-table model wiring) remains** -- see "S1b closure record" and "S1 acceptance manifest (Llm
+side)" below. Llm's first production consumer of Sub0MemPage is the opt-in decode transport
+`--moe-io-mode mempage` (`include/sub0/moe_io_mempage.hpp`); CMake fetches and links MemPage only for a
+build configured that way. The E1 TieredCache adapter is still test-only behind the default-OFF
+`SUB0_STORAGE_TIEREDCACHE` option. The default build depends on neither library. This plan authorizes staged
 design/implementation work. It does not claim that NVIDIA GDS, a CUDA row cache or the end-to-end
 stack is available.
 
@@ -154,10 +155,54 @@ supports plain HTTP only. No timing claim exists in any of the three repositorie
 | Slice | Status |
 |---|---|
 | S0 contract/fixtures | **Lower layers done**: MemPage M2 plus the fake backend, and the TieredCache T0 oracle. Llm E1 is implemented in S1a; E2–E5 fixtures remain to be written. |
-| S1 local CPU vertical slice | **Partial: S1a E1 fixture done**: MemPage M3 slice 1 and TieredCache T1 run on real MemPage at the pins above; Llm's E1 fixture, adapter (`include/sub0/ngram_tiered_storage.hpp`) and resident-reference comparison are merged behind `SUB0_STORAGE_TIEREDCACHE` (default OFF). See "S1 acceptance manifest (Llm side)" below. E2's byte adapter is not started -- E1 only. |
+| S1 local CPU vertical slice | **Partial: S1a E1 fixture and S1b E2 transport done; S1c open.** S1b: see "S1b closure record" below. S1a: MemPage M3 slice 1 and TieredCache T1 run on real MemPage at the pins above; Llm's E1 fixture, adapter (`include/sub0/ngram_tiered_storage.hpp`) and resident-reference comparison are merged behind `SUB0_STORAGE_TIEREDCACHE` (default OFF). See "S1 acceptance manifest (Llm side)" below. |
 | S2–S5 | Not started. T3 remote code exists early; see above. |
 
-### Next: S1b routed-MoE byte adapter
+### S1b closure record -- DONE 2026-09-29
+
+Opt-in `--moe-io-mode mempage` routes decode's selected-expert plane reads through
+`moeio::MemPagePlaneIo`: one `LocalFileBackend` registration plus one explicit-destination
+`TransferSet` per staged plane, set up once at load, with one reader per selected expert
+(`EXPERTS_PER_TOK`). Claims are retired at the next layer's prefetch, after the OpenMP region has joined
+every consumer. No per-token allocation. The reactive default and the pipelined IOCP reader are unchanged.
+
+| Evidence | Result |
+|---|---|
+| Revisions | Sub0Llm `baf33b9` (local main); runtime MemPage pin `213acdd` (unchanged). Packaging-only lower commits, not pinned: MemPage `ef40370`, TieredCache `53f91e2` (5/5 and 11/11 CTest on Windows Clang and WSL GCC 15). |
+| Artifact | `qwen4_full48_q_bf16.bin` + `.moeq` (39,848,247,352 bytes, 73,728 planes, 512 experts, top-10). |
+| Output parity | Reactive, pipelined and mempage give byte-identical 6-token `forward_one` logits: SHA-256 `99BFC58A...` with `--backbone-quant-dot 0`, and `D1F29B19...` under the recommended defaults (mempage at both 30 and 10 readers). |
+| Adapter suite | `sub0_storage_moe_io_tests`: 642 assertions / 5 cases on Windows Clang and WSL GCC 15, including the real-sidecar case (encoded bytes and dequantized values vs `moeq::Store`). |
+| Default build | Neutral d196 suites exact: `sub0_tests` 29,510,661/147, `sub0_frontend_tests` 231,180/304. |
+| Review | `cpp-review` pass: no MUST findings. The retire-at-prefetch invariant is documented at its call site. |
+
+Performance (`run_perf_suite.py`, arms built once, rotated, 20 s cooldown, per-sample contention gate;
+median s/token over 6 tokens, 8 warm rounds and 4 cold rounds with verified eviction):
+
+| Arm | Warm | Cold |
+|---|---:|---:|
+| reactive (mmap, default) | 0.115 | 0.396 |
+| pipelined (IOCP) | 0.196 | 0.267 |
+| mempage | 0.145 | **0.241** |
+
+Readers: depth 2 forfeits the cold benefit (0.404 s/token cold). Depths 8 and 30 tie at the median, and
+30 is much noisier, so the implementation uses one reader per selected expert.
+
+**Default decision: unchanged (reactive).** MemPage is the fastest cold-cache reader (-39% vs reactive,
+-10% vs IOCP). This host's normal state is warm, though: the 37 GiB sidecar fits in 63 GiB of RAM, and
+there reactive is still 26% faster. Closing the warm gap is the next optimization target. Its likely
+cost centres are the per-claim mutex/condition-variable completions and the copy into staging that
+reactive avoids. A scoped AUTO default, e.g. for hosts whose RAM cannot hold the sidecar, needs evidence
+from such a host first.
+
+Not measured: peak memory (staging is `EXPERTS_PER_TOK x 3 x max_desc_bytes`, as for pipelined) and
+macOS. Fixed along the way: a quantized-MoE build given `build_model()` without its sidecar now refuses
+instead of crashing with SIGSEGV; the 32-bit plane-size check now guards pipelined too; real-axes
+layout/tokenizer test defects are fixed; and `run_perf_suite.py` no longer rebuilds before every sample
+(thermal confound).
+
+Next: S1c (E1 frozen-table model wiring, below). M4/T2 staged CUDA is S2.
+
+### S1b package definition (historical, as planned)
 
 Refreshed 2026-09-29. The E1 row fixture is complete; the former instructions to implement it
 were stale. S1 is **partially complete against its original acceptance**: E2 is absent and E1 model

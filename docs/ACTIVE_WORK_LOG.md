@@ -994,3 +994,11 @@ MemPage worker count changed 2 -> one per destination (the 2-worker cap meant qu
 **2026-09-29 Claude Code — S1b perf re-run (holds the CPU, ~1-2 h).** Protocol fixed in `run_perf_suite.py`: arms built
 once (DLL hash proves distinct), rotated interleave, 20 s cooldown, 16 tokens warm / 8 cold. Then a MemPage worker sweep
 (2/8/30). The earlier S1b perf pass is superseded (rebuild-before-every-sample thermal confound).
+
+**2026-09-29 Claude Code — S1b DONE; CPU released.** Supersedes the Codex S1b "active" entry and the two
+Claude S1b entries above. Commits `a8aa3ad` (perf-suite protocol), `ea5c3e9` (real-axes test fixes),
+`12f89f3` + `baf33b9` (MemPage transport, one reader per selected expert). Cold: mempage 0.241 s/token vs
+IOCP 0.267 vs reactive 0.396; warm: reactive 0.115 stays default (mempage 0.145). Byte-identical logits
+across all modes. Full record: `docs/STORAGE_STACK_PLAN.md` "S1b closure record". Files released:
+`src/backends/cpu/{internal.hpp,backend.cpp,decode.cpp}`, `tools/configurator.cpp`. Build dirs
+`out/build/s1b` and `out/build/d196check` (neutral reconfigured) are free to reuse.
