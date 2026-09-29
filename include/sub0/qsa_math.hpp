@@ -177,6 +177,7 @@ inline constexpr std::size_t scratch_floats(const Dims& d, int T) {
     return 2u * static_cast<std::size_t>(T) * static_cast<std::size_t>(d.kv_width())   // k_cache, v_cache
          + static_cast<std::size_t>(T) * static_cast<std::size_t>(d.idx_head_dim)      // raw indexer keys
          + static_cast<std::size_t>(d.idx_q_width())                                    // indexer q (1 row)
+         + static_cast<std::size_t>(d.idx_qk_out())                                     // indexer q|k (1 row)
          + 2u * static_cast<std::size_t>(d.q_width())                                   // q, gate (1 row)
          + static_cast<std::size_t>(T)                                                  // visibility mask
          + block_key_cache_floats(d, T)                                                 // pooled block keys
@@ -241,23 +242,18 @@ inline void linear_row(const float* x, WP w, int in_n, int out_n, float* out) {
 // q_layernorm'd per head and rotated at this row's position; the KEY half is left COMPLETELY RAW
 // (k_layernorm and RoPE happen later, on the POOLED block key, at the block's own start position).
 // qk_proj_w: [hidden_size, idx_qk_out()]. q_ln_w: [idx_head_dim].
-template <bool UseSimd = false, class WP>
+// qk_buf: idx_qk_out() floats, caller-owned -- the whole projection, before the q/k split.
+// O11 (docs/optimization/opportunities/O10_subphase_roofline.md lever 1): the projection is ONE
+// gemv::axpy<Threads> over the whole tensor, then two copies. It was a serial scalar loop reading the
+// bf16 weight at ~4 GB/s (9.5 ms/token on the real model). gemv::axpy is bit-exact against that loop at
+// every thread count (gemv.hpp's own contract, including its zero-skip note).
+template <bool UseSimd = false, int Threads = 1, class WP>
 inline void indexer_project_row(const Dims& d, const float* x, WP qk_proj_w,
                                  WP q_ln_w, const float* cos_pos, const float* sin_pos,
-                                 float eps, float* out_q, float* out_raw_k) {
-    // Project straight into out_q for the query part; the key part needs its own tail slot, so the
-    // projection is done in two passes over the SAME weight columns rather than needing a joint buffer.
-    for (int o = 0; o < d.idx_q_width(); ++o) out_q[o] = 0.f;
-    for (int o = 0; o < d.idx_kv_heads * d.idx_head_dim; ++o) out_raw_k[o] = 0.f;
-    const int out_n = d.idx_qk_out();
-    for (int i = 0; i < d.hidden_size; ++i) {
-        const float xi = x[i];
-        if (xi == 0.f) continue;
-        const auto wr = qk_proj_w + static_cast<std::size_t>(i) * out_n;
-        for (int o = 0; o < d.idx_q_width(); ++o) out_q[o] += xi * wr[o];
-        for (int o = 0; o < d.idx_kv_heads * d.idx_head_dim; ++o)
-            out_raw_k[o] += xi * wr[d.idx_q_width() + o];
-    }
+                                 float eps, float* out_q, float* out_raw_k, float* qk_buf) {
+    gemv::axpy<Threads>(x, qk_proj_w, d.hidden_size, d.idx_qk_out(), qk_buf);
+    std::copy_n(qk_buf, d.idx_q_width(), out_q);
+    std::copy_n(qk_buf + d.idx_q_width(), d.idx_kv_heads * d.idx_head_dim, out_raw_k);
     for (int h = 0; h < d.idx_n_heads; ++h) {
         float* qh = out_q + static_cast<std::size_t>(h) * d.idx_head_dim;
         rms_norm_row<UseSimd>(qh, q_ln_w, d.idx_head_dim, eps, qh);
@@ -527,7 +523,8 @@ inline void forward(const Dims& d, int T, const float* hidden,
     float* v_cache  = k_cache + static_cast<std::size_t>(T) * kvw;
     float* raw_keys = v_cache + static_cast<std::size_t>(T) * kvw;
     float* idx_q    = raw_keys + static_cast<std::size_t>(T) * d.idx_head_dim;
-    float* q_row    = idx_q + d.idx_q_width();
+    float* idx_qk   = idx_q + d.idx_q_width();
+    float* q_row    = idx_qk + d.idx_qk_out();
     float* gate_row = q_row + d.q_width();
     float* mask     = gate_row + d.q_width();
     float* blk_keys = mask + T;
@@ -545,7 +542,7 @@ inline void forward(const Dims& d, int T, const float* hidden,
         // The indexer's raw key for THIS token must exist before it can be selected, and the reference
         // caches raw keys for the whole visible prefix -- so project every row's key as we go.
         indexer_project_row<UseSimd>(d, x, idx_qk_proj_w, idx_q_ln_w, cos_t, sin_t, eps, idx_q,
-                             raw_keys + static_cast<std::size_t>(t) * d.idx_head_dim);
+                             raw_keys + static_cast<std::size_t>(t) * d.idx_head_dim, idx_qk);
         attn_project_row<UseSimd>(d, x, q_w, gate_w, k_w, v_w, q_norm_w, k_norm_w, cos_t, sin_t, eps,
                           q_row, gate_row, k_cache + static_cast<std::size_t>(t) * kvw,
                           v_cache + static_cast<std::size_t>(t) * kvw);

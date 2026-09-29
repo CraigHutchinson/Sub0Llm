@@ -278,12 +278,13 @@ TEST_CASE("QSA's batched prefill and its incremental row composition agree bitwi
     std::vector<float> blk(sub0::qsa::block_key_cache_floats(d, T));
     int n_cached = 0;
     int total_dropped = 0;
+    std::vector<float> qkb(static_cast<std::size_t>(d.idx_qk_out()));   // O11: the q|k projection buffer
     for (int p = 0; p < T; ++p) {
         const float* x = hidden.data() + static_cast<std::size_t>(p) * d.hidden_size;
         const float* cp = cos.data() + static_cast<std::size_t>(p) * d.rotary_dim;
         const float* sp = sin.data() + static_cast<std::size_t>(p) * d.rotary_dim;
         sub0::qsa::indexer_project_row(d, x, qk.data(), qln.data(), cp, sp, sub0::qsa::RMS_EPS,
-                                        iq.data(), rk.data() + static_cast<std::size_t>(p) * d.idx_head_dim);
+                                        iq.data(), rk.data() + static_cast<std::size_t>(p) * d.idx_head_dim, qkb.data());
         sub0::qsa::attn_project_row(d, x, qw.data(), gw.data(), kw.data(), vw.data(), qn.data(), kn.data(),
                                      cp, sp, sub0::qsa::RMS_EPS, q.data(), g.data(),
                                      kc.data() + static_cast<std::size_t>(p) * d.kv_width(),
@@ -356,11 +357,12 @@ TEST_CASE("QSA pools each block key exactly once per run, not once per query", "
     std::vector<float> blk(sub0::qsa::block_key_cache_floats(d, T));
     int n_cached = 0;
     sub0::qsa::stats::pool_block_key_calls = 0;
+    std::vector<float> qkb(static_cast<std::size_t>(d.idx_qk_out()));   // O11: the q|k projection buffer
     for (int p = 0; p < T; ++p) {
         const float* x = hidden.data() + static_cast<std::size_t>(p) * d.hidden_size;
         sub0::qsa::indexer_project_row(d, x, qk.data(), qln.data(), cos.data(), sin.data(),
                                         sub0::qsa::RMS_EPS, iq.data(),
-                                        rk.data() + static_cast<std::size_t>(p) * d.idx_head_dim);
+                                        rk.data() + static_cast<std::size_t>(p) * d.idx_head_dim, qkb.data());
         sub0::qsa::attn_project_row(d, x, qw.data(), gw.data(), kw.data(), vw.data(), qn.data(), kn.data(),
                                      cos.data(), sin.data(), sub0::qsa::RMS_EPS, q.data(), g.data(),
                                      kc.data() + static_cast<std::size_t>(p) * d.kv_width(),
@@ -381,7 +383,7 @@ TEST_CASE("QSA pools each block key exactly once per run, not once per query", "
         const float* x = hidden.data() + static_cast<std::size_t>(p) * d.hidden_size;
         sub0::qsa::indexer_project_row(d, x, qk.data(), qln.data(), cos.data(), sin.data(),
                                         sub0::qsa::RMS_EPS, iq.data(),
-                                        rk.data() + static_cast<std::size_t>(p) * d.idx_head_dim);
+                                        rk.data() + static_cast<std::size_t>(p) * d.idx_head_dim, qkb.data());
         sub0::qsa::attn_project_row(d, x, qw.data(), gw.data(), kw.data(), vw.data(), qn.data(), kn.data(),
                                      cos.data(), sin.data(), sub0::qsa::RMS_EPS, q.data(), g.data(),
                                      kc.data() + static_cast<std::size_t>(p) * d.kv_width(),

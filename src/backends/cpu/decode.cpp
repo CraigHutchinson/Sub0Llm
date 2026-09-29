@@ -261,6 +261,8 @@ thread_local bbqd::ActSuper g_qsa_x_q_super{};
 thread_local bbqd::ActSuper g_qsa_ao_q_super{};
 // The whole q|gate GEMV's output, before qsa::attn_project_row scatters it per head.
 thread_local std::array<float, 2 * static_cast<std::size_t>(QSA_DIMS_BUF.q_width())> g_qsa_qg_buf{};
+// The indexer's whole q|k projection, before qsa::indexer_project_row splits it (O11).
+thread_local std::array<float, static_cast<std::size_t>(QSA_DIMS_BUF.idx_qk_out())> g_qsa_idx_qk_buf{};
 
 // MoE shared expert: x_q feeds gate/up (one shared D_MODEL-wide input row); pre_q is down's own
 // quantized (post-SwiGLU) input, D_FF-wide; gsum16 is shared Q6_K scratch (the real layer-2 outlier).
@@ -1064,10 +1066,11 @@ const float* Model::forward_one(int id, int pos) {
             const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * ROTARY_DIM;
             {
             [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> idx_phase(prof::Phase::QsaIndexer);
-            qsa::indexer_project_row<USE_SIMD_REDUCE>(QSA_DIMS, a, L.qsa_idx_qk->pdata,
+            qsa::indexer_project_row<USE_SIMD_REDUCE, DECODE_GEMV_THREADS>(QSA_DIMS, a, L.qsa_idx_qk->pdata,
                                       L.qsa_idx_qnorm->pdata, cos_pos, sin_pos, qsa::RMS_EPS,
                                       qsa_idx_q,
-                                      raw_k_base + static_cast<size_t>(pos) * QSA_INDEXER_HEAD_DIM);
+                                      raw_k_base + static_cast<size_t>(pos) * QSA_INDEXER_HEAD_DIM,
+                                      g_qsa_idx_qk_buf.data());
             }
             // O5 phase 2b-3 phase B: QsaQGateProj/QsaKProj/QsaVProj/QsaOProj -- the indexer's own
             // projection (above) is BF16 (already the resident target format, backbone_quant.hpp's own

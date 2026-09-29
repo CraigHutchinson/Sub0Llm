@@ -135,3 +135,18 @@ Best case if items 1-3 land: 114.7 - (8.5 + 4 + 4.5) = about 97.5 ms/token, roug
 ## 6. Follow-ups
 
 Next brief: O11 = thread the indexer projection (lever 1), measured with the O10 table as its baseline and `--stage ppl` for value neutrality (expected bit-identical). Then lever 2 (Q8_0) and lever 3 together, per the combination-matrix rule (AGENTS.md section 13).
+
+## Lever 1 done: O11, threaded QSA indexer projection (2026-09-29, primary agent)
+
+`qsa::indexer_project_row` now takes `Threads` and a caller-owned `qk_buf` (`idx_qk_out()` floats). It
+projects the whole q|k tensor with one `gemv::axpy<Threads>` call, then copies the query and key parts out.
+Decode passes `DECODE_GEMV_THREADS` and a `thread_local` buffer. The batched `qsa::forward` takes its buffer
+from `scratch_floats`, which grew by `idx_qk_out()`. There were three test call sites; the first build missed
+them because the consumer grep covered `include/` and `src/` only.
+
+- **Bit-exact.** The real-model G-PPL gives ppl 14.7035, identical. Neutral: `sub0_tests` 29,510,661 / 147
+  with all fingerprints unchanged; `sub0_frontend_tests` 230,939 / 300, which covers the QSA fixture tests.
+- **Phase.** Warm `--tokens 6` profiles give `QSA: indexer` **9.45 -> 0.8-1.2 ms/token**. The same session
+  measured other phases 5-10% slower than this doc's baseline (GDN in-proj 21.7-23.7 against 19.45 ms), and
+  totals of 0.121-0.133 s/token. The host was in its slow state, so no absolute tok/s claim is made from
+  that session. The phase delta is the measured result.
