@@ -1,6 +1,7 @@
 # O9 -- per-256 `ActSuper` native kernels in decode (`--backbone-act-super 1`)
 
-Status: **built, default OFF, G-PPL PASS (2026-09-29)**. Recommendation is the primary agent's call; see S5.
+Status: **merged 2026-09-29, default OFF, recommended ON for the real model.** G-PPL PASS, reproduced
+bit-for-bit by the primary agent; long-run decode about **+14%** in the primary agent's own passes (S6).
 
 ## 1. What it does
 
@@ -82,3 +83,26 @@ r1 rows are cold.
   does not see at this sample size. A larger blend or a second text set would tighten it before recommending.
 - Per AGENTS.md S13 a positive result needs no parking; the toggle stays default-off until the primary agent
   decides. VNNI variant remains parked (S14d).
+
+## 6. Independent verification (primary agent, from merged `main`)
+
+Two more `--stage ppl` passes, run by the primary agent on a quiet host from `main` at 555fa12 (the
+`wp5c_full48` build dir, reconfigured and rebuilt for each arm by the script):
+
+| pass | order | base tok/s | super tok/s | gain |
+|---|---|---:|---:|---:|
+| 3 | super, base | 5.49 | 6.15 | +12% |
+| 4 | base, super | 5.94 | 6.91 | +16% |
+
+- Quality reproduces exactly: perplexity 14.7035 and 14.8488, the same dNLL of -0.0098 with the same CI, and 86.6%
+  top-1 agreement. That is expected, because the whole path is deterministic.
+- Pass 3 prints "inconclusive" only because its first arm (super) became the reference. Pass 4 prints PASS.
+- **Speed.** Super is faster in all four passes, but the size of the gain differs by who ran it:
+  - the authoring agent measured +28-33% (base 5.34-5.54, super 7.11-7.13);
+  - the primary agent measured +12-16%.
+  - Both agree that base runs at about 5.3-5.9 tok/s; they disagree on super.
+  - The phase profile in S4 (GDN -24%, a warm total of -9.5% on six tokens) is closer to the smaller figure.
+  - **The claim carried forward is the conservative +14%** (mean of passes 3-4: base 5.72, super 6.53 tok/s).
+- **Recommendation.** Add `--backbone-act-super 1` to the recommended real-model flags. The CI's upper bound
+  (+0.012) is well inside the gate's +0.03, and the speed-up is positive in every pass. The toggle itself stays
+  default-off (AGENTS.md S4), because the neutral build carries no sidecar to read.
