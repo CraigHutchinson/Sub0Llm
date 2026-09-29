@@ -1,7 +1,6 @@
 #include "sub0/moe_io_mempage.hpp"
 
 #include <cstdint>
-#include <cstdlib>
 #include <system_error>
 
 namespace sub0::moeio {
@@ -10,9 +9,10 @@ using sub0mempage::Status;
 MemPagePlaneIo::~MemPagePlaneIo() { close(); }
 
 Status MemPagePlaneIo::open(const std::filesystem::path& path,
-                           std::span<const std::span<std::byte>> destinations) {
+                           std::span<const std::span<std::byte>> destinations, std::uint32_t workers) {
     close();
-    if (destinations.empty() || destinations.size() >= UINT32_MAX) return Status::invalid_argument;
+    if (destinations.empty() || destinations.size() >= UINT32_MAX || workers == 0)
+        return Status::invalid_argument;
     for (std::size_t i = 0; i < destinations.size(); ++i) {
         const auto start = reinterpret_cast<std::uintptr_t>(destinations[i].data());
         if (destinations[i].empty() || start == 0 || destinations[i].size() > UINTPTR_MAX - start)
@@ -29,13 +29,6 @@ Status MemPagePlaneIo::open(const std::filesystem::path& path,
     if (bytes == 0) return Status::empty_range;
     // Build a temporary session so exceptions or registration failures leave this instance closed.
     MemPagePlaneIo next;
-    // Each LocalFileBackend worker performs one blocking positional read at a time, so the worker count
-    // IS the I/O queue depth. One worker per destination matches moeio::PlaneIo's IOCP path, which
-    // issues the whole selected-expert batch at once; fewer workers serialize a cold batch.
-    auto workers = static_cast<std::uint32_t>(destinations.size());
-    // TODO(S1b-measure): temporary A/B override, removed once the worker-count measurement is recorded.
-    if (const char* override_workers = std::getenv("SUB0_S1B_MEMPAGE_WORKERS"))
-        workers = static_cast<std::uint32_t>(std::strtoul(override_workers, nullptr, 10));
     auto backend = sub0mempage::LocalFileBackend::create({
         .workers = workers, .queue_capacity = static_cast<std::uint32_t>(destinations.size()), .max_sources = 1});
     if (!backend) return backend.error();

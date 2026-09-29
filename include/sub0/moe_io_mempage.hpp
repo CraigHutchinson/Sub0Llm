@@ -37,8 +37,8 @@ namespace sub0::moeio {
 }
 
 /** Moves one selected-expert batch into registered raw plane buffers using MemPage.
- *  One backend worker per registered destination: each worker performs one blocking positional read at
- *  a time, so the worker count is the I/O queue depth, matching PlaneIo's whole-batch IOCP submission.
+ *  Each backend worker performs one blocking positional read at a time, so the worker count chosen at
+ *  open is the I/O queue depth.
  *  The caller owns the buffers and keeps them alive until close/destruction finishes. Claims remain
  *  held after wait: retire_batch is called only after all compute readers have joined. open, close,
  *  submit and retire_batch require exclusive caller access; wait may run concurrently on live tags.
@@ -53,12 +53,14 @@ public:
     /// Drains writers before releasing registrations; callers must first join all compute readers.
     ~MemPagePlaneIo();
 
-    /** Registers one immutable file and non-overlapping caller destinations (one per request tag).
-     *  Any old session is closed first. Failure leaves the reader closed. Source identity/lifetime is
-     *  the caller's responsibility; replacing or modifying the file during a session is unsupported.
+    /** Registers one immutable file and non-overlapping caller destinations (one per request tag),
+     *  served by `workers` (>= 1) reader threads -- the queue depth. Any old session is closed first.
+     *  Failure leaves the reader closed. Source identity/lifetime is the caller's responsibility;
+     *  replacing or modifying the file during a session is unsupported.
      */
     [[nodiscard]] sub0mempage::Status open(const std::filesystem::path& path,
-                                          std::span<const std::span<std::byte>> destinations);
+                                          std::span<const std::span<std::byte>> destinations,
+                                          std::uint32_t workers);
     /** Administrative drain, including a partially submitted failed batch; leaves the reader closed.
      *  A worker-join or mutex failure terminates: freeing live destinations after failed drain is unsafe.
      */

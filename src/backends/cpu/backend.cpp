@@ -2065,7 +2065,11 @@ bool load_moe_quant_sidecar(const char* model_path) {
             std::array<std::span<std::byte>, MOE_IO_MAX_INFLIGHT> destinations{};
             for (std::size_t i = 0; i < destinations.size(); ++i)
                 destinations[i] = std::as_writable_bytes(std::span(g_moe_io_stage.buf[i]));
-            const auto status = g_moe_decode_io.open(path, destinations);
+            // One reader per selected expert. Measured 2026-09-29 on the real sidecar (S1b sweep): depth 2
+            // lost the whole cold-cache benefit (0.404 s/token, = reactive mmap); 8 and 30 tied at the
+            // median warm and cold, with 30 far noisier (reader threads contending with compute).
+            constexpr auto kReaders = static_cast<std::uint32_t>(EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1);
+            const auto status = g_moe_decode_io.open(path, destinations, kReaders);
             if (status != sub0mempage::Status::ok) {
                 err = std::string("MemPage registration failed: ") + std::string(moeio::status_name(status));
 #else
