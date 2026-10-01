@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <system_error>
 
@@ -149,6 +150,8 @@ void ExpertRowCache::close() noexcept {
     rows_.clear();
     leases_.clear();
     resolver_.store = nullptr;
+    wait_count_.store(0, std::memory_order_relaxed);
+    wait_ns_.store(0, std::memory_order_relaxed);
     selected_ = 0;
     budget_rows_ = 0;
     layer_ = -1;
@@ -172,7 +175,11 @@ Status ExpertRowCache::prefetch(int layer, std::span<const int> experts) noexcep
 Status ExpertRowCache::acquire(int k) noexcept {
     if (k < 0 || static_cast<std::uint32_t>(k) >= selected_) return Status::out_of_range;
     const auto at = static_cast<std::size_t>(k);
+    const auto start = std::chrono::steady_clock::now();
     const auto resolved = table_->resolve_into(std::span(rows_).subspan(at, 1), std::span(leases_).subspan(at, 1));
+    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+    wait_count_.fetch_add(1, std::memory_order_relaxed);
+    wait_ns_.fetch_add(static_cast<std::uint64_t>(waited.count()), std::memory_order_relaxed);
     return resolved ? Status::ok : resolved.error();
 }
 

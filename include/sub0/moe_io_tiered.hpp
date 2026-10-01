@@ -6,6 +6,7 @@
 #include <sub0mempage/local_file_backend.hpp>
 #include <sub0tieredcache/row_cache.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -87,6 +88,15 @@ public:
     [[nodiscard]] std::span<const std::uint8_t> plane(int k, int which) const noexcept;
 
     [[nodiscard]] sub0tieredcache::TableStats stats() const noexcept;
+    /// Blocking acquire() calls (a selected expert not yet resident) and the time they spent waiting:
+    /// the miss latency decode actually stalls on.
+    struct Waits {
+        std::uint64_t count = 0;
+        std::uint64_t nanoseconds = 0;
+    };
+    [[nodiscard]] Waits waits() const noexcept {
+        return {wait_count_.load(std::memory_order_relaxed), wait_ns_.load(std::memory_order_relaxed)};
+    }
     [[nodiscard]] std::uint32_t resident_rows() const noexcept { return budget_rows_; }
     /// Whether the rows are locked resident. Always true for an open cache: open() refuses otherwise.
     [[nodiscard]] bool pinned() const noexcept { return storage_.pinned; }
@@ -127,6 +137,8 @@ private:
     std::unique_ptr<sub0tieredcache::Table> table_;
     std::vector<std::uint64_t> rows_;                 // the last prefetch's rows, by selection index k
     std::vector<sub0tieredcache::RowLease> leases_;   // pins taken by acquire, by k
+    std::atomic<std::uint64_t> wait_count_{0}; // acquire may run concurrently for different k
+    std::atomic<std::uint64_t> wait_ns_{0};
     std::uint32_t selected_ = 0;
     std::uint32_t budget_rows_ = 0;
     int layer_ = -1;

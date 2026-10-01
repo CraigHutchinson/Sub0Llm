@@ -350,35 +350,10 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
         run_experts.prefetch(topk_idx, d.experts_per_tok);
     }
 
-    // Phase 1: every selected expert into its own buffer. Order-independent by construction.
-    //
-    // O8 (docs/optimization/opportunities/O8_moe_row_split.md): a SECOND optional hook, one seam beside
-    // prefetch()/compute_shared() above -- `run_rows(d, topk_idx, n, routed_out)`. Where prefetch() and
-    // compute_shared() add work AROUND the existing per-expert `compute_expert` callback, this one
-    // REPLACES phase 1 entirely: it is for a runner that wants to split each selected expert's own GEMVs
-    // by ROW RANGE across the team, instead of handing whole experts to whole threads -- a decomposition
-    // `compute_expert`'s "one opaque call per k" signature cannot express, since the row-level GEMV
-    // kernel knowledge (plane formats, block alignment) lives in moe_quant_dot.hpp/decode.cpp, not here
-    // (this header stays engine-free and format-agnostic, same reasoning as compute_shared's own comment
-    // on why ITS native path lives on the caller's RunExperts object instead of a Native struct here).
-    // Detected via the same `requires` pattern, so SerialExperts/ParallelExperts (no such method) take
-    // the exact same phase-1 path as before -- no branch at all in that case (the `if constexpr` compiles
-    // away). `compute_expert` is simply unused on the run_rows arm; its own captures (S.pre_q's resolve
-    // logic etc.) are dead code there, which is fine -- a lambda that is never invoked costs nothing.
-    if constexpr (requires { run_experts.run_rows(d, topk_idx, d.experts_per_tok, routed_out); }) {
-        run_experts.run_rows(d, topk_idx, d.experts_per_tok, routed_out);
-    } else {
-        run_experts(d.experts_per_tok, ffn_scratch, g_scratch, [&](int k, float* ffn, float* g) {
-            compute_expert(k, topk_idx[k], routed_out + static_cast<std::size_t>(k) * d.hidden_size, ffn, g);
-        });
-    }
-    // Phase 2: the weighted sum, in the original selection order, on one thread.
-    for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
-    for (int k = 0; k < d.experts_per_tok; ++k) {
-        const float* ek = routed_out + static_cast<std::size_t>(k) * d.hidden_size;
-        for (int j = 0; j < d.hidden_size; ++j) out[j] += topk_w[k] * ek[j];
-    }
-
+    // The shared expert runs BEFORE the routed experts: it needs only x, and the time it takes is a
+    // head start for any selected expert the runner is still fetching (a cache miss). It writes only
+    // expert_out, added to `out` after phase 2 exactly as before, so the order of the arithmetic --
+    // and the result -- is unchanged.
     // Shared expert: an ordinary (non-routed) SwiGLU FFN with its OWN weights, gated by
     // sigmoid(Linear(hidden_size, 1, bias=False)(x)) -- Qwen4ExpTextSparseMoeBlock.forward's own
     // `F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output`. Always
@@ -408,6 +383,36 @@ inline void forward_row_via_run_ex(const Dims& d, const float* x, WP router_w,
     // original scalar accumulation order.
     const float gate_logit = simd::dot_choice<UseSimd>(x, shared_gate_proj_w, d.hidden_size);  // [hidden_size,1]
     const float sg = detail::sigmoid(gate_logit);
+
+    // Phase 1: every selected expert into its own buffer. Order-independent by construction.
+    //
+    // O8 (docs/optimization/opportunities/O8_moe_row_split.md): a SECOND optional hook, one seam beside
+    // prefetch()/compute_shared() above -- `run_rows(d, topk_idx, n, routed_out)`. Where prefetch() and
+    // compute_shared() add work AROUND the existing per-expert `compute_expert` callback, this one
+    // REPLACES phase 1 entirely: it is for a runner that wants to split each selected expert's own GEMVs
+    // by ROW RANGE across the team, instead of handing whole experts to whole threads -- a decomposition
+    // `compute_expert`'s "one opaque call per k" signature cannot express, since the row-level GEMV
+    // kernel knowledge (plane formats, block alignment) lives in moe_quant_dot.hpp/decode.cpp, not here
+    // (this header stays engine-free and format-agnostic, same reasoning as compute_shared's own comment
+    // on why ITS native path lives on the caller's RunExperts object instead of a Native struct here).
+    // Detected via the same `requires` pattern, so SerialExperts/ParallelExperts (no such method) take
+    // the exact same phase-1 path as before -- no branch at all in that case (the `if constexpr` compiles
+    // away). `compute_expert` is simply unused on the run_rows arm; its own captures (S.pre_q's resolve
+    // logic etc.) are dead code there, which is fine -- a lambda that is never invoked costs nothing.
+    if constexpr (requires { run_experts.run_rows(d, topk_idx, d.experts_per_tok, routed_out); }) {
+        run_experts.run_rows(d, topk_idx, d.experts_per_tok, routed_out);
+    } else {
+        run_experts(d.experts_per_tok, ffn_scratch, g_scratch, [&](int k, float* ffn, float* g) {
+            compute_expert(k, topk_idx[k], routed_out + static_cast<std::size_t>(k) * d.hidden_size, ffn, g);
+        });
+    }
+    // Phase 2: the weighted sum, in the original selection order, on one thread.
+    for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
+    for (int k = 0; k < d.experts_per_tok; ++k) {
+        const float* ek = routed_out + static_cast<std::size_t>(k) * d.hidden_size;
+        for (int j = 0; j < d.hidden_size; ++j) out[j] += topk_w[k] * ek[j];
+    }
+
     for (int j = 0; j < d.hidden_size; ++j) out[j] += sg * expert_out[j];
 }
 

@@ -1981,6 +1981,10 @@ void print_decode_io_stats() {
                  "resident-hit rate {:.1f}%",
                  s.resident, g_moe_cache.resident_rows(), accesses, s.fetches, s.evictions,
                  accesses ? 100.0 * (1.0 - static_cast<double>(s.fetches) / static_cast<double>(accesses)) : 0.0);
+    const auto w = g_moe_cache.waits();
+    std::println("expert cache waits: {} blocking acquires, {:.1f} ms total, {:.1f} us each",
+                 w.count, static_cast<double>(w.nanoseconds) / 1e6,
+                 w.count ? static_cast<double>(w.nanoseconds) / 1e3 / static_cast<double>(w.count) : 0.0);
     // Where the rest of decode's hot memory stands. Not pinned yet, so a low share here means the OS
     // trimmed it (parameters to the pagefile, the mapped backbone back to its file) during the run.
     const auto params = residency::query(g_param_data.get(), PARAM_FLOATS * sizeof(param_t), false);
