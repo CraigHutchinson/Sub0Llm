@@ -1039,3 +1039,8 @@ Reactive vs owned cache at a matched 10 GiB budget, 2,000 G-PPL tokens, 2 rotate
 
 **2026-10-01 Claude Code — matched-footprint deep regime-2 A/B, done; CPU released.** reactive 6.67/6.33, pinned cache
 14 GiB 5.89/5.51 (95.3% hit). Gap is per-layer miss latency, not paging. Record: STORAGE_STACK_PLAN.md.
+
+**2026-10-01 Claude Code — apples-to-apples deep regime-2 A/B (reactive vs pinned chunked cache 17 GiB), active (CPU + ballast, ~1 h).**
+
+**2026-10-01 Claude Code — apples-to-apples A/B done; CPU released.** Matched memory: cache 17 GiB 6.42 vs reactive 6.38 tok/s
+(parity). Next: size-classed TieredCache table (exact-size slots).

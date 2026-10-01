@@ -262,6 +262,7 @@ Deep regime 2 (RAM ballast leaving ~10 GiB of room; 2,000 G-PPL tokens; 2 rotate
 | cache 6 GiB, resident-first waves (pass 2) | 5.31 | 85.3% | 25.4 GiB |
 | cache 10 GiB, unpinned / pinned | 5.42 / 5.45 | 91.9% | 29.7 GiB |
 | cache 14 GiB, pinned | 5.70 | 95.3% | 33.7 GiB |
+| **cache 17 GiB, pinned, 256 KiB chunked fills, shared expert first** | **6.42** (6.38/6.46) vs reactive 6.38 (6.23/6.52) | 96.7% | 33.6-34.5 GiB both arms: matched |
 
 Reading:
 - Each step of budget raises the hit rate and the speed.
@@ -272,6 +273,18 @@ Reading:
   pay a 1.7 MB buffered copy plus a worker hand-off.
 - Next lever: hide or shorten miss latency (prefetching the next layer's experts before its router runs),
   not more memory or pinning.
+- **Apples-to-apples (2026-10-01):** at matched memory, the owned cache is at parity with reactive mmap
+  (+0.7%, inside reactive's own 4.6% round-to-round spread). It started 25% behind.
+- What closed the gap:
+  - Resident-first waves.
+  - The shared expert run before the routed experts.
+  - Chunked miss fills. Sandbox: miss p50 392 -> 206 us. That needed Sub0MemPage's live-claim submit fix.
+  - A matched budget.
+  - Pinning prevents a regression, but did not add speed.
+- Remaining cost: ~60k blocking acquires per 2,000 tokens at ~333 us, ~20 s of a ~310 s decode.
+- Next lever: exact-size cache slots. Today every slot is the largest expert's width, wasting ~8% of the
+  budget, and more resident experts means fewer misses.
+
 
 Platform coverage: Windows (Clang) and Linux (WSL2 GCC 15) build and pass the cache suite, 182
 assertions in 6 cases, including the real sidecar. macOS is reviewed against its APIs (`MAP_ANONYMOUS`,
