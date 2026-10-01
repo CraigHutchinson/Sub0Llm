@@ -262,7 +262,8 @@ Deep regime 2 (RAM ballast leaving ~10 GiB of room; 2,000 G-PPL tokens; 2 rotate
 | cache 6 GiB, resident-first waves (pass 2) | 5.31 | 85.3% | 25.4 GiB |
 | cache 10 GiB, unpinned / pinned | 5.42 / 5.45 | 91.9% | 29.7 GiB |
 | cache 14 GiB, pinned | 5.70 | 95.3% | 33.7 GiB |
-| **cache 17 GiB, pinned, 256 KiB chunked fills, shared expert first** | **6.42** (6.38/6.46) vs reactive 6.38 (6.23/6.52) | 96.7% | 33.6-34.5 GiB both arms: matched |
+| cache 17 GiB, pinned, 256 KiB chunked fills, shared expert first | 6.42 (6.38/6.46) vs reactive 6.38 (6.23/6.52) | 96.7% | 33.6-34.5 GiB both arms: matched |
+| **cache 17 GiB as above, exact-size slots (`SizeClassedTable`)** | **6.69** (6.72/6.66) vs reactive 6.49 (6.59/6.39) | 97.2% | 33.9-35.4 GiB both arms: matched |
 
 Reading:
 - Each step of budget raises the hit rate and the speed.
@@ -282,12 +283,25 @@ Reading:
   - A matched budget.
   - Pinning prevents a regression, but did not add speed.
 - Remaining cost: ~60k blocking acquires per 2,000 tokens at ~333 us, ~20 s of a ~310 s decode.
-- Next lever: exact-size cache slots. Today every slot is the largest expert's width, wasting ~8% of the
-  budget, and more resident experts means fewer misses.
+- **Exact-size slots (2026-10-01): the owned cache now beats reactive at matched memory, +3.0%.** Both
+  cache runs beat both reactive runs; perplexity unchanged.
+  - Padded slots (every slot the largest expert's width) wasted ~8% of the budget. TieredCache
+    `SizeClassedTable` keeps one exact-width table per expert size, splitting the storage by each size's
+    total bytes. The same 17 GiB now holds 11,257 experts instead of 10,333 (+9%).
+  - Sandbox first (trace replay, full 2,000-token trace, 3 rotated rounds): misses -14%, stall -14-16%,
+    per-miss latency unchanged.
+  - Engine: 51.9k fetches per 2,000 tokens, identical in both rounds; 51.5-51.8k blocking acquires at
+    ~474 us each (24.5 s), against ~333 us recorded for the padded run. A short prover rules out
+    the table: replaying 30,000 batches with 2.8 ms of busy compute per layer (decode's pace), the per-miss
+    wait is the same for both (p50 265 vs 268 us, p90 519 vs 517), while exact slots still cut misses 10%
+    and stall 22%. Waits grow with concurrent compute (~190 us p50 without it), so the per-wait difference
+    is between runs, not between table types. Shortening the miss under load stays the next lever.
+  - Each size must hold two layers' selections plus one expert per worker, since a layer's selection
+    is all one size; `open()` refuses a budget that gives any size less.
 
 
-Platform coverage: Windows (Clang) and Linux (WSL2 GCC 15) build and pass the cache suite, 182
-assertions in 6 cases, including the real sidecar. macOS is reviewed against its APIs (`MAP_ANONYMOUS`,
+Platform coverage: Windows (Clang) and Linux (WSL2 GCC 15) build and pass the cache suite, 341
+assertions in 7 cases, including the real sidecar. macOS is reviewed against its APIs (`MAP_ANONYMOUS`,
 `mlock`, `mincore` with `char*`, `pread`) but has not been built or run.
 
 ### Owned expert cache (`--moe-io-mode cache`) -- first measurement, 2026-10-01

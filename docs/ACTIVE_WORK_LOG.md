@@ -1044,3 +1044,9 @@ Reactive vs owned cache at a matched 10 GiB budget, 2,000 G-PPL tokens, 2 rotate
 
 **2026-10-01 Claude Code — apples-to-apples A/B done; CPU released.** Matched memory: cache 17 GiB 6.42 vs reactive 6.38 tok/s
 (parity). Next: size-classed TieredCache table (exact-size slots).
+
+**2026-10-01 Claude Code — size-classed expert cache: deep regime-2 A/B (reactive vs cache 17 GiB, exact-size slots), active (CPU + ballast, ~1 h).** Sandbox replay first: -14% misses, -14-16% stall at 17 GiB (TieredCache `cb0b15c`).
+
+**2026-10-01 Claude Code — size-classed expert cache A/B done; CPU released.** Matched memory: cache 17 GiB
+exact-size slots 6.69 vs reactive 6.49 tok/s (+3.0%, both cache runs above both reactive runs; ppl 11.930422).
+Record: STORAGE_STACK_PLAN.md. Next: shorten the miss under compute load; next-layer prefetch later.

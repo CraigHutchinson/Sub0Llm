@@ -4,7 +4,7 @@
 #include "sub0/residency.hpp"
 
 #include <sub0mempage/local_file_backend.hpp>
-#include <sub0tieredcache/row_cache.hpp>
+#include <sub0tieredcache/size_classed_table.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -24,8 +24,8 @@ namespace sub0::moeio {
  *  This replaces OS paging of the S0Q1 sidecar for the regime where it does not fit in RAM
  *  (docs/STORAGE_STACK_PLAN.md "Core use case"). A hit costs no copy, no syscall and no page fault:
  *  plane() points straight into the resident row. A miss is one read of the whole expert, started at
- *  router time by prefetch(). Rows are bounded-extent (sub0tieredcache::RowExtent::bounded) because
- *  expert sizes differ between layers.
+ *  router time by prefetch(). Expert sizes differ between layers, so each size is held in slots of
+ *  exactly its own width (sub0tieredcache::SizeClassedTable), with no budget spent on padding.
  *
  *  Per layer: prefetch(layer, experts), then acquire(k) for each selected expert before reading
  *  plane(k, ...). The pins taken by acquire are released by the next prefetch, which the caller makes
@@ -46,14 +46,15 @@ public:
 
     /** Registers `sidecar` (the file `store` was opened from) and sizes the cache.
      *  @param store         Must outlive this cache; its descriptors locate and size every row.
-     *  @param budget_bytes  RAM for resident rows, rounded down to whole rows and capped at the table.
+     *  @param budget_bytes  RAM for resident rows, split between expert sizes by their total bytes,
+     *                       rounded down to whole rows and capped at the table.
      *  @param max_selected  Experts selected per layer: the per-call batch bound.
      *  @param readers       Backend read threads (the I/O queue depth).
      *  @param concurrent_pins Extra rows pin() may hold at once (one per batched-forward worker).
      *  @param fill_chunk_bytes Split each missed expert's read into pieces of at most this many bytes,
      *         so idle readers share it and the miss lands sooner (0 = one read per expert).
      *  @return invalid_argument if an expert's planes are not contiguous in the file, if the budget
-     *          holds fewer than two layers' selections plus `concurrent_pins`, or if the OS cannot
+     *          gives any expert size fewer than two layers' selections plus `concurrent_pins`, or if the OS cannot
      *          commit the budget's storage; pool_exhausted if the OS refuses to lock that storage in
      *          RAM. An unpinned cache is refused rather than used: the OS would page it out under
      *          memory pressure, turning hits into pagefile reads.
@@ -79,8 +80,8 @@ public:
 
     /** Blocks until `expert` of `layer` is resident, then pins it for the returned lease's lifetime.
      *  Thread-safe and independent of prefetch/acquire: for the batched forward() path, which decodes
-     *  an expert from its bytes and releases it at once. Fails with pool_exhausted if more than
-     *  `concurrent_pins` such leases are held at once.
+     *  an expert from its bytes and releases it at once. Up to `concurrent_pins` such leases are
+     *  always served; beyond that, one whose expert size has every slot pinned fails with pool_exhausted.
      */
     [[nodiscard]] std::expected<sub0tieredcache::RowLease, sub0tieredcache::Status> pin(int layer, int expert) noexcept;
     /// Encoded bytes of plane `which` within a row returned by pin(layer, expert).
@@ -137,7 +138,7 @@ private:
     Storage storage_;
     Resolver resolver_;
     std::unique_ptr<sub0mempage::LocalFileBackend> backend_;
-    std::unique_ptr<sub0tieredcache::Table> table_;
+    std::unique_ptr<sub0tieredcache::SizeClassedTable> table_;
     std::vector<std::uint64_t> rows_;                 // the last prefetch's rows, by selection index k
     std::vector<sub0tieredcache::RowLease> leases_;   // pins taken by acquire, by k
     std::atomic<std::uint64_t> wait_count_{0}; // acquire may run concurrently for different k

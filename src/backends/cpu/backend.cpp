@@ -2153,7 +2153,8 @@ bool load_moe_quant_sidecar(const char* model_path) {
                                  ? "The OS refused to lock that much RAM, and an unpinned cache would be paged out "
                                    "under memory pressure. Lower --moe-cache-gib, or raise the lock limit (Linux: "
                                    "`ulimit -l` or CAP_IPC_LOCK)."
-                                 : "A smaller --moe-cache-gib helps if the OS cannot commit that much memory.");
+                                 : "The budget must hold two layers' selections plus one expert per worker for each "
+                                   "expert size, and the OS must be able to commit it: adjust --moe-cache-gib.");
                 return false;
             }
             std::println("routed-expert cache: {} of {} experts resident ({:.1f} GiB budget, {})", g_moe_cache.resident_rows(),

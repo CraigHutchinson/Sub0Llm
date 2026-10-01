@@ -77,7 +77,7 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
     const auto row_count = static_cast<std::uint64_t>(h.num_experts) * static_cast<std::uint64_t>(h.n_layers);
 
     // One row must be one read: refuse a sidecar whose expert planes are not stored back to back.
-    std::uint64_t row_bytes = 0;
+    std::uint64_t row_bytes = 0, table_bytes = 0;
     for (int layer = 0; layer < h.n_layers; ++layer) {
         for (int expert = 0; expert < h.num_experts; ++expert) {
             const moeq::Desc& gate = store.desc(layer, expert, moeq::Gate);
@@ -85,18 +85,16 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
             const moeq::Desc& down = store.desc(layer, expert, moeq::Down);
             if (up.off != gate.off + gate.bytes || down.off != up.off + up.bytes) return Status::invalid_argument;
             row_bytes = std::max(row_bytes, gate.bytes + up.bytes + down.bytes);
+            table_bytes += gate.bytes + up.bytes + down.bytes;
         }
     }
-    // Two layers' selections must fit (the current layer stays pinned while the next is prefetched),
-    // plus whatever pin() may hold concurrently.
-    const std::uint64_t rows = std::min(budget_bytes / row_bytes, row_count);
-    if (rows < 2ull * max_selected + concurrent_pins || rows >= UINT32_MAX) return Status::invalid_argument;
+    const std::uint64_t storage_bytes = std::min(budget_bytes, table_bytes);
 
     std::error_code error;
     const auto file_bytes = std::filesystem::file_size(sidecar, error);
     if (error) return Status::io_error;
 
-    if (!storage_.reserve(static_cast<std::size_t>(rows * row_bytes))) return Status::invalid_argument;
+    if (!storage_.reserve(static_cast<std::size_t>(storage_bytes))) return Status::invalid_argument;
     if (!storage_.pinned) { // see open()'s contract: an unpinned owned cache is worse than none
         close();
         return Status::pool_exhausted;
@@ -118,29 +116,34 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
 
     resolver_.store = &store;
     const auto sources = sub0tieredcache::single_source(kSidecarSource, file_bytes);
-    sub0tieredcache::TableConfig config{};
+    sub0tieredcache::SizeClassedTableConfig config{};
     config.row_count = row_count;
-    config.source_row_bytes = row_bytes;
-    config.output_row_bytes = row_bytes;
-    config.row_extent = sub0tieredcache::RowExtent::bounded;
-    config.representation = sub0tieredcache::Representation::identity;
     config.sources = sources;
     config.generation = 1;
     config.resolve_extent = sub0tieredcache::RowExtentResolverRef(resolver_);
     config.output_storage = std::span(storage_.data, storage_.bytes);
-    config.budget_rows = static_cast<std::uint32_t>(rows);
     config.max_tickets = 4;
     config.max_batch_rows = max_selected;
     config.fill_chunk_bytes = fill_chunk_bytes;
-    auto table = sub0tieredcache::Table::create(config, sub0mempage::FillBackendRef(*backend_));
+    auto table = sub0tieredcache::SizeClassedTable::create(config, sub0mempage::FillBackendRef(*backend_));
     if (!table) {
         close();
         return table.error();
     }
     table_ = std::move(*table);
+    // Every expert size must fit two layers' selections (the current layer stays pinned while the next
+    // is prefetched), plus whatever pin() may hold concurrently: a layer's selection can be all one size.
+    std::uint64_t resident = 0;
+    for (const auto& cls : table_->classes()) {
+        if (cls.budget_rows < std::min<std::uint64_t>(2ull * max_selected + concurrent_pins, cls.rows)) {
+            close();
+            return Status::invalid_argument;
+        }
+        resident += cls.budget_rows;
+    }
     rows_.assign(max_selected, 0);
     leases_.resize(max_selected);
-    budget_rows_ = static_cast<std::uint32_t>(rows);
+    budget_rows_ = static_cast<std::uint32_t>(resident);
     return Status::ok;
 }
 
@@ -171,9 +174,8 @@ Status ExpertRowCache::prefetch(int layer, std::span<const int> experts) noexcep
         rows_[k] = static_cast<std::uint64_t>(layer) * per_layer + static_cast<std::uint64_t>(experts[k]);
     layer_ = layer;
     selected_ = static_cast<std::uint32_t>(experts.size());
-    // The ticket is dropped at once: fills continue, and acquire() waits on the rows themselves.
-    const auto ticket = table_->prefetch(std::span(rows_).first(selected_));
-    return ticket ? Status::ok : ticket.error();
+    // Fills continue in the background; acquire() waits on the rows themselves.
+    return table_->prefetch(std::span(rows_).first(selected_));
 }
 
 Status ExpertRowCache::acquire(int k) noexcept {
