@@ -44,8 +44,9 @@ public:
      *  @param budget_bytes  RAM for resident rows, rounded down to whole rows and capped at the table.
      *  @param max_selected  Experts selected per layer: the per-call batch bound.
      *  @param readers       Backend read threads (the I/O queue depth).
-     *  @return invalid_argument if an expert's planes are not contiguous in the file, or if the budget
-     *          holds fewer than two layers' selections (one pinned while the next is prefetched).
+     *  @return invalid_argument if an expert's planes are not contiguous in the file, if the budget
+     *          holds fewer than two layers' selections (one pinned while the next is prefetched), or if
+     *          the OS cannot commit the budget's storage.
      *  @note Administrative: allocates and may block. Any previous session is closed first.
      */
     [[nodiscard]] sub0tieredcache::Status open(const std::filesystem::path& sidecar, const moeq::Store& store,
@@ -60,7 +61,8 @@ public:
     [[nodiscard]] sub0tieredcache::Status prefetch(int layer, std::span<const int> experts) noexcept;
     /// Blocks until selected expert `k` of the last prefetch is resident, then pins it.
     [[nodiscard]] sub0tieredcache::Status acquire(int k) noexcept;
-    /// Encoded bytes of plane `which` (moeq::Gate/Up/Down) of pinned expert `k`.
+    /// Encoded bytes of plane `which` (moeq::Gate/Up/Down) of expert `k`.
+    /// @pre acquire(k) succeeded since the last prefetch; the span is valid until the next prefetch.
     [[nodiscard]] std::span<const std::uint8_t> plane(int k, int which) const noexcept;
 
     [[nodiscard]] sub0tieredcache::TableStats stats() const noexcept;

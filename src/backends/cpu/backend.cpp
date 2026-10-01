@@ -2055,7 +2055,10 @@ bool load_moe_quant_sidecar(const char* model_path) {
             constexpr auto kSelected = static_cast<std::uint32_t>(EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1);
             if (const auto status = g_moe_cache.open(path, g_moe_quant, MOE_CACHE_BUDGET_BYTES, kSelected, kSelected);
                 status != sub0tieredcache::Status::ok) {
-                std::println(stderr, "error: the routed-expert cache could not open beside the S0Q1 sidecar: {}",
+                std::println(stderr,
+                             "error: the routed-expert cache could not open beside the S0Q1 sidecar with a {:.1f} GiB "
+                             "budget: {} (a smaller --moe-cache-gib helps if the OS cannot commit that much memory)",
+                             static_cast<double>(MOE_CACHE_BUDGET_BYTES) / (1024.0 * 1024.0 * 1024.0),
                              moeio::status_name(status));
                 return false;
             }

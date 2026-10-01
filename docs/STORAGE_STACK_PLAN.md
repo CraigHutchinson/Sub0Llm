@@ -224,6 +224,38 @@ layout/tokenizer test defects are fixed; and `run_perf_suite.py` no longer rebui
 
 Next: S1c (E1 frozen-table model wiring, below). M4/T2 staged CUDA is S2.
 
+### Owned expert cache (`--moe-io-mode cache`) -- first measurement, 2026-10-01
+
+One Sub0TieredCache row per (layer, expert) holds the expert's three contiguous encoded planes. The rows
+are `RowExtent::bounded`, a TieredCache addition at `65e59d5`, because expert sizes differ between
+layers. The cache uses caller-owned RAM committed on first touch, with a budget from `--moe-cache-gib`
+(default: half of physical RAM). Decode reads planes in place. Fills are buffered for now, because
+unbuffered reads plateau on this host: Sub0MemPage `docs/investigations/unbuffered-read-ceiling.md`.
+
+| Evidence | Result |
+|---|---|
+| Revisions | Sub0Llm `f048990`; Sub0TieredCache `65e59d5` (local, not yet published); Sub0MemPage pin `213acdd` |
+| Output parity | 6-token logits byte-identical to reactive (`D1F29B19...`); perplexity 11.930422 across every arm below |
+| Suites | `sub0_storage_moe_cache_tests` 124/4 (includes the real sidecar); TieredCache 11/11 on Windows and Linux |
+
+Long decode (2,000 G-PPL tokens) from an evicted cache, 2 rotated rounds:
+
+| Arm | Round 1 | Round 2 | Mean tok/s | Peak working set |
+|---|---:|---:|---:|---:|
+| cache, 31.7 GiB (auto) | 6.65 | 6.82 | **6.73** | 49.2 GiB |
+| reactive | 6.31 | 6.76 | 6.53 | 50.7 GiB |
+| cache, 20 GiB | 6.22 | 6.44 | 6.33 | 39.0 GiB |
+| mempage | 4.82 | 5.03 | 4.93 | 19.7 GiB |
+
+Reading:
+- At equal memory the cache is at parity with reactive, slightly ahead (+3%). That is within run-to-run
+  noise; reactive's own two rounds differ by 7%.
+- Reactive's speed depends on how much RAM the OS happens to spare. The same arm peaked at 27.5 GiB and
+  decoded at 4.93 tok/s in an earlier session.
+- The owned budget is fixed and predictable. At 20 GiB it gives up 3% for 11.6 GiB less memory.
+- This idle host is only shallowly in regime 2. The deciding test is deep regime 2: hold RAM so only
+  ~20 GB is free, then compare at a matched budget. The default stays reactive until that test.
+
 ### S1b package definition (historical, as planned)
 
 Refreshed 2026-09-29. The E1 row fixture is complete; the former instructions to implement it

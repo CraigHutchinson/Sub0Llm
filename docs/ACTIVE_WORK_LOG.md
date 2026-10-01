@@ -1007,7 +1007,7 @@ across all modes. Full record: `docs/STORAGE_STACK_PLAN.md` "S1b closure record"
 Profiling (phase profiler, VTune) and perf-suite runs in `out/build/s1b`. May edit
 `include/sub0/moe_io_mempage.hpp`, `src/moe_io_mempage.cpp`, `src/backends/cpu/decode.cpp` (MoE prefetch/wait seam only).
 
-**2026-09-30 Claude Code (Sub0ECS, other repo) — v2 reference benchmark capture, PAUSED (CPU free) since 2026-09-30 ~23:25 while the harness moves to nanobench; will restart and re-mark active here.**
+**2026-09-30 Claude Code (Sub0ECS, other repo) — v2 reference benchmark capture, STOPPED 2026-10-01 ~08:50 at the user's request: Sub0ECS work stays off this CPU until further notice. CPU free.**
 `D:\Craig\GitHub\Sub0ECS` `bench/tools/run.py --profile reference` (MSVC, pinned to the P-cores, then the
 thread-scaling suite across all 24 cores). No Sub0Llm files touched. Any Sub0Llm perf/timing run in this window is
 contended — and would perturb the Sub0ECS numbers too. Will mark done here when finished.
@@ -1020,3 +1020,10 @@ owned-cache design for MoE + n-gram (docs only until agreed). Will mark done her
 evicted start: reactive 4.93 tok/s, mempage 4.50, pipelined 3.30 (ppl 11.930 all). Engine working set ~19.5 GiB
 leaves ~22 GiB of OS cache for the 37 GiB sidecar (~60%): partial regime 2. CPU released. Next: owned expert cache
 (TieredCache variable-extent rows + MemPage unbuffered fills), designed for n-gram rows too.
+
+**2026-10-01 Claude Code — owned expert cache regime-2 A/B, active (holds the CPU ~1.5 h).** `out/build/s1b`, 2,000 G-PPL
+tokens from an evicted cache: reactive / mempage / cache (auto 31.7 GiB) / cache 20 GiB, 2 rotated rounds.
+
+**2026-10-01 Claude Code — owned expert cache regime-2 A/B, done; CPU released.** Mean tok/s over 2 rounds: cache
+(auto 31.7 GiB) 6.73, reactive 6.53, cache 20 GiB 6.33, mempage 4.93; ppl 11.930 all. Record: STORAGE_STACK_PLAN.md
+"Owned expert cache". Next: deep regime-2 test (held RAM, matched budget).
