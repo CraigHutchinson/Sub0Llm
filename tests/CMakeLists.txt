@@ -316,7 +316,8 @@ endif()
 # configured --moe-io-mode cache.
 if(SUB0_STORAGE_TIEREDCACHE OR SUB0_MOE_TIERED_ENABLED)
   include("${CMAKE_SOURCE_DIR}/cmake/TieredCache.cmake")
-  add_executable(sub0_storage_moe_cache_tests moe_io_tiered_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_tiered.cpp")
+  add_executable(sub0_storage_moe_cache_tests moe_io_tiered_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_tiered.cpp"
+    "${CMAKE_SOURCE_DIR}/src/residency.cpp")
   target_include_directories(sub0_storage_moe_cache_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
   target_link_libraries(sub0_storage_moe_cache_tests PRIVATE
     Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache Catch2::Catch2WithMain)

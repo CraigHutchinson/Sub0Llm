@@ -13,18 +13,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#ifndef PSAPI_VERSION
-#define PSAPI_VERSION 2 // QueryWorkingSetEx resolves to kernel32's K32QueryWorkingSetEx: no psapi.lib
-#endif
-#include <psapi.h>
 #else
 #include <sys/mman.h>
-#include <sys/resource.h>
-#include <unistd.h>
-#if defined(__linux__)
-#include <fstream>
-#include <string>
-#endif
 #endif
 
 namespace sub0::moeio {
@@ -45,24 +35,7 @@ bool ExpertRowCache::Storage::reserve(std::size_t size) noexcept {
     if (p == nullptr) return false;
     data = static_cast<std::byte*>(p);
     bytes = size;
-#if defined(_WIN32)
-    // VirtualLock is bounded by the working-set minimum, so the quota grows by the pool's size first
-    // (standard users hold SeIncreaseWorkingSetPrivilege). release() gives it back.
-    SIZE_T min_ws = 0, max_ws = 0;
-    const HANDLE self = ::GetCurrentProcess();
-    pinned = ::GetProcessWorkingSetSize(self, &min_ws, &max_ws) &&
-             ::SetProcessWorkingSetSizeEx(self, min_ws + size, max_ws + size,
-                                          QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) &&
-             ::VirtualLock(p, size);
-#else
-    // mlock is bounded by RLIMIT_MEMLOCK (often 8 MiB on Linux, unlimited on macOS): raise the soft
-    // limit to the hard one first. A hard limit below the budget needs `ulimit -l` or CAP_IPC_LOCK.
-    if (rlimit lim{}; ::getrlimit(RLIMIT_MEMLOCK, &lim) == 0 && lim.rlim_cur < lim.rlim_max) {
-        lim.rlim_cur = lim.rlim_max;
-        (void)::setrlimit(RLIMIT_MEMLOCK, &lim);
-    }
-    pinned = ::mlock(p, size) == 0;
-#endif
+    pinned = residency::pin(p, size);
     return true;
 }
 
@@ -70,67 +43,13 @@ void ExpertRowCache::Storage::release() noexcept {
     if (data == nullptr) return;
 #if defined(_WIN32)
     ::VirtualFree(data, 0, MEM_RELEASE); // also releases the lock
-    if (pinned) {
-        SIZE_T min_ws = 0, max_ws = 0;
-        const HANDLE self = ::GetCurrentProcess();
-        if (::GetProcessWorkingSetSize(self, &min_ws, &max_ws) && min_ws > bytes && max_ws > bytes)
-            (void)::SetProcessWorkingSetSizeEx(self, min_ws - bytes, max_ws - bytes,
-                                               QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-    }
 #else
     ::munmap(data, bytes);               // also releases the lock
 #endif
+    if (pinned) residency::release_quota(bytes);
     data = nullptr;
     bytes = 0;
     pinned = false;
-}
-
-ExpertRowCache::Residency ExpertRowCache::Storage::verify() const noexcept {
-    Residency r;
-    if (data == nullptr) return r;
-#if defined(_WIN32)
-    constexpr std::size_t kPage = 4096, kChunk = 4096;
-    std::array<PSAPI_WORKING_SET_EX_INFORMATION, kChunk> info{};
-    r.pages = bytes / kPage;
-    for (std::uint64_t first = 0; first < r.pages; first += kChunk) {
-        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, r.pages - first));
-        for (std::size_t i = 0; i < count; ++i) info[i].VirtualAddress = data + (first + i) * kPage;
-        if (!::QueryWorkingSetEx(::GetCurrentProcess(), info.data(),
-                                 static_cast<DWORD>(count * sizeof(PSAPI_WORKING_SET_EX_INFORMATION))))
-            return Residency{};
-        for (std::size_t i = 0; i < count; ++i) {
-            r.resident += info[i].VirtualAttributes.Valid;
-            r.locked += info[i].VirtualAttributes.Valid && info[i].VirtualAttributes.Locked;
-        }
-    }
-#else
-    const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
-    constexpr std::size_t kChunk = 4096;
-#if defined(__APPLE__)
-    std::array<char, kChunk> vec{};
-#else
-    std::array<unsigned char, kChunk> vec{};
-#endif
-    r.pages = (bytes + page - 1) / page;
-    for (std::uint64_t first = 0; first < r.pages; first += kChunk) {
-        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, r.pages - first));
-        if (::mincore(data + first * page, count * page, vec.data()) != 0) return Residency{};
-        for (std::size_t i = 0; i < count; ++i) r.resident += (vec[i] & 1) != 0;
-    }
-#if defined(__linux__)
-    // No per-page lock bit on Linux: VmLck covers every lock this process holds, so it is a lower bound
-    // check -- if it is below the pool's size, the pool cannot be fully locked.
-    std::ifstream status("/proc/self/status");
-    std::uint64_t vm_lck_kib = 0;
-    for (std::string line; std::getline(status, line);)
-        if (line.rfind("VmLck:", 0) == 0) vm_lck_kib = std::strtoull(line.c_str() + 6, nullptr, 10);
-    r.locked = pinned && vm_lck_kib * 1024 >= bytes ? r.resident : 0;
-#else
-    // macOS exposes no per-page lock state; mlock's success is the evidence.
-    r.locked = pinned ? r.resident : 0;
-#endif
-#endif
-    return r;
 }
 
 std::expected<sub0tieredcache::RowLocation, Status>

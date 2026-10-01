@@ -596,6 +596,8 @@ public:
     }
 
     [[nodiscard]] std::uint64_t resident_bytes() const { return h_.data_bytes; }
+    /// The whole mapped file (empty if not loaded): what a residency report asks the OS about.
+    [[nodiscard]] std::span<const std::uint8_t> mapping() const { return {map_.data(), map_.size()}; }
 
     /** Read one byte of every 4 KiB page of the mapped payload, so decode never takes a first-touch
      * soft page fault on it.

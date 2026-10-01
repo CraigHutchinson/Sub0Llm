@@ -1981,6 +1981,14 @@ void print_decode_io_stats() {
                  "resident-hit rate {:.1f}%",
                  s.resident, g_moe_cache.resident_rows(), accesses, s.fetches, s.evictions,
                  accesses ? 100.0 * (1.0 - static_cast<double>(s.fetches) / static_cast<double>(accesses)) : 0.0);
+    // Where the rest of decode's hot memory stands. Not pinned yet, so a low share here means the OS
+    // trimmed it (parameters to the pagefile, the mapped backbone back to its file) during the run.
+    const auto params = residency::query(g_param_data.get(), PARAM_FLOATS * sizeof(param_t), false);
+    const auto backbone = g_backbone_quant.mapping();
+    const auto native = residency::query(backbone.data(), backbone.size(), false);
+    std::println("end-of-run residency: parameters {:.1f}% of {:.2f} GiB, native backbone mapping {:.1f}% of {:.2f} GiB",
+                 100.0 * params.resident_fraction(), static_cast<double>(PARAM_FLOATS * sizeof(param_t)) / (1u << 30),
+                 100.0 * native.resident_fraction(), static_cast<double>(backbone.size()) / (1u << 30));
 #endif
 }
 

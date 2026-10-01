@@ -1032,3 +1032,5 @@ tokens from an evicted cache: reactive / mempage / cache (auto 31.7 GiB) / cache
 Reactive vs owned cache at a matched 10 GiB budget, 2,000 G-PPL tokens, 2 rotated rounds, `out/build/s1b`.
 
 **2026-10-01 Claude Code — owned cache pass 2 (resident-first waves) deep regime-2 A/B, active (CPU + ~24 GiB locked ballast, ~1 h).**
+
+**2026-10-01 Claude Code — pinned-cache deep regime-2 A/B (pass 3), active (CPU + ~19 GiB locked ballast, ~1 h).**

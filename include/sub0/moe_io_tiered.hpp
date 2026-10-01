@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sub0/moe_quant.hpp"
+#include "sub0/residency.hpp"
 
 #include <sub0mempage/local_file_backend.hpp>
 #include <sub0tieredcache/row_cache.hpp>
@@ -32,14 +33,8 @@ namespace sub0::moeio {
  */
 class ExpertRowCache {
 public:
-    /// Page counts over the cache's own RAM. `locked` counts resident pages the OS cannot page out.
-    struct Residency {
-        std::uint64_t pages = 0;
-        std::uint64_t resident = 0;
-        std::uint64_t locked = 0;
-        /// Every page resident and locked: nothing of the pool can have reached the pagefile.
-        [[nodiscard]] bool complete() const noexcept { return pages != 0 && locked == pages; }
-    };
+    /// Page counts over the cache's own RAM (sub0/residency.hpp).
+    using Residency = residency::Report;
 
     /// Constructs a closed cache; no storage, worker or file handle exists until open.
     ExpertRowCache() = default;
@@ -122,7 +117,7 @@ private:
         /// Allocates `size` bytes and tries to lock them; `pinned` reports whether the lock held.
         [[nodiscard]] bool reserve(std::size_t size) noexcept;
         void release() noexcept;
-        [[nodiscard]] Residency verify() const noexcept;
+        [[nodiscard]] Residency verify() const noexcept { return residency::query(data, bytes, pinned); }
     };
 
     // Destruction order matters (reverse of declaration): leases, then table, then backend, then storage.
