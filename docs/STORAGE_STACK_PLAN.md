@@ -239,7 +239,39 @@ code and checked by a test that fails when it is violated.
 | S0Q1 sidecar, reactive / pipelined / mempage | Mapped (reactive) or explicit buffered reads | `FileMap`; `ReadFile`/`pread` | Unchanged; these modes are regime 1 by design |
 | Native backbone `.bbq`, tokenizer | Mapped, always hot | `FileMap` (clean pages: dropped, never written to the pagefile) | Intentional; none needed |
 | Buffered fills into the pool | Known double-caching through the OS page cache | Buffered `ReadFile`/`pread` | Open: unbuffered reads plateau at ~3 GB/s on this host (Sub0MemPage `docs/investigations/unbuffered-read-ceiling.md`) |
-| Engine heap (~19.5 GiB: parameters, workers, activations) | Not yet decided | Ordinary pageable allocation | **Gap:** it can reach the pagefile under the same pressure. Pinning it is the next residency package |
+| Engine heap (~19.5 GiB: parameters, workers, activations) | Pageable; cold parts may page out | Ordinary allocation | Measured 2026-10-01: with the native backbone, decode reads only **0.18 GiB (2.0%)** of the 9.16 GiB parameter arena (router, norms, small projections). The large matrices are read from `.bbq`; one embedding row is touched per token. Paging the cold 98% costs decode nothing, so pinning the whole arena would lock cold memory. The hot 0.18 GiB stays resident by use |
+
+**Correction (2026-10-01):** pinning the pool held (the residency guard passed) but did not change
+throughput: 5.46/5.43 tok/s pinned against 5.41/5.44 unpinned. Two readings published earlier were
+wrong:
+- The page-ins seen during cache runs are the cache's own miss reads. Buffered fills go through the OS
+  file cache and count as page input: 144k fetches x ~1.65 MB over ~370 s is ~157k pages/s.
+- The low parameter residency (41.6%) is cold memory, so it does not explain the gap. Commit `dae9b5c`'s
+  message carries the wrong conclusion.
+
+The gap is the hit rate at the budget. Under the "10 GiB room" ballast, reactive's working set reached
+~33 GiB (~13-14 GB of expert pages, plus standby), against the cache's fixed 10 GiB.
+
+Deep regime 2 (RAM ballast leaving ~10 GiB of room; 2,000 G-PPL tokens; 2 rotated rounds; perplexity
+11.930422 throughout):
+
+| Arm | Mean tok/s | Hit rate | Peak working set |
+|---|---:|---:|---:|
+| reactive mmap | 6.43-6.56 across runs | n/a | 32-37 GiB (grows into free RAM) |
+| cache 6 GiB, before waves (pass 1) | 4.73 | 85.3% | 25.3 GiB |
+| cache 6 GiB, resident-first waves (pass 2) | 5.31 | 85.3% | 25.4 GiB |
+| cache 10 GiB, unpinned / pinned | 5.42 / 5.45 | 91.9% | 29.7 GiB |
+| cache 14 GiB, pinned | 5.70 | 95.3% | 33.7 GiB |
+
+Reading:
+- Each step of budget raises the hit rate and the speed.
+- At ~95% hits, about 42 experts per token (~70 MB) still miss, roughly one per layer.
+- A miss's read outlasts the layer's resident compute, so wave 1 stalls almost every layer: ~0.5 ms x 48,
+  about the remaining gap.
+- Reactive's misses mostly land in the OS standby cache as microsecond soft faults. The cache's misses
+  pay a 1.7 MB buffered copy plus a worker hand-off.
+- Next lever: hide or shorten miss latency (prefetching the next layer's experts before its router runs),
+  not more memory or pinning.
 
 Platform coverage: Windows (Clang) and Linux (WSL2 GCC 15) build and pass the cache suite, 182
 assertions in 6 cases, including the real sidecar. macOS is reviewed against its APIs (`MAP_ANONYMOUS`,
