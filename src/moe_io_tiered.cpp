@@ -1,6 +1,8 @@
 #include "sub0/moe_io_tiered.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <system_error>
 
 #if defined(_WIN32)
@@ -11,8 +13,18 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#ifndef PSAPI_VERSION
+#define PSAPI_VERSION 2 // QueryWorkingSetEx resolves to kernel32's K32QueryWorkingSetEx: no psapi.lib
+#endif
+#include <psapi.h>
 #else
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#if defined(__linux__)
+#include <fstream>
+#include <string>
+#endif
 #endif
 
 namespace sub0::moeio {
@@ -33,18 +45,92 @@ bool ExpertRowCache::Storage::reserve(std::size_t size) noexcept {
     if (p == nullptr) return false;
     data = static_cast<std::byte*>(p);
     bytes = size;
+#if defined(_WIN32)
+    // VirtualLock is bounded by the working-set minimum, so the quota grows by the pool's size first
+    // (standard users hold SeIncreaseWorkingSetPrivilege). release() gives it back.
+    SIZE_T min_ws = 0, max_ws = 0;
+    const HANDLE self = ::GetCurrentProcess();
+    pinned = ::GetProcessWorkingSetSize(self, &min_ws, &max_ws) &&
+             ::SetProcessWorkingSetSizeEx(self, min_ws + size, max_ws + size,
+                                          QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) &&
+             ::VirtualLock(p, size);
+#else
+    // mlock is bounded by RLIMIT_MEMLOCK (often 8 MiB on Linux, unlimited on macOS): raise the soft
+    // limit to the hard one first. A hard limit below the budget needs `ulimit -l` or CAP_IPC_LOCK.
+    if (rlimit lim{}; ::getrlimit(RLIMIT_MEMLOCK, &lim) == 0 && lim.rlim_cur < lim.rlim_max) {
+        lim.rlim_cur = lim.rlim_max;
+        (void)::setrlimit(RLIMIT_MEMLOCK, &lim);
+    }
+    pinned = ::mlock(p, size) == 0;
+#endif
     return true;
 }
 
 void ExpertRowCache::Storage::release() noexcept {
     if (data == nullptr) return;
 #if defined(_WIN32)
-    ::VirtualFree(data, 0, MEM_RELEASE);
+    ::VirtualFree(data, 0, MEM_RELEASE); // also releases the lock
+    if (pinned) {
+        SIZE_T min_ws = 0, max_ws = 0;
+        const HANDLE self = ::GetCurrentProcess();
+        if (::GetProcessWorkingSetSize(self, &min_ws, &max_ws) && min_ws > bytes && max_ws > bytes)
+            (void)::SetProcessWorkingSetSizeEx(self, min_ws - bytes, max_ws - bytes,
+                                               QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    }
 #else
-    ::munmap(data, bytes);
+    ::munmap(data, bytes);               // also releases the lock
 #endif
     data = nullptr;
     bytes = 0;
+    pinned = false;
+}
+
+ExpertRowCache::Residency ExpertRowCache::Storage::verify() const noexcept {
+    Residency r;
+    if (data == nullptr) return r;
+#if defined(_WIN32)
+    constexpr std::size_t kPage = 4096, kChunk = 4096;
+    std::array<PSAPI_WORKING_SET_EX_INFORMATION, kChunk> info{};
+    r.pages = bytes / kPage;
+    for (std::uint64_t first = 0; first < r.pages; first += kChunk) {
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, r.pages - first));
+        for (std::size_t i = 0; i < count; ++i) info[i].VirtualAddress = data + (first + i) * kPage;
+        if (!::QueryWorkingSetEx(::GetCurrentProcess(), info.data(),
+                                 static_cast<DWORD>(count * sizeof(PSAPI_WORKING_SET_EX_INFORMATION))))
+            return Residency{};
+        for (std::size_t i = 0; i < count; ++i) {
+            r.resident += info[i].VirtualAttributes.Valid;
+            r.locked += info[i].VirtualAttributes.Valid && info[i].VirtualAttributes.Locked;
+        }
+    }
+#else
+    const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    constexpr std::size_t kChunk = 4096;
+#if defined(__APPLE__)
+    std::array<char, kChunk> vec{};
+#else
+    std::array<unsigned char, kChunk> vec{};
+#endif
+    r.pages = (bytes + page - 1) / page;
+    for (std::uint64_t first = 0; first < r.pages; first += kChunk) {
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, r.pages - first));
+        if (::mincore(data + first * page, count * page, vec.data()) != 0) return Residency{};
+        for (std::size_t i = 0; i < count; ++i) r.resident += (vec[i] & 1) != 0;
+    }
+#if defined(__linux__)
+    // No per-page lock bit on Linux: VmLck covers every lock this process holds, so it is a lower bound
+    // check -- if it is below the pool's size, the pool cannot be fully locked.
+    std::ifstream status("/proc/self/status");
+    std::uint64_t vm_lck_kib = 0;
+    for (std::string line; std::getline(status, line);)
+        if (line.rfind("VmLck:", 0) == 0) vm_lck_kib = std::strtoull(line.c_str() + 6, nullptr, 10);
+    r.locked = pinned && vm_lck_kib * 1024 >= bytes ? r.resident : 0;
+#else
+    // macOS exposes no per-page lock state; mlock's success is the evidence.
+    r.locked = pinned ? r.resident : 0;
+#endif
+#endif
+    return r;
 }
 
 std::expected<sub0tieredcache::RowLocation, Status>
@@ -63,7 +149,8 @@ ExpertRowCache::Resolver::resolve_extent(std::uint64_t row) const noexcept {
 ExpertRowCache::~ExpertRowCache() { close(); }
 
 Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::Store& store,
-                            std::uint64_t budget_bytes, std::uint32_t max_selected, std::uint32_t readers) {
+                            std::uint64_t budget_bytes, std::uint32_t max_selected, std::uint32_t readers,
+                            std::uint32_t concurrent_pins) {
     close();
     const auto& h = store.header();
     if (max_selected == 0 || readers == 0 || h.num_experts <= 0 || h.n_layers <= 0) return Status::invalid_argument;
@@ -80,15 +167,20 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
             row_bytes = std::max(row_bytes, gate.bytes + up.bytes + down.bytes);
         }
     }
-    // Two layers' selections must fit: the current layer stays pinned while the next is prefetched.
+    // Two layers' selections must fit (the current layer stays pinned while the next is prefetched),
+    // plus whatever pin() may hold concurrently.
     const std::uint64_t rows = std::min(budget_bytes / row_bytes, row_count);
-    if (rows < 2ull * max_selected || rows >= UINT32_MAX) return Status::invalid_argument;
+    if (rows < 2ull * max_selected + concurrent_pins || rows >= UINT32_MAX) return Status::invalid_argument;
 
     std::error_code error;
     const auto file_bytes = std::filesystem::file_size(sidecar, error);
     if (error) return Status::io_error;
 
     if (!storage_.reserve(static_cast<std::size_t>(rows * row_bytes))) return Status::invalid_argument;
+    if (!storage_.pinned) { // see open()'s contract: an unpinned owned cache is worse than none
+        close();
+        return Status::pool_exhausted;
+    }
     auto backend = sub0mempage::LocalFileBackend::create(
         {.workers = readers, .queue_capacity = 4 * max_selected, .max_sources = 1});
     if (!backend) {
@@ -172,6 +264,25 @@ bool ExpertRowCache::try_acquire(int k) noexcept {
     if (!lease) return false;
     leases_[at] = std::move(*lease);
     return true;
+}
+
+std::expected<sub0tieredcache::RowLease, Status> ExpertRowCache::pin(int layer, int expert) noexcept {
+    if (!table_) return std::unexpected(Status::invalid_argument);
+    const auto& h = resolver_.store->header();
+    if (layer < 0 || layer >= h.n_layers || expert < 0 || expert >= h.num_experts)
+        return std::unexpected(Status::out_of_range);
+    const std::array<std::uint64_t, 1> row{static_cast<std::uint64_t>(layer) * static_cast<std::uint64_t>(h.num_experts) +
+                                           static_cast<std::uint64_t>(expert)};
+    std::array<sub0tieredcache::RowLease, 1> lease;
+    if (const auto resolved = table_->resolve_into(row, lease); !resolved) return std::unexpected(resolved.error());
+    return std::move(lease[0]);
+}
+
+std::span<const std::uint8_t> ExpertRowCache::plane(const sub0tieredcache::RowLease& row, int layer, int expert,
+                                                    int which) const noexcept {
+    const moeq::Desc& gate = resolver_.store->desc(layer, expert, moeq::Gate);
+    const moeq::Desc& d = resolver_.store->desc(layer, expert, which);
+    return {reinterpret_cast<const std::uint8_t*>(row.bytes().data()) + (d.off - gate.off), static_cast<std::size_t>(d.bytes)};
 }
 
 std::span<const std::uint8_t> ExpertRowCache::plane(int k, int which) const noexcept {

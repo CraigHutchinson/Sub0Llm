@@ -1969,6 +1969,14 @@ void print_decode_io_stats() {
     // a hit, so the miss rate is fetches / accesses, not coalesced / accesses.
     const auto s = g_moe_cache.stats();
     const std::uint64_t accesses = s.hits + s.coalesced;
+    // The cache is only worth having if every page it owns stayed in RAM. A lost page means the OS paged
+    // pinned memory out, so this run's numbers are not what they claim to be: fail it.
+    const auto residency = g_moe_cache.verify_resident();
+    if (!residency.complete()) {
+        std::println(stderr, "fatal: the routed-expert cache lost residency: {} of {} pages resident, {} locked",
+                     residency.resident, residency.pages, residency.locked);
+        std::abort();
+    }
     std::println("expert cache: {} rows resident of {} budget | {} accesses, {} fetches, {} evictions | "
                  "resident-hit rate {:.1f}%",
                  s.resident, g_moe_cache.resident_rows(), accesses, s.fetches, s.evictions,
@@ -2029,7 +2037,14 @@ bool load_moe_quant_sidecar(const char* model_path) {
     } else {
         const std::string path = std::string(model_path) + ".moeq";
         std::string err;
-        if (!g_moe_quant.open(path, err)) {
+#ifdef SUB0_MOE_IO_TIERED
+        // The owned expert cache reads every expert into RAM it pins itself, so the sidecar is never
+        // mapped: a stray read through the mapping becomes a fatal error, not silent OS paging.
+        constexpr auto kPayload = moeq::Store::Payload::descriptors_only;
+#else
+        constexpr auto kPayload = moeq::Store::Payload::mapped;
+#endif
+        if (!g_moe_quant.open(path, err, kPayload)) {
             std::println(stderr,
                          "error: this build keeps its routed experts quantized-resident "
                          "(MOE_QUANT_EXPERTS), so it needs the S0Q1 sidecar beside the model: {}",
@@ -2067,18 +2082,27 @@ bool load_moe_quant_sidecar(const char* model_path) {
             // The owned expert cache: rows are read straight into resident slots and decode reads them
             // in place, so there is no staging to size. One reader per selected expert, as for mempage.
             constexpr auto kSelected = static_cast<std::uint32_t>(EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1);
-            if (const auto status = g_moe_cache.open(path, g_moe_quant, MOE_CACHE_BUDGET_BYTES, kSelected, kSelected);
+            // The batched forward() path pins at most one expert per worker thread at a time.
+            if (const auto status = g_moe_cache.open(path, g_moe_quant, MOE_CACHE_BUDGET_BYTES, kSelected, kSelected,
+                                                     static_cast<std::uint32_t>(MAX_WORKERS));
                 status != sub0tieredcache::Status::ok) {
+                const bool pin_refused = status == sub0tieredcache::Status::pool_exhausted;
                 std::println(stderr,
                              "error: the routed-expert cache could not open beside the S0Q1 sidecar with a {:.1f} GiB "
-                             "budget: {} (a smaller --moe-cache-gib helps if the OS cannot commit that much memory)",
+                             "budget: {}. {}",
                              static_cast<double>(MOE_CACHE_BUDGET_BYTES) / (1024.0 * 1024.0 * 1024.0),
-                             moeio::status_name(status));
+                             moeio::status_name(status),
+                             pin_refused
+                                 ? "The OS refused to lock that much RAM, and an unpinned cache would be paged out "
+                                   "under memory pressure. Lower --moe-cache-gib, or raise the lock limit (Linux: "
+                                   "`ulimit -l` or CAP_IPC_LOCK)."
+                                 : "A smaller --moe-cache-gib helps if the OS cannot commit that much memory.");
                 return false;
             }
-            std::println("routed-expert cache: {} of {} experts resident ({:.1f} GiB budget)", g_moe_cache.resident_rows(),
+            std::println("routed-expert cache: {} of {} experts resident ({:.1f} GiB budget, {})", g_moe_cache.resident_rows(),
                          static_cast<long long>(N_LAYERS) * NUM_EXPERTS,
-                         static_cast<double>(MOE_CACHE_BUDGET_BYTES) / (1024.0 * 1024.0 * 1024.0));
+                         static_cast<double>(MOE_CACHE_BUDGET_BYTES) / (1024.0 * 1024.0 * 1024.0),
+                         g_moe_cache.pinned() ? "pinned" : "NOT pinned: the OS may page it out under memory pressure");
 #else
             // AGENTS.md S1: size the staging buffers ONCE, here, not per prefetch() call --
             // prefetch() runs once per layer per token, so sizing there would put the first

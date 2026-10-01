@@ -27,6 +27,7 @@
 #endif
 #ifdef SUB0_MOE_IO_TIERED
 #include "sub0/moe_io_tiered.hpp"
+#include <optional>
 #endif
 #include "sub0/moe_io.hpp"          // B36: explicit overlapped I/O for decode's resolve path
 #include "sub0/moe_math.hpp"        // moe::ExpertWeights (moe_resolve) + scratch sizing
@@ -673,7 +674,27 @@ inline void require_moe_sidecar() {
 template <class Cache>
 inline moe::ExpertWeights moe_resolve(Layer& L, int layer_index, int e, [[maybe_unused]] Cache& cache) {
     if constexpr (USE_MOE_QUANT) {
+#ifdef SUB0_MOE_IO_TIERED
+        // The sidecar is open descriptors-only, so a miss decodes from the owned cache's pinned row
+        // instead of the mapping. The pin is taken only on a miss and released on return: the expert's
+        // weights now live in this worker's own pool slot.
+        std::optional<sub0tieredcache::RowLease> row;
+        const auto bytes_of = [&](int which, const moeq::Desc&) {
+            if (!row) {
+                auto pinned = g_moe_cache.pin(layer_index, e);
+                if (!pinned) {
+                    std::println(stderr, "fatal: routed-expert cache could not pin layer {} expert {}: {}",
+                                 layer_index, e, moeio::status_name(pinned.error()));
+                    std::abort();
+                }
+                row = std::move(*pinned);
+            }
+            return g_moe_cache.plane(*row, layer_index, e, which);
+        };
+        const auto r = cache.resolve(g_moe_quant, layer_index, e, bytes_of);
+#else
         const auto r = cache.resolve(g_moe_quant, layer_index, e);
+#endif
         if (r.gate == nullptr) {
             std::println(stderr,
                          "fatal: could not dequantize routed expert {} of layer {} from the S0Q1 "

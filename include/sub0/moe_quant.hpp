@@ -68,7 +68,11 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <span>
 #include <string>
@@ -198,64 +202,77 @@ inline bool dequantize_expert(const Desc& d, std::span<const std::uint8_t> raw, 
 // reading a `Desc` through a pointer into mapped bytes whose alignment is the file's business.
 class Store {
 public:
+    /// How the payload is reached. `mapped` memory-maps the whole sidecar so raw() can address any
+    /// plane (the reactive and explicit-reader modes). `descriptors_only` reads just the header and
+    /// descriptor table with ordinary file reads and maps nothing: for consumers that fetch expert
+    /// bytes themselves into memory they own (--moe-io-mode cache), so no plane is ever paged in
+    /// through the OS. raw() on such a store is a fatal error, never a silent fallback.
+    enum class Payload : std::uint8_t { mapped, descriptors_only };
+
     // Returns false and fills `err` on any problem; never throws, never partially initializes.
-    bool open(const std::string& path, std::string& err) {
+    bool open(const std::string& path, std::string& err, Payload payload = Payload::mapped) {
         map_.close();
         descs_.clear();
         h_ = Header{};
         data_ = nullptr;
+        payload_ = payload;
+
+        if (payload == Payload::descriptors_only) {
+            std::error_code ec;
+            const std::uint64_t file_bytes = std::filesystem::file_size(path, ec);
+            if (ec) { err = "cannot open " + path; return false; }
+            std::ifstream in(path, std::ios::binary);
+            if (!in) { err = "cannot open " + path; return false; }
+            Header h{};
+            in.read(reinterpret_cast<char*>(&h), sizeof h);
+            if (in.gcount() != static_cast<std::streamsize>(sizeof h)) { err = path + ": truncated header"; return false; }
+            if (!validate_header(h, file_bytes, path, err)) return false;
+            std::vector<Desc> descs(static_cast<std::size_t>(h.n_tensors));
+            const auto table_bytes = static_cast<std::streamsize>(h.n_tensors * sizeof(Desc));
+            in.read(reinterpret_cast<char*>(descs.data()), table_bytes);
+            if (in.gcount() != table_bytes) { err = path + ": truncated descriptor table"; return false; }
+            if (!validate_descs(h, descs, path, err)) return false;
+            h_ = h;
+            descs_ = std::move(descs);
+            return true;
+        }
 
         FileMap m;
         if (!m.open(path, err)) return false;
         const std::uint8_t* p = m.data();
         const std::uint64_t file_bytes = m.size();
-
         if (file_bytes < sizeof(Header)) { err = path + ": truncated header"; return false; }
-        std::memcpy(&h_, p, sizeof h_);
-        if (std::memcmp(h_.magic, "S0Q1", 4) != 0) { err = path + ": not an S0Q1 sidecar"; return false; }
-        if (h_.version != 1) { err = path + ": unsupported S0Q1 version"; return false; }
-        if (h_.n_tensors != static_cast<std::uint64_t>(h_.n_layers) * h_.num_experts * PerExpert) {
-            err = path + ": tensor count does not match n_layers * num_experts * 3";
-            return false;
-        }
-        const std::uint64_t table_bytes = h_.n_tensors * sizeof(Desc);
-        if (file_bytes < sizeof(Header) + table_bytes) {
-            err = path + ": truncated descriptor table";
-            return false;
-        }
-        descs_.resize(static_cast<std::size_t>(h_.n_tensors));
-        std::memcpy(descs_.data(), p + sizeof(Header), static_cast<std::size_t>(table_bytes));
-
-        // The payload must lie wholly inside the file. This is the check the eager read got for free
-        // from a short read; with a mapping it has to be explicit, because addressing past the end of a
-        // view is an access violation rather than a `gcount()` shortfall.
-        if (h_.data_off > file_bytes || h_.data_bytes > file_bytes - h_.data_off) {
-            err = path + ": the payload runs past the end of the file";
-            return false;
-        }
-        // And every descriptor must lie inside the payload. Checked once here so no resolve has to.
-        max_desc_bytes_ = 0;
-        for (const Desc& d : descs_) {
-            if (d.off > h_.data_bytes || d.bytes > h_.data_bytes - d.off) {
-                err = path + ": a descriptor's byte range runs past the payload";
-                return false;
-            }
-            // B36: the largest single plane, so an explicit-I/O consumer (moeio::PlaneIo) can size ITS
-            // OWN staging buffers once, up front, rather than per resolve (AGENTS.md S1).
-            if (d.bytes > max_desc_bytes_) max_desc_bytes_ = d.bytes;
-        }
+        Header h{};
+        std::memcpy(&h, p, sizeof h);
+        if (!validate_header(h, file_bytes, path, err)) return false;
+        std::vector<Desc> descs(static_cast<std::size_t>(h.n_tensors));
+        std::memcpy(descs.data(), p + sizeof(Header), static_cast<std::size_t>(h.n_tensors * sizeof(Desc)));
+        if (!validate_descs(h, descs, path, err)) return false;
+        h_ = h;
+        descs_ = std::move(descs);
         map_ = std::move(m);
         data_ = map_.data() + h_.data_off;
         return true;
     }
 
     const Header& header() const { return h_; }
-    bool loaded() const { return data_ != nullptr; }
+    /// Whether a sidecar is open in either payload mode.
+    bool loaded() const { return h_.n_tensors != 0; }
+    /// Whether the payload is memory-mapped; false for a descriptors_only store.
+    [[nodiscard]] bool mapped() const { return data_ != nullptr; }
 
     const Desc& desc(int layer, int expert, int which) const {
         return descs_[static_cast<std::size_t>(desc_index(h_.num_experts, layer, expert, which))];
     }
+    /// The plane's encoded bytes, addressed through the mapping.
+    /// @note Fatal on a descriptors_only store: reaching it means some path would page expert bytes in
+    ///       through the OS where the configuration promised it never would.
     std::span<const std::uint8_t> raw(const Desc& d) const {
+        if (data_ == nullptr) [[unlikely]] {
+            std::fprintf(stderr, "fatal: an S0Q1 plane was read through a memory mapping, but this sidecar was "
+                                 "opened descriptors-only (--moe-io-mode cache owns expert residency)\n");
+            std::abort();
+        }
         return {data_ + d.off, static_cast<std::size_t>(d.bytes)};
     }
 
@@ -270,11 +287,47 @@ public:
     [[nodiscard]] std::uint64_t max_desc_bytes() const { return max_desc_bytes_; }
 
 private:
+    static bool validate_header(const Header& h, std::uint64_t file_bytes, const std::string& path, std::string& err) {
+        if (std::memcmp(h.magic, "S0Q1", 4) != 0) { err = path + ": not an S0Q1 sidecar"; return false; }
+        if (h.version != 1) { err = path + ": unsupported S0Q1 version"; return false; }
+        if (h.n_tensors != static_cast<std::uint64_t>(h.n_layers) * h.num_experts * PerExpert) {
+            err = path + ": tensor count does not match n_layers * num_experts * 3";
+            return false;
+        }
+        if (file_bytes < sizeof(Header) + h.n_tensors * sizeof(Desc)) {
+            err = path + ": truncated descriptor table";
+            return false;
+        }
+        // The payload must lie wholly inside the file. This is the check the eager read got for free
+        // from a short read; with a mapping it has to be explicit, because addressing past the end of a
+        // view is an access violation rather than a `gcount()` shortfall.
+        if (h.data_off > file_bytes || h.data_bytes > file_bytes - h.data_off) {
+            err = path + ": the payload runs past the end of the file";
+            return false;
+        }
+        return true;
+    }
+    // Every descriptor must lie inside the payload. Checked once here so no resolve has to.
+    bool validate_descs(const Header& h, const std::vector<Desc>& descs, const std::string& path, std::string& err) {
+        max_desc_bytes_ = 0;
+        for (const Desc& d : descs) {
+            if (d.off > h.data_bytes || d.bytes > h.data_bytes - d.off) {
+                err = path + ": a descriptor's byte range runs past the payload";
+                return false;
+            }
+            // B36: the largest single plane, so an explicit-I/O consumer (moeio::PlaneIo) can size ITS
+            // OWN staging buffers once, up front, rather than per resolve (AGENTS.md S1).
+            if (d.bytes > max_desc_bytes_) max_desc_bytes_ = d.bytes;
+        }
+        return true;
+    }
+
     Header                    h_{};
     std::vector<Desc>         descs_;
     FileMap                   map_;
-    const std::uint8_t*       data_ = nullptr;   // map_.data() + h_.data_off, or null
+    const std::uint8_t*       data_ = nullptr;   // map_.data() + h_.data_off, or null (descriptors_only)
     std::uint64_t             max_desc_bytes_ = 0;
+    Payload                   payload_ = Payload::mapped;
 };
 
 // --- the fixed-capacity resolve pool ------------------------------------------------------------------
@@ -314,6 +367,14 @@ public:
     // three planes. Returns {nullptr,...} only if a decode fails, which means an unsupported GGML type
     // or a corrupt payload -- the caller must treat that as fatal, not as a miss.
     Resolved resolve(const Store& store, int layer, int expert) {
+        return resolve(store, layer, expert, [&store](int, const Desc& d) { return store.raw(d); });
+    }
+
+    /// As above, but a miss decodes from `bytes_of(plane, desc)` -- a span over that plane's encoded
+    /// bytes -- instead of the mapping. Called only on a miss, so a hit never asks for bytes: an owned
+    /// expert cache (--moe-io-mode cache) pins the expert lazily inside it.
+    template <class BytesOf>
+    Resolved resolve(const Store& store, int layer, int expert, BytesOf&& bytes_of) {
         const std::uint64_t key = (static_cast<std::uint64_t>(layer) << 32)
                                   | static_cast<std::uint32_t>(expert);
         for (int s = 0; s < Slots; ++s)
@@ -326,7 +387,7 @@ public:
         live_[static_cast<std::size_t>(s)] = false;
         for (int w = 0; w < PerExpert; ++w) {
             const Desc& d = store.desc(layer, expert, w);
-            if (!dequantize_expert(d, store.raw(d), plane(s, w), raw_scratch_))
+            if (!dequantize_expert(d, bytes_of(w, d), plane(s, w), raw_scratch_))
                 return {nullptr, nullptr, nullptr};
         }
         key_[static_cast<std::size_t>(s)] = key;
@@ -394,6 +455,14 @@ public:
     }
 
     Resolved resolve(const Store& store, int layer, int expert) {
+        return resolve(store, layer, expert, [&store](int, const Desc& d) { return store.raw(d); });
+    }
+
+    /// As above, but a miss decodes from `bytes_of(plane, desc)` -- a span over that plane's encoded
+    /// bytes -- instead of the mapping. Called only on a miss, so a hit never asks for bytes: an owned
+    /// expert cache (--moe-io-mode cache) pins the expert lazily inside it.
+    template <class BytesOf>
+    Resolved resolve(const Store& store, int layer, int expert, BytesOf&& bytes_of) {
         const std::uint64_t key = (static_cast<std::uint64_t>(layer) << 32)
                                   | static_cast<std::uint32_t>(expert);
         for (int s = 0; s < Slots; ++s)
@@ -406,7 +475,7 @@ public:
         live_[static_cast<std::size_t>(s)] = false;
         for (int w = 0; w < PerExpert; ++w) {
             const Desc& d = store.desc(layer, expert, w);
-            if (!dequantize_expert_source(d, store.raw(d), plane_[static_cast<std::size_t>(s)][static_cast<std::size_t>(w)]))
+            if (!dequantize_expert_source(d, bytes_of(w, d), plane_[static_cast<std::size_t>(s)][static_cast<std::size_t>(w)]))
                 return {nullptr, nullptr, nullptr};
         }
         key_[static_cast<std::size_t>(s)] = key;

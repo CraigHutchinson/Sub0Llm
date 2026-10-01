@@ -32,6 +32,15 @@ namespace sub0::moeio {
  */
 class ExpertRowCache {
 public:
+    /// Page counts over the cache's own RAM. `locked` counts resident pages the OS cannot page out.
+    struct Residency {
+        std::uint64_t pages = 0;
+        std::uint64_t resident = 0;
+        std::uint64_t locked = 0;
+        /// Every page resident and locked: nothing of the pool can have reached the pagefile.
+        [[nodiscard]] bool complete() const noexcept { return pages != 0 && locked == pages; }
+    };
+
     /// Constructs a closed cache; no storage, worker or file handle exists until open.
     ExpertRowCache() = default;
     ExpertRowCache(const ExpertRowCache&) = delete;
@@ -44,14 +53,18 @@ public:
      *  @param budget_bytes  RAM for resident rows, rounded down to whole rows and capped at the table.
      *  @param max_selected  Experts selected per layer: the per-call batch bound.
      *  @param readers       Backend read threads (the I/O queue depth).
+     *  @param concurrent_pins Extra rows pin() may hold at once (one per batched-forward worker).
      *  @return invalid_argument if an expert's planes are not contiguous in the file, if the budget
-     *          holds fewer than two layers' selections (one pinned while the next is prefetched), or if
-     *          the OS cannot commit the budget's storage.
-     *  @note Administrative: allocates and may block. Any previous session is closed first.
+     *          holds fewer than two layers' selections plus `concurrent_pins`, or if the OS cannot
+     *          commit the budget's storage; pool_exhausted if the OS refuses to lock that storage in
+     *          RAM. An unpinned cache is refused rather than used: the OS would page it out under
+     *          memory pressure, turning hits into pagefile reads.
+     *  @note Administrative: allocates, faults in and locks the whole budget, so it takes time
+     *        proportional to the budget. Any previous session is closed first.
      */
     [[nodiscard]] sub0tieredcache::Status open(const std::filesystem::path& sidecar, const moeq::Store& store,
                                                std::uint64_t budget_bytes, std::uint32_t max_selected,
-                                               std::uint32_t readers);
+                                               std::uint32_t readers, std::uint32_t concurrent_pins);
     /// Administrative; idempotent. Releases pins and drains in-flight fills before freeing storage.
     void close() noexcept;
 
@@ -64,12 +77,27 @@ public:
     /// Pins selected expert `k` only if it is already resident; never blocks and never starts I/O.
     /// Lets decode compute resident experts while the others are still filling.
     [[nodiscard]] bool try_acquire(int k) noexcept;
+
+    /** Blocks until `expert` of `layer` is resident, then pins it for the returned lease's lifetime.
+     *  Thread-safe and independent of prefetch/acquire: for the batched forward() path, which decodes
+     *  an expert from its bytes and releases it at once. Fails with pool_exhausted if more than
+     *  `concurrent_pins` such leases are held at once.
+     */
+    [[nodiscard]] std::expected<sub0tieredcache::RowLease, sub0tieredcache::Status> pin(int layer, int expert) noexcept;
+    /// Encoded bytes of plane `which` within a row returned by pin(layer, expert).
+    [[nodiscard]] std::span<const std::uint8_t> plane(const sub0tieredcache::RowLease& row, int layer, int expert,
+                                                      int which) const noexcept;
     /// Encoded bytes of plane `which` (moeq::Gate/Up/Down) of expert `k`.
     /// @pre acquire(k) succeeded since the last prefetch; the span is valid until the next prefetch.
     [[nodiscard]] std::span<const std::uint8_t> plane(int k, int which) const noexcept;
 
     [[nodiscard]] sub0tieredcache::TableStats stats() const noexcept;
     [[nodiscard]] std::uint32_t resident_rows() const noexcept { return budget_rows_; }
+    /// Whether the rows are locked resident. Always true for an open cache: open() refuses otherwise.
+    [[nodiscard]] bool pinned() const noexcept { return storage_.pinned; }
+    /// Asks the OS which of the cache's pages are resident and locked right now. Administrative: walks
+    /// every page. A pool that is not complete() means memory the cache owns was paged out.
+    [[nodiscard]] Residency verify_resident() const noexcept { return storage_.verify(); }
 
 private:
     /// Row r is expert r % num_experts of layer r / num_experts: the span from its gate plane's start
@@ -79,16 +107,22 @@ private:
         [[nodiscard]] std::expected<sub0tieredcache::RowLocation, sub0tieredcache::Status>
         resolve_extent(std::uint64_t row) const noexcept;
     };
-    /// Page-granular RAM committed on first touch, so a multi-GB budget costs nothing until filled.
+    /// The cache's RAM, pinned when the OS allows. An unpinned pool is private, dirty memory, so under
+    /// pressure the OS writes it to the pagefile and a "hit" becomes a pagefile read: measured
+    /// 2026-10-01, pagefile use rose 20% -> 47% and pages read in ran at 100-236k/s during a 10 GiB cache
+    /// run under a RAM ballast, while reactive mmap's clean file pages are simply dropped instead.
     struct Storage {
         std::byte* data = nullptr; // owning
         std::size_t bytes = 0;
+        bool pinned = false;       // locked resident (VirtualLock/mlock) rather than pageable
         Storage() = default;
         Storage(const Storage&) = delete;
         Storage& operator=(const Storage&) = delete;
         ~Storage() { release(); }
+        /// Allocates `size` bytes and tries to lock them; `pinned` reports whether the lock held.
         [[nodiscard]] bool reserve(std::size_t size) noexcept;
         void release() noexcept;
+        [[nodiscard]] Residency verify() const noexcept;
     };
 
     // Destruction order matters (reverse of declaration): leases, then table, then backend, then storage.

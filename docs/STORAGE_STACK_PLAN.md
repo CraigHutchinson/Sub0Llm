@@ -224,6 +224,27 @@ layout/tokenizer test defects are fixed; and `run_perf_suite.py` no longer rebui
 
 Next: S1c (E1 frozen-table model wiring, below). M4/T2 staged CUDA is S2.
 
+### Residency intent and guards (2026-10-01)
+
+An owned cache only works if the memory it owns stays in RAM. The unpinned first version was paged to
+the pagefile under memory pressure: pagefile use rose 20% -> 47%, with 100-236k pages/s read in, during
+a 10 GiB cache run under a RAM ballast, so its "hits" were disk reads. Every large memory consumer
+therefore declares how it is meant to be resident, and each declaration that matters is enforced in
+code and checked by a test that fails when it is violated.
+
+| Memory | Intent | Mechanism | Guard |
+|---|---|---|---|
+| Expert cache pool (`--moe-io-mode cache`) | Owned, pinned, never paged | Windows: `VirtualAlloc`, working-set quota raised, `VirtualLock`. Linux: anonymous `mmap`, soft `RLIMIT_MEMLOCK` raised to hard, `mlock`. macOS: anonymous `mmap`, `mlock` | `open()` refuses an unpinned pool (`pool_exhausted`, with a per-platform remedy). End of run: `verify_resident()` (Windows `QueryWorkingSetEx` Valid+Locked per page; Linux `mincore` plus `VmLck`; macOS `mincore`) aborts on any lost page. Tests assert pinned and complete residency after eviction churn. |
+| S0Q1 sidecar in cache mode | Read only into the pool; never mapped | `moeq::Store::Payload::descriptors_only`: header and descriptors via file reads; decode and batched `forward()` both get bytes from pinned rows | `Store::raw()` on an unmapped store is fatal. A test asserts `mapped() == false`. The batched path matches reactive bit-for-bit (`max abs diff` 5.95202 at the same cell, the existing MOE_QUANT_DOT gap) |
+| S0Q1 sidecar, reactive / pipelined / mempage | Mapped (reactive) or explicit buffered reads | `FileMap`; `ReadFile`/`pread` | Unchanged; these modes are regime 1 by design |
+| Native backbone `.bbq`, tokenizer | Mapped, always hot | `FileMap` (clean pages: dropped, never written to the pagefile) | Intentional; none needed |
+| Buffered fills into the pool | Known double-caching through the OS page cache | Buffered `ReadFile`/`pread` | Open: unbuffered reads plateau at ~3 GB/s on this host (Sub0MemPage `docs/investigations/unbuffered-read-ceiling.md`) |
+| Engine heap (~19.5 GiB: parameters, workers, activations) | Not yet decided | Ordinary pageable allocation | **Gap:** it can reach the pagefile under the same pressure. Pinning it is the next residency package |
+
+Platform coverage: Windows (Clang) and Linux (WSL2 GCC 15) build and pass the cache suite, 182
+assertions in 6 cases, including the real sidecar. macOS is reviewed against its APIs (`MAP_ANONYMOUS`,
+`mlock`, `mincore` with `char*`, `pread`) but has not been built or run.
+
 ### Owned expert cache (`--moe-io-mode cache`) -- first measurement, 2026-10-01
 
 One Sub0TieredCache row per (layer, expert) holds the expert's three contiguous encoded planes. The rows
