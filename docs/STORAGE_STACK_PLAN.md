@@ -295,7 +295,13 @@ Reading:
     the table: replaying 30,000 batches with 2.8 ms of busy compute per layer (decode's pace), the per-miss
     wait is the same for both (p50 265 vs 268 us, p90 519 vs 517), while exact slots still cut misses 10%
     and stall 22%. Waits grow with concurrent compute (~190 us p50 without it), so the per-wait difference
-    is between runs, not between table types. Shortening the miss under load stays the next lever.
+    is between runs, not between table types.
+- **Where a miss's time goes (2026-10-01):** in the buffered copy, not in MemPage. Hand-offs cost ~40 us.
+  The copy peaks at ~10 GB/s however it is parallelised. Under decode's saturated DRAM it takes the
+  engine's ~500 us. Ruled out: the shared file handle, waiter spinning, and OpenMP spin-waiting (~7%).
+  The remaining lever is not copying (unbuffered DMA into the pinned pool), which makes Sub0MemPage
+  `docs/investigations/unbuffered-read-ceiling.md` (~3 GB/s plateau) the critical path. Probes:
+  Sub0MemPage `tools/miss_probe/`.
   - Each size must hold two layers' selections plus one expert per worker, since a layer's selection
     is all one size; `open()` refuses a budget that gives any size less.
 
