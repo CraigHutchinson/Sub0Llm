@@ -34,6 +34,9 @@ constexpr std::uint32_t kExperts = 7;
 constexpr std::array<std::uint32_t, 3> kPlaneBytes{4096 + 17, 8192 - 3, 1031}; // gate, up, down; unaligned
 constexpr std::uint64_t kExpertBytes = kPlaneBytes[0] + kPlaneBytes[1] + kPlaneBytes[2];
 constexpr std::uint64_t kHeaderBytes = 61; // payload does not start at 0, like a real sidecar
+// Smaller than every fixture plane and dividing none of them, so each plane splits into several
+// chunks with an odd remainder; the real-sidecar case below uses decode's own chunk size.
+constexpr std::uint32_t kChunk = 1000;
 
 constexpr std::uint8_t fixture_byte(std::uint64_t i) {
     return static_cast<std::uint8_t>((i * 131u) ^ (i >> 8) ^ (i >> 16));
@@ -103,7 +106,7 @@ TEST_CASE("MemPagePlaneIo: selected planes match positional reads and PlaneIo", 
 
     Staging staging(kTags);
     MemPagePlaneIo io;
-    REQUIRE(io.open(file.path, staging.spans, 3) == Status::ok);
+    REQUIRE(io.open(file.path, staging.spans, 3, kChunk) == Status::ok);
     const auto requests = plane_requests(selected, staging);
     REQUIRE(io.submit(requests) == Status::ok);
     for (std::size_t i = kTags; i-- > 0;) REQUIRE(io.wait(static_cast<int>(i)) == Status::ok); // reverse order
@@ -128,7 +131,7 @@ TEST_CASE("MemPagePlaneIo: batches are reused only after retirement", "[moeio][m
     const TempFile file("sub0_moeio_mempage_reuse.bin", kHeaderBytes + kExperts * kExpertBytes);
     Staging staging(6);
     MemPagePlaneIo io;
-    REQUIRE(io.open(file.path, staging.spans, 3) == Status::ok);
+    REQUIRE(io.open(file.path, staging.spans, 3, kChunk) == Status::ok);
 
     const std::array<std::uint32_t, 2> first{3, 1};
     const auto first_requests = plane_requests(first, staging);
@@ -162,7 +165,7 @@ TEST_CASE("MemPagePlaneIo: invalid batches are refused before any read is issued
     Staging staging(3);
     MemPagePlaneIo io;
     CHECK(io.submit({}) == Status::invalid_argument); // closed
-    REQUIRE(io.open(file.path, staging.spans, 3) == Status::ok);
+    REQUIRE(io.open(file.path, staging.spans, 3, kChunk) == Status::ok);
 
     auto dst = [&](std::size_t tag) { return reinterpret_cast<std::uint8_t*>(staging.spans[tag].data()); };
     const std::array<Request, 1> past_eof{{{file_bytes - 10, 11, dst(0)}}};
@@ -193,17 +196,18 @@ TEST_CASE("MemPagePlaneIo: open validates registrations and sessions repeat", "[
     Staging staging(3);
     MemPagePlaneIo io;
 
-    CHECK(io.open(a.path.string() + ".missing", staging.spans, 3) == Status::io_error);
-    CHECK(io.open(a.path, staging.spans, 0) == Status::invalid_argument);
-    CHECK(io.open(a.path, {}, 3) == Status::invalid_argument);
+    CHECK(io.open(a.path.string() + ".missing", staging.spans, 3, kChunk) == Status::io_error);
+    CHECK(io.open(a.path, staging.spans, 0, kChunk) == Status::invalid_argument);
+    CHECK(io.open(a.path, staging.spans, 3, 0) == Status::invalid_argument);
+    CHECK(io.open(a.path, {}, 3, kChunk) == Status::invalid_argument);
     const std::array<std::span<std::byte>, 2> overlapping{staging.spans[0], staging.spans[0].subspan(100)};
-    CHECK(io.open(a.path, overlapping, 3) == Status::invalid_argument);
+    CHECK(io.open(a.path, overlapping, 3, kChunk) == Status::invalid_argument);
     const std::array<std::span<std::byte>, 1> empty_slot{std::span<std::byte>{}};
-    CHECK(io.open(a.path, empty_slot, 3) == Status::invalid_argument);
+    CHECK(io.open(a.path, empty_slot, 3, kChunk) == Status::invalid_argument);
 
     for (int session = 0; session < 5; ++session) {
         const auto& file = (session % 2 == 0) ? a : b;
-        REQUIRE(io.open(file.path, staging.spans, 3) == Status::ok);
+        REQUIRE(io.open(file.path, staging.spans, 3, kChunk) == Status::ok);
         const std::array<Request, 3> requests{{
             {0, 4096, reinterpret_cast<std::uint8_t*>(staging.spans[0].data())},
             {100, 7, reinterpret_cast<std::uint8_t*>(staging.spans[1].data())},
@@ -258,7 +262,7 @@ TEST_CASE("MemPagePlaneIo: real S0Q1 planes preserve encoded and decoded values"
         }
     }
     MemPagePlaneIo io;
-    REQUIRE(io.open(path, destinations, 3) == Status::ok);
+    REQUIRE(io.open(path, destinations, 3, 256 * 1024) == Status::ok);
     REQUIRE(io.submit(requests) == Status::ok);
     for (std::size_t i = tags; i-- > 0;) REQUIRE(io.wait(static_cast<int>(i)) == Status::ok);
     for (std::size_t k = 0; k < experts.size(); ++k) {

@@ -54,13 +54,14 @@ public:
     ~MemPagePlaneIo();
 
     /** Registers one immutable file and non-overlapping caller destinations (one per request tag),
-     *  served by `workers` (>= 1) reader threads -- the queue depth. Any old session is closed first.
+     *  served by `workers` (>= 1) reader threads -- the queue depth. Each request is split into
+     *  `chunk_bytes` (>= 1) pieces so several workers copy one plane. Any old session is closed first.
      *  Failure leaves the reader closed. Source identity/lifetime is the caller's responsibility;
      *  replacing or modifying the file during a session is unsupported.
      */
     [[nodiscard]] sub0mempage::Status open(const std::filesystem::path& path,
                                           std::span<const std::span<std::byte>> destinations,
-                                          std::uint32_t workers);
+                                          std::uint32_t workers, std::uint32_t chunk_bytes);
     /** Administrative drain, including a partially submitted failed batch; leaves the reader closed.
      *  A worker-join or mutex failure terminates: freeing live destinations after failed drain is unsafe.
      */
@@ -84,7 +85,9 @@ private:
     std::vector<sub0mempage::Claim> claims_;
     std::vector<std::span<std::byte>> destinations_; // non-owning; registered caller buffers
     std::uint64_t source_bytes_ = 0;
-    std::size_t submitted_ = 0;
+    std::size_t submitted_ = 0;      // tags submitted in the current batch
+    std::size_t max_chunks_ = 0;     // claim slots per tag: claims_[tag * max_chunks_ + chunk]
+    std::uint64_t chunk_bytes_ = 0;
     sub0mempage::Status batch_status_ = sub0mempage::Status::ok;
 };
 

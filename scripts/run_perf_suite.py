@@ -156,7 +156,8 @@ def decode_s_per_token(build: pathlib.Path, tokens: int = 3, cold: bool = False)
     return float(m.group(1)) if m else None
 
 
-def stage_arm_binaries(build: pathlib.Path, arms: list[tuple[str, list[str]]]) -> dict[str, pathlib.Path]:
+def stage_arm_binaries(build: pathlib.Path, arms: list[tuple[str, list[str]]],
+                       targets: tuple[str, ...] = ("sub0llm-qwen4-forward",)) -> dict[str, pathlib.Path]:
     """Configure + build every arm ONCE, copying its executable and DLLs into build/arms/<name>/.
 
     Timing then never follows a compile. The old loop rebuilt before every sample, so each arm was
@@ -170,11 +171,12 @@ def stage_arm_binaries(build: pathlib.Path, arms: list[tuple[str, list[str]]]) -
     hashes: dict[str, str] = {}
     for name, flags in arms:
         configure(build, flags)
-        build_target(build, "sub0llm-qwen4-forward")
+        for target in targets:
+            build_target(build, target)
         dst = build / "arms" / name
         shutil.rmtree(dst, ignore_errors=True)
         dst.mkdir(parents=True)
-        for f in [build / "sub0llm-qwen4-forward.exe", *build.glob("*.dll")]:
+        for f in [*(build / f"{t}.exe" for t in targets), *build.glob("*.dll")]:
             shutil.copy2(f, dst / f.name)
         # The generated headers ARE the build's compile-time identity. The DLL is not: the linker stamps
         # it, so identical flags hash differently on every build and a DLL comparison can never fire.

@@ -2069,7 +2069,10 @@ bool load_moe_quant_sidecar(const char* model_path) {
             // lost the whole cold-cache benefit (0.404 s/token, = reactive mmap); 8 and 30 tied at the
             // median warm and cold, with 30 far noisier (reader threads contending with compute).
             constexpr auto kReaders = static_cast<std::uint32_t>(EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1);
-            const auto status = g_moe_decode_io.open(path, destinations, kReaders);
+            // Whole planes per request. Splitting planes across workers (256 KiB chunks) left the routed
+            // phase unchanged warm (50.9 vs 50.6 ms/token, S1b-W pass 1); the chunked path stays tested.
+            const auto chunk_bytes = static_cast<std::uint32_t>(g_moe_quant.max_desc_bytes());
+            const auto status = g_moe_decode_io.open(path, destinations, kReaders, chunk_bytes);
             if (status != sub0mempage::Status::ok) {
                 err = std::string("MemPage registration failed: ") + std::string(moeio::status_name(status));
 #else

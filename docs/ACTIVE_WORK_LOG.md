@@ -1002,3 +1002,21 @@ IOCP 0.267 vs reactive 0.396; warm: reactive 0.115 stays default (mempage 0.145)
 across all modes. Full record: `docs/STORAGE_STACK_PLAN.md` "S1b closure record". Files released:
 `src/backends/cpu/{internal.hpp,backend.cpp,decode.cpp}`, `tools/configurator.cpp`. Build dirs
 `out/build/s1b` and `out/build/d196check` (neutral reconfigured) are free to reuse.
+
+**2026-09-29 Claude Code — S1b-W (close mempage's warm gap vs reactive), active; holds CPU intermittently.**
+Profiling (phase profiler, VTune) and perf-suite runs in `out/build/s1b`. May edit
+`include/sub0/moe_io_mempage.hpp`, `src/moe_io_mempage.cpp`, `src/backends/cpu/decode.cpp` (MoE prefetch/wait seam only).
+
+**2026-09-30 Claude Code (Sub0ECS, other repo) — v2 reference benchmark capture, PAUSED (CPU free) since 2026-09-30 ~23:25 while the harness moves to nanobench; will restart and re-mark active here.**
+`D:\Craig\GitHub\Sub0ECS` `bench/tools/run.py --profile reference` (MSVC, pinned to the P-cores, then the
+thread-scaling suite across all 24 cores). No Sub0Llm files touched. Any Sub0Llm perf/timing run in this window is
+contended — and would perturb the Sub0ECS numbers too. Will mark done here when finished.
+
+**2026-10-01 Claude Code — S1b-W regime-2 baseline, active (holds the CPU ~1.5 h).** Long decode (2,000 G-PPL
+tokens) from an evicted cache, reactive/pipelined/mempage, 2 rotated rounds, `out/build/s1b`. Then MemPage
+owned-cache design for MoE + n-gram (docs only until agreed). Will mark done here.
+
+**2026-10-01 Claude Code — S1b-W regime-2 baseline, done (1 of 2 rounds; session ended mid-run).** 2,000 G-PPL tokens,
+evicted start: reactive 4.93 tok/s, mempage 4.50, pipelined 3.30 (ppl 11.930 all). Engine working set ~19.5 GiB
+leaves ~22 GiB of OS cache for the 37 GiB sidecar (~60%): partial regime 2. CPU released. Next: owned expert cache
+(TieredCache variable-extent rows + MemPage unbuffered fills), designed for n-gram rows too.

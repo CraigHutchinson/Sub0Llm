@@ -138,6 +138,28 @@ build configured that way. The E1 TieredCache adapter is still test-only behind 
 design/implementation work. It does not claim that NVIDIA GDS, a CUDA row cache or the end-to-end
 stack is available.
 
+### Core use case: the n-gram table, which never fits (user direction, 2026-09-29)
+
+The stack serves two workload regimes:
+
+1. **Everything fits in RAM.** The OS page cache already does the job, and reactive mmap is the right
+   transport. An owned cache is not needed there; it only needs to be close enough.
+2. **The working set exceeds RAM.** A generic OS cache thrashes. MemPage owns the cache, bypassing OS
+   paging, so it can prefetch, pin and evict for the specific workload.
+
+MemPage targets regime 2. **Its core consumer is the real n-gram embedding table (E1)**: 102.4 GB bf16
+(`docs/NGRAM_TABLE_TIERED_STORAGE.md`) against 63 GB of RAM, touched as 16 hash-scattered 320-byte rows
+per token. It is regime 2 by construction. It is also the worst case for OS paging: a 4 KB fault per
+320-byte row is about 12x read amplification, and the page cache fills with neighbouring rows nobody
+asked for. That makes it the design driver for TieredCache (rows) over MemPage (owned slots and fills).
+Routed-MoE experts (E2, S1b) are the second consumer of the same substrate.
+
+Owned-cache capabilities should be designed for E1's rows first and then reused for E2's variable
+expert extents, never as a MoE-only special case. These are extent- or row-keyed slots, unbuffered
+aligned fills (no double caching through the OS), and access-aware admission and prefetch. Benchmarks
+for these features must run in regime 2: long decodes, or tables larger than RAM. A 6-token rerun of a
+cached prompt measures regime 1.
+
 ### Pinned lower revisions (both on `main`)
 
 | Repository | Revision | Content | Evidence |
