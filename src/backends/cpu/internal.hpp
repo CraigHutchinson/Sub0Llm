@@ -25,6 +25,9 @@
 #ifdef SUB0_MOE_IO_MEMPAGE
 #include "sub0/moe_io_mempage.hpp"
 #endif
+#ifdef SUB0_MOE_IO_TIERED
+#include "sub0/moe_io_tiered.hpp"
+#endif
 #include "sub0/moe_io.hpp"          // B36: explicit overlapped I/O for decode's resolve path
 #include "sub0/moe_math.hpp"        // moe::ExpertWeights (moe_resolve) + scratch sizing
 #include "sub0/moe_quant.hpp"       // WP4e: the quantized-resident routed-expert store + pool
@@ -408,6 +411,10 @@ using MoePlaneIo = moeio::MemPagePlaneIo;
 using MoePlaneIo = moeio::PlaneIo<MOE_IO_MAX_INFLIGHT>;
 #endif
 extern MoePlaneIo g_moe_decode_io;
+#ifdef SUB0_MOE_IO_TIERED
+// --moe-io-mode cache: the owned routed-expert cache that replaces g_moe_decode_io + g_moe_io_stage.
+extern moeio::ExpertRowCache g_moe_cache;
+#endif
 
 // B36: staging buffers pipelined I/O reads into -- one gate/up/down triple PER SELECTED EXPERT, indexed
 // by the router's own top-k selection order k (NOT by decode thread: MOE_DECODE_THREADS is 1 since B29,

@@ -1,0 +1,205 @@
+#include "sub0/moe_io_tiered.hpp"
+
+#include <algorithm>
+#include <system_error>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
+namespace sub0::moeio {
+using sub0tieredcache::Status;
+
+namespace {
+constexpr auto kSidecarSource = static_cast<sub0mempage::SourceId>(1);
+} // namespace
+
+bool ExpertRowCache::Storage::reserve(std::size_t size) noexcept {
+    release();
+#if defined(_WIN32)
+    void* p = ::VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) p = nullptr;
+#endif
+    if (p == nullptr) return false;
+    data = static_cast<std::byte*>(p);
+    bytes = size;
+    return true;
+}
+
+void ExpertRowCache::Storage::release() noexcept {
+    if (data == nullptr) return;
+#if defined(_WIN32)
+    ::VirtualFree(data, 0, MEM_RELEASE);
+#else
+    ::munmap(data, bytes);
+#endif
+    data = nullptr;
+    bytes = 0;
+}
+
+std::expected<sub0tieredcache::RowLocation, Status>
+ExpertRowCache::Resolver::resolve_extent(std::uint64_t row) const noexcept {
+    const auto& h = store->header();
+    const auto experts = static_cast<std::uint64_t>(h.num_experts);
+    if (row >= experts * static_cast<std::uint64_t>(h.n_layers)) return std::unexpected(Status::out_of_range);
+    const int layer = static_cast<int>(row / experts);
+    const int expert = static_cast<int>(row % experts);
+    const moeq::Desc& gate = store->desc(layer, expert, moeq::Gate);
+    const moeq::Desc& down = store->desc(layer, expert, moeq::Down);
+    return sub0tieredcache::RowLocation{
+        0, sub0mempage::ByteRange{h.data_off + gate.off, down.off + down.bytes - gate.off}};
+}
+
+ExpertRowCache::~ExpertRowCache() { close(); }
+
+Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::Store& store,
+                            std::uint64_t budget_bytes, std::uint32_t max_selected, std::uint32_t readers) {
+    close();
+    const auto& h = store.header();
+    if (max_selected == 0 || readers == 0 || h.num_experts <= 0 || h.n_layers <= 0) return Status::invalid_argument;
+    const auto row_count = static_cast<std::uint64_t>(h.num_experts) * static_cast<std::uint64_t>(h.n_layers);
+
+    // One row must be one read: refuse a sidecar whose expert planes are not stored back to back.
+    std::uint64_t row_bytes = 0;
+    for (int layer = 0; layer < h.n_layers; ++layer) {
+        for (int expert = 0; expert < h.num_experts; ++expert) {
+            const moeq::Desc& gate = store.desc(layer, expert, moeq::Gate);
+            const moeq::Desc& up = store.desc(layer, expert, moeq::Up);
+            const moeq::Desc& down = store.desc(layer, expert, moeq::Down);
+            if (up.off != gate.off + gate.bytes || down.off != up.off + up.bytes) return Status::invalid_argument;
+            row_bytes = std::max(row_bytes, gate.bytes + up.bytes + down.bytes);
+        }
+    }
+    // Two layers' selections must fit: the current layer stays pinned while the next is prefetched.
+    const std::uint64_t rows = std::min(budget_bytes / row_bytes, row_count);
+    if (rows < 2ull * max_selected || rows >= UINT32_MAX) return Status::invalid_argument;
+
+    std::error_code error;
+    const auto file_bytes = std::filesystem::file_size(sidecar, error);
+    if (error) return Status::io_error;
+
+    if (!storage_.reserve(static_cast<std::size_t>(rows * row_bytes))) return Status::invalid_argument;
+    auto backend = sub0mempage::LocalFileBackend::create(
+        {.workers = readers, .queue_capacity = 4 * max_selected, .max_sources = 1});
+    if (!backend) {
+        close();
+        return Status::io_error;
+    }
+    backend_ = std::move(*backend);
+    if (backend_->register_file(kSidecarSource, sidecar) != sub0mempage::Status::ok) {
+        close();
+        return Status::io_error;
+    }
+
+    resolver_.store = &store;
+    const auto sources = sub0tieredcache::single_source(kSidecarSource, file_bytes);
+    sub0tieredcache::TableConfig config{};
+    config.row_count = row_count;
+    config.source_row_bytes = row_bytes;
+    config.output_row_bytes = row_bytes;
+    config.row_extent = sub0tieredcache::RowExtent::bounded;
+    config.representation = sub0tieredcache::Representation::identity;
+    config.sources = sources;
+    config.generation = 1;
+    config.resolve_extent = sub0tieredcache::RowExtentResolverRef(resolver_);
+    config.output_storage = std::span(storage_.data, storage_.bytes);
+    config.budget_rows = static_cast<std::uint32_t>(rows);
+    config.max_tickets = 4;
+    config.max_batch_rows = max_selected;
+    auto table = sub0tieredcache::Table::create(config, sub0mempage::FillBackendRef(*backend_));
+    if (!table) {
+        close();
+        return table.error();
+    }
+    table_ = std::move(*table);
+    rows_.assign(max_selected, 0);
+    leases_.resize(max_selected);
+    budget_rows_ = static_cast<std::uint32_t>(rows);
+    return Status::ok;
+}
+
+void ExpertRowCache::close() noexcept {
+    for (auto& lease : leases_) lease.reset();
+    if (table_) (void)table_->drain(); // fills still need the backend's workers to finish
+    table_.reset();
+    if (backend_) backend_->shutdown();
+    backend_.reset();
+    storage_.release();
+    rows_.clear();
+    leases_.clear();
+    resolver_.store = nullptr;
+    selected_ = 0;
+    budget_rows_ = 0;
+    layer_ = -1;
+}
+
+Status ExpertRowCache::prefetch(int layer, std::span<const int> experts) noexcept {
+    if (!table_) return Status::invalid_argument;
+    if (experts.empty()) return Status::empty_range;
+    if (experts.size() > rows_.size()) return Status::batch_too_large;
+    for (std::uint32_t k = 0; k < selected_; ++k) leases_[k].reset();
+    const auto per_layer = static_cast<std::uint64_t>(resolver_.store->header().num_experts);
+    for (std::size_t k = 0; k < experts.size(); ++k)
+        rows_[k] = static_cast<std::uint64_t>(layer) * per_layer + static_cast<std::uint64_t>(experts[k]);
+    layer_ = layer;
+    selected_ = static_cast<std::uint32_t>(experts.size());
+    // The ticket is dropped at once: fills continue, and acquire() waits on the rows themselves.
+    const auto ticket = table_->prefetch(std::span(rows_).first(selected_));
+    return ticket ? Status::ok : ticket.error();
+}
+
+Status ExpertRowCache::acquire(int k) noexcept {
+    if (k < 0 || static_cast<std::uint32_t>(k) >= selected_) return Status::out_of_range;
+    const auto at = static_cast<std::size_t>(k);
+    const auto resolved = table_->resolve_into(std::span(rows_).subspan(at, 1), std::span(leases_).subspan(at, 1));
+    return resolved ? Status::ok : resolved.error();
+}
+
+std::span<const std::uint8_t> ExpertRowCache::plane(int k, int which) const noexcept {
+    const auto at = static_cast<std::size_t>(k);
+    const auto expert = static_cast<int>(rows_[at] % static_cast<std::uint64_t>(resolver_.store->header().num_experts));
+    const moeq::Desc& gate = resolver_.store->desc(layer_, expert, moeq::Gate);
+    const moeq::Desc& d = resolver_.store->desc(layer_, expert, which);
+    const auto* row = reinterpret_cast<const std::uint8_t*>(leases_[at].bytes().data());
+    return {row + (d.off - gate.off), static_cast<std::size_t>(d.bytes)};
+}
+
+sub0tieredcache::TableStats ExpertRowCache::stats() const noexcept {
+    return table_ ? table_->stats() : sub0tieredcache::TableStats{};
+}
+
+std::string_view status_name(Status status) noexcept {
+    using enum Status;
+    switch (status) {
+    case ok: return "ok";
+    case pending: return "pending";
+    case not_resident: return "not_resident";
+    case pool_exhausted: return "pool_exhausted";
+    case batch_too_large: return "batch_too_large";
+    case ticket_exhausted: return "ticket_exhausted";
+    case out_of_range: return "out_of_range";
+    case empty_range: return "empty_range";
+    case invalid_argument: return "invalid_argument";
+    case busy: return "busy";
+    case short_read: return "short_read";
+    case io_error: return "io_error";
+    case cancelled: return "cancelled";
+    case timeout: return "timeout";
+    case codec_failed: return "codec_failed";
+    case unsupported_conversion: return "unsupported_conversion";
+    case declined: return "declined";
+    }
+    return "unknown";
+}
+
+} // namespace sub0::moeio

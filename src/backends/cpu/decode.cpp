@@ -184,6 +184,13 @@ std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
 // returning. Shared by the resolve path and B35's fused path: the wait is identical at both, only what
 // consumes the bytes afterwards differs. [[maybe_unused]] because a reactive build never calls it.
 [[maybe_unused]] void moe_io_wait_expert(int k, int layer, int expert) {
+#ifdef SUB0_MOE_IO_TIERED
+    if (const auto status = g_moe_cache.acquire(k); status != sub0tieredcache::Status::ok) {
+        std::println(stderr, "fatal: routed-expert cache could not make layer {} expert {} resident: {}", layer,
+                     expert, moeio::status_name(status));
+        std::abort();
+    }
+#else
     for (int w = 0; w < moeq::PerExpert; ++w) {
 #ifdef SUB0_MOE_IO_MEMPAGE
         const auto status = g_moe_decode_io.wait(k * moeq::PerExpert + w);
@@ -199,13 +206,19 @@ std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
             std::abort();
         }
     }
+#endif
 }
 
 // B36: the bytes staged for selected-expert `k`'s plane `which`, as its descriptor sizes them.
 [[maybe_unused]] std::span<const std::uint8_t> moe_io_staged(int k, int which,
                                                               const moeq::Desc& d) {
+#ifdef SUB0_MOE_IO_TIERED
+    (void)d; // the cache sizes the plane from the same descriptor
+    return g_moe_cache.plane(k, which);
+#else
     return {g_moe_io_stage.buf[static_cast<std::size_t>(k * moeq::PerExpert + which)].data(),
             static_cast<std::size_t>(d.bytes)};
+#endif
 }
 
 // B35 (docs/MOE_QUANT_DOT.md S4): the MoE row activation, quantized to int8 ONCE per (token, layer) and
@@ -305,6 +318,15 @@ struct ParallelExperts {
 
     void prefetch(const int* idx, int n) const {
         if constexpr (USE_MOE_QUANT && MOE_IO_PIPELINED) {
+#ifdef SUB0_MOE_IO_TIERED
+            // The previous layer's readers joined at its OpenMP region's end, so its pins may go now.
+            if (const auto status = g_moe_cache.prefetch(layer_index, std::span(idx, static_cast<std::size_t>(n)));
+                status != sub0tieredcache::Status::ok) {
+                std::println(stderr, "fatal: routed-expert cache prefetch failed at layer {}: {}", layer_index,
+                             moeio::status_name(status));
+                std::abort();
+            }
+#else
             std::array<moeio::Request, static_cast<std::size_t>(MOE_IO_MAX_INFLIGHT)> reqs{};
             int nr = 0;
             for (int k = 0; k < n; ++k) {
@@ -334,6 +356,7 @@ struct ParallelExperts {
                              layer_index, err);
                 std::abort();
             }
+#endif
         }
     }
 

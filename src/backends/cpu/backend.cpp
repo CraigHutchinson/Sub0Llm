@@ -154,6 +154,9 @@ moeq::Store g_moe_quant;
 bbq::Store g_backbone_quant;
 BackboneRoleTable g_backbone_roles;   // O5 phase 2b-3 phase A: built once in load_backbone_quant_sidecar
 MoeIoStage g_moe_io_stage;                              // B36 -- sized once, beside the open below
+#ifdef SUB0_MOE_IO_TIERED
+moeio::ExpertRowCache g_moe_cache;   // --moe-io-mode cache -- opened alongside g_moe_quant below
+#endif
 MoePlaneIo g_moe_decode_io;   // B36 -- opened alongside g_moe_quant below, only
                                                         // under MOE_IO_PIPELINED
 
@@ -2046,6 +2049,20 @@ bool load_moe_quant_sidecar(const char* model_path) {
         // handle at all, matching AGENTS.md S4's "zero effect on existing builds until explicitly
         // enabled".
         if constexpr (MOE_IO_PIPELINED) {
+#ifdef SUB0_MOE_IO_TIERED
+            // The owned expert cache: rows are read straight into resident slots and decode reads them
+            // in place, so there is no staging to size. One reader per selected expert, as for mempage.
+            constexpr auto kSelected = static_cast<std::uint32_t>(EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1);
+            if (const auto status = g_moe_cache.open(path, g_moe_quant, MOE_CACHE_BUDGET_BYTES, kSelected, kSelected);
+                status != sub0tieredcache::Status::ok) {
+                std::println(stderr, "error: the routed-expert cache could not open beside the S0Q1 sidecar: {}",
+                             moeio::status_name(status));
+                return false;
+            }
+            std::println("routed-expert cache: {} of {} experts resident ({:.1f} GiB budget)", g_moe_cache.resident_rows(),
+                         static_cast<long long>(N_LAYERS) * NUM_EXPERTS,
+                         static_cast<double>(MOE_CACHE_BUDGET_BYTES) / (1024.0 * 1024.0 * 1024.0));
+#else
             // AGENTS.md S1: size the staging buffers ONCE, here, not per prefetch() call --
             // prefetch() runs once per layer per token, so sizing there would put the first
             // token's heap allocation inside decode's hot path. max_desc_bytes() is final the
@@ -2083,6 +2100,7 @@ bool load_moe_quant_sidecar(const char* model_path) {
                              err);
                 return false;
             }
+#endif
         }
         return true;
     }

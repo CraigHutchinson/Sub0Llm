@@ -649,6 +649,7 @@ int main(int argc, char** argv) {
     // mode is expected to win. Windows-only implementation (moe_io.hpp's own header comment); a POSIX
     // build falls back to a synchronous, non-concurrent pread and gets no benefit from setting this.
     int moe_io_pipelined  = 0;
+    int moe_cache_gib     = -1;  // --moe-io-mode cache budget; -1 = auto (half of physical RAM)
     // B35 (docs/MOE_QUANT_DOT.md): decode's routed-expert resolve computes its dot products directly
     // against the sidecar's native IQ1_S/IQ2_XXS/IQ4_NL bytes instead of dequantizing each selected
     // expert to f32 first. 0 = off (default, today's dequantize-then-f32-dot path, bit-exact). See the
@@ -836,10 +837,17 @@ int main(int argc, char** argv) {
                    "Measured ~1.4% WORSE on this host's current warm-page-cache state -- pipelined wins "
                    "only when the sidecar is NOT already resident in the OS page cache (a cold boot, "
                    "memory pressure evicting it, or a host too small to cache it at all). "
-                   "mempage (2) = bounded portable MemPage worker reads; experimental.")
-       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"reactive", 0}, {"pipelined", 1}, {"mempage", 2}},
+                   "mempage (2) = bounded portable MemPage worker reads; experimental. "
+                   "cache (3) = an owned expert cache (Sub0TieredCache rows over MemPage reads) that "
+                   "replaces OS paging when the sidecar does not fit in RAM; see --moe-cache-gib.")
+       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"reactive", 0}, {"pipelined", 1}, {"mempage", 2},
+                                                                     {"cache", 3}},
                                            CLI::ignore_case))
        ->default_str("reactive");
+    app.add_option("--moe-cache-gib", moe_cache_gib,
+                   "RAM budget for --moe-io-mode cache, in GiB. -1 (default) = half of physical RAM, "
+                   "measured on the build host (this project builds where it runs)")
+       ->capture_default_str()->check(CLI::Range(-1, 1 << 20));
     app.add_option("--moe-quant-dot", moe_quant_dot,
                    "1 = decode's routed-expert resolve takes its dot products DIRECTLY against the "
                    "--moe-quant-experts sidecar's native IQ1_S/IQ2_XXS/IQ4_NL bytes, quantizing the "
@@ -1346,6 +1354,11 @@ int main(int argc, char** argv) {
     if (moe_io_pipelined != 0 && moe_quant_experts == 0) {
         std::println(stderr, "configure error: moe-io-mode pipelined requires --moe-quant-experts 1 -- "
                              "there is no S0Q1 sidecar to issue overlapped reads against otherwise");
+        return 1;
+    }
+    if (moe_cache_gib >= 0 && moe_io_pipelined != 3) {
+        std::println(stderr, "configure error: --moe-cache-gib sizes the --moe-io-mode cache expert cache "
+                             "and has no effect in any other mode");
         return 1;
     }
     // B35: the fused dot has nothing to dot against without a quantized-resident sidecar -- the f32
@@ -1930,6 +1943,13 @@ int main(int argc, char** argv) {
     // A transport/build dependency, not model math: excluded from ARCH_FINGERPRINT.
     // Emit only for the opt-in mode so existing generated configurations stay byte-identical.
     if (moe_io_pipelined == 2) cos << "#define SUB0_MOE_IO_MEMPAGE 1\n";
+    if (moe_io_pipelined == 3) {
+        // Same exclusion as the mempage marker: a transport/residency choice, not model math.
+        const std::uintmax_t budget = moe_cache_gib >= 0 ? static_cast<std::uintmax_t>(moe_cache_gib) << 30
+                                                         : total_physical_ram_bytes() / 2;
+        cos << "#define SUB0_MOE_IO_TIERED 1\n";
+        cos << "inline constexpr unsigned long long MOE_CACHE_BUDGET_BYTES = " << budget << "ull;\n";
+    }
     // B35: fused quantized dot products against the sidecar's native bytes -- see --moe-quant-dot's own
     // help text for the measured accuracy/throughput tradeoff. false reproduces today's
     // dequantize-then-f32-dot resolve bit-for-bit.

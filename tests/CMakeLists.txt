@@ -280,8 +280,6 @@ catch_discover_tests(sub0_tests
 option(SUB0_STORAGE_TIEREDCACHE
   "Build the Sub0TieredCache/Sub0MemPage S1 integration test (fetches two pinned sibling libraries)" OFF)
 if(SUB0_STORAGE_TIEREDCACHE)
-  include(FetchContent)
-
   # Pinned lower revisions (docs/STORAGE_STACK_PLAN.md "Current checkpoint" -> "Pinned lower
   # revisions"). Advance these only once the plan's own pin-advance gate (consumer CI green) is met --
   # never silently track a branch. Offline/sibling-checkout development: set
@@ -289,19 +287,7 @@ if(SUB0_STORAGE_TIEREDCACHE)
   # revision (a detached worktree, e.g. `git worktree add --detach <dir> <sha>` -- never point this at
   # a shared checkout's live working tree, which another session may be advancing past the pin) plus
   # -DFETCHCONTENT_FULLY_DISCONNECTED=ON to guarantee no network access is attempted.
-  # MemPage is made available FIRST, by Sub0Llm itself: at the pinned TieredCache revision its
-  # CMakeLists.txt only fetches and links MemPage when it is the top-level project, never as a
-  # subproject. The 2026-09-29 TieredCache packaging fix makes its target link MemPage transitively;
-  # this stays until the pin advances past that fix.
-  include("${CMAKE_SOURCE_DIR}/cmake/MemPage.cmake")
-  set(SUB0_STORAGE_SUB0TIEREDCACHE_REVISION "e4da6a7e87bcbc65f79257bef9843d41adbec66d")
-
-  set(SUB0TIEREDCACHE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-  set(SUB0TIEREDCACHE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(Sub0TieredCache
-    GIT_REPOSITORY https://github.com/CraigHutchinson/Sub0TieredCache.git
-    GIT_TAG ${SUB0_STORAGE_SUB0TIEREDCACHE_REVISION})
-  FetchContent_MakeAvailable(Sub0TieredCache)
+  include("${CMAKE_SOURCE_DIR}/cmake/TieredCache.cmake")
 
   # tests/ngram_tiered_storage_tests.cpp: S1's own gate (docs/STORAGE_STACK_PLAN.md step 6) -- byte-for-
   # byte adapter-vs-resident-reference-vs-generator-oracle agreement, duplicates/non-monotonic order,
@@ -322,4 +308,17 @@ if(SUB0_STORAGE_TIEREDCACHE OR SUB0_MOE_MEMPAGE_ENABLED)
   target_include_directories(sub0_storage_moe_io_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
   target_link_libraries(sub0_storage_moe_io_tests PRIVATE Sub0MemPage::Sub0MemPage Catch2::Catch2WithMain)
   catch_discover_tests(sub0_storage_moe_io_tests)
+endif()
+
+# tests/moe_io_tiered_tests.cpp: the owned routed-expert cache (include/sub0/moe_io_tiered.hpp), one
+# Sub0TieredCache bounded-extent row per (layer, expert), against positional reads of synthetic and (with
+# SUB0_QWEN4_MOEQ_PATH) real S0Q1 sidecars. Built with the storage tests, and in any engine build
+# configured --moe-io-mode cache.
+if(SUB0_STORAGE_TIEREDCACHE OR SUB0_MOE_TIERED_ENABLED)
+  include("${CMAKE_SOURCE_DIR}/cmake/TieredCache.cmake")
+  add_executable(sub0_storage_moe_cache_tests moe_io_tiered_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_tiered.cpp")
+  target_include_directories(sub0_storage_moe_cache_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  target_link_libraries(sub0_storage_moe_cache_tests PRIVATE
+    Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache Catch2::Catch2WithMain)
+  catch_discover_tests(sub0_storage_moe_cache_tests)
 endif()
