@@ -1962,6 +1962,51 @@ void print_host_memplan() {
                      " CPU parallelises over WINDOWS, so batch costs worker slots, not arena bytes", DEFAULT_THREADS);
 }
 
+void start_expert_trace(std::size_t max_batches) {
+    g_expert_trace.sizes.clear();
+    g_expert_trace.rows.clear();
+    g_expert_trace.sizes.reserve(max_batches);
+    g_expert_trace.rows.reserve(max_batches * static_cast<std::size_t>(EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1));
+    g_expert_trace.active = true;
+}
+
+bool write_expert_trace(const char* extents_path, const char* trace_path) {
+    g_expert_trace.active = false;
+    if constexpr (!USE_MOE_QUANT) {
+        (void)extents_path; (void)trace_path;
+        return false;
+    } else {
+        const auto& h = g_moe_quant.header();
+        if (h.n_tensors == 0) return false;
+        std::ofstream ex(extents_path, std::ios::binary), tr(trace_path, std::ios::binary);
+        if (!ex || !tr) return false;
+        const auto put = [](std::ofstream& os, const auto& v) { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
+        // S0RX: one row per (layer, expert), the contiguous span of its three planes.
+        ex.write("S0RX", 4);
+        put(ex, std::uint32_t{1});
+        put(ex, static_cast<std::uint64_t>(h.n_layers) * static_cast<std::uint64_t>(h.num_experts));
+        for (int layer = 0; layer < h.n_layers; ++layer)
+            for (int e = 0; e < h.num_experts; ++e) {
+                const moeq::Desc& g = g_moe_quant.desc(layer, e, moeq::Gate);
+                const moeq::Desc& u = g_moe_quant.desc(layer, e, moeq::Up);
+                const moeq::Desc& dn = g_moe_quant.desc(layer, e, moeq::Down);
+                if (u.off != g.off + g.bytes || dn.off != u.off + u.bytes) return false;
+                put(ex, h.data_off + g.off);
+                put(ex, dn.off + dn.bytes - g.off);
+            }
+        // S0RT: one batch per recorded layer.
+        tr.write("S0RT", 4);
+        put(tr, std::uint32_t{1});
+        put(tr, static_cast<std::uint64_t>(g_expert_trace.sizes.size()));
+        std::size_t at = 0;
+        for (const std::uint32_t n : g_expert_trace.sizes) {
+            put(tr, n);
+            for (std::uint32_t k = 0; k < n; ++k) put(tr, g_expert_trace.rows[at++]);
+        }
+        return static_cast<bool>(ex) && static_cast<bool>(tr);
+    }
+}
+
 void print_decode_io_stats() {
 #ifdef SUB0_MOE_IO_TIERED
     // Every acquire is one access, counted as a hit (row Ready) or coalesced (joined its in-flight fill,

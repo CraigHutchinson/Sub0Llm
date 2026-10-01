@@ -590,6 +590,7 @@ struct RowSplitExperts : ParallelExperts {
         } else {
             [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> routed(prof::Phase::MoeRouted);
             RowSplitScratch& S = g_row_split;
+            record_expert_selection(layer_index, idx, n);
 
             // Binds selected-expert k's descriptors and bytes. The caller has already made them
             // available: waited for them, pinned them, or (reactive) they are in the mapping.

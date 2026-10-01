@@ -127,7 +127,13 @@ SUB0_API void print_config();                      // human-readable config + me
 // Host-side memory plan (shared params + one Worker per compute thread), for `sub0llm memplan`. Defined in
 // the CPU backend because the per-thread cost is sizeof(Worker), a type private to that TU.
 SUB0_API void print_host_memplan();
-SUB0_API void print_decode_io_stats();               // --moe-io-mode cache counters; silent otherwise
+SUB0_API void print_decode_io_stats();
+// Routed-expert access trace, for replaying cache behaviour without the engine (Sub0TieredCache
+// docs/trace-replay.md). start records each decode layer's selected experts (row-split decode builds),
+// up to max_batches layers, into storage reserved here; write saves them with every expert's file
+// extent. write fails if no quantized sidecar is open or its expert planes are not contiguous.
+SUB0_API void start_expert_trace(std::size_t max_batches);
+[[nodiscard]] SUB0_API bool write_expert_trace(const char* extents_path, const char* trace_path);               // --moe-io-mode cache counters; silent otherwise
 
 // Fast transcendental math (vectorized exp / tanh-form GELU) for the forward and
 // backward passes. Selected at compile time: configure with SUB0_EXACT_MATH=ON (or

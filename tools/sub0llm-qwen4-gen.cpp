@@ -231,13 +231,15 @@ bool load_engine(const std::string& model_path) {
  * @param dump_path   optional per-token record (position, target, nll, argmax) for a paired comparison.
  * @return the process exit code.
  */
-int run_ppl(const std::vector<int>& ids, long max_scored, const std::string& dump_path) {
+int run_ppl(const std::vector<int>& ids, long max_scored, const std::string& dump_path,
+            const std::string& expert_trace) {
     std::ofstream dump;
     if (!dump_path.empty() && !(dump.open(dump_path), dump)) {
         std::println(stderr, "FAIL: cannot open --ppl-dump '{}' for writing", dump_path);
         return 6;
     }
     const int n = static_cast<int>(ids.size());
+    if (!expert_trace.empty()) sub0::start_expert_trace(static_cast<std::size_t>(max_scored + 1) * N_LAYERS);
     double nll_sum = 0.0, fwd_s = 0.0;
     long scored = 0, top1 = 0;
     for (int w0 = 0; w0 + 1 < n && scored < max_scored; w0 += SEQ_LEN) {
@@ -273,6 +275,13 @@ int run_ppl(const std::vector<int>& ids, long max_scored, const std::string& dum
                  std::exp(mean), mean, static_cast<double>(top1) / static_cast<double>(scored),
                  static_cast<double>(scored) / fwd_s);
     sub0::print_decode_io_stats();
+    if (!expert_trace.empty()) {
+        if (!sub0::write_expert_trace((expert_trace + ".extents").c_str(), (expert_trace + ".trace").c_str())) {
+            std::println(stderr, "FAIL: could not write --expert-trace '{}' (.extents/.trace)", expert_trace);
+            return 7;
+        }
+        std::println("expert trace written: {}.extents, {}.trace", expert_trace, expert_trace);
+    }
     report_memory("final");
     return 0;
 }
@@ -296,6 +305,10 @@ int main(int argc, char** argv) {
     app.add_option("--ppl-tokens", ppl_tokens, "--ppl: stop after this many scored tokens")
        ->capture_default_str()->check(CLI::PositiveNumber);
     app.add_option("--ppl-dump", ppl_dump, "--ppl: write position, target, nll, argmax per scored token");
+    std::string expert_trace;
+    app.add_option("--expert-trace", expert_trace,
+                   "--ppl: record each layer's selected experts and write PREFIX.extents/PREFIX.trace for "
+                   "Sub0TieredCache's trace-replay benchmark (row-split decode builds)");
     app.add_option("--tokenizer-dir", tok_dir_cli,
                    "directory holding vocab.json / merges.txt / tokenizer_config.json "
                    "(default: $SUB0_QWEN_TOKENIZER_DIR, then <repo>/data/qwen_tokenizer)");
@@ -368,7 +381,7 @@ int main(int argc, char** argv) {
         std::println("\n--- ppl: {} ({} bytes -> {} tokens), windows of SEQ_LEN {}, up to {} scored ---",
                      ppl_path, text.size(), ppl_ids.size(), SEQ_LEN, ppl_tokens);
         if (!load_engine(model_path)) return 5;
-        return run_ppl(ppl_ids, ppl_tokens, ppl_dump);
+        return run_ppl(ppl_ids, ppl_tokens, ppl_dump, expert_trace);
     }
 
     // --- 2. encode, and the round trip ------------------------------------------------------------

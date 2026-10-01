@@ -406,6 +406,24 @@ extern BackboneRoleTable g_backbone_roles;
 // against EXPERTS_PER_TOK == 0 in a MoE-off build, where this is declared but never opened or submitted
 // to (see backend.cpp's load_moe_quant_sidecar and decode.cpp's ParallelExperts::prefetch).
 inline constexpr int MOE_IO_MAX_INFLIGHT = (EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1) * moeq::PerExpert;
+// Routed-expert access trace (start_expert_trace in core.hpp). Capacity is reserved when recording
+// starts, so record_expert_selection never allocates: past capacity it stops recording.
+struct ExpertTrace {
+    bool active = false;
+    std::vector<std::uint32_t> sizes;   // per recorded layer: how many experts it selected
+    std::vector<std::uint64_t> rows;    // layer * NUM_EXPERTS + expert, in selection order
+};
+inline ExpertTrace g_expert_trace;
+inline void record_expert_selection(int layer, const int* idx, int n) {
+    ExpertTrace& t = g_expert_trace;
+    if (!t.active || t.sizes.size() == t.sizes.capacity() ||
+        t.rows.size() + static_cast<std::size_t>(n) > t.rows.capacity())
+        return;
+    t.sizes.push_back(static_cast<std::uint32_t>(n));
+    for (int k = 0; k < n; ++k)
+        t.rows.push_back(static_cast<std::uint64_t>(layer) * NUM_EXPERTS + static_cast<std::uint64_t>(idx[k]));
+}
+
 // Most experts one layer selects: bounds decode's per-layer expert lists.
 inline constexpr std::size_t MOE_IO_MAX_SELECTED = EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1;
 #ifdef SUB0_MOE_IO_MEMPAGE
