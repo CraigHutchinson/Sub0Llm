@@ -272,6 +272,7 @@ int run_ppl(const std::vector<int>& ids, long max_scored, const std::string& dum
     std::println("PPL-RESULT tokens={} ppl={:.6f} mean_nll={:.6f} top1={:.4f} decode_tok_s={:.3f}", scored,
                  std::exp(mean), mean, static_cast<double>(top1) / static_cast<double>(scored),
                  static_cast<double>(scored) / fwd_s);
+    sub0::print_decode_io_stats();
     report_memory("final");
     return 0;
 }
@@ -492,6 +493,7 @@ int main(int argc, char** argv) {
     if (prefix_violation)
         std::println("NOTE: the decode prefix invariant was violated while streaming (see above), so "
                      "the 'full text' line is authoritative and the streamed bytes are not");
+    sub0::print_decode_io_stats();
     report_memory("final");
     return 0;
 }

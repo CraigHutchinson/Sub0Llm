@@ -9,6 +9,7 @@ void set_persistent_bindings(const PersistentBindings* bindings) { cpu_detail::s
 void set_sentinel_bindings(const SentinelBindings* bindings) { cpu_detail::set_sentinel_bindings(bindings); }
 void print_host_memplan() { cpu_detail::print_host_memplan(); }
 void print_config() { cpu_detail::print_config(); }
+void print_decode_io_stats() { cpu_detail::print_decode_io_stats(); }
 bool load_moe_quant_sidecar(const char* model_path) { return cpu_detail::load_moe_quant_sidecar(model_path); }
 bool load_backbone_quant_sidecar(const char* model_path) {
     return cpu_detail::load_backbone_quant_sidecar(model_path);

@@ -61,6 +61,9 @@ public:
     [[nodiscard]] sub0tieredcache::Status prefetch(int layer, std::span<const int> experts) noexcept;
     /// Blocks until selected expert `k` of the last prefetch is resident, then pins it.
     [[nodiscard]] sub0tieredcache::Status acquire(int k) noexcept;
+    /// Pins selected expert `k` only if it is already resident; never blocks and never starts I/O.
+    /// Lets decode compute resident experts while the others are still filling.
+    [[nodiscard]] bool try_acquire(int k) noexcept;
     /// Encoded bytes of plane `which` (moeq::Gate/Up/Down) of expert `k`.
     /// @pre acquire(k) succeeded since the last prefetch; the span is valid until the next prefetch.
     [[nodiscard]] std::span<const std::uint8_t> plane(int k, int which) const noexcept;

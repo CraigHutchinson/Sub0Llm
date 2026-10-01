@@ -1027,3 +1027,8 @@ tokens from an evicted cache: reactive / mempage / cache (auto 31.7 GiB) / cache
 **2026-10-01 Claude Code — owned expert cache regime-2 A/B, done; CPU released.** Mean tok/s over 2 rounds: cache
 (auto 31.7 GiB) 6.73, reactive 6.53, cache 20 GiB 6.33, mempage 4.93; ppl 11.930 all. Record: STORAGE_STACK_PLAN.md
 "Owned expert cache". Next: deep regime-2 test (held RAM, matched budget).
+
+**2026-10-01 Claude Code — deep regime-2 A/B, active (holds the CPU and a locked 10 GiB RAM ballast, ~1 h).**
+Reactive vs owned cache at a matched 10 GiB budget, 2,000 G-PPL tokens, 2 rotated rounds, `out/build/s1b`.
+
+**2026-10-01 Claude Code — owned cache pass 2 (resident-first waves) deep regime-2 A/B, active (CPU + ~24 GiB locked ballast, ~1 h).**

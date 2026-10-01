@@ -127,6 +127,7 @@ SUB0_API void print_config();                      // human-readable config + me
 // Host-side memory plan (shared params + one Worker per compute thread), for `sub0llm memplan`. Defined in
 // the CPU backend because the per-thread cost is sizeof(Worker), a type private to that TU.
 SUB0_API void print_host_memplan();
+SUB0_API void print_decode_io_stats();               // --moe-io-mode cache counters; silent otherwise
 
 // Fast transcendental math (vectorized exp / tanh-form GELU) for the forward and
 // backward passes. Selected at compile time: configure with SUB0_EXACT_MATH=ON (or

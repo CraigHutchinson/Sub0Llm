@@ -209,6 +209,18 @@ std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
 #endif
 }
 
+// Pins selected-expert `k` without blocking if its bytes are already in place; false means the caller
+// must wait for it. Only the owned expert cache can tell; the explicit readers report readiness only by
+// waiting, so they always take the waiting path, exactly as before.
+[[maybe_unused]] bool moe_io_try_expert(int k) {
+#ifdef SUB0_MOE_IO_TIERED
+    return g_moe_cache.try_acquire(k);
+#else
+    (void)k;
+    return false;
+#endif
+}
+
 // B36: the bytes staged for selected-expert `k`'s plane `which`, as its descriptor sizes them.
 [[maybe_unused]] std::span<const std::uint8_t> moe_io_staged(int k, int which,
                                                               const moeq::Desc& d) {
@@ -579,10 +591,9 @@ struct RowSplitExperts : ParallelExperts {
             [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> routed(prof::Phase::MoeRouted);
             RowSplitScratch& S = g_row_split;
 
-            // This row's per-expert plane descriptors + bytes -- mirrors ParallelExperts' own body
-            // lambda's Gate/Up/Down Desc lookups (moved here since run_rows replaces that lambda
-            // entirely on this build).
-            for (int k = 0; k < n; ++k) {
+            // Binds selected-expert k's descriptors and bytes. The caller has already made them
+            // available: waited for them, pinned them, or (reactive) they are in the mapping.
+            const auto bind = [&](int k) {
                 moeqd::ExpertPlanes& pl = S.planes[static_cast<std::size_t>(k)];
                 const int e = idx[k];
                 const moeq::Desc& dg = g_moe_quant.desc(layer_index, e, moeq::Gate);
@@ -590,7 +601,6 @@ struct RowSplitExperts : ParallelExperts {
                 const moeq::Desc& dd = g_moe_quant.desc(layer_index, e, moeq::Down);
                 pl.gate.desc = dg; pl.up.desc = du; pl.down.desc = dd;
                 if constexpr (MOE_IO_PIPELINED) {
-                    moe_io_wait_expert(k, layer_index, e);
                     pl.gate.bytes = moe_io_staged(k, moeq::Gate, dg);
                     pl.up.bytes   = moe_io_staged(k, moeq::Up, du);
                     pl.down.bytes = moe_io_staged(k, moeq::Down, dd);
@@ -616,106 +626,126 @@ struct RowSplitExperts : ParallelExperts {
                                  e, layer_index, moeqd::GROUP);
                     std::abort();
                 }
-            }
-
-            // Phase-1 work list: (k, Gate|Up) x row chunks of d.d_ff rows. A plane that cannot be
-            // row-sliced (plane_bytes(type, d.hidden_size) == 0 -- gemv_plane_range's own comment)
-            // becomes ONE chunk covering [0, d.d_ff) instead of several.
-            S.gu_count = 0;
-            for (int k = 0; k < n; ++k) {
-                for (int which = 0; which < 2; ++which) {   // moeq::Gate == 0, moeq::Up == 1
-                    const moeqd::EncodedPlane& ep = which == moeq::Gate
-                        ? S.planes[static_cast<std::size_t>(k)].gate
-                        : S.planes[static_cast<std::size_t>(k)].up;
-                    const bool sliceable =
-                        moeqd::plane_bytes(ep.desc.type_raw, static_cast<std::uint64_t>(d.hidden_size)) != 0;
-                    if (sliceable) {
-                        for (int r0 = 0; r0 < d.d_ff; r0 += ROW_SPLIT_GU_CHUNK_ROWS) {
-                            const int r1 = std::min(r0 + ROW_SPLIT_GU_CHUNK_ROWS, d.d_ff);
+            };
+            // Phases 1-3 for one wave of selected experts. Each expert writes its own routed_out
+            // slice, combined later in fixed k order (moe_math.hpp), so which wave an expert is
+            // computed in never changes the arithmetic.
+            const auto compute = [&](std::span<const int> wave) {
+                // Phase-1 work list: (k, Gate|Up) x row chunks of d.d_ff rows. A plane that cannot be
+                // row-sliced (plane_bytes(type, d.hidden_size) == 0 -- gemv_plane_range's own comment)
+                // becomes ONE chunk covering [0, d.d_ff) instead of several.
+                S.gu_count = 0;
+                for (const int k : wave) {
+                    for (int which = 0; which < 2; ++which) {   // moeq::Gate == 0, moeq::Up == 1
+                        const moeqd::EncodedPlane& ep = which == moeq::Gate
+                            ? S.planes[static_cast<std::size_t>(k)].gate
+                            : S.planes[static_cast<std::size_t>(k)].up;
+                        const bool sliceable =
+                            moeqd::plane_bytes(ep.desc.type_raw, static_cast<std::uint64_t>(d.hidden_size)) != 0;
+                        if (sliceable) {
+                            for (int r0 = 0; r0 < d.d_ff; r0 += ROW_SPLIT_GU_CHUNK_ROWS) {
+                                const int r1 = std::min(r0 + ROW_SPLIT_GU_CHUNK_ROWS, d.d_ff);
+                                S.gu_chunks[static_cast<std::size_t>(S.gu_count++)] =
+                                    {static_cast<std::int16_t>(k), static_cast<std::int16_t>(which), r0, r1};
+                            }
+                        } else {
                             S.gu_chunks[static_cast<std::size_t>(S.gu_count++)] =
-                                {static_cast<std::int16_t>(k), static_cast<std::int16_t>(which), r0, r1};
+                                {static_cast<std::int16_t>(k), static_cast<std::int16_t>(which), 0, d.d_ff};
+                        }
+                    }
+                }
+                // Phase-3 work list: (k) x row chunks of d.hidden_size rows, over the down plane.
+                S.dn_count = 0;
+                for (const int k : wave) {
+                    const moeqd::EncodedPlane& ep = S.planes[static_cast<std::size_t>(k)].down;
+                    const bool sliceable =
+                        moeqd::plane_bytes(ep.desc.type_raw, static_cast<std::uint64_t>(d.d_ff)) != 0;
+                    if (sliceable) {
+                        for (int r0 = 0; r0 < d.hidden_size; r0 += ROW_SPLIT_DN_CHUNK_ROWS) {
+                            const int r1 = std::min(r0 + ROW_SPLIT_DN_CHUNK_ROWS, d.hidden_size);
+                            S.dn_chunks[static_cast<std::size_t>(S.dn_count++)] = {static_cast<std::int16_t>(k), 0, r0, r1};
                         }
                     } else {
-                        S.gu_chunks[static_cast<std::size_t>(S.gu_count++)] =
-                            {static_cast<std::int16_t>(k), static_cast<std::int16_t>(which), 0, d.d_ff};
+                        S.dn_chunks[static_cast<std::size_t>(S.dn_count++)] = {static_cast<std::int16_t>(k), 0, 0, d.hidden_size};
                     }
                 }
-            }
-            // Phase-3 work list: (k) x row chunks of d.hidden_size rows, over the down plane.
-            S.dn_count = 0;
-            for (int k = 0; k < n; ++k) {
-                const moeqd::EncodedPlane& ep = S.planes[static_cast<std::size_t>(k)].down;
-                const bool sliceable =
-                    moeqd::plane_bytes(ep.desc.type_raw, static_cast<std::uint64_t>(d.d_ff)) != 0;
-                if (sliceable) {
-                    for (int r0 = 0; r0 < d.hidden_size; r0 += ROW_SPLIT_DN_CHUNK_ROWS) {
-                        const int r1 = std::min(r0 + ROW_SPLIT_DN_CHUNK_ROWS, d.hidden_size);
-                        S.dn_chunks[static_cast<std::size_t>(S.dn_count++)] = {static_cast<std::int16_t>(k), 0, r0, r1};
-                    }
-                } else {
-                    S.dn_chunks[static_cast<std::size_t>(S.dn_count++)] = {static_cast<std::int16_t>(k), 0, 0, d.hidden_size};
-                }
-            }
 
-            // Shared across the team below: set on any rejected plane (an unsupported format or a
-            // geometry mismatch -- see gemv_plane's own contract), checked once after the region.
-            // std::atomic rather than a plain bool: several threads may set it concurrently, and a
-            // plain bool would be a data race even though every write stores the same value.
-            std::atomic<bool> ok{true};
-            #pragma omp parallel num_threads(MOE_DECODE_THREADS)
-            {
-                // FTZ/DAZ per worker -- same reasoning as ParallelExperts::operator()'s own comment: a
-                // thread that skipped it would compute DIFFERENT floats the moment an intermediate went
-                // subnormal, not merely slower ones.
-                set_flush_denormals();
-                // Phase 1: gate + up, split by row range, dynamically scheduled (O4's own lever-2
-                // precedent: a token's selected planes are not uniform work -- different formats have a
-                // real measured per-format cost spread, O1's kernel bench).
-                #pragma omp for schedule(dynamic)
-                for (int c = 0; c < S.gu_count; ++c) {
-                    const RowSplitChunk ch = S.gu_chunks[static_cast<std::size_t>(c)];
-                    const moeqd::EncodedPlane& ep = ch.which == moeq::Gate
-                        ? S.planes[static_cast<std::size_t>(ch.k)].gate
-                        : S.planes[static_cast<std::size_t>(ch.k)].up;
-                    float* dst = (ch.which == moeq::Gate ? S.gate[static_cast<std::size_t>(ch.k)].data()
-                                                          : S.up[static_cast<std::size_t>(ch.k)].data());
-                    if (!gemv_plane_range(ep, d.hidden_size, ch.r0, ch.r1, g_moe_act_q, dst + ch.r0))
-                        ok.store(false, std::memory_order_relaxed);
-                }
-                // Phase 2 (implicit barrier above already separates it from phase 1): SiLU-gate combine
-                // + per-expert re-quantization of the down projection's own input. Small against the
-                // GEMVs either side of it, so a plain static split over k is enough.
-                #pragma omp for schedule(static)
-                for (int k = 0; k < n; ++k) {
-                    auto& g = S.gate[static_cast<std::size_t>(k)];
-                    auto& u = S.up[static_cast<std::size_t>(k)];
-                    for (int o = 0; o < d.d_ff; ++o) {
-                        const auto oi = static_cast<std::size_t>(o);
-                        u[oi] = moe::detail::silu(g[oi]) * u[oi];
+                // Shared across the team below: set on any rejected plane (an unsupported format or a
+                // geometry mismatch -- see gemv_plane's own contract), checked once after the region.
+                // std::atomic rather than a plain bool: several threads may set it concurrently, and a
+                // plain bool would be a data race even though every write stores the same value.
+                std::atomic<bool> ok{true};
+                #pragma omp parallel num_threads(MOE_DECODE_THREADS)
+                {
+                    // FTZ/DAZ per worker -- same reasoning as ParallelExperts::operator()'s own comment: a
+                    // thread that skipped it would compute DIFFERENT floats the moment an intermediate went
+                    // subnormal, not merely slower ones.
+                    set_flush_denormals();
+                    // Phase 1: gate + up, split by row range, dynamically scheduled (O4's own lever-2
+                    // precedent: a token's selected planes are not uniform work -- different formats have a
+                    // real measured per-format cost spread, O1's kernel bench).
+                    #pragma omp for schedule(dynamic)
+                    for (int c = 0; c < S.gu_count; ++c) {
+                        const RowSplitChunk ch = S.gu_chunks[static_cast<std::size_t>(c)];
+                        const moeqd::EncodedPlane& ep = ch.which == moeq::Gate
+                            ? S.planes[static_cast<std::size_t>(ch.k)].gate
+                            : S.planes[static_cast<std::size_t>(ch.k)].up;
+                        float* dst = (ch.which == moeq::Gate ? S.gate[static_cast<std::size_t>(ch.k)].data()
+                                                              : S.up[static_cast<std::size_t>(ch.k)].data());
+                        if (!gemv_plane_range(ep, d.hidden_size, ch.r0, ch.r1, g_moe_act_q, dst + ch.r0))
+                            ok.store(false, std::memory_order_relaxed);
                     }
-                    S.pq[static_cast<std::size_t>(k)].quantize(u.data(), d.d_ff);
+                    // Phase 2 (implicit barrier above already separates it from phase 1): SiLU-gate combine
+                    // + per-expert re-quantization of the down projection's own input. Small against the
+                    // GEMVs either side of it, so a plain static split over k is enough.
+                    #pragma omp for schedule(static)
+                    for (std::size_t w = 0; w < wave.size(); ++w) {
+                        const int k = wave[w];
+                        auto& g = S.gate[static_cast<std::size_t>(k)];
+                        auto& u = S.up[static_cast<std::size_t>(k)];
+                        for (int o = 0; o < d.d_ff; ++o) {
+                            const auto oi = static_cast<std::size_t>(o);
+                            u[oi] = moe::detail::silu(g[oi]) * u[oi];
+                        }
+                        S.pq[static_cast<std::size_t>(k)].quantize(u.data(), d.d_ff);
+                    }
+                    // Phase 3 (implicit barrier above): down, split by row range, dynamically scheduled --
+                    // writes directly into routed_out, the SAME buffer moe_math.hpp's own phase 2 (the
+                    // fixed-k-order weighted sum) reads from next.
+                    #pragma omp for schedule(dynamic)
+                    for (int c = 0; c < S.dn_count; ++c) {
+                        const RowSplitChunk ch = S.dn_chunks[static_cast<std::size_t>(c)];
+                        const moeqd::EncodedPlane& ep = S.planes[static_cast<std::size_t>(ch.k)].down;
+                        float* dst = routed_out
+                                     + static_cast<std::size_t>(ch.k) * static_cast<std::size_t>(d.hidden_size);
+                        if (!gemv_plane_range(ep, d.d_ff, ch.r0, ch.r1, S.pq[static_cast<std::size_t>(ch.k)],
+                                              dst + ch.r0))
+                            ok.store(false, std::memory_order_relaxed);
+                    }
                 }
-                // Phase 3 (implicit barrier above): down, split by row range, dynamically scheduled --
-                // writes directly into routed_out, the SAME buffer moe_math.hpp's own phase 2 (the
-                // fixed-k-order weighted sum) reads from next.
-                #pragma omp for schedule(dynamic)
-                for (int c = 0; c < S.dn_count; ++c) {
-                    const RowSplitChunk ch = S.dn_chunks[static_cast<std::size_t>(c)];
-                    const moeqd::EncodedPlane& ep = S.planes[static_cast<std::size_t>(ch.k)].down;
-                    float* dst = routed_out
-                                 + static_cast<std::size_t>(ch.k) * static_cast<std::size_t>(d.hidden_size);
-                    if (!gemv_plane_range(ep, d.d_ff, ch.r0, ch.r1, S.pq[static_cast<std::size_t>(ch.k)],
-                                          dst + ch.r0))
-                        ok.store(false, std::memory_order_relaxed);
+                if (!ok.load(std::memory_order_relaxed)) {
+                    std::println(stderr,
+                                 "fatal: O8 row-split MoE resolve rejected a plane at layer {} -- an "
+                                 "unsupported GGML type or a geometry mismatch against this build's axes",
+                                 layer_index);
+                    std::abort();
                 }
+            };
+            std::array<int, MOE_IO_MAX_SELECTED> resident{}, waiting{};
+            std::size_t n_resident = 0, n_waiting = 0;
+            for (int k = 0; k < n; ++k) {
+                if (!MOE_IO_PIPELINED || moe_io_try_expert(k)) resident[n_resident++] = k;
+                else waiting[n_waiting++] = k;
             }
-            if (!ok.load(std::memory_order_relaxed)) {
-                std::println(stderr,
-                             "fatal: O8 row-split MoE resolve rejected a plane at layer {} -- an "
-                             "unsupported GGML type or a geometry mismatch against this build's axes",
-                             layer_index);
-                std::abort();
+            // Wave 0: experts already in place compute while the others' router-time fills finish.
+            for (std::size_t i = 0; i < n_resident; ++i) bind(resident[i]);
+            if (n_resident != 0) compute(std::span(resident).first(n_resident));
+            // Wave 1: wait for the rest, then compute them.
+            for (std::size_t i = 0; i < n_waiting; ++i) {
+                moe_io_wait_expert(waiting[i], layer_index, idx[waiting[i]]);
+                bind(waiting[i]);
             }
+            if (n_waiting != 0) compute(std::span(waiting).first(n_waiting));
         }
     }
 };

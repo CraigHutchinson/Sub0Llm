@@ -1962,6 +1962,20 @@ void print_host_memplan() {
                      " CPU parallelises over WINDOWS, so batch costs worker slots, not arena bytes", DEFAULT_THREADS);
 }
 
+void print_decode_io_stats() {
+#ifdef SUB0_MOE_IO_TIERED
+    // Every acquire is one access, counted as a hit (row Ready) or coalesced (joined its in-flight fill,
+    // usually the router-time prefetch). A prefetched row that finished before acquire still counts as
+    // a hit, so the miss rate is fetches / accesses, not coalesced / accesses.
+    const auto s = g_moe_cache.stats();
+    const std::uint64_t accesses = s.hits + s.coalesced;
+    std::println("expert cache: {} rows resident of {} budget | {} accesses, {} fetches, {} evictions | "
+                 "resident-hit rate {:.1f}%",
+                 s.resident, g_moe_cache.resident_rows(), accesses, s.fetches, s.evictions,
+                 accesses ? 100.0 * (1.0 - static_cast<double>(s.fetches) / static_cast<double>(accesses)) : 0.0);
+#endif
+}
+
 void print_config() {
     // Host footprint, reported as it is actually paid: a SHARED parameter set plus one whole Worker per
     // compute thread. This used to print `2 * ACT_CAP * sizeof(float)` as "acts", which was wrong twice

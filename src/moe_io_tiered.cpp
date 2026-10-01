@@ -165,6 +165,15 @@ Status ExpertRowCache::acquire(int k) noexcept {
     return resolved ? Status::ok : resolved.error();
 }
 
+bool ExpertRowCache::try_acquire(int k) noexcept {
+    if (k < 0 || static_cast<std::uint32_t>(k) >= selected_) return false;
+    const auto at = static_cast<std::size_t>(k);
+    auto lease = table_->try_get(rows_[at]);
+    if (!lease) return false;
+    leases_[at] = std::move(*lease);
+    return true;
+}
+
 std::span<const std::uint8_t> ExpertRowCache::plane(int k, int which) const noexcept {
     const auto at = static_cast<std::size_t>(k);
     const auto expert = static_cast<int>(rows_[at] % static_cast<std::uint64_t>(resolver_.store->header().num_experts));

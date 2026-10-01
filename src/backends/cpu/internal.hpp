@@ -405,6 +405,8 @@ extern BackboneRoleTable g_backbone_roles;
 // against EXPERTS_PER_TOK == 0 in a MoE-off build, where this is declared but never opened or submitted
 // to (see backend.cpp's load_moe_quant_sidecar and decode.cpp's ParallelExperts::prefetch).
 inline constexpr int MOE_IO_MAX_INFLIGHT = (EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1) * moeq::PerExpert;
+// Most experts one layer selects: bounds decode's per-layer expert lists.
+inline constexpr std::size_t MOE_IO_MAX_SELECTED = EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1;
 #ifdef SUB0_MOE_IO_MEMPAGE
 using MoePlaneIo = moeio::MemPagePlaneIo;
 #else
