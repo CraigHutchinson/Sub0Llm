@@ -2141,7 +2141,7 @@ bool load_moe_quant_sidecar(const char* model_path) {
             constexpr auto kSelected = static_cast<std::uint32_t>(EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1);
             // The batched forward() path pins at most one expert per worker thread at a time.
             if (const auto status = g_moe_cache.open(path, g_moe_quant, MOE_CACHE_BUDGET_BYTES, kSelected, kSelected,
-                                                     static_cast<std::uint32_t>(MAX_WORKERS));
+                                                     static_cast<std::uint32_t>(MAX_WORKERS), MOE_CACHE_CHUNK_BYTES);
                 status != sub0tieredcache::Status::ok) {
                 const bool pin_refused = status == sub0tieredcache::Status::pool_exhausted;
                 std::println(stderr,

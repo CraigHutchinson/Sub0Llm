@@ -3,10 +3,10 @@ include(FetchContent)
 # Shared by the optional engine expert cache (--moe-io-mode cache) and the standalone storage tests.
 # MemPage comes first and from Sub0Llm itself, so one MemPage target serves both libraries.
 include("${CMAKE_CURRENT_LIST_DIR}/MemPage.cmake")
-# 65e59d5 adds RowExtent::bounded (variable-size rows), which the expert cache needs. It is not yet
-# published: until it is, build with FETCHCONTENT_SOURCE_DIR_SUB0TIEREDCACHE pointing at a checkout of
+# 4fcc36f: RowExtent::bounded (variable-size rows) and fill_chunk_bytes (chunked row fills), both used by
+# the expert cache. Not yet published: until it is, build with FETCHCONTENT_SOURCE_DIR_SUB0TIEREDCACHE at
 # exactly this revision, plus FETCHCONTENT_FULLY_DISCONNECTED=ON.
-set(SUB0_STORAGE_SUB0TIEREDCACHE_REVISION "65e59d5")
+set(SUB0_STORAGE_SUB0TIEREDCACHE_REVISION "4fcc36f")
 set(SUB0TIEREDCACHE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(SUB0TIEREDCACHE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(Sub0TieredCache

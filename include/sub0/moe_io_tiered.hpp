@@ -50,6 +50,8 @@ public:
      *  @param max_selected  Experts selected per layer: the per-call batch bound.
      *  @param readers       Backend read threads (the I/O queue depth).
      *  @param concurrent_pins Extra rows pin() may hold at once (one per batched-forward worker).
+     *  @param fill_chunk_bytes Split each missed expert's read into pieces of at most this many bytes,
+     *         so idle readers share it and the miss lands sooner (0 = one read per expert).
      *  @return invalid_argument if an expert's planes are not contiguous in the file, if the budget
      *          holds fewer than two layers' selections plus `concurrent_pins`, or if the OS cannot
      *          commit the budget's storage; pool_exhausted if the OS refuses to lock that storage in
@@ -60,7 +62,8 @@ public:
      */
     [[nodiscard]] sub0tieredcache::Status open(const std::filesystem::path& sidecar, const moeq::Store& store,
                                                std::uint64_t budget_bytes, std::uint32_t max_selected,
-                                               std::uint32_t readers, std::uint32_t concurrent_pins);
+                                               std::uint32_t readers, std::uint32_t concurrent_pins,
+                                               std::uint64_t fill_chunk_bytes);
     /// Administrative; idempotent. Releases pins and drains in-flight fills before freeing storage.
     void close() noexcept;
 

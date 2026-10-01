@@ -106,7 +106,7 @@ TEST_CASE("ExpertRowCache: every plane matches the file across eviction and reus
     REQUIRE(store.open(file.path.string(), error, kNoMap));
     ExpertRowCache cache;
     // Six rows of twelve: two layers' selections plus two pins, so walking every layer evicts and reuses.
-    REQUIRE(cache.open(file.path, store, 6 * largest_expert_bytes(), kSelected, 2, kPins) == Status::ok);
+    REQUIRE(cache.open(file.path, store, 6 * largest_expert_bytes(), kSelected, 2, kPins, 0) == Status::ok);
     REQUIRE(cache.resident_rows() == 6);
 
     for (int pass = 0; pass < 2; ++pass) {
@@ -131,7 +131,7 @@ TEST_CASE("ExpertRowCache: a resident expert is served without a second read", "
     std::string error;
     REQUIRE(store.open(file.path.string(), error, kNoMap));
     ExpertRowCache cache;
-    REQUIRE(cache.open(file.path, store, 12 * largest_expert_bytes(), kSelected, 2, kPins) == Status::ok);
+    REQUIRE(cache.open(file.path, store, 12 * largest_expert_bytes(), kSelected, 2, kPins, 0) == Status::ok);
 
     const std::array<int, kSelected> experts{2, 1};
     REQUIRE(cache.prefetch(1, experts) == Status::ok);
@@ -153,16 +153,16 @@ TEST_CASE("ExpertRowCache: open refuses layouts and budgets it cannot serve", "[
     std::string error;
     REQUIRE(gapped_store.open(gapped.path.string(), error, kNoMap));
     ExpertRowCache cache;
-    CHECK(cache.open(gapped.path, gapped_store, 12 * largest_expert_bytes(), kSelected, 2, kPins) ==
+    CHECK(cache.open(gapped.path, gapped_store, 12 * largest_expert_bytes(), kSelected, 2, kPins, 0) ==
           Status::invalid_argument); // planes not contiguous: one row would not be one read
 
     const Sidecar file("sub0_moe_cache_budget.moeq", 0);
     moeq::Store store;
     REQUIRE(store.open(file.path.string(), error, kNoMap));
-    CHECK(cache.open(file.path, store, 5 * largest_expert_bytes(), kSelected, 2, kPins) == Status::invalid_argument);
-    CHECK(cache.open(file.path, store, 12 * largest_expert_bytes(), 0, 2, kPins) == Status::invalid_argument);
+    CHECK(cache.open(file.path, store, 5 * largest_expert_bytes(), kSelected, 2, kPins, 0) == Status::invalid_argument);
+    CHECK(cache.open(file.path, store, 12 * largest_expert_bytes(), 0, 2, kPins, 0) == Status::invalid_argument);
     CHECK(cache.prefetch(0, std::array<int, 1>{0}) == Status::invalid_argument); // closed
-    REQUIRE(cache.open(file.path, store, 12 * largest_expert_bytes(), kSelected, 2, kPins) == Status::ok);
+    REQUIRE(cache.open(file.path, store, 12 * largest_expert_bytes(), kSelected, 2, kPins, 0) == Status::ok);
     CHECK(cache.prefetch(0, std::array<int, 3>{0, 1, 2}) == Status::batch_too_large);
     CHECK(cache.acquire(0) == Status::out_of_range); // nothing prefetched yet
 }
@@ -186,7 +186,7 @@ TEST_CASE("ExpertRowCache: real S0Q1 experts match the mapped sidecar", "[moeio]
     ExpertRowCache cache;
     // 32 MiB: eight rows of ~1.8 MB, inside WSL2's default 64 MiB lock limit. A host whose limit is lower
     // refuses here with pool_exhausted -- the cache will not run unpinned -- so raise `ulimit -l` there.
-    REQUIRE(cache.open(path, store, std::uint64_t{32} << 20, 3, 3, 2) == Status::ok);
+    REQUIRE(cache.open(path, store, std::uint64_t{32} << 20, 3, 3, 2, 512 * 1024) == Status::ok); // chunked, as the engine
     const std::array<int, 3> experts{h.num_experts - 1, 0, 7};
     for (const int layer : {0, h.n_layers - 1}) {
         REQUIRE(cache.prefetch(layer, experts) == Status::ok);
@@ -209,7 +209,7 @@ TEST_CASE("ExpertRowCache: the pool is pinned and the sidecar is never mapped", 
     CHECK(store.loaded());
     CHECK_FALSE(store.mapped()); // no plane can be paged in through the OS
     ExpertRowCache cache;
-    REQUIRE(cache.open(file.path, store, 12 * largest_expert_bytes(), kSelected, 2, kPins) == Status::ok);
+    REQUIRE(cache.open(file.path, store, 12 * largest_expert_bytes(), kSelected, 2, kPins, 0) == Status::ok);
     CHECK(cache.pinned());
     const auto residency = cache.verify_resident();
     CHECK(residency.pages > 0);
@@ -223,7 +223,7 @@ TEST_CASE("ExpertRowCache: pin() serves the batched path and is bounded", "[moei
     REQUIRE(store.open(file.path.string(), error, kNoMap));
     ExpertRowCache cache;
     // Exactly two layers' selections plus two pins: six rows.
-    REQUIRE(cache.open(file.path, store, 6 * largest_expert_bytes(), kSelected, 2, kPins) == Status::ok);
+    REQUIRE(cache.open(file.path, store, 6 * largest_expert_bytes(), kSelected, 2, kPins, 0) == Status::ok);
     std::vector<sub0tieredcache::RowLease> held;
     for (int expert = 0; expert < 4; ++expert) {
         for (const int layer : {0, 1}) {
@@ -244,4 +244,24 @@ TEST_CASE("ExpertRowCache: pin() serves the batched path and is bounded", "[moei
     REQUIRE_FALSE(overflow.has_value());
     CHECK(overflow.error() == Status::pool_exhausted);
     CHECK(cache.pin(kLayers, 0).error() == Status::out_of_range);
+}
+
+TEST_CASE("ExpertRowCache: chunked fills deliver every plane intact", "[moeio][tiered]") {
+    const Sidecar file("sub0_moe_cache_chunked.moeq", 0);
+    moeq::Store store;
+    std::string error;
+    REQUIRE(store.open(file.path.string(), error, kNoMap));
+    ExpertRowCache cache;
+    // 1000-byte chunks: every expert (3,633 or 4,533 bytes) splits into several reads, one of them short.
+    REQUIRE(cache.open(file.path, store, 6 * largest_expert_bytes(), kSelected, 4, kPins, 1000) == Status::ok);
+    for (int pass = 0; pass < 2; ++pass)
+        for (int layer = 0; layer < kLayers; ++layer) {
+            const std::array<int, kSelected> experts{(layer + pass) % kExperts, (layer + 2) % kExperts};
+            REQUIRE(cache.prefetch(layer, experts) == Status::ok);
+            for (int k = 0; k < static_cast<int>(kSelected); ++k) {
+                REQUIRE(cache.acquire(k) == Status::ok);
+                CHECK(plane_matches_file(cache, store, file.path, k, layer, experts[static_cast<std::size_t>(k)]));
+            }
+        }
+    CHECK(cache.verify_resident().complete());
 }

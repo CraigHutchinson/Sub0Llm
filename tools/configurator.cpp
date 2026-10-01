@@ -650,6 +650,7 @@ int main(int argc, char** argv) {
     // build falls back to a synchronous, non-concurrent pread and gets no benefit from setting this.
     int moe_io_pipelined  = 0;
     int moe_cache_gib     = -1;  // --moe-io-mode cache budget; -1 = auto (half of physical RAM)
+    int moe_cache_chunk_kib = 256; // --moe-io-mode cache: split each missed expert's read into chunks
     // B35 (docs/MOE_QUANT_DOT.md): decode's routed-expert resolve computes its dot products directly
     // against the sidecar's native IQ1_S/IQ2_XXS/IQ4_NL bytes instead of dequantizing each selected
     // expert to f32 first. 0 = off (default, today's dequantize-then-f32-dot path, bit-exact). See the
@@ -848,6 +849,12 @@ int main(int argc, char** argv) {
                    "RAM budget for --moe-io-mode cache, in GiB. -1 (default) = half of physical RAM, "
                    "measured on the build host (this project builds where it runs)")
        ->capture_default_str()->check(CLI::Range(-1, 1 << 20));
+    app.add_option("--moe-cache-chunk-kib", moe_cache_chunk_kib,
+                   "--moe-io-mode cache: read each missed expert in chunks of this many KiB, spread over idle "
+                   "readers so the miss lands sooner (0 = one read per expert). 256 measured best on a real "
+                   "Qwen4 trace: miss wait p50 392 -> 206 us, replay wall -40% (Sub0TieredCache trace-replay, "
+                   "17 GiB, 10 readers, 2026-10-01)")
+       ->capture_default_str()->check(CLI::Range(0, 1 << 20));
     app.add_option("--moe-quant-dot", moe_quant_dot,
                    "1 = decode's routed-expert resolve takes its dot products DIRECTLY against the "
                    "--moe-quant-experts sidecar's native IQ1_S/IQ2_XXS/IQ4_NL bytes, quantizing the "
@@ -1949,6 +1956,8 @@ int main(int argc, char** argv) {
                                                          : total_physical_ram_bytes() / 2;
         cos << "#define SUB0_MOE_IO_TIERED 1\n";
         cos << "inline constexpr unsigned long long MOE_CACHE_BUDGET_BYTES = " << budget << "ull;\n";
+        cos << "inline constexpr unsigned long long MOE_CACHE_CHUNK_BYTES = "
+            << (static_cast<unsigned long long>(moe_cache_chunk_kib) << 10) << "ull;\n";
     }
     // B35: fused quantized dot products against the sidecar's native bytes -- see --moe-quant-dot's own
     // help text for the measured accuracy/throughput tradeoff. false reproduces today's

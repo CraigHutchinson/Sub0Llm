@@ -70,7 +70,7 @@ ExpertRowCache::~ExpertRowCache() { close(); }
 
 Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::Store& store,
                             std::uint64_t budget_bytes, std::uint32_t max_selected, std::uint32_t readers,
-                            std::uint32_t concurrent_pins) {
+                            std::uint32_t concurrent_pins, std::uint64_t fill_chunk_bytes) {
     close();
     const auto& h = store.header();
     if (max_selected == 0 || readers == 0 || h.num_experts <= 0 || h.n_layers <= 0) return Status::invalid_argument;
@@ -101,8 +101,11 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
         close();
         return Status::pool_exhausted;
     }
+    // Every chunk of every in-flight fill must fit in the queue: two layers' selections plus the pins.
+    const auto chunks = static_cast<std::uint32_t>(
+        fill_chunk_bytes != 0 && fill_chunk_bytes < row_bytes ? (row_bytes + fill_chunk_bytes - 1) / fill_chunk_bytes : 1);
     auto backend = sub0mempage::LocalFileBackend::create(
-        {.workers = readers, .queue_capacity = 4 * max_selected, .max_sources = 1});
+        {.workers = readers, .queue_capacity = (4 * max_selected + concurrent_pins) * chunks, .max_sources = 1});
     if (!backend) {
         close();
         return Status::io_error;
@@ -128,6 +131,7 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
     config.budget_rows = static_cast<std::uint32_t>(rows);
     config.max_tickets = 4;
     config.max_batch_rows = max_selected;
+    config.fill_chunk_bytes = fill_chunk_bytes;
     auto table = sub0tieredcache::Table::create(config, sub0mempage::FillBackendRef(*backend_));
     if (!table) {
         close();
