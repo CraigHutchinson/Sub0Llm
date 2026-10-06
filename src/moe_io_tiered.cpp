@@ -70,8 +70,14 @@ ExpertRowCache::~ExpertRowCache() { close(); }
 
 Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::Store& store,
                             std::uint64_t budget_bytes, std::uint32_t max_selected, std::uint32_t readers,
-                            std::uint32_t concurrent_pins, std::uint64_t fill_chunk_bytes) {
+                            std::uint32_t concurrent_pins, std::uint64_t fill_chunk_bytes,
+                            sub0mempage::FileAccess access) {
     close();
+    // Uncached fills read the block-aligned window around each expert, so every slot holds that window.
+    const std::uint64_t alignment = access == sub0mempage::FileAccess::uncached ? sub0mempage::kUncachedAlignment : 0;
+    const auto slot_bytes = [&](std::uint64_t expert_bytes) {
+        return alignment != 0 ? sub0tieredcache::aligned_slot_bytes(expert_bytes, alignment) : expert_bytes;
+    };
     const auto& h = store.header();
     if (max_selected == 0 || readers == 0 || h.num_experts <= 0 || h.n_layers <= 0) return Status::invalid_argument;
     const auto row_count = static_cast<std::uint64_t>(h.num_experts) * static_cast<std::uint64_t>(h.n_layers);
@@ -84,8 +90,8 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
             const moeq::Desc& up = store.desc(layer, expert, moeq::Up);
             const moeq::Desc& down = store.desc(layer, expert, moeq::Down);
             if (up.off != gate.off + gate.bytes || down.off != up.off + up.bytes) return Status::invalid_argument;
-            row_bytes = std::max(row_bytes, gate.bytes + up.bytes + down.bytes);
-            table_bytes += gate.bytes + up.bytes + down.bytes;
+            row_bytes = std::max(row_bytes, slot_bytes(gate.bytes + up.bytes + down.bytes));
+            table_bytes += slot_bytes(gate.bytes + up.bytes + down.bytes);
         }
     }
     const std::uint64_t storage_bytes = std::min(budget_bytes, table_bytes);
@@ -109,7 +115,7 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
         return Status::io_error;
     }
     backend_ = std::move(*backend);
-    if (backend_->register_file(kSidecarSource, sidecar) != sub0mempage::Status::ok) {
+    if (backend_->register_file(kSidecarSource, sidecar, access) != sub0mempage::Status::ok) {
         close();
         return Status::io_error;
     }
@@ -125,6 +131,7 @@ Status ExpertRowCache::open(const std::filesystem::path& sidecar, const moeq::St
     config.max_tickets = 4;
     config.max_batch_rows = max_selected;
     config.fill_chunk_bytes = fill_chunk_bytes;
+    config.fill_alignment = alignment;
     auto table = sub0tieredcache::SizeClassedTable::create(config, sub0mempage::FillBackendRef(*backend_));
     if (!table) {
         close();

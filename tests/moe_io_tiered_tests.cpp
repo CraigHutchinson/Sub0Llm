@@ -268,3 +268,38 @@ TEST_CASE("ExpertRowCache: chunked fills deliver every plane intact", "[moeio][t
         }
     CHECK(cache.verify_resident().complete());
 }
+
+TEST_CASE("ExpertRowCache: uncached fills deliver every plane intact", "[moeio][tiered]") {
+    const Sidecar file("sub0_moe_cache_uncached.moeq", 0);
+    moeq::Store store;
+    std::string error;
+    // Header and descriptors read non-cached too: nothing in this case reads the sidecar through the OS cache.
+    REQUIRE(store.open(file.path.string(), error, moeq::Store::Payload::descriptors_uncached));
+    CHECK_FALSE(store.mapped());
+    ExpertRowCache cache;
+    // Each slot holds the 4 KiB-aligned window around its expert: 8,192 and 12,288 bytes for the two sizes.
+    const std::uint64_t block = sub0mempage::kUncachedAlignment;
+    const std::uint64_t slots = sub0tieredcache::aligned_slot_bytes(expert_bytes(0), block) +
+                                sub0tieredcache::aligned_slot_bytes(expert_bytes(1), block);
+    REQUIRE(cache.open(file.path, store, 6 * slots + 64, kSelected, 4, kPins, block, sub0mempage::FileAccess::uncached) ==
+            Status::ok);
+    REQUIRE(cache.resident_rows() == 12);
+    // Every expert of every layer, twice: experts start mid-block, span blocks, and the last one ends at
+    // the end of a file whose size is not a multiple of the block.
+    for (int pass = 0; pass < 2; ++pass)
+        for (int layer = 0; layer < kLayers; ++layer)
+            for (int first = 0; first < kExperts; first += static_cast<int>(kSelected)) {
+                const std::array<int, kSelected> experts{first, first + 1};
+                REQUIRE(cache.prefetch(layer, experts) == Status::ok);
+                for (int k = 0; k < static_cast<int>(kSelected); ++k) {
+                    REQUIRE(cache.acquire(k) == Status::ok);
+                    CHECK(plane_matches_file(cache, store, file.path, k, layer, experts[static_cast<std::size_t>(k)]));
+                }
+            }
+    CHECK(cache.stats().evictions > 0);
+    CHECK(cache.verify_resident().complete());
+    // A chunk size that is not whole blocks cannot be read non-cached.
+    ExpertRowCache refused;
+    CHECK(refused.open(file.path, store, 6 * slots + 64, kSelected, 4, kPins, 1000, sub0mempage::FileAccess::uncached) !=
+          Status::ok);
+}

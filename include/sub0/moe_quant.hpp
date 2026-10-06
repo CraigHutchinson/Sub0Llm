@@ -65,6 +65,7 @@
 #include "sub0/file_map.hpp"
 #include "sub0/gguf.hpp"
 #include "sub0/transplant.hpp"
+#include "sub0/uncached_file.hpp"
 
 #include <array>
 #include <cstdint>
@@ -207,7 +208,10 @@ public:
     /// descriptor table with ordinary file reads and maps nothing: for consumers that fetch expert
     /// bytes themselves into memory they own (--moe-io-mode cache), so no plane is ever paged in
     /// through the OS. raw() on such a store is a fatal error, never a silent fallback.
-    enum class Payload : std::uint8_t { mapped, descriptors_only };
+    /// `descriptors_uncached` is the same, with the header and table themselves read non-cached
+    /// (sub0/uncached_file.hpp): for a consumer whose own reads are non-cached, which a cached reader
+    /// of the same file would slow down.
+    enum class Payload : std::uint8_t { mapped, descriptors_only, descriptors_uncached };
 
     // Returns false and fills `err` on any problem; never throws, never partially initializes.
     bool open(const std::string& path, std::string& err, Payload payload = Payload::mapped) {
@@ -217,6 +221,24 @@ public:
         data_ = nullptr;
         payload_ = payload;
 
+        if (payload == Payload::descriptors_uncached) {
+            std::error_code ec;
+            const std::uint64_t file_bytes = std::filesystem::file_size(path, ec);
+            if (ec) { err = "cannot open " + path; return false; }
+            std::vector<std::uint8_t> bytes;
+            if (!read_prefix_uncached(path, sizeof(Header), bytes, err)) return false;
+            Header h{};
+            std::memcpy(&h, bytes.data(), sizeof h);
+            if (!validate_header(h, file_bytes, path, err)) return false;
+            const auto table_bytes = static_cast<std::size_t>(h.n_tensors * sizeof(Desc));
+            if (!read_prefix_uncached(path, sizeof(Header) + table_bytes, bytes, err)) return false;
+            std::vector<Desc> descs(static_cast<std::size_t>(h.n_tensors));
+            std::memcpy(descs.data(), bytes.data() + sizeof(Header), table_bytes);
+            if (!validate_descs(h, descs, path, err)) return false;
+            h_ = h;
+            descs_ = std::move(descs);
+            return true;
+        }
         if (payload == Payload::descriptors_only) {
             std::error_code ec;
             const std::uint64_t file_bytes = std::filesystem::file_size(path, ec);
@@ -258,7 +280,7 @@ public:
     const Header& header() const { return h_; }
     /// Whether a sidecar is open in either payload mode.
     bool loaded() const { return h_.n_tensors != 0; }
-    /// Whether the payload is memory-mapped; false for a descriptors_only store.
+    /// Whether the payload is memory-mapped; false for a descriptors-only store.
     [[nodiscard]] bool mapped() const { return data_ != nullptr; }
 
     const Desc& desc(int layer, int expert, int which) const {

@@ -1007,7 +1007,7 @@ across all modes. Full record: `docs/STORAGE_STACK_PLAN.md` "S1b closure record"
 Profiling (phase profiler, VTune) and perf-suite runs in `out/build/s1b`. May edit
 `include/sub0/moe_io_mempage.hpp`, `src/moe_io_mempage.cpp`, `src/backends/cpu/decode.cpp` (MoE prefetch/wait seam only).
 
-**2026-09-30 Claude Code (Sub0ECS, other repo) — v2 reference benchmark capture, STOPPED 2026-10-01 ~08:50 at the user's request: Sub0ECS work stays off this CPU until further notice. CPU free.**
+**2026-10-05 Claude Code (Sub0ECS, other repo) — v2 reference benchmark capture DONE 16:55 (22 min). 2026-10-05 evening: MSVC optimisation pass DONE ~20:00 (Sub0ECS PR 7). Reference-benchmark rework DONE 2026-10-06 00:30 (Sub0ECS PR 8). 2026-10-06 09:00: execution-suite captures DONE (Sub0ECS PR 10). 2026-10-06 14:10: thread-pool work and captures DONE (Sub0ECS PR 11). CPU released. Note for other sessions: a Sub0Pipeline benchmark overlapped one of these captures on 2026-10-05 ~23:30; check for running `*_Bench.exe` / `capture_benchmarks.py` before sampling.**
 `D:\Craig\GitHub\Sub0ECS` `bench/tools/run.py --profile reference` (MSVC, pinned to the P-cores, then the
 thread-scaling suite across all 24 cores). No Sub0Llm files touched. Any Sub0Llm perf/timing run in this window is
 contended — and would perturb the Sub0ECS numbers too. Will mark done here when finished.
@@ -1050,3 +1050,9 @@ Reactive vs owned cache at a matched 10 GiB budget, 2,000 G-PPL tokens, 2 rotate
 **2026-10-01 Claude Code — size-classed expert cache A/B done; CPU released.** Matched memory: cache 17 GiB
 exact-size slots 6.69 vs reactive 6.49 tok/s (+3.0%, both cache runs above both reactive runs; ppl 11.930422).
 Record: STORAGE_STACK_PLAN.md. Next: shorten the miss under compute load; next-layer prefetch later.
+
+**2026-10-06 Claude Code — uncached expert-cache fills (`--moe-cache-io uncached`): deep regime-2 A/B (reactive / cache buffered / cache uncached, 17 GiB), active (CPU + ballast, ~40 min).** Sandbox first: miss wait p50 618 -> 518 us, stall -16% under memory pressure (TieredCache `0511d55`, MemPage `f74b65e`).
+
+**2026-10-06 Claude Code — uncached expert-cache fills A/B done; CPU released.** Deep regime 2, 17 GiB: cache
+uncached 7.85 tok/s, cache buffered 7.60, reactive 7.14 (ppl 11.930422 throughout); waits 189 vs 274 us.
+Uncached is now the default within `--moe-io-mode cache`. Record: STORAGE_STACK_PLAN.md.

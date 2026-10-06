@@ -238,7 +238,7 @@ code and checked by a test that fails when it is violated.
 | S0Q1 sidecar in cache mode | Read only into the pool; never mapped | `moeq::Store::Payload::descriptors_only`: header and descriptors via file reads; decode and batched `forward()` both get bytes from pinned rows | `Store::raw()` on an unmapped store is fatal. A test asserts `mapped() == false`. The batched path matches reactive bit-for-bit (`max abs diff` 5.95202 at the same cell, the existing MOE_QUANT_DOT gap) |
 | S0Q1 sidecar, reactive / pipelined / mempage | Mapped (reactive) or explicit buffered reads | `FileMap`; `ReadFile`/`pread` | Unchanged; these modes are regime 1 by design |
 | Native backbone `.bbq`, tokenizer | Mapped, always hot | `FileMap` (clean pages: dropped, never written to the pagefile) | Intentional; none needed |
-| Buffered fills into the pool | Known double-caching through the OS page cache | Buffered `ReadFile`/`pread` | Open: unbuffered reads plateau at ~3 GB/s on this host (Sub0MemPage `docs/investigations/unbuffered-read-ceiling.md`) |
+| Fills into the pool | Uncached by default (`--moe-cache-io`): the drive writes straight into the pinned slot; nothing of the sidecar enters the OS cache | `FILE_FLAG_NO_BUFFERING` / `O_DIRECT` / `F_NOCACHE` via Sub0MemPage `FileAccess::uncached`; slots hold the 4 KiB-aligned window around each expert; the header and descriptor table are read non-cached too (`Store::Payload::descriptors_uncached`) | A misaligned request is refused by the backend (`invalid_argument`). Tests fill every expert uncached and compare with positional reads. `--moe-cache-io buffered` remains for filesystems that refuse non-cached opens |
 | Engine heap (~19.5 GiB: parameters, workers, activations) | Pageable; cold parts may page out | Ordinary allocation | Measured 2026-10-01: with the native backbone, decode reads only **0.18 GiB (2.0%)** of the 9.16 GiB parameter arena (router, norms, small projections). The large matrices are read from `.bbq`; one embedding row is touched per token. Paging the cold 98% costs decode nothing, so pinning the whole arena would lock cold memory. The hot 0.18 GiB stays resident by use |
 
 **Correction (2026-10-01):** pinning the pool held (the residency guard passed) but did not change
@@ -302,12 +302,36 @@ Reading:
   The remaining lever is not copying (unbuffered DMA into the pinned pool), which makes Sub0MemPage
   `docs/investigations/unbuffered-read-ceiling.md` (~3 GB/s plateau) the critical path. Probes:
   Sub0MemPage `tools/miss_probe/`.
+- **Uncached fills (2026-10-06): the cache is now ~10% ahead of reactive.** Deep regime 2, 17 GiB cache,
+  2,000 G-PPL tokens, 2 rotated rounds, perplexity 11.930422 in all six runs:
+
+  | Arm | tok/s (rounds) | Blocking waits |
+  |---|---|---|
+  | reactive mmap | 7.14 (7.08 / 7.20) | n/a |
+  | cache, buffered fills | 7.60 (7.65 / 7.55) | ~51.8k x 274 us = 14.2 s |
+  | **cache, uncached fills** | **7.85 (7.90 / 7.79)** | ~52.2k x 189 us = 9.9 s |
+
+  - Absolute speeds are higher than the 2026-10-01 rows above because less memory was free, so the
+    ballast was smaller (10 GiB against 17). Compare arms within a table, not across tables.
+  - Why it pays: in deep regime 2 every fill is a real disk read. One cache run read 94 GiB from D:, of
+    which the 51.9k fills are ~80 GiB; the OS standby cache shrank to ~4 GiB. A buffered fill is
+    disk -> OS cache -> copy; an uncached fill is disk -> slot.
+  - The plateau's cause (Sub0MemPage investigation): on Windows, non-cached reads of a file queue
+    behind each other while that file has, or recently had, a cached reader. So in this mode nothing
+    reads the sidecar through the OS cache, the header and descriptor table included.
+  - Sandbox first (trace replay under a ballast leaving ~4 GiB beside the cache): miss wait p50
+    618 -> 518 us, p90 910 -> 732 us, stall -16%.
+  - Uncached is the default within `--moe-io-mode cache`. The reactive build's generated config is
+    byte-identical (sha `0fd94882a83f` before and after).
+  - Open: whether another process's cached read of the sidecar (a scanner, an indexer) slows fills
+    mid-run; and an IOCP issue path in Sub0MemPage (~10% on a lone miss in the read shootout).
   - Each size must hold two layers' selections plus one expert per worker, since a layer's selection
     is all one size; `open()` refuses a budget that gives any size less.
 
 
 Platform coverage: Windows (Clang) and Linux (WSL2 GCC 15) build and pass the cache suite, 341
-assertions in 7 cases, including the real sidecar. macOS is reviewed against its APIs (`MAP_ANONYMOUS`,
+assertions in 7 cases, including the real sidecar. With uncached fills (2026-10-06): 524 assertions in
+8 cases on both. macOS is reviewed against its APIs (`MAP_ANONYMOUS`,
 `mlock`, `mincore` with `char*`, `pread`) but has not been built or run.
 
 ### Owned expert cache (`--moe-io-mode cache`) -- first measurement, 2026-10-01

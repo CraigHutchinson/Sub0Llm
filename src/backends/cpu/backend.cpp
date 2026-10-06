@@ -2097,7 +2097,10 @@ bool load_moe_quant_sidecar(const char* model_path) {
 #ifdef SUB0_MOE_IO_TIERED
         // The owned expert cache reads every expert into RAM it pins itself, so the sidecar is never
         // mapped: a stray read through the mapping becomes a fatal error, not silent OS paging.
-        constexpr auto kPayload = moeq::Store::Payload::descriptors_only;
+        // With uncached fills the descriptor table is read non-cached too: any cached reader of the
+        // sidecar makes the cache's own non-cached reads queue behind each other (FileAccess::uncached).
+        constexpr auto kPayload = MOE_CACHE_UNCACHED ? moeq::Store::Payload::descriptors_uncached
+                                                     : moeq::Store::Payload::descriptors_only;
 #else
         constexpr auto kPayload = moeq::Store::Payload::mapped;
 #endif
@@ -2141,7 +2144,9 @@ bool load_moe_quant_sidecar(const char* model_path) {
             constexpr auto kSelected = static_cast<std::uint32_t>(EXPERTS_PER_TOK > 0 ? EXPERTS_PER_TOK : 1);
             // The batched forward() path pins at most one expert per worker thread at a time.
             if (const auto status = g_moe_cache.open(path, g_moe_quant, MOE_CACHE_BUDGET_BYTES, kSelected, kSelected,
-                                                     static_cast<std::uint32_t>(MAX_WORKERS), MOE_CACHE_CHUNK_BYTES);
+                                                     static_cast<std::uint32_t>(MAX_WORKERS), MOE_CACHE_CHUNK_BYTES,
+                                                     MOE_CACHE_UNCACHED ? sub0mempage::FileAccess::uncached
+                                                                        : sub0mempage::FileAccess::buffered);
                 status != sub0tieredcache::Status::ok) {
                 const bool pin_refused = status == sub0tieredcache::Status::pool_exhausted;
                 std::println(stderr,
@@ -2157,9 +2162,10 @@ bool load_moe_quant_sidecar(const char* model_path) {
                                    "expert size, and the OS must be able to commit it: adjust --moe-cache-gib.");
                 return false;
             }
-            std::println("routed-expert cache: {} of {} experts resident ({:.1f} GiB budget, {})", g_moe_cache.resident_rows(),
-                         static_cast<long long>(N_LAYERS) * NUM_EXPERTS,
+            std::println("routed-expert cache: {} of {} experts resident ({:.1f} GiB budget, {} fills, {})",
+                         g_moe_cache.resident_rows(), static_cast<long long>(N_LAYERS) * NUM_EXPERTS,
                          static_cast<double>(MOE_CACHE_BUDGET_BYTES) / (1024.0 * 1024.0 * 1024.0),
+                         MOE_CACHE_UNCACHED ? "uncached" : "buffered",
                          g_moe_cache.pinned() ? "pinned" : "NOT pinned: the OS may page it out under memory pressure");
 #else
             // AGENTS.md S1: size the staging buffers ONCE, here, not per prefetch() call --
