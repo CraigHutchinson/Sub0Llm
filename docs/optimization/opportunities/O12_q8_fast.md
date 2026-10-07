@@ -1,8 +1,8 @@
 # O12 -- vector-accumulator Q8_0 GEMV for the native backbone (`--backbone-q8-fast 1`)
 
-Status: **built, default OFF (auto resolves OFF), awaiting primary-agent review.** G-PPL is **inconclusive by
-0.0002 nats** on the letter of the gate (S5); decode is ~6-7% faster long-run and the GR down projection ~30%
-faster warm. Not bit-exact.
+Status: **merged, default ON (auto) for real-axes builds since 2026-10-07.** G-PPL PASS on `ppl_blend_v2`
+(S7); the Gated Residual up projection and the shared expert's down projection are 11-17% faster and
+long-run decode about 4% (S8). Not bit-exact. `--backbone-q8-fast 0` restores the per-block path.
 
 ## 1. What it does
 
@@ -95,49 +95,50 @@ already at this host's ~19-20 GB/s stride ceiling for this layout.
   `sub0_frontend_tests` **231,180 / 304** = 230,939 / 300 + 241 / 4 (all new cases). Builds confirmed successful
   before every count.
 
-## 7. G-PPL (real 48-layer artifact, `ppl_blend_v1`, 2,418 tokens)
+## 7. G-PPL (real 48-layer artifact, `ppl_blend_v2`, 9,631 tokens)
 
 | | base | q8fast |
 |---|---:|---:|
-| perplexity (base arm matches the pinned 14.7035) | 14.7035 | 14.8559 |
-| mean NLL | 2.6881 | 2.6984 |
-| top-1 | 48.76% | 48.88% |
+| perplexity | 11.2956 | 11.3589 |
+| mean NLL | 2.4244 | 2.4300 |
+| top-1 | 51.91% | 51.77% |
 
-Paired dNLL q8fast-base **+0.0103 nats/token, 95% CI -0.0096..+0.0302**, top-1 agreement 86.8%. The gate passes if
-the CI upper bound is <= +0.03: **0.0302 -- INCONCLUSIVE by 0.0002.** (The reversed-order pass prints PASS because it
-reports base-minus-q8fast; that direction is not the question and is not evidence.)
+Paired dNLL q8fast-base **+0.0056 nats/token, 95% CI -0.0041..+0.0153**, top-1 agreement 88.1%: **PASS**. The
+gate needs the CI upper bound at or below +0.03. Measured twice with identical results (2026-09-29 and
+2026-10-07); the path is deterministic.
 
-**Noise floor, measured, not assumed.** The per-token difference has std ~0.5 nats and mean |d| ~0.25 nats even though
-the arithmetic differs only by float reassociation -- the MoE routing over IQ1_S experts turns rounding noise into
-discrete expert flips. To check that this is the model's noise floor and not a defect, a THROWAWAY control (not
-committed) ran the SAME fast kernel with a different accumulator split, changing rounding only: ctl-vs-q8fast
-mean +0.0029, std 0.535; ctl-vs-base mean +0.0133, std 0.509 (ctl ppl 14.8997). Two independent reassociations both
-land ~+0.01 above base with the same per-token spread as q8fast itself, so q8fast's shift is indistinguishable from
-rounding noise -- but note both sit above base, so a small systematic effect cannot be excluded at 2,418 tokens.
-More tokens is the gate's own remedy (needs a larger fixture than `ppl_blend_v1`).
+**Why v2.** On the 2,418-token `ppl_blend_v1` this change was inconclusive by 0.0002 nats. A throwaway control
+that ran the same fast kernel with a different accumulator split, changing rounding order only, moved
+perplexity as far as the kernel itself did (per-token std ~0.5 nats). MoE routing over the IQ1_S experts turns
+rounding noise into discrete expert flips, so v1's CI half-width (~0.02) was mostly that noise. v2 halves it.
 
-## 8. Throughput
+## 8. Throughput (primary agent, 2026-10-07)
 
-Long-run decode (tok/s from the ppl runs, same process, ~2,400 tokens):
+Long-run decode from one `--stage ppl --ppl-speed-rounds 2` run: every arm built before any run, a cooldown
+before each, the two 2,000-token rounds in rotated order.
 
-| | base | q8fast | delta |
-|---|---:|---:|---:|
-| pass 1 (base first) | 6.19 | 6.64 | +7.3% |
-| pass 2 (q8fast first) | 6.26 | 6.66 | +6.4% |
+| Run | base tok/s | q8fast tok/s |
+|---|---:|---:|
+| scoring run, 9,631 tokens | 7.83 | 8.29 |
+| speed round 1, 2,000 tokens | 6.93 | 7.45 |
+| speed round 2, 2,000 tokens | 7.28 | 7.16 |
+| mean | 7.35 | 7.63 (+3.9%) |
 
-`--profile-phases 1` `sub0llm-qwen4-forward --tokens 6`, separate build dirs per arm, interleaved, first pair of each
-batch discarded, `busy_procs=0` at every start. The runs are dominated by page-cache state (a 22.8 GiB working set):
-cold runs show GR down at 20-37 ms in either arm, so medians are unreliable and the warm band is what is reported.
+q8fast lost one of the three pairings, so the long-run gain is small against this host's run-to-run spread.
+The phase profile is the direct evidence (`--profile-phases 1`, `sub0llm-qwen4-forward --tokens 6`, four
+alternating runs per arm, the first of each discarded; ms/token):
 
-| GR sub-phase (ms/token) | base warm | q8fast warm |
+| Phase | base | q8fast |
 |---|---|---|
-| down GEMV | 8.7, 9.0 (also 13.8, 20.8, 28.2 cold) | 6.1, 6.2, 6.4, 7.2 (also 27.0 cold) |
-| up GEMV | 7.8, 8.0, 8.5, 8.8, 10.2 | 7.0, 7.3, 7.3, 7.4, 8.0 |
-| implied GB/s (338 MB/token each) | down ~38-39, up ~40-43 | down ~47-55, up ~45-48 |
-| forward_one s/token (warm) | 0.114, 0.116, 0.118 | 0.109, 0.112, 0.123 |
+| GR: up GEMV | 8.4, 7.6, 8.4 | 6.8, 6.6, 6.9 |
+| MoE: router + shared + combine | 8.8, 9.3, 8.9 | 7.9, 7.8, 8.2 |
+| GR: down GEMV | 10.3, 27.0, 14.0 | 9.1, 5.9, 9.6 |
+| whole token, s | 0.120, 0.132, 0.126 | 0.118, 0.106, 0.119 |
 
-Down: roughly -25% to -30% warm. Up: -10% to -15%. Both stay below the ~79 GB/s roof; the 1-thread stream ceiling
-(S5) and per-call OpenMP overhead on 3.5 MB planes are the remaining gap.
+The up projection and the shared expert's down projection improve in every run. The down projection's row
+swings from 6 to 27 ms between runs of the same binary in both arms, so it shows no reliable delta here;
+the swing itself is unexplained (the `.bbq` is a file mapping whose residency nothing guards, see
+`O13_storage_convergence.md` C2).
 
 ## 9. Follow-ups / unverified
 
@@ -146,23 +147,4 @@ Down: roughly -25% to -30% warm. Up: -10% to -15%. Both stay below the ~79 GB/s 
 - Iteration status (AGENTS.md S13): three design passes on the kernel (per-block splat -> 4 accumulators -> 4-block
   hadd fold; ISA variants; prefetch). Two-rows-at-a-time (sharing the activation loads) was not tried: the DRAM
   numbers show all forms already tie at the stream ceiling.
-- Promotion: change `resolve(backbone_q8_fast, false)` to `backbone_quant_dot != 0` in `resolve_decode_defaults`.
-
-## G-PPL on the larger fixture (primary agent, 2026-09-29)
-
-`ppl_blend_v1` could not decide this change: its CI half-width (~0.02 nats) is mostly rounding noise (the control
-run above). Re-scored on the new `ppl_blend_v2` (9,631 tokens) through the real-axes default build:
-
-| arm | ppl |
-|---|---:|
-| base (current defaults) | 11.2956 |
-| q8fast | 11.3589 |
-
-Paired dNLL q8fast - base **+0.0056 nats/token, 95% CI -0.0041..+0.0153**, std 0.487, top-1 agreement 88.1%:
-**PASS**, with the upper bound well inside +0.03.
-
-The run was interrupted by a host reboot after these two arms. Its third arm (`--backbone-act-super 0`, to
-re-check O9 on v2) and the script's history rows were lost, and the numbers above were computed from the two
-complete per-token dumps. **Default still OFF:** the only throughput evidence is the authoring agent's own
-+6-7%, and O9's agent-reported gain halved when re-measured. Flip `resolve(backbone_q8_fast, false)` once a
-primary-agent long-run A/B confirms the speed.
+- Promoted 2026-10-07: `resolve(backbone_q8_fast, backbone_quant_dot != 0)` in `resolve_decode_defaults`.

@@ -741,10 +741,14 @@ struct RowSplitExperts : ParallelExperts {
             // Wave 0: experts already in place compute while the others' router-time fills finish.
             for (std::size_t i = 0; i < n_resident; ++i) bind(resident[i]);
             if (n_resident != 0) compute(std::span(resident).first(n_resident));
-            // Wave 1: wait for the rest, then compute them.
-            for (std::size_t i = 0; i < n_waiting; ++i) {
-                moe_io_wait_expert(waiting[i], layer_index, idx[waiting[i]]);
-                bind(waiting[i]);
+            // Wave 1: wait for the rest, then compute them. The wait runs on this (the phase-owning)
+            // thread, so it gets its own profile row: stall on a miss, kept apart from kernel time.
+            {
+                [[maybe_unused]] const prof::PhaseScope<PROFILE_PHASES> wait_phase(prof::Phase::MoeMissWait);
+                for (std::size_t i = 0; i < n_waiting; ++i) {
+                    moe_io_wait_expert(waiting[i], layer_index, idx[waiting[i]]);
+                    bind(waiting[i]);
+                }
             }
             if (n_waiting != 0) compute(std::span(waiting).first(n_waiting));
         }

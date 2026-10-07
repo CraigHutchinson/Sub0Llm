@@ -545,10 +545,15 @@ TEST_CASE("moeq (B38): forward_row_via_run_ex<UseSimd=true> builds, runs, and st
 
     // Shared-expert weights: reuse routed expert 0's own planes as stand-ins (this test only needs SOME
     // real, non-degenerate weight bytes; the shared expert's identity is irrelevant to what's gated).
+    // They live in their OWN one-slot source: `fused` below has one slot too, and every routed resolve
+    // overwrites it. Sharing that slot made the stand-in's bytes depend on which expert ran last, which
+    // differed between the two arms once the shared expert began running before the routed ones.
+    moeq::ExpertCacheSource<1, kPerExpert> shared_source;
+    shared_source.allocate();
+    const auto shared = shared_source.resolve(store, 0, 0);
+    REQUIRE(shared.gate != nullptr);
     moeq::ExpertCacheSource<1, kPerExpert> fused;
     fused.allocate();
-    const auto shared = fused.resolve(store, 0, 0);
-    REQUIRE(shared.gate != nullptr);
 
     // A trivial router: [hidden_size, num_experts], f32, zero-initialized (uniform routing -- this test
     // does not care WHICH experts are picked, only that the shared-expert gate logit reduction differs).

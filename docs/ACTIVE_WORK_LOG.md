@@ -1060,3 +1060,5 @@ Uncached is now the default within `--moe-io-mode cache`. Record: STORAGE_STACK_
 **2026-10-07 Claude Code — storage session closed; nothing held.** Sub0MemPage `f74b65e`, Sub0TieredCache `1fa4700` and this repo published; pins point at them and a network-fetched build passes the storage suites. Measurement drivers: `scripts/storage_ab/`. Follow-ups: STORAGE_STACK_PLAN.md "Follow-ups".
 
 **2026-10-07 Claude Code — O12/O9 quality + long-run speed A/B on ppl_blend_v2, active (CPU, ~2 h).** Three arms (defaults / `--backbone-q8-fast 1` / `--backbone-act-super 0`), `out/build/wp5c_full48`; no engine edits. Do not start timing runs or heavy builds until this is marked done.
+
+**2026-10-07 Claude Code — O12/O9 A/B done; CPU released.** Both pass G-PPL on ppl_blend_v2; O12 (`--backbone-q8-fast`) is now an auto default. Records: `docs/optimization/opportunities/O9_act_super.md`, `O12_q8_fast.md`. Fixed a latent slot-aliasing bug in `tests/moe_quant_tests.cpp` (B38 case) that `cbb89dd` exposed: frontend suite is 231,180 / 304.

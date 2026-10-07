@@ -45,11 +45,15 @@ namespace sub0::prof {
 ///                          gr::MixStage marks; the rest at decode.cpp's call boundaries). What is left
 ///                          on GatedResidual itself is the read/write lambda glue.
 ///   inside Mixer:          QsaIndexer, QsaProj, QsaAttn (call boundaries in decode.cpp)
+///   inside MoeRouted:      MoeMissWait -- blocked on routed experts that were not yet in place
+///                          (--moe-io-mode cache/mempage/pipelined; always 0 under reactive mmap, whose
+///                          page faults land inside the kernels and stay on MoeRouted).
 enum class Phase : std::uint8_t {
     Other, Mixer, MixerGdn, Moe, MoeRouted, GatedResidual, LmHead,
     GdnInQuant, GdnInProj, GdnBaProj, GdnConv, GdnRecur, GdnGateNorm, GdnOutQuant, GdnOutProj,
     GrNorm, GrQuant, GrDown, GrUp, GrMixEw, GrGate, GrCombine,
     QsaIndexer, QsaProj, QsaAttn,
+    MoeMissWait,
     Count };
 
 inline constexpr std::array<std::string_view, static_cast<std::size_t>(Phase::Count)> kPhaseNames{
@@ -60,7 +64,8 @@ inline constexpr std::array<std::string_view, static_cast<std::size_t>(Phase::Co
     "GDN: out-proj gather+quantize", "GDN: out-proj GEMV",
     "GR: hc_norm", "GR: act quantize (down+up)", "GR: down GEMV", "GR: up GEMV", "GR: mix elementwise",
     "GR: inject gate", "GR: combine (write)",
-    "QSA: indexer (project+select)", "QSA: q/k/v projections", "QSA: attention + o-proj"};
+    "QSA: indexer (project+select)", "QSA: q/k/v projections", "QSA: attention + o-proj",
+    "MoE: wait for missing experts"};
 
 /** Per-phase accumulated nanoseconds and the phase currently being charged.
  *

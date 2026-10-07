@@ -666,7 +666,7 @@ int main(int argc, char** argv) {
     int backbone_act_super = -1;   // -1 = auto
     // O12 (docs/optimization/opportunities/O12_q8_fast.md): the Q8_0 roles (Gated Residual down/up, the
     // shared expert's down projection) use the vector-accumulator Q8_0 kernel. NOT bit-exact (float sum
-    // reassociated), so it is gated on G-PPL. Auto currently resolves OFF -- see resolve_decode_defaults.
+    // reassociated), so it is gated on G-PPL (PASS on ppl_blend_v2). Auto: see resolve_decode_defaults.
     int backbone_q8_fast = -1;     // -1 = auto
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
@@ -893,7 +893,8 @@ int main(int argc, char** argv) {
                    "and does one horizontal reduction per row, instead of one per block. NOT bit-exact "
                    "(the float sum is reassociated) -- gated on end-to-end perplexity "
                    "(docs/optimization/kpi_gates.json G-PPL). Requires --backbone-quant-dot 1. 0 = off "
-                   "(the per-block path, bit-exact). -1 = auto (default): currently off pending review.")
+                   "(the per-block path, bit-exact). -1 = auto (default): on whenever --backbone-quant-dot "
+                   "resolves on.")
        ->capture_default_str()->check(CLI::Range(-1, 1));
     app.add_option("--backbone-act-super", backbone_act_super,
                    "O9 (docs/BACKBONE_NATIVE_QUANT.md S14): every --backbone-quant-dot role whose real "
@@ -1114,9 +1115,7 @@ int main(int argc, char** argv) {
         resolve(decode_omp_spin, quant_inference);
         resolve(backbone_quant_dot, quant_inference && tie_embeddings == 0);
         resolve(backbone_act_super, backbone_quant_dot != 0);
-        // O12: not yet promoted, so auto resolves OFF. To promote it once its G-PPL and throughput gates
-        // are reviewed, change `false` to `backbone_quant_dot != 0` (the same shape as act_super above).
-        resolve(backbone_q8_fast, false);
+        resolve(backbone_q8_fast, backbone_quant_dot != 0);
         // 8 = this host's P-core count, the measured best for both teams (O8 S8: 8 beat 12 and 16 once
         // E-cores join), capped at the machine's hardware threads on a smaller host.
         // TODO(decode-threads-topology): derive from the P-core count once Sub0Llm has a topology probe.
