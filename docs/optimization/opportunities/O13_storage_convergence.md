@@ -16,6 +16,31 @@ the owned expert cache) raises tok/s when it does not (regime 2). They meet in t
 - **The same predictor.** Prefetching experts and speculative decoding both need to know what a layer
   will want before it asks.
 
+## 1a. Operating assumption: this host is RAM-constrained (user direction, 2026-10-07)
+
+Self-managed memory is the long-term path here, ahead of the n-gram integration and not only because of
+it. The model's files are 49.5 GiB (9.16 + 3.26 + 37.11) on a 63 GiB host that already commits about
+20 GiB before the model loads, so under any real load the expert sidecar cannot sit in the OS cache.
+The owned cache already wins there: 7.85 tok/s against reactive mmap's 7.14 at a 17 GiB budget, with
+identical perplexity (storage plan, 2026-10-06). Consequences for the decode track:
+
+- **Regime 2 with the owned cache is the reference configuration**, not a special case. An optimization
+  is measured there as well as on an idle host.
+- **Every decode optimization to date (O1-O12) was measured on reactive mmap only.** The optimization
+  build dir (`out/build/wp5c_full48`) is not even configured with `SUB0_STORAGE_TIEREDCACHE`; only
+  `out/build/s1b` is.
+- **Part of the decode track's run-to-run noise is probably reactive mmap itself.** Reactive's speed
+  follows how much RAM the OS spares that day (4.93 to 7.14 tok/s across sessions in the storage plan).
+  The decode track has recorded an unexplained "slow host state" and day-to-day drift in long runs
+  (5.73 against 6.98 tok/s for the same build on 2026-09-29). A 2,000-token run touches 32.3 GiB of
+  experts (section 2), more than an idle host has free, so long runs are partly I/O-bound even when the
+  host looks idle. That link is an inference from those numbers and has not been tested. A fixed, owned
+  budget would remove the variable from A/Bs.
+- **The same principle extends past the experts.** Memory decode needs every token should be owned and
+  pinned; memory it rarely needs should be droppable for free. Today the engine does the reverse in two
+  places: the cold 9 GiB parameter arena is anonymous heap (C1), and the 3.26 GiB `.bbq`, read almost in
+  full every token, is a file mapping the OS may trim (C2).
+
 ## 2. Evidence: the expert access trace
 
 `out/build/s1b/qwen4-g2000.{trace,extents}` (written by `sub0llm-qwen4-gen --expert-trace`, 2026-10-01):
@@ -83,9 +108,11 @@ pays nothing unless its predictor is content-based.
 - Reactive mmap cannot change this: file-backed pages are 4 KiB. The owned pool is `VirtualAlloc` +
   `VirtualLock` memory, so it can be 2 MiB pages (`MEM_LARGE_PAGES`; needs the "Lock pages in memory"
   privilege, which the pool's lock quota already goes most of the way to requiring).
-- This is the one route by which the cache could beat reactive in regime 1, where it otherwise only adds
-  misses (storage follow-up 3).
-- The same applies to the 3.26 GiB `.bbq`, which is mapped and always hot. O10 lever 4 (K-quant GEMVs
+- This is the one route by which the cache could beat reactive when everything fits in RAM, where it
+  otherwise only adds misses (storage follow-up 3).
+- The same applies to the 3.26 GiB `.bbq`, which is mapped and always hot. The residency table in the
+  storage plan gives it no guard ("none needed"): it stays resident by use, which nothing checks under
+  load or across an idle gap between prompts. An owned, pinned copy gives it the expert pool's guarantee. O10 lever 4 (K-quant GEMVs
   plateau at ~53 GB/s) lists TLB as a suspect; a pinned large-page copy made through `residency.hpp` at
   load tests it directly.
 - **First step is a microbenchmark, not an engine change:** the existing expert and backbone kernel
@@ -130,17 +157,24 @@ a spinning worker. Untested.
 
 ## 4. Ranked next steps
 
-| # | Step | Track it serves | Cost | Evidence it rests on |
-|---|---|---|---|---|
-| 1 | C1: map the bf16 arena for inference builds | both | medium; shared files | 2% of the arena is read; 9 GiB = -68% misses at 17 GiB |
-| 2 | C5: miss-wait phase row; ballast option on the suite | both | small | needed to measure 1, 3 and 4 |
-| 3 | C2: 4 KiB against 2 MiB kernel microbench | decode first | small | experts at ~25 GB/s against a 79 GB/s roof |
-| 4 | C3: log the early router in the trace; offline recall | storage lever 2 | small | recency recall on misses is 0.0% |
-| 5 | C4 / S1c: n-gram rows, issued at token start | both | large | already the storage track's next slice |
-| 6 | C6: reader affinity | storage | small | none yet |
+Ordered for a RAM-constrained host (section 1a): first make the owned cache the measured default, then
+give it more memory, then make its misses rarer.
+
+| # | Step | Cost | Evidence it rests on |
+|---|---|---|---|
+| 1 | Build the optimization dir with the cache; give `run_perf_suite.py` a ballast option, so every A/B runs in both regimes | small | O1-O12 were measured on reactive only |
+| 2 | C5: the miss-wait phase row, and the phase table in the long-run tool | small | a regime-2 profile cannot separate stall from compute today |
+| 3 | Promote `--moe-io-mode cache` to the auto default: the storage plan's checklist (budget from free memory at load, regime-1 A/B, full suite with the cache on, Linux fallback) | medium | cache 7.85 against reactive 7.14 tok/s in deep regime 2 |
+| 4 | C1: map the bf16 arena for inference builds | medium; shared files | 2% of the arena is read; 9 GiB = -68% misses at 17 GiB |
+| 5 | C2: own and pin the `.bbq`; 4 KiB against 2 MiB pages for it and for the expert pool | small to measure | experts at ~25 GB/s against a 79 GB/s roof; `.bbq` residency under load is unguarded |
+| 6 | C3: log the early router in the trace; offline recall on misses | small | recency recall on misses is 0.0% |
+| 7 | C4 / S1c: n-gram rows, issued at token start | large | the storage track's next slice |
+| 8 | C6: reader affinity | small | none yet |
 
 ## 5. What does not converge
 
 - **Recency-based prefetch**: 0.0% recall on misses (section 2).
 - **Pinning for speed**: the pinned pool prevents a regression but measured no gain (storage plan).
-- **The cache in regime 1 as it stands**: reactive has no misses there. Only C2 could change that.
+- **The cache on a host with RAM to spare**: reactive has no misses when the whole sidecar fits in the OS
+  cache, so the cache can only match it there unless C2 pays. Section 1a is why that case is not this
+  host's normal one.
