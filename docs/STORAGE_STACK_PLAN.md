@@ -356,7 +356,9 @@ quantized-MoE builds needs all of:
    cache. Reactive then has no misses at all; the cache at its budget still does.
 4. **The full suite, unfiltered, with the cache on** (AGENTS.md S10.1). Only the storage suites and the
    G-PPL decode have run in cache mode.
-5. **macOS built and run.** Reviewed against its APIs only.
+5. **macOS built and run in this repo.** Sub0MemPage's uncached backend and Sub0TieredCache pass their
+   suites on macOS in CI; this repo's cache (`moe_io_tiered.cpp`, `residency.cpp`, `uncached_file.hpp`)
+   is reviewed against the macOS APIs only, and this repo has no CI.
 
 **Open questions.**
 - Does another process reading the sidecar through the OS cache mid-run (a virus scanner, an indexer)
@@ -374,9 +376,11 @@ quantized-MoE builds needs all of:
    sharing a block between rows before `fill_alignment` is used there.
 
 **Sub0MemPage diagnostics, not started.** Linux `io_uring`, large-page slots, and a whole-row mode for
-the pool arms in `tools/read_shootout`; the ARM stage of `dev.py check` is skipped on this host (no
-cross toolchain); `dev.py bench`'s G-PERF gate failed on 2026-10-01 with identical headers in both arms
-(noise in the bookkeeping benchmark, recorded there, not investigated).
+the pool arms in `tools/read_shootout`; `dev.py bench`'s G-PERF gate failed on 2026-10-01 with identical
+headers in both arms (noise in the bookkeeping benchmark, recorded there, not investigated). Both
+libraries' CI is green on every job as of 2026-10-07 (Sub0MemPage `2eefa1e`, Sub0TieredCache `e231e45`),
+after fixing a timing-dependent shutdown test and consumer checks that had failed the clang job since
+before this work.
 
 ### Owned expert cache (`--moe-io-mode cache`) -- first measurement, 2026-10-01
 
