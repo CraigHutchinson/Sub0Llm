@@ -334,6 +334,50 @@ assertions in 7 cases, including the real sidecar. With uncached fills (2026-10-
 8 cases on both. macOS is reviewed against its APIs (`MAP_ANONYMOUS`,
 `mlock`, `mincore` with `char*`, `pread`) but has not been built or run.
 
+### Follow-ups (recorded 2026-10-07)
+
+State: Sub0MemPage `f74b65e`, Sub0TieredCache `1fa4700` and this repo are published; `cmake/MemPage.cmake`
+and `cmake/TieredCache.cmake` pin those commits and a network-fetched build passes the storage suites.
+How to measure: `scripts/storage_ab/README.md`.
+
+**Defaults.** Within `--moe-io-mode cache`, every proven lever is on by default: uncached fills,
+exact-size slots, 256 KiB chunked fills, a pinned pool, the shared expert first, resident-first waves.
+`--moe-io-mode` itself still defaults to `reactive`. Promoting `cache` to the automatic default for
+quantized-MoE builds needs all of:
+
+1. **A budget from available memory, at startup.** `MOE_CACHE_BUDGET_BYTES` is fixed at configure time
+   (default: half of physical RAM, 31.7 GiB here). On 2026-10-06 only ~42 GiB was free, and the engine
+   needs ~20: a default-on cache would have over-committed. The budget should be what is free when the
+   model loads, less the engine's footprint and headroom.
+2. **A working default on Linux.** The cache refuses to run unpinned, and the default `RLIMIT_MEMLOCK`
+   is 64 MiB, so a default-on cache would fail to open. Decide between falling back to reactive with a
+   clear message and requiring the limit to be raised.
+3. **Regime 1 measured.** Cache against a fully warm reactive run when the whole sidecar fits in the OS
+   cache. Reactive then has no misses at all; the cache at its budget still does.
+4. **The full suite, unfiltered, with the cache on** (AGENTS.md S10.1). Only the storage suites and the
+   G-PPL decode have run in cache mode.
+5. **macOS built and run.** Reviewed against its APIs only.
+
+**Open questions.**
+- Does another process reading the sidecar through the OS cache mid-run (a virus scanner, an indexer)
+  slow uncached fills? The mechanism says it could; it has not been tested.
+- The 2026-10-06 engine A/B is two rounds. The uncached-over-buffered margin (+3.2%, waits -31%) is
+  consistent across both and agrees with the sandbox, but has not been repeated on another day.
+
+**Next levers, in order.**
+1. An IOCP issue path in Sub0MemPage's `LocalFileBackend` for uncached sources: ~10% on a lone miss in
+   the read shootout (`iocp-unbuffered` 483 us p50 against `mempage-unbuffered` 532 us).
+2. Next-layer prefetch: request a layer's likely experts before its router runs. A wrong guess still
+   pays the miss, which is why the miss was made cheap first.
+3. S1c: the n-gram table (102 GB of 320-byte rows) on the same substrate. Rows are far smaller than a
+   block, so the aligned-window slot costs 8 KiB per 320-byte row as it stands: this needs a design for
+   sharing a block between rows before `fill_alignment` is used there.
+
+**Sub0MemPage diagnostics, not started.** Linux `io_uring`, large-page slots, and a whole-row mode for
+the pool arms in `tools/read_shootout`; the ARM stage of `dev.py check` is skipped on this host (no
+cross toolchain); `dev.py bench`'s G-PERF gate failed on 2026-10-01 with identical headers in both arms
+(noise in the bookkeeping benchmark, recorded there, not investigated).
+
 ### Owned expert cache (`--moe-io-mode cache`) -- first measurement, 2026-10-01
 
 One Sub0TieredCache row per (layer, expert) holds the expert's three contiguous encoded planes. The rows

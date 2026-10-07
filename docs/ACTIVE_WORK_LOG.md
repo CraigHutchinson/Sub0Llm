@@ -1056,3 +1056,5 @@ Record: STORAGE_STACK_PLAN.md. Next: shorten the miss under compute load; next-l
 **2026-10-06 Claude Code — uncached expert-cache fills A/B done; CPU released.** Deep regime 2, 17 GiB: cache
 uncached 7.85 tok/s, cache buffered 7.60, reactive 7.14 (ppl 11.930422 throughout); waits 189 vs 274 us.
 Uncached is now the default within `--moe-io-mode cache`. Record: STORAGE_STACK_PLAN.md.
+
+**2026-10-07 Claude Code — storage session closed; nothing held.** Sub0MemPage `f74b65e`, Sub0TieredCache `1fa4700` and this repo published; pins point at them and a network-fetched build passes the storage suites. Measurement drivers: `scripts/storage_ab/`. Follow-ups: STORAGE_STACK_PLAN.md "Follow-ups".
