@@ -2050,8 +2050,7 @@ int main(int argc, char** argv) {
     // neighbours: PARAM_FLOATS, the Header and every computed value are unchanged, so it joins neither
     // ARCH_FINGERPRINT nor ARCH_FINGERPRINT2 (AGENTS.md S10.3) -- a model written by either arena
     // loads under either.
-    cos << "constexpr bool PARAM_ARENA_MAPPED = " << (param_arena_mapped ? "true" : "false") << ";
-";
+    cos << "constexpr bool PARAM_ARENA_MAPPED = " << (param_arena_mapped ? "true" : "false") << ";\n";
     // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
     cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
     cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";

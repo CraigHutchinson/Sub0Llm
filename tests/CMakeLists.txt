@@ -244,6 +244,16 @@ if(SUB0_BUILD_CUDA)
   target_compile_definitions(sub0_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 endif()
 
+# O14: the parameter arena as a read-only file view. Its own executable so sub0_tests keeps its exact
+# assertion counts; the positive cases only run in a forward-only build (see the file's header comment).
+add_executable(sub0_param_arena_tests param_arena_tests.cpp)
+target_include_directories(sub0_param_arena_tests PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+target_link_libraries(sub0_param_arena_tests PRIVATE sub0_core Catch2::Catch2WithMain)
+set_target_properties(sub0_param_arena_tests PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+catch_discover_tests(sub0_param_arena_tests
+  DL_PATHS "$<TARGET_FILE_DIR:sub0_core>"
+  DISCOVERY_MODE PRE_TEST)
+
 # Find the sub0_core shared lib next to the test binary at runtime.
 set_target_properties(sub0_tests PROPERTIES
   BUILD_RPATH "$ORIGIN"
