@@ -44,7 +44,9 @@ std::vector<int> window(int T) {
 }
 
 struct TempModel {
-    std::string path = (std::filesystem::temp_directory_path() / "sub0_param_arena_model.bin").string();
+    explicit TempModel(const char* name = "sub0_param_arena_model.bin")
+        : path((std::filesystem::temp_directory_path() / name).string()) {}
+    std::string path;
     ~TempModel() {
         (void)sub0::param_store_ptr();   // a mapped view holds the file open; a writer un-maps it first
         std::error_code ec;
@@ -97,7 +99,7 @@ TEST_CASE("a file-view arena is byte- and output-identical to the heap arena", "
         REQUIRE(arena_bytes() == bytes0);   // build_model's init is deterministic
     }
     SECTION("saving from a view does not un-map it, and writes the same file") {
-        TempModel again;
+        TempModel again("sub0_param_arena_resave.bin");
         REQUIRE(sub0::save_model(again.path.c_str()));
         REQUIRE(sub0::param_arena_mapped());
         REQUIRE(std::filesystem::file_size(again.path) == std::filesystem::file_size(m.path));
