@@ -20,7 +20,7 @@ std::size_t trainable_floats();
 float* params_ptr();
 void* param_store_ptr();
 std::size_t param_store_bytes();
-const void* param_store_view();
+[[nodiscard]] const void* param_store_view();
 [[nodiscard]] bool adopt_param_file_view(const char* path, std::uint64_t data_offset);
 [[nodiscard]] bool param_arena_mapped();
 float* grad_ptr();

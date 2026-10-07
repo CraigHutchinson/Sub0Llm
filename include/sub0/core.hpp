@@ -401,7 +401,7 @@ SUB0_API void*       param_store_ptr();
 SUB0_API std::size_t param_store_bytes();
 // O14: READ-ONLY access to the same storage, for callers that only read it (save_model). Unlike
 // param_store_ptr() it never converts a mapped arena to a heap one, so reading a 9 GiB mapped arena stays free.
-SUB0_API const void* param_store_view();
+[[nodiscard]] SUB0_API const void* param_store_view();
 // O14: makes the parameter arena a read-only view of `path`'s bytes from `data_offset` on (the model blob
 // inside a model file), instead of a heap copy the caller reads into. Any parameter pointers this thread's
 // graph already captured are re-derived, so it is valid before or after build_model()/the first forward.
