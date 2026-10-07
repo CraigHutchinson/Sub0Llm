@@ -366,6 +366,13 @@ quantized-MoE builds needs all of:
 - The 2026-10-06 engine A/B is two rounds. The uncached-over-buffered margin (+3.2%, waits -31%) is
   consistent across both and agrees with the sandbox, but has not been repeated on another day.
 
+**Convergence with the decode optimization track (2026-10-07).**
+[`optimization/opportunities/O13_storage_convergence.md`](optimization/opportunities/O13_storage_convergence.md)
+prices a cache budget from the recorded trace and ranks the shared work. Two results change this list:
+recent tokens predict 0.0% of the experts that miss, so lever 2 below needs a content-based predictor;
+and the engine's cold 9 GiB parameter arena is worth more to the cache than any remaining miss-path lever
+(17 -> 26 GiB cuts misses per token from 23.1 to 7.4).
+
 **Next levers, in order.**
 1. An IOCP issue path in Sub0MemPage's `LocalFileBackend` for uncached sources: ~10% on a lone miss in
    the read shootout (`iocp-unbuffered` 483 us p50 against `mempage-unbuffered` 532 us).

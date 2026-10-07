@@ -249,35 +249,54 @@ PPL_GATE_NATS = 0.03   # per token; ~3% perplexity. See the G-PPL entry in kpi_g
 
 
 def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens: int,
-              version: str) -> dict:
+              version: str, speed_rounds: int = 0, speed_tokens: int = 2000,
+              cooldown_s: float = 20.0) -> dict:
     """Score the pinned fixture through forward_one per arm, then compare each arm with the first.
 
-    Perplexity is deterministic for a given build and text, so one run per arm suffices; contention
-    changes only the reported decode speed, never the score. The comparison is PAIRED (per-token NLL
-    differences on identical tokens), which cancels the text's own difficulty and is far more sensitive
-    than comparing two perplexities.
+    Perplexity is deterministic for a given build and text, so one scoring run per arm suffices;
+    contention changes only the reported decode speed, never the score. The comparison is PAIRED
+    (per-token NLL differences on identical tokens), which cancels the text's own difficulty and is far
+    more sensitive than comparing two perplexities.
+
+    Every arm is built once up front (stage_arm_binaries), so no run follows a compile. `speed_rounds`
+    then adds that many shorter runs per arm in ROTATED order with a cooldown before each: the long-run
+    decode tok/s of an A/B. The scoring run's own tok/s is reported but is one sample in a fixed order.
     """
     import make_ppl_fixture
     fixture = make_ppl_fixture.ensure(make_ppl_fixture.default_path(version), version)
     tok = qwen_tokenizer_dir()
-    per_arm: dict = {}
-    nll: dict[str, list[float]] = {}
-    argmax: dict[str, list[str]] = {}
-    for name, flags in arms:
-        configure(build, flags)
-        build_target(build, "sub0llm-qwen4-gen")
-        dump = build / f"ppl_{name}.tsv"
-        out = run([str(build / "sub0llm-qwen4-gen.exe"), "--model", ARTIFACT, "--tokenizer-dir", str(tok),
-                   "--ppl", str(fixture), "--ppl-tokens", str(max_tokens), "--ppl-dump", str(dump)],
-                  timeout=4 * 3600)
+    staged = stage_arm_binaries(build, arms, targets=("sub0llm-qwen4-gen",))
+
+    def score(name: str, tokens: int, dump: pathlib.Path | None) -> dict:
+        time.sleep(cooldown_s)
+        while (n := contention_count()) > 0:
+            print(f"  paused before {name}: {n} named competing process(es) running", flush=True)
+            time.sleep(30)
+        cmd = [str(staged[name] / "sub0llm-qwen4-gen.exe"), "--model", ARTIFACT, "--tokenizer-dir", str(tok),
+               "--ppl", str(fixture), "--ppl-tokens", str(tokens)]
+        out = run(cmd + (["--ppl-dump", str(dump)] if dump else []), timeout=4 * 3600)
         m = re.search(r"PPL-RESULT (.*)", out)
         if not m:
             raise RuntimeError(f"arm {name}: no PPL-RESULT line")
-        per_arm[name] = {k: float(v) for k, v in (kv.split("=") for kv in m.group(1).split())}
+        return {k: float(v) for k, v in (kv.split("=") for kv in m.group(1).split())}
+
+    per_arm: dict = {}
+    nll: dict[str, list[float]] = {}
+    argmax: dict[str, list[str]] = {}
+    for name, _ in arms:
+        dump = build / f"ppl_{name}.tsv"
+        per_arm[name] = score(name, max_tokens, dump)
         rows = [line.split("\t") for line in dump.read_text(encoding="utf-8").splitlines() if line]
         nll[name] = [float(r[2]) for r in rows]
         argmax[name] = [r[3] for r in rows]
-        print(f"  {name}: ppl {per_arm[name]['ppl']:.4f} over {int(per_arm[name]['tokens'])} tokens", flush=True)
+        print(f"  {name}: ppl {per_arm[name]['ppl']:.4f} over {int(per_arm[name]['tokens'])} tokens, "
+              f"{per_arm[name]['decode_tok_s']:.2f} tok/s", flush=True)
+    for i in range(speed_rounds):
+        shift = (i + 1) % len(arms)
+        for name, _ in arms[shift:] + arms[:shift]:
+            v = score(name, speed_tokens, None)["decode_tok_s"]
+            per_arm[name].setdefault("speed_tok_s", []).append(v)
+            print(f"  speed [{i+1}/{speed_rounds}] {name}: {v:.2f} tok/s over {speed_tokens} tokens", flush=True)
     base, *rest = [a for a, _ in arms]
     paired = {}
     for other in rest:
@@ -409,6 +428,9 @@ def main() -> int:
                     help="ppl stage: cap on scored tokens (v2 has ~9,400, v1 ~2,400)")
     ap.add_argument("--ppl-fixture", choices=["ppl_blend_v1", "ppl_blend_v2"], default="ppl_blend_v2",
                     help="ppl stage: pinned text (scripts/make_ppl_fixture.py); v1 only to compare with old history")
+    ap.add_argument("--ppl-speed-rounds", type=int, default=0, metavar="N",
+                    help="ppl stage: after scoring, N more runs per arm in rotated order (long-run decode tok/s)")
+    ap.add_argument("--ppl-speed-tokens", type=int, default=2000, help="ppl stage: tokens per speed-round run")
     ap.add_argument("--arm", action="append", default=[],
                     help='"name:flags", e.g. "fused:--moe-quant-dot 1". First arm is the baseline.')
     ap.add_argument("--build", default="out/build/wp5c_full48", help="build dir for real-artifact stages")
@@ -480,7 +502,8 @@ def run_suite(args, sb) -> int:
         results["cache"] = "cold" if args.cold else "warm"
 
     if "ppl" in stages:
-        results["ppl"] = stage_ppl(build, arms, args.ppl_tokens, args.ppl_fixture)
+        results["ppl"] = stage_ppl(build, arms, args.ppl_tokens, args.ppl_fixture, args.ppl_speed_rounds,
+                                   args.ppl_speed_tokens, args.cooldown)
 
     if "vtune" in stages:
         # Profiles the LAST arm -- normally the one under investigation, since profiling the baseline
@@ -507,9 +530,12 @@ def run_suite(args, sb) -> int:
             lines.append(f"| {name} | {st['median']:.3f} | {st['spread_pct']:.1f}% | {runs} |")
     if results.get("ppl"):
         lines += ["", f"## Perplexity ({results['ppl']['fixture']}, decode path)", "",
-                  "| Arm | Perplexity | Mean NLL | Top-1 | Decode tok/s |", "|---|---:|---:|---:|---:|"]
+                  "| Arm | Perplexity | Mean NLL | Top-1 | Decode tok/s (scoring run) | Speed rounds, tok/s |",
+                  "|---|---:|---:|---:|---:|---|"]
         for name, a in results["ppl"]["arms"].items():
-            lines.append(f"| {name} | {a['ppl']:.4f} | {a['mean_nll']:.4f} | {a['top1']:.4f} | {a['decode_tok_s']:.2f} |")
+            speed = ", ".join(f"{x:.2f}" for x in a.get("speed_tok_s", [])) or "-"
+            lines.append(f"| {name} | {a['ppl']:.4f} | {a['mean_nll']:.4f} | {a['top1']:.4f} | "
+                         f"{a['decode_tok_s']:.2f} | {speed} |")
     lines += ["", "History: `perf_history.jsonl`. Policy: `docs/OPTIMIZATION_PROCESS.md`.", ""]
     REPORT.write_text("\n".join(lines), encoding="utf-8")
 

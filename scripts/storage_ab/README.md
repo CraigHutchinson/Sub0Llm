@@ -13,6 +13,9 @@ Measure in this order; each step is cheaper than the next and has caught a mista
 | 3. The engine | `deep_regime.py` | the model, sidecar, tokenizer, a configured `out/build/s1b` | ~35 min |
 
 `cold_fraction.py` answers a separate question: how much of the cache's fill traffic really comes from disk.
+`trace_predictability.py` needs only a recorded trace: it reports the working set, the hit rate each budget
+buys, and whether recent tokens would have predicted the misses
+([`O13_storage_convergence.md`](../../docs/optimization/opportunities/O13_storage_convergence.md)).
 
 ## Setup
 
