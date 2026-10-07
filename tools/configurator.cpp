@@ -668,6 +668,9 @@ int main(int argc, char** argv) {
     // shared expert's down projection) use the vector-accumulator Q8_0 kernel. NOT bit-exact (float sum
     // reassociated), so it is gated on G-PPL (PASS on ppl_blend_v2). Auto: see resolve_decode_defaults.
     int backbone_q8_fast = -1;     // -1 = auto
+    // O14 (docs/optimization/opportunities/O14_mapped_param_arena.md): the parameter arena is a read-only
+    // file mapping of the model blob instead of a heap copy. -1 = auto, see resolve_decode_defaults.
+    int param_arena_mapped = -1;
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
     // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
@@ -896,6 +899,16 @@ int main(int argc, char** argv) {
                    "(the per-block path, bit-exact). -1 = auto (default): on whenever --backbone-quant-dot "
                    "resolves on.")
        ->capture_default_str()->check(CLI::Range(-1, 1));
+    app.add_option("--param-arena", param_arena_mapped,
+                   "O14 (docs/optimization/opportunities/O14_mapped_param_arena.md): where the parameter arena "
+                   "lives for a forward-only build (Gated Residual / MoE / QSA, CPU compute). heap = load_model "
+                   "reads the whole blob into anonymous memory; mapped = the arena is a read-only view of the "
+                   "model file itself, so cold pages are clean (the OS drops them for free) and load does not "
+                   "read the blob. Same bytes, same arithmetic: no model-shape or checkpoint-identity change. "
+                   "Refused for any build that can train or runs on a device. auto (default) = heap for now.")
+       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"auto", -1}, {"heap", 0}, {"mapped", 1}},
+                                           CLI::ignore_case))
+       ->default_str("auto");
     app.add_option("--backbone-act-super", backbone_act_super,
                    "O9 (docs/BACKBONE_NATIVE_QUANT.md S14): every --backbone-quant-dot role whose real "
                    "sidecar plane is Q4_K/Q5_K/Q6_K and satisfies bbqd::super_fusable (256-element-"
@@ -1116,6 +1129,10 @@ int main(int argc, char** argv) {
         resolve(backbone_quant_dot, quant_inference && tie_embeddings == 0);
         resolve(backbone_act_super, backbone_quant_dot != 0);
         resolve(backbone_q8_fast, backbone_quant_dot != 0);
+        // TODO(param-arena-auto): auto stays heap while O14 is being evaluated. Once the mapped arena has
+        // passed its gates (bit-exact G-PPL, load time, regime-2 throughput), flip this to
+        // `quant_inference` -- the build class it was measured on -- per AGENTS.md S4.
+        resolve(param_arena_mapped, false);
         // 8 = this host's P-core count, the measured best for both teams (O8 S8: 8 beat 12 and 16 once
         // E-cores join), capped at the machine's hardware threads on a smaller host.
         // TODO(decode-threads-topology): derive from the P-core count once Sub0Llm has a topology probe.
@@ -1136,6 +1153,24 @@ int main(int argc, char** argv) {
     if (backbone_quant_dot && tie_embeddings) {
         std::println(stderr, "configure error: --backbone-quant-dot currently requires --tie-embeddings 0");
         return 1;
+    }
+    // O14: a read-only mapped arena faults on the first write, so it is only legal where nothing writes
+    // the arena after load: the three CPU-forward-only mechanisms (backend.cpp's FORWARD_ONLY) on the
+    // host compute backend. Mirrors that constant's own definition; refusing here names the flag.
+    if (param_arena_mapped) {
+        const bool forward_only = hc_count >= 2 || num_experts >= 2 ||
+                                  (qsa_idx_n_heads >= 1 && qsa_idx_budget >= 1);
+        if (!forward_only) {
+            std::println(stderr, "configure error: --param-arena mapped requires a forward-only build "
+                                 "(--hc-count >= 2, --num-experts >= 2 or QSA on): a build that can train "
+                                 "writes the parameter arena, and a mapped arena is read-only");
+            return 1;
+        }
+        if (compute != 0) {
+            std::println(stderr, "configure error: --param-arena mapped requires --compute 0: a device backend "
+                                 "keeps its own parameter copy and syncs the host arena through writes");
+            return 1;
+        }
     }
     // O9: the per-256 ActSuper kernel has nothing to feed without a real backbone sidecar loaded --
     // mirrors --moe-row-split's own "requires --moe-quant-dot 1" refusal exactly.
@@ -2010,6 +2045,13 @@ int main(int argc, char** argv) {
     // identity changes, so it does NOT join ARCH_FINGERPRINT/PARAM_FLOATS (AGENTS.md S10) -- the same
     // sidecar and model load and compute correctly (to within float reassociation) under either setting.
     cos << "constexpr bool BACKBONE_Q8_FAST = " << (backbone_q8_fast ? "true" : "false") << ";\n";
+    // O14 (docs/optimization/opportunities/O14_mapped_param_arena.md): the parameter arena is a read-only
+    // mapping of the model file. Storage placement only, same classification as BACKBONE_Q8_FAST's
+    // neighbours: PARAM_FLOATS, the Header and every computed value are unchanged, so it joins neither
+    // ARCH_FINGERPRINT nor ARCH_FINGERPRINT2 (AGENTS.md S10.3) -- a model written by either arena
+    // loads under either.
+    cos << "constexpr bool PARAM_ARENA_MAPPED = " << (param_arena_mapped ? "true" : "false") << ";
+";
     // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
     cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
     cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";

@@ -36,6 +36,7 @@
 #include "sub0/layout.hpp"
 #include "sub0/muon.hpp"
 #include "sub0/scratch_slots.hpp"   // content-derived scratch-slot embeddings (range + ScratchBindings + encoders)
+#include "sub0/file_map.hpp"      // O14: the parameter arena as a read-only file view
 #include "internal.hpp"          // backend-private shared detail: arenas, Worker/W, Layer, Model
 
 #include <algorithm>
@@ -103,7 +104,7 @@ namespace sub0 {
 // them once (zeroed) before any parameter node references them; unique_ptr<float[]> keeps [] and .get().
 // See internal.hpp's FORWARD_ONLY for why a build that cannot train allocates only the first of them.
 //
-// B24 (docs/BACKBONE_PRECISION.md S1): only the WEIGHTS took a dtype. `g_param_data`'s element type is
+// B24 (docs/BACKBONE_PRECISION.md S1): only the WEIGHTS took a dtype. `g_param.base`'s element type is
 // `param_t` -- `float` by default, `bf16` when the configurator baked `--prec-param 1`, halving 18.31
 // GiB to 9.16 at the real Qwen4 axes. The three TRAINING arenas below stay f32 unconditionally: they
 // hold gradients and AdamW moments, whose dynamic range is exactly what a reduced master-weight format
@@ -115,14 +116,30 @@ static_assert(PARAM_DTYPE == Dtype::F32 || FORWARD_ONLY,
               "weights is a separate, unvalidated question this phase does not answer. Configure "
               "--prec-param 1/2 only for a "
               "forward-only build (Gated Residual / MoE / QSA on), or keep the F32 default.");
-static std::unique_ptr<param_t[]> g_param_data;
+// O14: the parameter arena has ONE owner type, and every reader reaches the bytes through its `base`.
+// `base` points into `heap` (the default: a zeroed arena the caller reads or fills) or into `map` (a
+// read-only view of the model file, see adopt_param_file_view below), never both. Whoever owns the bytes
+// is private to this file; mk_param, param_store_*, save_model's view and the residency report all
+// read `base`, so there is no second pointer to keep in step.
+struct ParamArena {
+    std::unique_ptr<param_t[]> heap;       // owning; empty while the arena is a file view
+    FileMap                    map;        // owning; empty unless the arena is a read-only file view
+    param_t*                   base = nullptr;   // non-owning; into heap or map. In a mapped arena it
+                                                 // is read-only memory: writers go through
+                                                 // make_param_arena_writable() first.
+    [[nodiscard]] bool mapped() const noexcept { return map.mapped(); }
+};
+static ParamArena g_param;
 static std::unique_ptr<float[]> g_param_grad;
 static std::unique_ptr<float[]> g_param_m;
 static std::unique_ptr<float[]> g_param_vel;
 static std::once_flag           g_shared_params_once;
 static void ensure_shared_params() {
     std::call_once(g_shared_params_once, [] {
-        g_param_data = std::make_unique<param_t[]>(PARAM_FLOATS);   // value-initialized -> zeroed
+        if (!g_param.base) {   // already set when a file view was adopted before the first graph
+            g_param.heap = std::make_unique<param_t[]>(PARAM_FLOATS);   // value-initialized -> zeroed
+            g_param.base = g_param.heap.get();
+        }
         if constexpr (!FORWARD_ONLY) {
             g_param_grad = std::make_unique<float[]>(PARAM_FLOATS);
             g_param_m    = std::make_unique<float[]>(PARAM_FLOATS);
@@ -206,9 +223,9 @@ static Node* mk_param(int r, int c, bool decay) {
     // the arena really is f32. In a bf16 build there is no honest f32 span over two-byte elements, so it
     // stays empty on purpose -- see Node::pdata's comment in core.hpp for why an empty span is the right
     // failure mode here rather than a reinterpreted one.
-    nd.pdata = param_cptr(g_param_data.get() + off);            // shared weights
+    nd.pdata = param_cptr(g_param.base + off);            // shared weights
     if constexpr (PARAM_DTYPE == Dtype::F32)
-        nd.data = std::span<float>(reinterpret_cast<float*>(g_param_data.get()) + off, n);
+        nd.data = std::span<float>(reinterpret_cast<float*>(g_param.base) + off, n);
     else
         nd.data = std::span<float>{};
     // FORWARD_ONLY: no per-thread gradient accumulator exists, so a parameter leaf carries an EMPTY
@@ -235,7 +252,18 @@ static Node* mk_param(int r, int c, bool decay) {
 static bf16*  param_write_ptr_of(Bf16CPtr p)      { return const_cast<bf16*>(p.p); }
 static fp8*   param_write_ptr_of(Fp8CPtr p)       { return const_cast<fp8*>(p.p); }
 static float* param_write_ptr_of(const float* p)  { return const_cast<float*>(p); }
-static param_t* param_write_ptr(Node* t) { return param_write_ptr_of(t->pdata); }
+// Lowest-seam backstop for O14: init_weights is the one node-level writer. build_model() converts a mapped
+// arena to a heap one BEFORE calling it, so this only fires if a future caller skips that.
+[[noreturn]] static void refuse_write_to_mapped_arena() {
+    std::println(stderr, "fatal: a write was requested into the parameter arena while it is a read-only "
+                         "view of the model file (--param-arena mapped). Writers must call "
+                         "make_param_arena_writable() first.");
+    std::abort();
+}
+static param_t* param_write_ptr(Node* t) {
+    if (g_param.mapped()) refuse_write_to_mapped_arena();
+    return param_write_ptr_of(t->pdata);
+}
 static std::size_t param_count(const Node* t) {
     return static_cast<std::size_t>(t->rows) * static_cast<std::size_t>(t->cols);
 }
@@ -1883,6 +1911,46 @@ void ensure_thread_built() {
     g_model.build_layout();
 }
 
+// --- O14: the parameter arena as a file view ---------------------------------------------------------
+//
+// mk_param captures `g_param.base + off` into this thread's parameter Nodes (and Model::build_layout's
+// ngram_wblock views) when the graph is built, so changing `base` after that leaves them dangling. The
+// graph layout is a pure function of `base` -- build_layout() is idempotent and rewrites every Node in
+// place at the same address -- so moving the arena means pointing `base` at the new bytes and running it
+// again. That only reaches the CALLING thread's Worker (W and g_model are thread_local), so a move is
+// refused while any other thread has built a graph rather than leaving its Nodes pointing at freed or
+// unmapped memory.
+static bool other_thread_has_graph() noexcept {
+    for (const auto& w : g_workers)
+        if (w && w.get() != W) return true;
+    return false;
+}
+
+// Re-derive this thread's captured parameter pointers from the current `g_param.base`.
+static void rebind_param_nodes() {
+    if (W) g_model.build_layout();
+}
+
+// Turns a mapped arena into a writable heap one, copying the bytes. Every writer the arena has (the
+// writable accessors below, build_model's random init) comes through here, so a read-only view can never be
+// written to. A no-op for a heap arena, which is every build that does not opt in.
+static void make_param_arena_writable() {
+    if (!g_param.mapped()) return;
+    if (other_thread_has_graph()) {
+        std::println(stderr, "fatal: the parameter arena is a read-only file view (--param-arena mapped) and "
+                             "a write was requested after another thread built its graph; that thread's "
+                             "pointers cannot be re-derived from here. Write the arena before any worker "
+                             "thread runs, or use --param-arena heap.");
+        std::abort();
+    }
+    auto heap = std::make_unique<param_t[]>(PARAM_FLOATS);
+    std::memcpy(heap.get(), g_param.base, PARAM_FLOATS * sizeof(param_t));
+    g_param.base = heap.get();
+    g_param.heap = std::move(heap);
+    rebind_param_nodes();
+    g_param.map.close();      // after the rebind: nothing points into the view any more
+}
+
 // ============================================================================
 //  Backend-private API implementation
 // ============================================================================
@@ -1891,6 +1959,7 @@ namespace cpu_detail {
 
 void build_model() {
     ensure_thread_built();      // this (main) thread's node layout
+    make_param_arena_writable();   // init_weights writes: a mapped arena becomes a heap one first
     // Unconditional, not "once": every real caller (each production stage -- train/gen/report/...)
     // invokes this exactly once per process, immediately followed by load_model()/load_checkpoint()
     // whenever a prior model exists, so re-running the deterministic init here is a no-op in
@@ -2032,11 +2101,11 @@ void print_decode_io_stats() {
                  w.count ? static_cast<double>(w.nanoseconds) / 1e3 / static_cast<double>(w.count) : 0.0);
     // Where the rest of decode's hot memory stands. Not pinned yet, so a low share here means the OS
     // trimmed it (parameters to the pagefile, the mapped backbone back to its file) during the run.
-    const auto params = residency::query(g_param_data.get(), PARAM_FLOATS * sizeof(param_t), false);
+    const auto params = residency::query(g_param.base, PARAM_FLOATS * sizeof(param_t), false);
     const auto backbone = g_backbone_quant.mapping();
     const auto native = residency::query(backbone.data(), backbone.size(), false);
-    std::println("end-of-run residency: parameters {:.1f}% of {:.2f} GiB, native backbone mapping {:.1f}% of {:.2f} GiB",
-                 100.0 * params.resident_fraction(), static_cast<double>(PARAM_FLOATS * sizeof(param_t)) / (1u << 30),
+    std::println("end-of-run residency: parameters ({}) {:.1f}% of {:.2f} GiB, native backbone mapping {:.1f}% of {:.2f} GiB",
+                 g_param.mapped() ? "mapped" : "heap", 100.0 * params.resident_fraction(), static_cast<double>(PARAM_FLOATS * sizeof(param_t)) / (1u << 30),
                  100.0 * native.resident_fraction(), static_cast<double>(backbone.size()) / (1u << 30));
 #endif
 }
@@ -2260,17 +2329,58 @@ bool load_backbone_quant_sidecar(const char* model_path) {
 float*      params_ptr()       {
     ensure_shared_params();
     if constexpr (PARAM_DTYPE != Dtype::F32) refuse_f32_params();
-    else return reinterpret_cast<float*>(g_param_data.get());
+    else { make_param_arena_writable(); return reinterpret_cast<float*>(g_param.base); }
 }
-void*       param_store_ptr()  { ensure_shared_params(); return g_param_data.get(); }
+void*       param_store_ptr()  { ensure_shared_params(); make_param_arena_writable(); return g_param.base; }
+const void* param_store_view() { ensure_shared_params(); return g_param.base; }
 std::size_t param_store_bytes(){ return PARAM_FLOATS * sizeof(param_t); }
+
+bool param_arena_mapped() { return g_param.mapped(); }
+
+bool adopt_param_file_view(const char* path, std::uint64_t data_offset) {
+    if constexpr (!FORWARD_ONLY) {
+        // AdamW and the optimizers write the arena in place; a read-only view would fault on the first step.
+        std::println(stderr, "note: the parameter arena stays on the heap: this build can train, and a "
+                             "mapped arena is read-only (--param-arena mapped needs a forward-only build)");
+        (void)path; (void)data_offset;
+        return false;
+    } else {
+        constexpr std::uint64_t bytes = PARAM_FLOATS * sizeof(param_t);
+        if (data_offset % alignof(param_t) != 0) {
+            std::println(stderr, "note: the parameter arena stays on the heap: offset {} is not aligned for "
+                                 "its element type", data_offset);
+            return false;
+        }
+        if (other_thread_has_graph()) {
+            std::println(stderr, "note: the parameter arena stays on the heap: another thread already built "
+                                 "its graph, so its parameter pointers cannot be re-derived");
+            return false;
+        }
+        FileMap fm;
+        std::string err;
+        if (!fm.open(path, err) || fm.size() < data_offset + bytes) {
+            std::println(stderr, "note: the parameter arena stays on the heap: cannot map {} ({})", path,
+                         err.empty() ? "file shorter than its header says" : err);
+            return false;
+        }
+        // A read-only file view has no heap behind it. `base` is non-const only because the heap case
+        // shares the field; make_param_arena_writable() is the only way a write reaches it.
+        auto* const view = reinterpret_cast<param_t*>(const_cast<std::uint8_t*>(fm.data()) + data_offset);
+        FileMap previous = std::move(g_param.map);   // a second load replaces the first view
+        g_param.map  = std::move(fm);
+        g_param.base = view;
+        rebind_param_nodes();
+        g_param.heap.reset();                        // nothing points into it any more
+        return true;
+    }
+}
 // The optimizer's in-place f32 master-weight view. Unreachable in a bf16 build: the arena's own
 // static_assert makes bf16 imply FORWARD_ONLY, and every caller below sits behind AdamW::step's
 // [[noreturn]] FORWARD_ONLY refusal. Kept as a named function so that reasoning lives in one place
-// rather than at each `g_param_data[i]` the optimizer touches.
+// rather than at each `g_param.base[i]` the optimizer touches.
 static float* param_master_f32() {
     if constexpr (PARAM_DTYPE != Dtype::F32) refuse_f32_params();
-    else return reinterpret_cast<float*>(g_param_data.get());
+    else return reinterpret_cast<float*>(g_param.base);
 }
 // reduced grad the optimizer reads / the two AdamW moments -- all three absent under FORWARD_ONLY.
 float*      grad_ptr()         { ensure_shared_params(); if constexpr (FORWARD_ONLY) refuse_training_arena("the parameter-gradient arena"); else return g_param_grad.get(); }

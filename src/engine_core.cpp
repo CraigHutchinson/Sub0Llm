@@ -94,7 +94,7 @@ bool save_model(const char* path) {
     // see its own comment in core.hpp).
     h.param_dtype = static_cast<std::int32_t>(PARAM_FILE_DTYPE);
     os.write((const char*)&h, sizeof(h));
-    os.write((const char*)param_store_ptr(), (std::streamsize)param_store_bytes());
+    os.write((const char*)param_store_view(), (std::streamsize)param_store_bytes());   // read-only: never un-maps an O14 view
     // Trailing 8-byte tokenizer fingerprint: stamps WHICH vocab these weights were trained against so a
     // mismatched decoder is caught on load (0 when no tokenizer is loaded). Appended after the params so
     // a legacy reader that stops at PARAM_FLOATS is unaffected -- and a legacy file (no trailer) simply
@@ -195,8 +195,21 @@ bool load_model(const char* path) {
             param_dtype_name(static_cast<std::int32_t>(PARAM_FILE_DTYPE)));
         return false;
     }
-    is.read((char*)param_store_ptr(), (std::streamsize)param_store_bytes());
-    if (!is) return false;
+    // O14 (docs/optimization/opportunities/O14_mapped_param_arena.md): with PARAM_ARENA_MAPPED the arena becomes
+    // a read-only view of this very file's blob instead of a copy of it. Everything above has already
+    // validated the header, the dtype and the file size, so the view is exactly the bytes the read would
+    // have produced. A refusal (a build that can train, another thread's graph) falls back to the read, so
+    // the flag changes where the bytes live, never whether the load works.
+    bool adopted = false;
+    if constexpr (PARAM_ARENA_MAPPED) {
+        static_assert(sizeof(Header) % alignof(param_t) == 0, "the blob must start element-aligned in the file");
+        adopted = adopt_param_file_view(path, sizeof(Header));
+        if (adopted) is.seekg(static_cast<std::streamoff>(sizeof(Header) + param_store_bytes()));
+    }
+    if (!adopted) {
+        is.read((char*)param_store_ptr(), (std::streamsize)param_store_bytes());
+        if (!is) return false;
+    }
     sync_params_to_device();                     // push the loaded weights to the live (device) copy
     // Trailing tokenizer fingerprint (see save_model) -- REQUIRED. The "absent means unknown, no
     // guard" path is gone with the rest of the legacy-format support: every model this build can load

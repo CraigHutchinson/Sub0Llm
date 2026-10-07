@@ -22,6 +22,11 @@ std::size_t trainable_floats() { return cpu_detail::trainable_floats(); }
 float* params_ptr() { return cpu_detail::params_ptr(); }
 void* param_store_ptr() { return cpu_detail::param_store_ptr(); }
 std::size_t param_store_bytes() { return cpu_detail::param_store_bytes(); }
+const void* param_store_view() { return cpu_detail::param_store_view(); }
+bool adopt_param_file_view(const char* path, std::uint64_t data_offset) {
+    return cpu_detail::adopt_param_file_view(path, data_offset);
+}
+bool param_arena_mapped() { return cpu_detail::param_arena_mapped(); }
 float* grad_ptr() { return cpu_detail::grad_ptr(); }
 float* adam_m_ptr() { return cpu_detail::adam_m_ptr(); }
 float* adam_v_ptr() { return cpu_detail::adam_v_ptr(); }
