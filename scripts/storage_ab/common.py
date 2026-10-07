@@ -29,3 +29,31 @@ def start_ballast(ballast_exe: str, gib: int) -> subprocess.Popen:
     process = subprocess.Popen([ballast_exe, str(gib)], stdout=subprocess.PIPE, text=True)
     print(process.stdout.readline().strip(), flush=True)
     return process
+
+
+# The engine's measured working set (~19.5 GiB) rounded up, and headroom left for the OS.
+ENGINE_GIB, SLACK_GIB = 20, 2
+BALLAST_EXE = REPO / "out" / "tools" / "ballast.exe"
+
+
+def ensure_ballast() -> pathlib.Path:
+    """Builds ballast.exe once into out/tools/ and returns its path."""
+    if not BALLAST_EXE.exists():
+        BALLAST_EXE.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["clang++", "-O2", str(pathlib.Path(__file__).with_name("ballast.cpp")), "-o", str(BALLAST_EXE)],
+                       check=True)
+    return BALLAST_EXE
+
+
+def start_memory_pressure(room_gib: float, files: list[str], ballast_exe: str | None = None) -> subprocess.Popen:
+    """Evicts `files`, then locks enough RAM that only `room_gib` is left for caching them beyond the engine.
+
+    The eviction comes first so the files' own standby pages do not count as memory in use. Kill the
+    returned process to release the memory.
+    """
+    import page_cache
+    page_cache.evict_verified(files)
+    available = available_gib()
+    gib = max(1, int(available - ENGINE_GIB - room_gib - SLACK_GIB))
+    print(f"available {available:.1f} GiB -> ballast {gib} GiB, leaving ~{room_gib:g} GiB for expert caching", flush=True)
+    return start_ballast(ballast_exe or str(ensure_ballast()), gib)

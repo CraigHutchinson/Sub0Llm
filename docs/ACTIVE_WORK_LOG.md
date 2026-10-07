@@ -1062,3 +1062,5 @@ Uncached is now the default within `--moe-io-mode cache`. Record: STORAGE_STACK_
 **2026-10-07 Claude Code — O12/O9 quality + long-run speed A/B on ppl_blend_v2, active (CPU, ~2 h).** Three arms (defaults / `--backbone-q8-fast 1` / `--backbone-act-super 0`), `out/build/wp5c_full48`; no engine edits. Do not start timing runs or heavy builds until this is marked done.
 
 **2026-10-07 Claude Code — O12/O9 A/B done; CPU released.** Both pass G-PPL on ppl_blend_v2; O12 (`--backbone-q8-fast`) is now an auto default. Records: `docs/optimization/opportunities/O9_act_super.md`, `O12_q8_fast.md`. Fixed a latent slot-aliasing bug in `tests/moe_quant_tests.cpp` (B38 case) that `cbb89dd` exposed: frontend suite is 231,180 / 304.
+
+**2026-10-07 Claude Code — regime-2 A/B of the optimized decode (reactive vs owned cache 17 GiB, ballast room 10), queued behind the contention gate (CPU + ~7 GiB locked ballast, ~30 min once it starts).** `run_perf_suite.py --stage ppl --ballast-room 10`, `out/build/wp5c_full48`. Waiting for another session's Sub0Pub compile benchmark to finish first.

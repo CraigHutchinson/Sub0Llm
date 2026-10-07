@@ -21,8 +21,6 @@ import make_ppl_fixture
 import page_cache
 import run_perf_suite as r
 
-ENGINE_GIB, SLACK_GIB = 20, 2  # measured engine working set (~19.5 GiB) rounded up; headroom for the OS
-
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("ballast_exe")
 parser.add_argument("--room-gib", type=int, default=10, help="memory left for expert caching beyond the engine")
@@ -49,11 +47,7 @@ staged = r.stage_arm_binaries(build, arms, ("sub0llm-qwen4-gen",))
 fixture = make_ppl_fixture.ensure(make_ppl_fixture.default_path("ppl_blend_v2"), "ppl_blend_v2")
 tokenizer = r.qwen_tokenizer_dir()
 files = [r.ARTIFACT, r.ARTIFACT + ".moeq"]
-page_cache.evict_verified(files)  # so "available" is not inflated by sidecar standby pages
-available = common.available_gib()
-ballast_gib = max(1, int(available - ENGINE_GIB - args.room_gib - SLACK_GIB))
-print(f"available {available:.1f} GiB -> ballast {ballast_gib} GiB, leaving ~{args.room_gib} GiB for expert caching", flush=True)
-ballast = common.start_ballast(args.ballast_exe, ballast_gib)
+ballast = common.start_memory_pressure(args.room_gib, files, args.ballast_exe)
 try:
     for i in range(args.rounds):
         for name, _ in arms[i % len(arms):] + arms[:i % len(arms)]:

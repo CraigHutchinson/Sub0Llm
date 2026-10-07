@@ -250,7 +250,7 @@ PPL_GATE_NATS = 0.03   # per token; ~3% perplexity. See the G-PPL entry in kpi_g
 
 def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens: int,
               version: str, speed_rounds: int = 0, speed_tokens: int = 2000,
-              cooldown_s: float = 20.0) -> dict:
+              cooldown_s: float = 20.0, ballast_room_gib: float | None = None) -> dict:
     """Score the pinned fixture through forward_one per arm, then compare each arm with the first.
 
     Perplexity is deterministic for a given build and text, so one scoring run per arm suffices;
@@ -261,25 +261,66 @@ def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens
     Every arm is built once up front (stage_arm_binaries), so no run follows a compile. `speed_rounds`
     then adds that many shorter runs per arm in ROTATED order with a cooldown before each: the long-run
     decode tok/s of an A/B. The scoring run's own tok/s is reported but is one sample in a fixed order.
+
+    `ballast_room_gib` measures under memory pressure (regime 2, docs/STORAGE_STACK_PLAN.md): a locked RAM
+    ballast leaves only that much room for expert bytes beyond the engine, and the model files are evicted
+    before EVERY run, so each starts cold and no arm inherits another's OS cache. Windows only.
     """
     import make_ppl_fixture
     fixture = make_ppl_fixture.ensure(make_ppl_fixture.default_path(version), version)
     tok = qwen_tokenizer_dir()
     staged = stage_arm_binaries(build, arms, targets=("sub0llm-qwen4-gen",))
+    files = [ARTIFACT, ARTIFACT + ".moeq"]
+    ballast = None
+    if ballast_room_gib is not None:
+        sys.path.insert(0, str(ROOT / "scripts" / "storage_ab"))
+        import common as storage_ab
+        import page_cache
+        ballast = storage_ab.start_memory_pressure(ballast_room_gib, files)
 
     def score(name: str, tokens: int, dump: pathlib.Path | None) -> dict:
         time.sleep(cooldown_s)
         while (n := contention_count()) > 0:
             print(f"  paused before {name}: {n} named competing process(es) running", flush=True)
             time.sleep(30)
+        if ballast is not None:
+            page_cache.evict_verified(files)
         cmd = [str(staged[name] / "sub0llm-qwen4-gen.exe"), "--model", ARTIFACT, "--tokenizer-dir", str(tok),
                "--ppl", str(fixture), "--ppl-tokens", str(tokens)]
         out = run(cmd + (["--ppl-dump", str(dump)] if dump else []), timeout=4 * 3600)
         m = re.search(r"PPL-RESULT (.*)", out)
         if not m:
             raise RuntimeError(f"arm {name}: no PPL-RESULT line")
-        return {k: float(v) for k, v in (kv.split("=") for kv in m.group(1).split())}
+        result = {k: float(v) for k, v in (kv.split("=") for kv in m.group(1).split())}
+        # What the engine reports about its own memory, when it does (cache mode; any --ppl run for the rest).
+        for key, pattern in (("cache_hit_pct", r"resident-hit rate ([\d.]+)%"),
+                             ("wait_ms_total", r"expert cache waits: \d+ blocking acquires, ([\d.]+) ms total"),
+                             ("wait_us_each", r"ms total, ([\d.]+) us each"),
+                             ("peak_working_set_gib", r"\[mem\] final\s+peak working set ([\d.]+) GiB"),
+                             ("params_resident_pct", r"end-of-run residency: parameters ([\d.]+)%"),
+                             ("backbone_resident_pct", r"native backbone mapping ([\d.]+)%")):
+            if (found := re.search(pattern, out)):
+                result[key] = float(found.group(1))
+        return result
 
+    def memory_note(a: dict) -> str:
+        parts = [f"{label} {a[key]:{fmt}}{unit}" for key, label, fmt, unit in (
+            ("cache_hit_pct", "cache hit", ".1f", "%"), ("wait_ms_total", "waits", ".0f", " ms"),
+            ("peak_working_set_gib", "peak", ".1f", " GiB"), ("backbone_resident_pct", "backbone resident", ".0f", "%"),
+            ("params_resident_pct", "parameters resident", ".0f", "%")) if key in a]
+        return ("; " + ", ".join(parts)) if parts else ""
+
+    try:
+        return _score_arms(build, arms, max_tokens, version, speed_rounds, speed_tokens, score, memory_note,
+                           ballast_room_gib)
+    finally:
+        if ballast is not None:
+            ballast.kill()
+
+
+def _score_arms(build, arms, max_tokens, version, speed_rounds, speed_tokens, score, memory_note,
+                ballast_room_gib) -> dict:
+    """stage_ppl's scoring pass, speed rounds and paired comparison, split out so the ballast is always released."""
     per_arm: dict = {}
     nll: dict[str, list[float]] = {}
     argmax: dict[str, list[str]] = {}
@@ -290,13 +331,15 @@ def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens
         nll[name] = [float(r[2]) for r in rows]
         argmax[name] = [r[3] for r in rows]
         print(f"  {name}: ppl {per_arm[name]['ppl']:.4f} over {int(per_arm[name]['tokens'])} tokens, "
-              f"{per_arm[name]['decode_tok_s']:.2f} tok/s", flush=True)
+              f"{per_arm[name]['decode_tok_s']:.2f} tok/s{memory_note(per_arm[name])}", flush=True)
     for i in range(speed_rounds):
         shift = (i + 1) % len(arms)
         for name, _ in arms[shift:] + arms[:shift]:
-            v = score(name, speed_tokens, None)["decode_tok_s"]
+            r = score(name, speed_tokens, None)
+            v = r["decode_tok_s"]
             per_arm[name].setdefault("speed_tok_s", []).append(v)
-            print(f"  speed [{i+1}/{speed_rounds}] {name}: {v:.2f} tok/s over {speed_tokens} tokens", flush=True)
+            print(f"  speed [{i+1}/{speed_rounds}] {name}: {v:.2f} tok/s over {speed_tokens} tokens{memory_note(r)}",
+                  flush=True)
     base, *rest = [a for a, _ in arms]
     paired = {}
     for other in rest:
@@ -307,7 +350,7 @@ def stage_ppl(build: pathlib.Path, arms: list[tuple[str, list[str]]], max_tokens
                          "ci95": [mean - 1.96 * se, mean + 1.96 * se],
                          "ppl_ratio": per_arm[other]["ppl"] / per_arm[base]["ppl"],
                          "top1_agreement": sum(x == y for x, y in zip(argmax[base], argmax[other])) / len(d)}
-    return {"fixture": version, "arms": per_arm, "paired": paired}
+    return {"fixture": version, "arms": per_arm, "paired": paired, "ballast_room_gib": ballast_room_gib}
 
 
 def evaluate_gates(results: dict, gates: dict) -> list[dict]:
@@ -431,6 +474,9 @@ def main() -> int:
     ap.add_argument("--ppl-speed-rounds", type=int, default=0, metavar="N",
                     help="ppl stage: after scoring, N more runs per arm in rotated order (long-run decode tok/s)")
     ap.add_argument("--ppl-speed-tokens", type=int, default=2000, help="ppl stage: tokens per speed-round run")
+    ap.add_argument("--ballast-room", type=float, default=None, metavar="GIB",
+                    help="ppl stage: measure under memory pressure. Locks RAM so only GIB is left for expert bytes "
+                         "beyond the engine, and evicts the model files before every run (regime 2; Windows)")
     ap.add_argument("--arm", action="append", default=[],
                     help='"name:flags", e.g. "fused:--moe-quant-dot 1". First arm is the baseline.')
     ap.add_argument("--build", default="out/build/wp5c_full48", help="build dir for real-artifact stages")
@@ -503,7 +549,7 @@ def run_suite(args, sb) -> int:
 
     if "ppl" in stages:
         results["ppl"] = stage_ppl(build, arms, args.ppl_tokens, args.ppl_fixture, args.ppl_speed_rounds,
-                                   args.ppl_speed_tokens, args.cooldown)
+                                   args.ppl_speed_tokens, args.cooldown, args.ballast_room)
 
     if "vtune" in stages:
         # Profiles the LAST arm -- normally the one under investigation, since profiling the baseline
@@ -529,7 +575,9 @@ def run_suite(args, sb) -> int:
             runs = ", ".join(f"{x:.3f}" for x in st["runs"])
             lines.append(f"| {name} | {st['median']:.3f} | {st['spread_pct']:.1f}% | {runs} |")
     if results.get("ppl"):
-        lines += ["", f"## Perplexity ({results['ppl']['fixture']}, decode path)", "",
+        room = results["ppl"].get("ballast_room_gib")
+        pressure = f", under a RAM ballast leaving {room:g} GiB for experts" if room is not None else ""
+        lines += ["", f"## Perplexity ({results['ppl']['fixture']}, decode path{pressure})", "",
                   "| Arm | Perplexity | Mean NLL | Top-1 | Decode tok/s (scoring run) | Speed rounds, tok/s |",
                   "|---|---:|---:|---:|---:|---|"]
         for name, a in results["ppl"]["arms"].items():

@@ -26,9 +26,9 @@ identical perplexity (storage plan, 2026-10-06). Consequences for the decode tra
 
 - **Regime 2 with the owned cache is the reference configuration**, not a special case. An optimization
   is measured there as well as on an idle host.
-- **Every decode optimization to date (O1-O12) was measured on reactive mmap only.** The optimization
-  build dir (`out/build/wp5c_full48`) is not even configured with `SUB0_STORAGE_TIEREDCACHE`; only
-  `out/build/s1b` is.
+- **Every decode optimization to date (O1-O12) was measured on reactive mmap only.** Nothing prevented
+  the other mode: any build dir builds the cache when an arm passes `--moe-io-mode cache`. It was simply
+  never an arm.
 - **Part of the decode track's run-to-run noise is probably reactive mmap itself.** Reactive's speed
   follows how much RAM the OS spares that day (4.93 to 7.14 tok/s across sessions in the storage plan).
   The decode track has recorded an unexplained "slow host state" and day-to-day drift in long runs
@@ -162,7 +162,7 @@ give it more memory, then make its misses rarer.
 
 | # | Step | Cost | Evidence it rests on |
 |---|---|---|---|
-| 1 | Build the optimization dir with the cache; give `run_perf_suite.py` a ballast option, so every A/B runs in both regimes | small | O1-O12 were measured on reactive only |
+| 1 | Give `run_perf_suite.py` a ballast option (`--ballast-room`, done 2026-10-07) and run every A/B with a cache arm under it | small | O1-O12 were measured on reactive only |
 | 2 | C5: the miss-wait phase row, and the phase table in the long-run tool | small | a regime-2 profile cannot separate stall from compute today |
 | 3 | Promote `--moe-io-mode cache` to the auto default: the storage plan's checklist (budget from free memory at load, regime-1 A/B, full suite with the cache on, Linux fallback) | medium | cache 7.85 against reactive 7.14 tok/s in deep regime 2 |
 | 4 | C1: map the bf16 arena for inference builds | medium; shared files | 2% of the arena is read; 9 GiB = -68% misses at 17 GiB |
