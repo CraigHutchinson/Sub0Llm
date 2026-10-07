@@ -41,6 +41,27 @@ identical perplexity (storage plan, 2026-10-06). Consequences for the decode tra
   places: the cold 9 GiB parameter arena is anonymous heap (C1), and the 3.26 GiB `.bbq`, read almost in
   full every token, is a file mapping the OS may trim (C2).
 
+## 1b. First converged measurement (2026-10-07)
+
+The fully optimized decode (every O1-O12 default on) under the storage track's protocol, run from the
+optimization suite: `run_perf_suite.py --stage ppl --ballast-room 10 --ppl-tokens 2000 --ppl-speed-rounds 1`,
+a 7 GiB locked ballast on a host with 39.1 GiB available, files evicted before every run, arms rotated.
+
+| Arm | Perplexity | tok/s (two runs) | Miss waits | Peak working set | End-of-run residency |
+|---|---:|---|---:|---:|---|
+| reactive mmap | 11.9443 | 7.08, 6.76 | n/a | 35.5, 39.0 GiB | not reported in this mode |
+| owned cache, 17 GiB | 11.9443 | 7.74, 7.69 | 9.07 s, 9.24 s | 36.4, 36.7 GiB | backbone 100%, parameters 54%, 52% |
+
+- The cache is **+11%** on the means (7.72 against 6.92 tok/s) with identical output, the same margin the
+  storage track measured before O12 (7.85 against 7.14). The decode optimizations and the cache add up.
+- The cache's two runs differ by 0.6%; reactive's differ by 4.7%. That is the predictability section 1a
+  expected, on two samples per arm.
+- Miss waits are 4.5-4.6 ms of a ~130 ms token. That is the whole prize for C1 and C3 at this budget and
+  this much pressure.
+- **Half the parameter arena was paged out during the run** (52-54% resident at the end). The OS is
+  already paying to write those cold pages to the pagefile, which is what C1 removes. The mapped `.bbq`
+  stayed fully resident here.
+
 ## 2. Evidence: the expert access trace
 
 `out/build/s1b/qwen4-g2000.{trace,extents}` (written by `sub0llm-qwen4-gen --expert-trace`, 2026-10-01):
