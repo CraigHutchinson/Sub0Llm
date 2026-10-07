@@ -399,6 +399,20 @@ SUB0_API float*      params_ptr();
 // read and write, so the file format follows the build's own element type with no second code path.
 SUB0_API void*       param_store_ptr();
 SUB0_API std::size_t param_store_bytes();
+// O14: READ-ONLY access to the same storage, for callers that only read it (save_model). Unlike
+// param_store_ptr() it never converts a mapped arena to a heap one, so reading a 9 GiB mapped arena stays free.
+[[nodiscard]] SUB0_API const void* param_store_view();
+// O14: makes the parameter arena a read-only view of `path`'s bytes from `data_offset` on (the model blob
+// inside a model file), instead of a heap copy the caller reads into. Any parameter pointers this thread's
+// graph already captured are re-derived, so it is valid before or after build_model()/the first forward.
+// Returns false, with the reason on stderr, and leaves the arena as it was when it cannot be done safely:
+// a build that can train (AdamW writes the arena), a graph already built on another thread (its captured
+// pointers cannot be re-derived from here), an unmappable file, or one too short. The caller falls back to
+// reading into param_store_ptr(). Single-threaded setup only, like load_model().
+[[nodiscard]] SUB0_API bool adopt_param_file_view(const char* path, std::uint64_t data_offset);
+// O14: true while the arena is a file mapping. Any later writer (param_store_ptr(), params_ptr(),
+// build_model()) turns it back into a writable heap arena first, copying the bytes.
+[[nodiscard]] SUB0_API bool param_arena_mapped();
 SUB0_API float*      grad_ptr();           // parameter gradients (filled by backward)
 SUB0_API float*      adam_m_ptr();         // Adam first-moment estimates
 SUB0_API float*      adam_v_ptr();         // Adam second-moment estimates
