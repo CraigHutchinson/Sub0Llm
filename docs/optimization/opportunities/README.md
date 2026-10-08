@@ -63,7 +63,7 @@ selection must cite this, not the pre-B35 numbers.
 The real-axes configure recipe alone (`--moe-quant-experts 1` + `--tie-embeddings 0`) builds the best measured
 decode. The configurator's auto defaults (`resolve_decode_defaults`, AGENTS.md §4) resolve to
 `--moe-quant-dot 1 --decode-gemv-threads 8 --moe-decode-threads 8 --decode-omp-spin 1 --backbone-quant-dot 1
---moe-row-split 1 --backbone-act-super 1 --backbone-q8-fast 1`. Every other build class resolves each option to
+--moe-row-split 1 --backbone-act-super 1 --backbone-q8-fast 1 --param-arena mapped`. Every other build class resolves each option to
 its old off/serial value, so the neutral build's generated header is byte-identical. Pass an explicit value to
 override: for example `--backbone-quant-dot 0` for a model without a `.bbq` sidecar, or `--backbone-q8-fast 0`
 to A/B O12. Measured 2026-10-07 on reactive mmap: 7.2-8.3 tok/s over long `--stage ppl` runs, ~8.8 over six
@@ -86,6 +86,7 @@ the next default to change.
 | O11 (in [O10](O10_subphase_roofline.md)) | QSA indexer projection through the shared threaded GEMV | **merged**, always on | Bit-exact; `QSA: indexer` 9.45 -> ~1 ms/token | 1 |
 | [O12](O12_q8_fast.md) | Vector-accumulator Q8_0 kernel for Gated Residual and the shared expert's down projection | **merged**, default ON (auto) for real-axes builds | G-PPL PASS on v2 (dNLL +0.0056, CI -0.0041..+0.0153); GR up and shared-down phases 11-17% faster, long-run decode ~+4% | 3 |
 | [O13](O13_storage_convergence.md) | Where the owned expert cache and the decode optimizations converge | analysis | A 17 GiB cache misses 23.1 experts/token and 26 GiB misses 7.4; recency predicts 0.0% of misses | - |
+| [O14](O14_mapped_param_arena.md) | The bf16 parameter arena as a read-only view of the model file | **merged**, default ON (auto) for quantized-MoE inference builds on CPU | Bit-exact; 6-9 GiB less peak working set under memory pressure; decode speed unchanged | 1 |
 
 **Candidates, not yet briefed — ordered and costed in [`../../SPECULATION_NGRAM_MOE_DESIGN.md`](../../SPECULATION_NGRAM_MOE_DESIGN.md).**
 

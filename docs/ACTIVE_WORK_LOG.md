@@ -1068,3 +1068,7 @@ Uncached is now the default within `--moe-io-mode cache`. Record: STORAGE_STACK_
 **2026-10-07 Claude Code — regime-2 A/B of the optimized decode done; CPU and ballast released.** Cache 17 GiB 7.74/7.69 against reactive 7.08/6.76 tok/s, perplexity identical (11.9443). Record: `docs/optimization/opportunities/O13_storage_convergence.md` section 1b. A Sonnet agent is on O14 (mapped parameter arena) in its own worktree and will add its own row before it measures.
 
 | 2026-10-07 | Sonnet 5.5 subagent (isolated worktree agent-aef830d63b692b3bc) | O14: mapped parameter arena (O13 C1) -- regime-2 run holds a locked RAM ballast (`--ballast-room 10`, ~1 h) | agent worktree | `src/engine_core.cpp`, `src/backends/cpu/backend.cpp`, `api.*`, `core.hpp`, `tools/configurator.cpp`, `tests/param_arena_tests.cpp`, `docs/optimization/opportunities/O14_mapped_param_arena.md` | done | Ballast run finished 2026-10-07; bit-exact (ppl 11.9443), results in O14_mapped_param_arena.md. |
+
+**2026-10-08 Claude Code — O14 regime-2 re-measurement (cache 17 heap arena / 17 mapped / 26 mapped, ballast room 10), active (CPU + locked ballast, ~55 min).** `out/build/wp5c_full48`. Do not start timing runs or heavy builds until this is marked done.
+
+**2026-10-08 Claude Code — O14 regime-2 re-measurement done; CPU and ballast released.** Mapped arena is bit-exact, 6-9 GiB less peak, speed unchanged; now the auto default for inference builds. Next in this tree: renaming library and test targets to the `sub0llm` prefix (touches every CMake file; full rebuilds).

@@ -1,7 +1,8 @@
 # O14 -- the parameter arena as a read-only file view (O13 step C1)
 
-Status: **implemented, default OFF (`--param-arena auto` resolves to heap), 2026-10-07.** The primary agent
-re-measures and decides the auto default.
+Status: **merged; the auto default is `mapped` for quantized-MoE inference builds on CPU compute since
+2026-10-08.** Bit-exact, 6-9 GiB less peak memory under pressure, no measurable speed change.
+`--param-arena heap` restores the heap arena.
 
 ## What it does
 
@@ -65,6 +66,28 @@ the configurator refuses anything else and names the reason. The backend refuses
   The speed rounds ran while sibling builds were active (the suite logged competing processes), one round
   each, so single numbers are not comparable; mapped26's waits fell by 37% as the trace replay predicts, but
   that is ~3 s of a ~260 s run and no tok/s gain is demonstrated here.
+
+## Independent verification (primary agent, 2026-10-08)
+
+`run_perf_suite.py --stage ppl --ballast-room 10 --ppl-tokens 2000 --ppl-speed-rounds 2`, cache mode, an
+8 GiB locked ballast on a host with 40.9 GiB available. Perplexity 11.9443 in all nine runs and paired dNLL
+exactly 0 against the heap arm.
+
+| Arm | tok/s (scoring, then two rotated rounds) | Mean | Miss waits | Peak working set |
+|---|---|---:|---|---:|
+| cache 17 GiB, heap arena | 8.16, 8.20, 8.51 | 8.29 | 8.6-10.2 s | 33.9-36.7 GiB |
+| cache 17 GiB, mapped arena | 8.39, 8.61, 8.50 | 8.50 | 9.3-10.1 s | 27.7 GiB |
+| cache 26 GiB, mapped arena | 8.79, 8.23, 8.47 | 8.50 | 5.1-6.3 s | 36.7 GiB |
+
+- A repository-wide file search ran on the same disk during the three scoring runs (the primary agent's
+  own mistake), so the first number in each row may be disturbed. The rotated rounds are clean.
+- **Memory:** the mapped arena holds 6-9 GiB less at the same budget, every run.
+- **Speed:** +2.5% on the means, inside the spread. Not claimed.
+- **A bigger cache did not buy speed here.** 26 GiB cut miss waits about 40% and ran no faster than
+  17 GiB. At this pressure the waits (4-5 ms of a ~118 ms token) are not what limits decode, so the freed
+  memory is headroom for the rest of the system, or for deeper pressure than this run applied.
+- Neutral build: generated header unchanged by the auto flip; `sub0_tests` 29,510,661 / 147 with the
+  three fingerprints unchanged, run against a fresh `sub0_core.dll` (see `tests/CMakeLists.txt`).
 
 ## Tests
 

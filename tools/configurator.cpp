@@ -905,7 +905,8 @@ int main(int argc, char** argv) {
                    "reads the whole blob into anonymous memory; mapped = the arena is a read-only view of the "
                    "model file itself, so cold pages are clean (the OS drops them for free) and load does not "
                    "read the blob. Same bytes, same arithmetic: no model-shape or checkpoint-identity change. "
-                   "Refused for any build that can train or runs on a device. auto (default) = heap for now.")
+                   "Refused for any build that can train or runs on a device. auto (default) = mapped for a "
+                   "--moe-quant-experts 1 build on CPU compute, heap otherwise.")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"auto", -1}, {"heap", 0}, {"mapped", 1}},
                                            CLI::ignore_case))
        ->default_str("auto");
@@ -1129,10 +1130,8 @@ int main(int argc, char** argv) {
         resolve(backbone_quant_dot, quant_inference && tie_embeddings == 0);
         resolve(backbone_act_super, backbone_quant_dot != 0);
         resolve(backbone_q8_fast, backbone_quant_dot != 0);
-        // TODO(param-arena-auto): auto stays heap while O14 is being evaluated. Once the mapped arena has
-        // passed its gates (bit-exact G-PPL, load time, regime-2 throughput), flip this to
-        // `quant_inference` -- the build class it was measured on -- per AGENTS.md S4.
-        resolve(param_arena_mapped, false);
+        // --param-arena auto is resolved below, next to its refusals: it also depends on the compute
+        // backend, which is not decided until after this block.
         // 8 = this host's P-core count, the measured best for both teams (O8 S8: 8 beat 12 and 16 once
         // E-cores join), capped at the machine's hardware threads on a smaller host.
         // TODO(decode-threads-topology): derive from the P-core count once Sub0Llm has a topology probe.
@@ -1157,6 +1156,9 @@ int main(int argc, char** argv) {
     // O14: a read-only mapped arena faults on the first write, so it is only legal where nothing writes
     // the arena after load: the three CPU-forward-only mechanisms (backend.cpp's FORWARD_ONLY) on the
     // host compute backend. Mirrors that constant's own definition; refusing here names the flag.
+    // Auto: mapped for the build class it was measured on (quantized-MoE inference on the host backend),
+    // where it is bit-exact and holds 6-9 GiB less at the same speed; heap everywhere else.
+    if (param_arena_mapped < 0) param_arena_mapped = (moe_quant_experts != 0 && compute == 0) ? 1 : 0;
     if (param_arena_mapped) {
         const bool forward_only = hc_count >= 2 || num_experts >= 2 ||
                                   (qsa_idx_n_heads >= 1 && qsa_idx_budget >= 1);

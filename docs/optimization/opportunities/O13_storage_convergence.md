@@ -170,6 +170,26 @@ pays nothing unless its predictor is content-based.
 - `resolve_decode_defaults` is where `--moe-io-mode` would be promoted. The budget it needs is the free
   memory at load, a runtime quantity, so it cannot follow the configure-time pattern unchanged.
 
+### C7. Size context memory to the conversation, with a planner (user direction, 2026-10-08)
+
+- **The problem.** Context-length memory (the K/V caches, the QSA indexer's raw keys and block keys,
+  per-position scratch, RoPE tables) is sized by the configured window, `SEQ_LEN`. A build configured for
+  a 32k window holds memory for 32k positions even when a chat needs a few hundred, and every GiB held
+  there is a GiB the expert cache or the OS cannot use for model weights.
+- **The direction.** At the start of a chat, size that memory to what the chat can reach: prompt length
+  + maximum response length + thinking limit. The configured window stays the upper bound.
+- **It needs a planner.** One module that decides, from the configuration and the memory free at load,
+  how much goes to context, how much to the expert cache budget, and how much is left as headroom,
+  or a fixed split taken from config. `include/sub0/memplan.hpp` already accounts for a build's
+  footprint from its `Dims`; this extends it from reporting to deciding. It is the same decision the
+  storage plan's follow-up 1 asks for (the cache budget from free memory at startup), so the two should
+  be one planner, not two.
+- **Tension to resolve in the design.** AGENTS.md S1/S2 make every dimension a compile-time constant and
+  forbid per-token allocation. A per-chat size is a runtime quantity chosen once per conversation: the
+  capacity can stay baked while the committed size is chosen at chat start, outside the token loop.
+- **Unmeasured.** How much context memory a real-axes build holds at a 32k window has not been
+  itemised; the builds measured so far use a 128-token window, where it is negligible.
+
 ### C6. Cores: readers on E-cores
 
 Decode keeps eight P-core workers spinning between regions (`DECODE_OMP_SPIN`). The cache's reader
@@ -186,11 +206,12 @@ give it more memory, then make its misses rarer.
 | 1 | Give `run_perf_suite.py` a ballast option (`--ballast-room`, done 2026-10-07) and run every A/B with a cache arm under it | small | O1-O12 were measured on reactive only |
 | 2 | C5: the miss-wait phase row, and the phase table in the long-run tool | small | a regime-2 profile cannot separate stall from compute today |
 | 3 | Promote `--moe-io-mode cache` to the auto default: the storage plan's checklist (budget from free memory at load, regime-1 A/B, full suite with the cache on, Linux fallback) | medium | cache 7.85 against reactive 7.14 tok/s in deep regime 2 |
-| 4 | C1: map the bf16 arena for inference builds | medium; shared files | 2% of the arena is read; 9 GiB = -68% misses at 17 GiB |
+| 4 | C1: map the bf16 arena for inference builds -- **done 2026-10-08** ([O14](O14_mapped_param_arena.md)): default for inference builds, 6-9 GiB less peak memory, speed unchanged | - | measured |
 | 5 | C2: own and pin the `.bbq`; 4 KiB against 2 MiB pages for it and for the expert pool | small to measure | experts at ~25 GB/s against a 79 GB/s roof; `.bbq` residency under load is unguarded |
 | 6 | C3: log the early router in the trace; offline recall on misses | small | recency recall on misses is 0.0% |
 | 7 | C4 / S1c: n-gram rows, issued at token start | large | the storage track's next slice |
 | 8 | C6: reader affinity | small | none yet |
+| 9 | C7: a memory planner; context memory sized per chat | medium; design first | user direction; unmeasured at a 32k window |
 
 ## 5. What does not converge
 
