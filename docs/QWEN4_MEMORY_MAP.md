@@ -231,7 +231,7 @@ stacks) ~53 MiB"). **NEW, this pass — broken out individually** rather than le
 | — `tok_blob_`/`dec_blob_` (byte-alphabet + decoded-byte text, one blob + offsets rather than ~248K separate `std::string`s) | ~2–4 MiB | | |
 | — `id_of_` (`unordered_map<string_view, int>`, 248,077 entries) | ~13–14 MiB | | node-based hash map overhead dominates over the (view-only, non-owning) key/value payload itself |
 | — `merges_` (`unordered_map<uint64_t, Merge>`, one entry per BPE merge rule, comparable in count to the vocabulary) | ~10–14 MiB | | |
-| `sub0llm-qwen4-gen.exe` + `sub0_core.dll` + system DLLs | 0.014 GiB | mapped image (`MEM_IMAGE`) | process/DLL load, before `main()` |
+| `sub0llm-qwen4-gen.exe` + `sub0llm_core.dll` + system DLLs | 0.014 GiB | mapped image (`MEM_IMAGE`) | process/DLL load, before `main()` |
 | OS thread stacks (main + up to 10 decode threads, default ~1 MiB each on Windows unless configured) | ~11 MiB | private heap (kernel-managed) | one per thread, as each is created — main at process start, decode threads on first entry into `ParallelExperts` |
 | Page-table overhead for the sidecar mapping, once substantially faulted in | on the order of tens of MiB (4-level x86-64 page tables, ~1/512 of resident bytes at the lowest level alone) | kernel memory, not this process's own working set | grows as more of the mapping is faulted in; never directly visible to this process, not part of any `[mem]` line this session has measured |
 | `TokMap` (`include/sub0/tokmap.hpp`) | N/A — **out of scope for the gen tool entirely** | | a second, hand-rolled mapping utility that exists for the TRAINING corpus path (`corpus.tok`); the gen tool never opens one. Named here only so a reader searching for "another mapping in this codebase" finds the answer rather than the silence. |
@@ -247,7 +247,7 @@ remaining unexplained bucket in the whole inventory.
 1. **Compile time** (`sub0llm-configure`, once, before any binary runs): every axis in the "axes" line
    above is baked as a `constexpr`/`consteval` — `PARAM_FLOATS`, `ACT_CAP`, `MAX_NODES`, `MOE_EXPERT_SLOT_FLOATS`,
    etc. Nothing here costs runtime memory; it determines the SIZES everything below will be.
-2. **Process start, before `main()`**: the exe + `sub0_core.dll` + system DLLs map in (~14 MiB, `MEM_IMAGE`).
+2. **Process start, before `main()`**: the exe + `sub0llm_core.dll` + system DLLs map in (~14 MiB, `MEM_IMAGE`).
 3. **Tokenizer load** (~25–35 MiB, private heap): `vocab.json`/`merges.txt`/`tokenizer_config.json` parsed
    into `tok_blob_`/`id_of_`/`merges_`.
 4. **`load_model`**: `ensure_shared_params()` allocates and zeroes `g_param_data` (18.31 GiB, private,

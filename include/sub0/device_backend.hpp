@@ -66,7 +66,7 @@ constexpr int SUB0_DEV_BIND_ENC_HRR      = 4;   // == (int)sub0::SlotEncoding::H
 #if defined(SUB0_BUILD_MOCK_DEVICE)
 
 // --- TEST-ONLY backend: an in-process device that is really the CPU engine -------------------------
-// Defined ONLY by the sub0_eval_seam_tests target (tests/CMakeLists.txt) and deliberately checked
+// Defined ONLY by the sub0llm_eval_seam_tests target (tests/CMakeLists.txt) and deliberately checked
 // BEFORE SUB0_BUILD_CUDA, so a CUDA-enabled tree still builds this target against the mock. It exists
 // because the interesting failures in a device consumer are not in the kernels: they are in the
 // PLUMBING around the seam -- how windows are batched, how ids and targets are paired (an off-by-one

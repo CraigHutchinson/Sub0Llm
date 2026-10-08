@@ -1578,7 +1578,7 @@ TEST_CASE("factspike Phase F: Pack-Aware Training re-tested WITHOUT the dilution
 
 // Fast, model-free algebraic sanity check for the KV-trace primitives' rotation math (core.hpp's
 // kv_rope_rotate) -- pure math on a caller-owned buffer, no tokenizer/model/config dependency, so this
-// runs in the normal always-on suite regardless of which config sub0_tests happens to be built against.
+// runs in the normal always-on suite regardless of which config sub0llm_tests happens to be built against.
 // Confirms de-rotate/re-rotate is wired correctly (R(-pos)*R(pos) = I) BEFORE any training-run time is
 // spent trusting Phase G's results below -- see docs/SCRATCH_TOKEN_FRAMING.md candidate 1.
 TEST_CASE("factspike kv_rope_rotate round-trips: rotate then inverse-rotate is the identity",

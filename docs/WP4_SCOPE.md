@@ -394,7 +394,7 @@ every field; then **C (`--rotary-dim`)** — small, and its `ARCH_FINGERPRINT2` 
 worked out; then **D (`Ln1`/`Ln2` removal under GR)** — self-contained to the GR branch; then **A
 (`--head-dim`)** last, because it has the widest blast radius and benefits from the others being settled.
 
-**Gate**: (i) at every neutral setting, the default `sub0_tests` suite is assertion- **and hash**-identical
+**Gate**: (i) at every neutral setting, the default `sub0llm_tests` suite is assertion- **and hash**-identical
 at all three of this thread's standard shapes (d96 L8 H2, d132 L11 H4 kv2, d196 L11 H7); (ii) all four
 existing real-weight fixture tests still pass unchanged; (iii) **a new two-scale test asserting
 `make_param_layout()` at Qwen4's real axes produces exactly the real model's per-tensor shapes** — i.e.
@@ -441,8 +441,8 @@ that test derives the total independently, tensor by tensor, to prove the match 
    all-zero decode trace). Exactly `AGENTS.md` §10's class: a derived width re-spelled locally instead
    of read from its one source of truth. The neutral suite could never have found it.
 
-**Gate results** — neutral (all new axes at their derived defaults) `sub0_tests` is hash-identical at all
-three standard shapes; `sub0_frontend_tests` (which carries all four real-weight fixture tests) is
+**Gate results** — neutral (all new axes at their derived defaults) `sub0llm_tests` is hash-identical at all
+three standard shapes; `sub0llm_frontend_tests` (which carries all four real-weight fixture tests) is
 byte-identical at 115,424 / 197; a genuinely non-square build (`--head-dim 64` at d96 H2, i.e. `D_Q` 128
 vs `D_MODEL` 96) passes the **entire** suite including the finite-difference gradient check; a GR-ON
 build passes `[layout]` and runs real forward passes through `Model::forward`; a neutral CUDA build
@@ -791,13 +791,13 @@ term and still meets `make_param_layout()`'s total.
 
 **Gates re-run:**
 
-- **Neutral identity**: `sub0_tests` is **hash-identical at all three standard shapes** —
+- **Neutral identity**: `sub0llm_tests` is **hash-identical at all three standard shapes** —
   d96 L8 H2 seq128 `forward 4e00b8a7dadafff8 / grad 6909ae0b3afc2caa / decode ab31e5533547f73a`,
   d132 L11 H4 kv2 seq96 `289b86042f02843e / 787ec95304201870 / 27ee1bd6fa0f35eb`,
   d196 L11 H7 seq256 `9c8c0c17cd5043d9 / 50fae4b8922bac0e / 55f09cee05eea34b`. Assertion counts are
   **+1** at each shape (17,827,371→372 / 29,771,943→944 / 54,070,193→194), 147 cases unchanged — the one
   new `REQUIRE` counting `LnF` entries in `layout_tests.cpp`, and nothing else.
-- **The four real-weight fixture tests**: `sub0_frontend_tests` green, 216 cases, 116,990 → **116,989**
+- **The four real-weight fixture tests**: `sub0llm_frontend_tests` green, 216 cases, 116,990 → **116,989**
   assertions — exactly `-1`, from `Dest::Count` losing one enumerator in `transplant_tests.cpp`'s own
   per-destination loop.
 - **Four-level transplant gate, re-run against the regenerated artifact**: level 1 — 6,239 / 6,239
@@ -999,13 +999,13 @@ property (`desc_index` is `(layer, expert, plane)`-major and a bijection) as a r
 
 **Gates run:**
 
-- **Neutral identity (`AGENTS.md` §4/§7)**: `sub0_tests` is **hash-identical at all three standard
+- **Neutral identity (`AGENTS.md` §4/§7)**: `sub0llm_tests` is **hash-identical at all three standard
   shapes**, with assertion counts unchanged from the recorded post-`LnF` baseline —
   d96 L8 H2 seq128 `4e00b8a7dadafff8 / 6909ae0b3afc2caa / ab31e5533547f73a`, 17,827,372 assertions;
   d132 L11 H4 kv2 seq96 `289b86042f02843e / 787ec95304201870 / 27ee1bd6fa0f35eb`, 29,771,944;
   d196 L11 H7 seq256 `9c8c0c17cd5043d9 / 50fae4b8922bac0e / 55f09cee05eea34b`, 54,070,194; 147 cases
   each. So the `moe_math.hpp` refactor and the new layout axis are byte-neutral in every existing build.
-- **`sub0_frontend_tests`**: 116,989 → **117,358** assertions, 216 → **222** cases — exactly
+- **`sub0llm_frontend_tests`**: 116,989 → **117,358** assertions, 216 → **222** cases — exactly
   `moe_quant_tests.cpp`'s own 369 assertions in 6 cases, and nothing else moved.
 - **The compile-time sub-stack claim, in BOTH residency forms.** `sub4_prefix.hpp` now carries
   hand-derived quantized-resident totals (`QUANT_NUM_PARAMS` 95, `QUANT_PARAM_FLOATS` 1,581,285,280 —
@@ -1274,14 +1274,14 @@ first exercise on real-sized tensors (`[6 x 248320]` included).
 
 **Gates run:**
 
-- **Neutral identity (`AGENTS.md` §4/§7)**: `sub0_tests` is **hash-identical at all three standard
+- **Neutral identity (`AGENTS.md` §4/§7)**: `sub0llm_tests` is **hash-identical at all three standard
   shapes**, with assertion counts unchanged from WP4e's recorded baseline — d96 L8 H2 seq128
   `4e00b8a7dadafff8 / 6909ae0b3afc2caa / ab31e5533547f73a`, 17,827,372 assertions; d132 L11 H4 kv2 seq96
   `289b86042f02843e / 787ec95304201870 / 27ee1bd6fa0f35eb`, 29,771,944; d196 L11 H7 seq256
   `9c8c0c17cd5043d9 / 50fae4b8922bac0e / 55f09cee05eea34b`, 54,070,194; 147 cases each. This matters
   more here than in most stages: the change edits `Model::forward` itself, the single hottest and most
   shared function in the engine.
-- **`sub0_frontend_tests`**: 117,358 → **117,431** assertions, 222 → **226** cases — exactly
+- **`sub0llm_frontend_tests`**: 117,358 → **117,431** assertions, 222 → **226** cases — exactly
   `hidden_dump_tests.cpp`'s own 73 assertions in 4 cases, and nothing else moved.
 - **The differ, end to end against a FOREIGN producer.** Exercised on S0HD files written by a Python
   script (a genuinely separate implementation of the format, which is the property that matters) across:
@@ -1410,8 +1410,8 @@ inverses backwards), and `transplant_tests.cpp` carries a genuine `n_k=2, n_v=6`
 | Level 4 — QSA layer-3 fixture replay | **1.40e-09** (was 1.86e-09) |
 | New mutation: read `ssm_a` verbatim | moves layer 0 by **9.5e-05**, ~1.9e6× the reference agreement |
 | New mutation: read the gammas verbatim | moves layer 3 by **5.7e-03** |
-| Neutral identity (`AGENTS.md` §4) | d96 L8 H2 seq128 `sub0_tests` **hash-identical** before/after: `4631786f4f7988a4 / 2385e62dd02c8295 / d415a605f2ce3671`, 12,784,031 assertions, 147 cases |
-| `sub0_frontend_tests` | 117,431 → **117,664** assertions, 226 → **230** cases — exactly the four new cases, nothing else moved |
+| Neutral identity (`AGENTS.md` §4) | d96 L8 H2 seq128 `sub0llm_tests` **hash-identical** before/after: `4631786f4f7988a4 / 2385e62dd02c8295 / d415a605f2ce3671`, 12,784,031 assertions, 147 cases |
+| `sub0llm_frontend_tests` | 117,431 → **117,664** assertions, 226 → **230** cases — exactly the four new cases, nothing else moved |
 | Real forward pass at the real axes, on the regenerated artifact | loads and runs; `forward` vs `forward_one` parity **0 exactly**; engine-vs-math-core replay worst **2.2e-08** (WP4d's own band) |
 
 ##### The cross-comparison, re-run
@@ -1668,8 +1668,8 @@ designed and it is the *decode cost* that is expensive.
   — empty backend source manifests, a `PARENT_SCOPE`-in-an-`include()` mistake — is fixed on this
   branch, the other is another agent's uncommitted `muon.hpp` and was left alone rather than guessed
   at. Everything that links no engine (all three transplant targets, all three shape targets,
-  `sub0_frontend_tests`, and the `--verify` pass above) WAS built and run on today's `main` plus that
-  fix; only `sub0llm-qwen4-forward` and `sub0_core` were built from this branch's own `4005819`.
+  `sub0llm_frontend_tests`, and the `--verify` pass above) WAS built and run on today's `main` plus that
+  fix; only `sub0llm-qwen4-forward` and `sub0llm_core` were built from this branch's own `4005819`.
 
 ---
 
@@ -1842,9 +1842,9 @@ identical to the recorded baseline's generated `sub0_corpus.hpp`:
 
 | | before (recorded) | this branch |
 |---|---|---|
-| `sub0_tests` | 28,755,032 / 147 | **28,755,032 / 147** |
-| `sub0_frontend_tests`, no real tokenizer files | 120,889 / 244 | **120,889 / 244** |
-| `sub0_frontend_tests`, `SUB0_QWEN_TOKENIZER_DIR` set | 121,457 / 244 | **121,457 / 244** |
+| `sub0llm_tests` | 28,755,032 / 147 | **28,755,032 / 147** |
+| `sub0llm_frontend_tests`, no real tokenizer files | 120,889 / 244 | **120,889 / 244** |
+| `sub0llm_frontend_tests`, `SUB0_QWEN_TOKENIZER_DIR` set | 121,457 / 244 | **121,457 / 244** |
 
 Full build **305/305 targets** green, including the new one. Expected, since no existing file's
 *content* changed — the diff is one new `tools/` file and one additive `CMakeLists.txt` block — but
@@ -1904,7 +1904,7 @@ config, printing `sizeof(Worker)` and every arena's `constexpr` byte count. The 
 | everything else private (tokenizer tables, CRT heap, stacks) | ~53 MiB | the residual of the walk's private total |
 | **private total, measured** | **32.835 GiB** | matches 18.310 + 14.045 + 0.480 |
 | MoE sidecar mapping, `.moeq` | 37.113 GiB committed, **4.809 GiB resident** | one `MEM_MAPPED` region, named by `GetMappedFileNameW` |
-| images (the exe, `sub0_core.dll`, system DLLs) | 0.014 GiB | 79 `MEM_IMAGE` regions |
+| images (the exe, `sub0llm_core.dll`, system DLLs) | 0.014 GiB | 79 `MEM_IMAGE` regions |
 
 So the answer to "what is in the 41 GiB" is: **18.31 GiB of weights that must be there, 14.05 GiB of
 Worker of which exactly half was dead, ~0.5 GiB of real decode scratch, and whatever slice of the 37.11
@@ -1947,8 +1947,8 @@ gap for free.
   **all 30 ids** and the full continuation text byte-for-byte:
   `[11751, 13, 2500, 1599, 5656, 599, 89798, 440, 4283, 4874, 30, 271, 27775, 383, 279, 38870, 3766, 303,
   678, 3296, 11, 279, 6511, 314, 9338, 369, 10503, 430, 2972, 57590]`.
-- **Neutral d196 L11 H7 (`FORWARD_ONLY` false, `act_grad` stays `ACT_CAP`).** `sub0_tests`
-  **28,875,042 assertions / 147 cases** and `sub0_frontend_tests` **120,889 / 244** — identical before and
+- **Neutral d196 L11 H7 (`FORWARD_ONLY` false, `act_grad` stays `ACT_CAP`).** `sub0llm_tests`
+  **28,875,042 assertions / 147 cases** and `sub0llm_frontend_tests` **120,889 / 244** — identical before and
   after, with the *before* re-taken on this same tree by stashing the diff and rebuilding, not cited from
   an earlier session.
 - **GDN-only, training-capable (`--gdn-full-attn-stride 2`, no GR/MoE/QSA, so `FORWARD_ONLY` is false and

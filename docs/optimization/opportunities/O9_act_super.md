@@ -34,8 +34,8 @@ per-16 sums, so no `Gsum16` is involved on the super path. Not touched: `moe_qua
 
 ## 3. Correctness
 
-- Default-off: `sub0_tests` 29,510,661 / 147, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` /
-  `d1625d19ed2258f1`; `sub0_frontend_tests` 228,198 / 295 before the new cases, 230,939 / 300 after (+2,741 / +5,
+- Default-off: `sub0llm_tests` 29,510,661 / 147, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` /
+  `d1625d19ed2258f1`; `sub0llm_frontend_tests` 228,198 / 295 before the new cases, 230,939 / 300 after (+2,741 / +5,
   all new cases).
 - New cases: `bbqd` Plane overload == loose overload exactly, `super_ok` truth table; `gdn::Native` super path
   == direct `gemv_plane_super` on the same bytes for in_qkv/in_z/out, and a Q8_0 in_z falls back to per-32 exactly

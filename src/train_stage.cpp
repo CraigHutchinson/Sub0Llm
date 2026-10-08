@@ -4432,7 +4432,7 @@ extern "C" SUB0_API int sub0_bundle_stage(const char* model_in) {
 #endif
 
     static constexpr const char* kFiles[] = {
-        "sub0llm.exe", "sub0_core.dll", "sub0_gen.dll", "sub0_train.dll",
+        "sub0llm.exe", "sub0llm_core.dll", "sub0llm_gen.dll", "sub0llm_train.dll",
     };
     const std::filesystem::path bundle_dir = model_dir / "bin";
     std::error_code ec;

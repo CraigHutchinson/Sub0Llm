@@ -1,7 +1,7 @@
 // frontend_bench.cpp — Catch2 microbenchmarks for the engine-free frontend hot paths the configurator
 // runs over the WHOLE corpus at ingest (per-byte cost matters at GBs). Statistical timing (Catch2 does
 // warmup + samples + mean/stddev) for the CPU optimization work. Device throughput is measured elsewhere
-// (`sub0-cuda-selftest bench`, cudaEvent-based).
+// (`sub0llm-cuda-selftest bench`, cudaEvent-based).
 //
 // These benches are the MEASUREMENT + GATING harness for the tokenizer-throughput workstream (see the
 // per-pass plan): they isolate the three corpus passes the configurator actually runs (Scan::add_names,

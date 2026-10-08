@@ -31,7 +31,7 @@
 // list in the GB/s. Read the throughput, not the label.
 //
 // ENGINE-FREE, deliberately, exactly like the three headers it measures: no sub0_config.hpp, no
-// layout.hpp, no sub0_core. Every dimension comes from the sidecar's OWN header (d_model, d_ff,
+// layout.hpp, no sub0llm_core. Every dimension comes from the sidecar's OWN header (d_model, d_ff,
 // n_layers, num_experts), so this binary characterizes whatever real file it is pointed at rather than
 // whatever the surrounding build happens to be configured for.
 //

@@ -55,8 +55,8 @@
 // else here is `inline` and lands in each consumer's own translation unit; these two are the symbols
 // that cross a library boundary (they use simdjson, which this header must not pull in).
 //
-// The frontend is the right home precisely because registry is frontend surface: sub0_frontend_tests
-// links it WITHOUT the engine, so a reader living in sub0_core would be unreachable from the very
+// The frontend is the right home precisely because registry is frontend surface: sub0llm_frontend_tests
+// links it WITHOUT the engine, so a reader living in sub0llm_core would be unreachable from the very
 // tests meant to cover it -- which is what forced the readers to stay inline in this header before.
 //
 // A self-contained copy of core.hpp's own SUB0_API (not an include of core.hpp itself) -- this

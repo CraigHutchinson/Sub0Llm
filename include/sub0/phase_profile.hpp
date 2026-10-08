@@ -15,7 +15,7 @@
 // the "unattributed" line B27's scaffold reported, which is the check that attribution is complete.
 //
 // ONE accumulator, owned by the engine library (sub0::phase_accumulator(), core.hpp). Not a header-local
-// static: sub0_core is a DLL on Windows, where a function-local static in an inline header function gets
+// static: sub0llm_core is a DLL on Windows, where a function-local static in an inline header function gets
 // a separate copy per module -- the tool would read its own empty counters while decode filled the DLL's.
 //
 // Single-threaded by design: every scope is opened on the thread running forward_one, never inside an

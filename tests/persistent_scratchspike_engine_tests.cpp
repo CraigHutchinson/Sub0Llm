@@ -11,7 +11,7 @@
 // gradient.
 //
 // Tagged "[.persistent_scratchspike]" (hidden, like "[.scratchspike]"): trains hundreds of steps per
-// TEST_CASE, not in the default ctest sweep. Invoke explicitly: `sub0_tests "[persistent_scratchspike]"`
+// TEST_CASE, not in the default ctest sweep. Invoke explicitly: `sub0llm_tests "[persistent_scratchspike]"`
 // (drop the leading dot -- Catch2's tag filter matches on the name, the dot only controls default-hiding).
 //
 // ENCODER SHOOTOUT (2026-07-16): MeanPool / Hash / HRR / ConvPool. The three parameter-free arms ran

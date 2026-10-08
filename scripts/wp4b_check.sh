@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WP4b neutral-identity harness: reconfigure + rebuild + run sub0_tests at the three standard
+# WP4b neutral-identity harness: reconfigure + rebuild + run sub0llm_tests at the three standard
 # shapes and print the assertion count + arch-identity fingerprints for each.
 # Usage: bash scripts/wp4b_check.sh [label]
 set -e
@@ -14,9 +14,9 @@ run_shape() {
   cmake --build "out/build/$dir" --target sub0llm-configure > /dev/null
   "./out/build/$dir/sub0llm-configure.exe" --corpus "$CORPUS" \
       -o "out/build/$dir/generated/sub0_config.hpp" "$@" --vocab 26260 --corpus-pretok 0 > /dev/null 2>&1
-  cmake --build "out/build/$dir" --target sub0_tests > /dev/null
+  cmake --build "out/build/$dir" --target sub0llm_tests > /dev/null
   cd "$ROOT/out/build/$dir/tests"
-  PATH="$PATH:../" ./sub0_tests.exe > "out_$LABEL.txt" 2>&1 || true
+  PATH="$PATH:../" ./sub0llm_tests.exe > "out_$LABEL.txt" 2>&1 || true
   echo "--- $desc ($dir) ---"
   grep -E "assertions in|forward: |grad:    |decode:  |FAILED|failed" "out_$LABEL.txt" | head -20
 }

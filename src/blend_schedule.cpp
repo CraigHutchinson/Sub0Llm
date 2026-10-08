@@ -4,10 +4,10 @@
 // in the codebase that needs to walk JSON ARRAYS/nested objects (config.json is flat), so the array/
 // per-element-object loops here are new idioms for this project, not reuse of an existing helper.
 //
-// Deliberately does NOT call sub0::log itself: this file lives in sub0_core.dll, whose sub0::log::logger()
-// is a SEPARATE header-only static instance from sub0_train.dll's (each DLL that includes the header-only
+// Deliberately does NOT call sub0::log itself: this file lives in sub0llm_core.dll, whose sub0::log::logger()
+// is a SEPARATE header-only static instance from sub0llm_train.dll's (each DLL that includes the header-only
 // logger gets its own copy) -- a message logged here would never reach train.log's file sink, which
-// sub0_train.dll's own copy configures. Returning structured error/warning text and letting the caller
+// sub0llm_train.dll's own copy configures. Returning structured error/warning text and letting the caller
 // (train_stage.cpp, where the correctly-configured logger lives) do the actual logging avoids that gap
 // entirely, and matches read_config_json's own existing precedent of doing no internal logging.
 

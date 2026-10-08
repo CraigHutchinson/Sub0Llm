@@ -2,7 +2,7 @@
 //
 // A mapped arena is only legal where nothing writes the arena after load, so the positive cases need a
 // FORWARD-ONLY engine build (Gated Residual / MoE / QSA). This file is its own executable for that reason:
-// the default sub0_tests config can train, where adopt_param_file_view() must refuse, and its assertion
+// the default sub0llm_tests config can train, where adopt_param_file_view() must refuse, and its assertion
 // counts must stay exactly what they were. In a trainable build the positive cases skip and the refusal
 // case runs; configure the build with e.g. `--num-experts 4 --experts-per-tok 2` (and optionally
 // `--param-arena mapped` to also drive load_model's own adoption) to run them.

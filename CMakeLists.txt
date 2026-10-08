@@ -61,7 +61,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 # Qwen3.8-Flash-Next's real axes PARAM_LAYOUT is ~6,200 tensors for a 4-layer sub-stack (~74,800 for the
 # full 48), which blows the default 1,048,576-step budget many times over. The failure is a "possible
 # infinite loop?" diagnostic, not a wrong answer, so the fix is a budget rather than a redesign -- and it
-# is a property of the MODEL's size, not of any one target, which is why sub0_qwen4_shape_tests and
+# is a property of the MODEL's size, not of any one target, which is why sub0llm_qwen4_shape_tests and
 # sub0llm-transplant already each set it locally and why the ENGINE now needs it too. Changes no
 # generated code at any smaller config: an unused budget costs nothing.
 if(NOT MSVC)
@@ -100,7 +100,7 @@ endif()
 
 # OpenMP detection lives in cmake/OpenMP.cmake and is included on the normal build path
 # below (after the super-build short-circuit), so it sets SUB0_OPENMP_TARGET before
-# sub0_core links it -- without blocking the super-build orchestrator on an OpenMP probe.
+# sub0llm_core links it -- without blocking the super-build orchestrator on an OpenMP probe.
 
 # Transcendental math path: fast vectorizable approximations (default) vs the exact
 # std::exp/std::erf path. Compile-time only -- the unused branch is eliminated.
@@ -146,7 +146,7 @@ CPMAddPackage("gh:simdjson/simdjson@3.10.1")
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
 # --- Compute-backend selection (CPU / GPU / HYBRID axis) ---------------------
-# Picks SUB0_BACKEND_SOURCES for sub0_core and enforces the backend invariants
+# Picks SUB0_BACKEND_SOURCES for sub0llm_core and enforces the backend invariants
 # (e.g. ternary is CPU-only for now). Needs SUB0_TERNARY (set above).
 include(cmake/Backends.cmake)
 
@@ -167,7 +167,7 @@ include(cmake/OpenMP.cmake)
 # -> ON), so SUB0_COMPUTE is the single user-facing switch. When ON, builds src/backend_cuda.cu
 # with nvcc (sm_${SUB0_CUDA_ARCH}) into a shared lib + self-test, and links it into the train
 # stage for the device training fast-path. enable_language(CUDA) is called here so nvcc is set
-# up before the targets below; the actual targets are defined next to sub0_core.
+# up before the targets below; the actual targets are defined next to sub0llm_core.
 if(SUB0_BUILD_CUDA)
   if(NOT SUB0_HAS_CUDA)
     message(FATAL_ERROR "SUB0_BUILD_CUDA=ON but no CUDA toolkit/device was detected at configure time.")
@@ -189,19 +189,19 @@ endif()
 # to cover it without building a model. It is a SEPARATE tokenizer from src/tokenizer.cpp -- the real
 # Qwen3.8-Flash-Next byte-level BPE, needed because the transplanted Qwen weights have no relationship
 # to this project's own token ids. See docs/QWEN_TOKENIZER.md.
-add_library(sub0_frontend STATIC src/tokenizer.cpp src/unigram.cpp src/tok_interchange.cpp src/run_config.cpp
+add_library(sub0llm_frontend STATIC src/tokenizer.cpp src/unigram.cpp src/tok_interchange.cpp src/run_config.cpp
                                  src/qwen_tokenizer.cpp)
-target_include_directories(sub0_frontend PUBLIC "${CMAKE_SOURCE_DIR}/include")
+target_include_directories(sub0llm_frontend PUBLIC "${CMAKE_SOURCE_DIR}/include")
 # run_config.cpp is registry.hpp's out-of-line half (read_config_json / read_state, both simdjson).
-# It belongs HERE, not in sub0_core: it includes only registry.hpp + simdjson -- no engine, no
+# It belongs HERE, not in sub0llm_core: it includes only registry.hpp + simdjson -- no engine, no
 # generated config -- and registry is named above as frontend surface precisely so "the engine-free
-# tests cover it without building the engine". While it sat in sub0_core, sub0_frontend_tests could
+# tests cover it without building the engine". While it sat in sub0llm_core, sub0llm_frontend_tests could
 # only reach registry's *header-only* half, which is why the readers had to stay inline in the header.
-target_link_libraries(sub0_frontend PRIVATE simdjson::simdjson)
-set_target_properties(sub0_frontend PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(sub0llm_frontend PRIVATE simdjson::simdjson)
+set_target_properties(sub0llm_frontend PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # WS6: casing.hpp's normalize_text/truecase_tokenize use `#pragma omp simd` (this project's
 # existing auto-vectorization convention, see src/backend_cpu.cpp) over their hot per-byte classify
-# loops. `sub0_frontend` never links the full OpenMP runtime (only sub0_core does, for the
+# loops. `sub0llm_frontend` never links the full OpenMP runtime (only sub0llm_core does, for the
 # data-parallel training path -- see cmake/OpenMP.cmake) -- without at least `-fopenmp-simd`, those
 # pragmas are silently inert (ignored, not an error) and the loops stay plain scalar. This flag
 # enables ONLY simd-pragma recognition, no threading runtime, so it's free to add here regardless
@@ -209,20 +209,20 @@ set_target_properties(sub0_frontend PROPERTIES POSITION_INDEPENDENT_CODE ON)
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-fopenmp-simd" SUB0_HAS_OPENMP_SIMD_FLAG)
 if(SUB0_HAS_OPENMP_SIMD_FLAG)
-  target_compile_options(sub0_frontend PRIVATE -fopenmp-simd)
+  target_compile_options(sub0llm_frontend PRIVATE -fopenmp-simd)
 endif()
 
 add_executable(sub0llm-configure tools/configurator.cpp)
 target_include_directories(sub0llm-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
-target_link_libraries(sub0llm-configure PRIVATE CLI11::CLI11 sub0_frontend)
+target_link_libraries(sub0llm-configure PRIVATE CLI11::CLI11 sub0llm_frontend)
 
 # WS7: engine-free tokenizer inspection/interchange (docs/WORKFLOW_ARCHITECTURE.md's "Tokenizer /
-# vocab as engine-free frontend tools" section) -- links sub0_frontend only, same as
+# vocab as engine-free frontend tools" section) -- links sub0llm_frontend only, same as
 # sub0llm-configure above, never the engine. Config-independent (no GEN_DIR dependency), unlike
 # sub0llm-configure below, since it only reads an already-built tokenizer.tok, not a corpus.
 add_executable(sub0llm-tokenizer tools/sub0llm-tokenizer.cpp)
 target_include_directories(sub0llm-tokenizer PRIVATE "${CMAKE_SOURCE_DIR}/include")
-target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0_frontend)
+target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0llm_frontend)
 
 # O5 phase 1 (docs/BACKBONE_NATIVE_QUANT.md): header/tensor-table-only census of the backbone's real
 # non-expert, non-PLE GGUF tensors -- name, type, shape, bytes, consumer. Engine-free (gguf.hpp only,
@@ -235,9 +235,9 @@ target_include_directories(sub0llm-backbone-census PRIVATE "${CMAKE_SOURCE_DIR}/
 # reason is worth stating at the target rather than only in the source: it is compiled against
 # tests/qwen4_real_axes/sub0_config.hpp -- Qwen3.8-Flash-Next's REAL RunConfig axes, with N_LAYERS
 # forced to 4 for the real repeating sub-stack (S7 Q3) -- INSTEAD of ${GEN_DIR}'s generated config. So
-# it links no engine library: sub0_core is compiled against the build's own config, and two definitions
+# it links no engine library: sub0llm_core is compiled against the build's own config, and two definitions
 # of sub0::PARAM_LAYOUT in one binary is an ODR violation. Same reasoning, and the same shape, as the
-# sub0_qwen4_shape_tests target in tests/CMakeLists.txt.
+# sub0llm_qwen4_shape_tests target in tests/CMakeLists.txt.
 #
 # The axes header is SHARED with that test rather than copied here: the real model's RunConfig has one
 # source of truth or it has none. sub4_prefix.hpp (same directory) carries the two literals both
@@ -251,7 +251,7 @@ target_compile_definitions(sub0llm-transplant PRIVATE SUB0_QWEN4_LAYERS=4)
 target_link_libraries(sub0llm-transplant PRIVATE CLI11::CLI11)
 # 512 experts x 4 layers makes PARAM_LAYOUT a ~6,200-tensor consteval walk, done several times over
 # (make_param_layout, DECAY_RANGES, MUON_RANGES, MUON_MAX_MN/MM, total_param_floats) -- past clang's
-# default 1,048,576-step budget. Same flag, same reason, as sub0_qwen4_shape_tests.
+# default 1,048,576-step budget. Same flag, same reason, as sub0llm_qwen4_shape_tests.
 if(NOT MSVC)
   target_compile_options(sub0llm-transplant PRIVATE -fconstexpr-steps=1000000000)
 endif()
@@ -316,11 +316,11 @@ target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 # part (tokenizer, serialization, sampler, config paths) and backend_cpu.cpp is the
 # CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
-add_library(sub0_core SHARED src/engine_core.cpp src/blend_schedule.cpp ${SUB0_BACKEND_SOURCES})
-target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
-# The runtime tokenizer (encode/detokenize/load) is the same sub0_frontend used by the
+add_library(sub0llm_core SHARED src/engine_core.cpp src/blend_schedule.cpp ${SUB0_BACKEND_SOURCES})
+target_include_directories(sub0llm_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+# The runtime tokenizer (encode/detokenize/load) is the same sub0llm_frontend used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
-target_link_libraries(sub0_core PRIVATE sub0_frontend)
+target_link_libraries(sub0llm_core PRIVATE sub0llm_frontend)
 # The configurator owns transport selection. Discover the generated marker after stage 1, and
 # reconfigure when its header changes; existing reactive/pipelined builds acquire no dependency.
 file(GLOB _sub0_storage_headers CONFIGURE_DEPENDS "${GEN_DIR}/sub0_corpus.hpp")
@@ -335,8 +335,8 @@ if(_sub0_storage_headers)
     endif()
     set(SUB0_MOE_MEMPAGE_ENABLED ON)
     include(cmake/MemPage.cmake)
-    target_sources(sub0_core PRIVATE src/moe_io_mempage.cpp)
-    target_link_libraries(sub0_core PRIVATE Sub0MemPage::Sub0MemPage)
+    target_sources(sub0llm_core PRIVATE src/moe_io_mempage.cpp)
+    target_link_libraries(sub0llm_core PRIVATE Sub0MemPage::Sub0MemPage)
   endif()
   file(STRINGS "${GEN_DIR}/sub0_corpus.hpp" _sub0_tiered_marker REGEX "^#define SUB0_MOE_IO_TIERED 1$")
   if(_sub0_tiered_marker)
@@ -345,46 +345,46 @@ if(_sub0_storage_headers)
     endif()
     set(SUB0_MOE_TIERED_ENABLED ON)
     include(cmake/TieredCache.cmake)
-    target_sources(sub0_core PRIVATE src/moe_io_tiered.cpp src/residency.cpp)
-    target_link_libraries(sub0_core PRIVATE Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache)
+    target_sources(sub0llm_core PRIVATE src/moe_io_tiered.cpp src/residency.cpp)
+    target_link_libraries(sub0llm_core PRIVATE Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache)
   endif()
 endif()
 # blend_schedule.cpp's parse_blend_schedule_json (blend_schedule.hpp's ScheduleSpec) uses simdjson to
 # parse blend_schedule.json. PRIVATE: consumers (train_stage.cpp etc.) only ever call the plain
 # std::-typed functions declared in their headers -- simdjson's own types never leak across that boundary.
-# (registry.hpp's own readers moved to sub0_frontend with run_config.cpp -- see above.)
-target_link_libraries(sub0_core PRIVATE simdjson::simdjson)
+# (registry.hpp's own readers moved to sub0llm_frontend with run_config.cpp -- see above.)
+target_link_libraries(sub0llm_core PRIVATE simdjson::simdjson)
 # The AdamW hot loop only ever sqrt()s non-negative values and never reads errno, so
 # the errno side-effect of the math libcalls is dead weight that stops the optimizer
 # from emitting vectorized vsqrtps. Dropping it changes no computed value (it is not a
 # fast-math reassociation flag) and lets the update loop vectorize.
-target_compile_options(sub0_core PRIVATE
+target_compile_options(sub0llm_core PRIVATE
   $<$<CXX_COMPILER_ID:Clang,GNU>:-fno-math-errno>)
 if(SUB0_EXACT_MATH)
-  target_compile_definitions(sub0_core PRIVATE SUB0_EXACT_MATH)
+  target_compile_definitions(sub0llm_core PRIVATE SUB0_EXACT_MATH)
 endif()
 if(SUB0_OPENMP_TARGET)
-  target_link_libraries(sub0_core PUBLIC ${SUB0_OPENMP_TARGET})
+  target_link_libraries(sub0llm_core PUBLIC ${SUB0_OPENMP_TARGET})
 endif()
 # Propagated to every TU compiled against the core so a build that lost OpenMP fails
 # loudly at compile time (see the #error in engine.cpp) instead of running serially.
 if(SUB0_REQUIRE_OPENMP)
-  target_compile_definitions(sub0_core PUBLIC SUB0_REQUIRE_OPENMP)
+  target_compile_definitions(sub0llm_core PUBLIC SUB0_REQUIRE_OPENMP)
 endif()
 
 # Performance-knob tuning mode (include/sub0/knob.hpp): PUBLIC so any TU using a Knob sees it.
 # OFF (default) bakes knobs as compile-time constants; ON makes them runtime-tunable.
 if(SUB0_TUNING)
-  target_compile_definitions(sub0_core PUBLIC SUB0_TUNING)
+  target_compile_definitions(sub0llm_core PUBLIC SUB0_TUNING)
 endif()
 
 # --- CUDA backend skeleton (Phase 2; built only when SUB0_BUILD_CUDA) --------
 # Compiled by nvcc; meets the clang world only at the extern "C" self-test boundary.
 # Grows into the real GPU backend (replacing backend_cpu.cpp under SUB0_COMPUTE=GPU).
 if(SUB0_BUILD_CUDA)
-  add_library(sub0_backend_cuda SHARED ${SUB0_CUDA_BACKEND_SOURCES})
-  target_include_directories(sub0_backend_cuda PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
-  set_target_properties(sub0_backend_cuda PROPERTIES
+  add_library(sub0llm_backend_cuda SHARED ${SUB0_CUDA_BACKEND_SOURCES})
+  target_include_directories(sub0llm_backend_cuda PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+  set_target_properties(sub0llm_backend_cuda PROPERTIES
     CUDA_ARCHITECTURES "${SUB0_CUDA_ARCH}"
     CUDA_STANDARD 20
     CUDA_STANDARD_REQUIRED ON)
@@ -392,7 +392,7 @@ if(SUB0_BUILD_CUDA)
   # FTZ/DAZ (set_flush_denormals in backend_cpu.cpp): denormals are underflow noise in the
   # hot loops and the slow-path handling is wasted work. NOT --use_fast_math (that would
   # also relax div/sqrt rounding); just the denormal flush.
-  target_compile_options(sub0_backend_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ftz=true>)
+  target_compile_options(sub0llm_backend_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ftz=true>)
   # Suppress nvcc diag #20280-D on embed_add_act_kernel<__nv_bfloat16>: it warns that a __global__
   # template instantiation "must have a definition in the current translation unit" under whole-
   # program compilation (-rdc=false, our mode -- this project is a single .cu file with no cross-TU
@@ -401,16 +401,16 @@ if(SUB0_BUILD_CUDA)
   # already satisfied; the kernel runs correctly (parity-tested by the forward/backward CUDA tests).
   # nvcc's own suggested fix for a genuinely benign case is -static-global-template-stub=false or
   # this diag suppression -- picked the latter since it is scoped to exactly this advisory.
-  target_compile_options(sub0_backend_cuda PRIVATE
+  target_compile_options(sub0llm_backend_cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe;--diag_suppress=20280>)
-  target_link_libraries(sub0_backend_cuda PRIVATE CUDA::cudart CUDA::cublas)
+  target_link_libraries(sub0llm_backend_cuda PRIVATE CUDA::cudart CUDA::cublas)
   if(SUB0_TUNING)
-    target_compile_definitions(sub0_backend_cuda PRIVATE SUB0_TUNING)
+    target_compile_definitions(sub0llm_backend_cuda PRIVATE SUB0_TUNING)
   endif()
 
-  add_executable(sub0-cuda-selftest tools/cuda_selftest.cpp)
-  target_link_libraries(sub0-cuda-selftest PRIVATE sub0_backend_cuda)
-  set_target_properties(sub0-cuda-selftest PROPERTIES
+  add_executable(sub0llm-cuda-selftest tools/cuda_selftest.cpp)
+  target_link_libraries(sub0llm-cuda-selftest PRIVATE sub0llm_backend_cuda)
+  set_target_properties(sub0llm-cuda-selftest PROPERTIES
     BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 endif()
 
@@ -424,52 +424,52 @@ add_custom_target(sub0_provenance ALL
   BYPRODUCTS "${SUB0_PROVENANCE_HEADER}"
   VERBATIM)
 
-add_library(sub0_train SHARED src/train_stage.cpp)
-# sub0_frontend (the tokenizer) links in DIRECTLY, not just transitively via sub0_core (which links
+add_library(sub0llm_train SHARED src/train_stage.cpp)
+# sub0llm_frontend (the tokenizer) links in DIRECTLY, not just transitively via sub0llm_core (which links
 # it PRIVATE, so its symbols aren't re-exported): --spell-mix deserializes tokenizer.tok into a raw
 # sub0::tok::Tokenizer and generates the uncombine curriculum (sub0/spellspike.hpp) as a blend source.
-# It's a static PIC lib, so this embeds its own copy in sub0_train.dll -- the stateless tokenizer
+# It's a static PIC lib, so this embeds its own copy in sub0llm_train.dll -- the stateless tokenizer
 # functions have no cross-DLL shared state, so a second copy is harmless.
-target_link_libraries(sub0_train PRIVATE sub0_core sub0_frontend)
-add_dependencies(sub0_train sub0_provenance)
-target_include_directories(sub0_train PRIVATE "${GEN_DIR}")
+target_link_libraries(sub0llm_train PRIVATE sub0llm_core sub0llm_frontend)
+add_dependencies(sub0llm_train sub0_provenance)
+target_include_directories(sub0llm_train PRIVATE "${GEN_DIR}")
 # MSVC's CRT headers flag std::getenv deprecated (favoring _dupenv_s); the two SUB0_TRAIN_CPU /
 # SUB0_FIXED_SEQ toggles are simple read-only env lookups with no buffer to overflow, so the
 # "insecure" warning has nothing to protect against here -- suppress it rather than take on a
 # Windows-only API for zero safety benefit.
-target_compile_definitions(sub0_train PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(sub0llm_train PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 # Phase 2e: when the CUDA backend is built, link it into the train stage and flag the GPU
 # training fast-path on. The train stage reaches the device through the extern "C" seam
 # (sub0_cuda_train_step etc.); without this it transparently runs the CPU loop.
 if(SUB0_BUILD_CUDA)
-  target_link_libraries(sub0_train PRIVATE sub0_backend_cuda)
-  target_compile_definitions(sub0_train PRIVATE SUB0_BUILD_CUDA)
+  target_link_libraries(sub0llm_train PRIVATE sub0llm_backend_cuda)
+  target_compile_definitions(sub0llm_train PRIVATE SUB0_BUILD_CUDA)
 endif()
 
 # The train/models stages tag each model with the code version that produced it and lay
 # them out under a models root. The provenance header is refreshed at build time so a
 # normal rebuild after a commit or source edit cannot retain configure-time metadata.
-target_compile_definitions(sub0_train PRIVATE
+target_compile_definitions(sub0llm_train PRIVATE
   SUB0_MODELS_ROOT="${CMAKE_SOURCE_DIR}/models")
 
-add_library(sub0_gen SHARED src/gen_stage.cpp)
-# sub0_frontend links in directly (as with sub0_train above): a model trained with --spell-mix drives
+add_library(sub0llm_gen SHARED src/gen_stage.cpp)
+# sub0llm_frontend links in directly (as with sub0llm_train above): a model trained with --spell-mix drives
 # gen's uncombine/combine interceptor, which deserializes tokenizer.tok into a raw sub0::tok::Tokenizer
 # to build the expand/combine callbacks the decode loop calls.
-target_link_libraries(sub0_gen PRIVATE sub0_core sub0_frontend)
+target_link_libraries(sub0llm_gen PRIVATE sub0llm_core sub0llm_frontend)
 
 # Phase 2e follow-up: GPU KV-cache decode (sub0_cuda_forward_one), parity-validated against a trained
-# model (cuda_tests.cpp) -- link it in the same way sub0_train links the training fast-path above.
+# model (cuda_tests.cpp) -- link it in the same way sub0llm_train links the training fast-path above.
 if(SUB0_BUILD_CUDA)
-  target_link_libraries(sub0_gen PRIVATE sub0_backend_cuda)
-  target_compile_definitions(sub0_gen PRIVATE SUB0_BUILD_CUDA)
+  target_link_libraries(sub0llm_gen PRIVATE sub0llm_backend_cuda)
+  target_compile_definitions(sub0llm_gen PRIVATE SUB0_BUILD_CUDA)
 endif()
 
 # --- Stage 5: the thin driver executable ------------------------------------
 add_executable(sub0llm src/driver.cpp)
 target_include_directories(sub0llm PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
-target_link_libraries(sub0llm PRIVATE sub0_train sub0_gen CLI11::CLI11)
+target_link_libraries(sub0llm PRIVATE sub0llm_train sub0llm_gen CLI11::CLI11)
 
 # Let the driver find the stage libs next to it without install/LD_LIBRARY_PATH.
 set_target_properties(sub0llm PROPERTIES
@@ -489,12 +489,12 @@ foreach(_stage train gen tune)
   set_target_properties(sub0llm-${_stage} PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 endforeach()
 # train + tune live in the train stage lib; gen in the gen stage lib.
-target_link_libraries(sub0llm-train PRIVATE sub0_train)
-target_link_libraries(sub0llm-tune  PRIVATE sub0_train)
-target_link_libraries(sub0llm-gen   PRIVATE sub0_gen)
+target_link_libraries(sub0llm-train PRIVATE sub0llm_train)
+target_link_libraries(sub0llm-tune  PRIVATE sub0llm_train)
+target_link_libraries(sub0llm-gen   PRIVATE sub0llm_gen)
 
 # --- WP4d: the real-axes forward harness ------------------------------------
-# The OPPOSITE of sub0llm-transplant/sub0_qwen4_shape_tests above: this one DOES link the engine, so it
+# The OPPOSITE of sub0llm-transplant/sub0llm_qwen4_shape_tests above: this one DOES link the engine, so it
 # is compiled against ${GEN_DIR}'s generated config like every other engine consumer -- which means the
 # build it belongs to must itself have been configured at the real Qwen4 axes (see
 # docs/WP4_SCOPE.md WP4d for the exact `sub0llm-configure` line). Built unconditionally because it costs
@@ -502,7 +502,7 @@ target_link_libraries(sub0llm-gen   PRIVATE sub0_gen)
 # the artifact it loads is a path argument, not a build dependency.
 add_executable(sub0llm-qwen4-forward tools/sub0llm-qwen4-forward.cpp)
 target_include_directories(sub0llm-qwen4-forward PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
-target_link_libraries(sub0llm-qwen4-forward PRIVATE sub0_core CLI11::CLI11)
+target_link_libraries(sub0llm-qwen4-forward PRIVATE sub0llm_core CLI11::CLI11)
 if(WIN32)
   # GetProcessMemoryInfo: the peak-working-set number docs/QWEN4_MEMORY_ORCHESTRATION.md wants measured.
   target_link_libraries(sub0llm-qwen4-forward PRIVATE psapi)
@@ -530,8 +530,8 @@ endif()
 # it is compiled against ${GEN_DIR}'s generated config and only does anything useful in a build that
 # was configured at the real Qwen4 axes. Two differences, both load-bearing:
 #
-# 1. It ALSO links sub0_frontend, because WP5a's real Qwen tokenizer (src/qwen_tokenizer.cpp) lives
-#    there -- engine-free by design, so it is not in sub0_core. SUB0_SOURCE_DIR is defined for the same
+# 1. It ALSO links sub0llm_frontend, because WP5a's real Qwen tokenizer (src/qwen_tokenizer.cpp) lives
+#    there -- engine-free by design, so it is not in sub0llm_core. SUB0_SOURCE_DIR is defined for the same
 #    reason tests/CMakeLists.txt defines it: the tool reuses the tokenizer test's own directory lookup
 #    (--tokenizer-dir, then $SUB0_QWEN_TOKENIZER_DIR, then <repo>/data/qwen_tokenizer) and the last of
 #    those needs the source root as a compile-time string.
@@ -547,7 +547,7 @@ endif()
 #    piece of work with its own review (recorded in docs/WP4_SCOPE.md WP5c).
 add_executable(sub0llm-qwen4-gen tools/sub0llm-qwen4-gen.cpp)
 target_include_directories(sub0llm-qwen4-gen PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
-target_link_libraries(sub0llm-qwen4-gen PRIVATE sub0_core sub0_frontend CLI11::CLI11)
+target_link_libraries(sub0llm-qwen4-gen PRIVATE sub0llm_core sub0llm_frontend CLI11::CLI11)
 target_compile_definitions(sub0llm-qwen4-gen PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 if(WIN32)
   # GetProcessMemoryInfo, as in the forward harness -- the peak-working-set number.
@@ -589,7 +589,7 @@ endif()
 # mean/stddev) instead of ad-hoc printf. Uses Catch2's benchmark support (already a project dep and it
 # builds cleanly on this clang-on-Windows toolchain -- Google Benchmark's cmake injects MSVC /W4 /MP
 # flags into clang++ and mis-probes std::regex, so it is not viable here). Host/CPU hot paths only;
-# device (CUDA) throughput stays on the cudaEvent-based sub0-cuda-selftest. Opt-in. See benchmarks/.
+# device (CUDA) throughput stays on the cudaEvent-based sub0llm-cuda-selftest. Opt-in. See benchmarks/.
 option(SUB0_BUILD_BENCHMARKS "Build the microbenchmark suite (Catch2 benchmarks)" OFF)
 if(SUB0_BUILD_BENCHMARKS)
   add_subdirectory(benchmarks)

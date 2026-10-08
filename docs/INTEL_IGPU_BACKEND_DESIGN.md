@@ -410,7 +410,7 @@ if it owns sampling/tokenization; do not disguise it as the same low-level `forw
 The first Intel consumer therefore owns one pre-sized full-vocabulary logits buffer for its session.
 Its oracle covers the complete head, and request timing records vocabulary-head compute plus completed
 device-to-host bytes/time before the CPU sampler or callback observes the buffer.
-The integration consumer is production `sub0_gen` in `src/gen_stage.cpp`, exercised by
+The integration consumer is production `sub0llm_gen` in `src/gen_stage.cpp`, exercised by
 `sub0llm-gen`. The WP5 `tools/sub0llm-qwen4-gen.cpp` path calls the CPU engine directly and remains an
 oracle until I17b deliberately connects the full artifact to the production stage. WP5c also measured
 that `sample_token` needs about 2.84 MiB of stack at `VOCAB=248320`; its Qwen4 executable uses a 32 MiB

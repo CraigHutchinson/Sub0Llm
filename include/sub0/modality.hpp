@@ -11,7 +11,7 @@
 // disagreeing corpus surfaces the mismatch instead of being silently averaged away, and the next
 // scheme version can be derived from a decisive, multi-corpus picture.
 //
-// Engine-free (depends only on casing.hpp), so it lives in sub0_frontend with the rest of the
+// Engine-free (depends only on casing.hpp), so it lives in sub0llm_frontend with the rest of the
 // tokenizer and is exercised by the engine-free tests.
 #pragma once
 

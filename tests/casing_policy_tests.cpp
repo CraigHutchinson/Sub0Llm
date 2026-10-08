@@ -26,7 +26,7 @@
 //
 // Hidden ([.casing]): reads a multi-hundred-MB real corpus from the source tree, so it is neither fast
 // nor available on every checkout. Run explicitly:
-//     sub0_frontend_tests "[.casing]" --reporter compact
+//     sub0llm_frontend_tests "[.casing]" --reporter compact
 
 #include <catch2/catch_test_macros.hpp>
 

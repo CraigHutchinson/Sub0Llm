@@ -1,7 +1,7 @@
 // cuda_selftest.cpp — tiny clang-built host driver for the CUDA backend self-test.
 //
 // Exists to exercise the multi-compiler boundary: this is compiled by clang and links
-// against sub0_backend_cuda (built by nvcc), calling across the extern "C" seam. If it
+// against sub0llm_backend_cuda (built by nvcc), calling across the extern "C" seam. If it
 // builds, links and returns 0 at runtime, the clang <-> nvcc pipeline + CUDA device
 // execution are all working on this host.
 //
@@ -56,8 +56,8 @@ int track(const char* what, int rc, int& failures) {
 // Any argument -> "bench only": skip the host-reference grad/AdamW parity check (a slow plain-C++
 // reference pass, impractical at large model dims) so this is a fast kernel driver at the training
 // config -- suitable for running under Nsight Compute (ncu) for an occupancy profile.
-//   sub0-cuda-selftest        = correctness gate (parity + benchmarks)
-//   sub0-cuda-selftest bench  = benchmarks only (FP32 vs TF32 vs graph, + the train-step tok/s curve)
+//   sub0llm-cuda-selftest        = correctness gate (parity + benchmarks)
+//   sub0llm-cuda-selftest bench  = benchmarks only (FP32 vs TF32 vs graph, + the train-step tok/s curve)
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // unbuffered: stream each benchmark line as it finishes
     int failures = 0;

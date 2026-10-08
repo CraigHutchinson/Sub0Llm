@@ -8,12 +8,12 @@
 // because the destination tensors were literally the wrong shape (GdnInProjQkv was [2560, 2984] here
 // against [2560, 10240] in the checkpoint). Closing that gap IS this test.
 //
-// WHY IT IS ITS OWN EXECUTABLE, not a case in sub0_tests: layout.hpp is closed over the BUILD's
+// WHY IT IS ITS OWN EXECUTABLE, not a case in sub0llm_tests: layout.hpp is closed over the BUILD's
 // generated sub0_config.hpp, so checking a different config means compiling it a second time against a
 // different one. Two definitions of sub0::PARAM_LAYOUT in one binary is an ODR violation, so this TU
 // gets its own target whose include path carries tests/qwen4_real_axes/sub0_config.hpp INSTEAD of the
 // generated dir -- the same "separate binary because the seam is compiled differently" reasoning
-// sub0_eval_seam_tests already uses for SUB0_BUILD_MOCK_DEVICE.
+// sub0llm_eval_seam_tests already uses for SUB0_BUILD_MOCK_DEVICE.
 //
 // It links no engine library: nothing here runs, so there is nothing to link. If it COMPILES, it passed.
 

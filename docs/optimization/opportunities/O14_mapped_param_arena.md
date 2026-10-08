@@ -86,12 +86,12 @@ exactly 0 against the heap arm.
 - **A bigger cache did not buy speed here.** 26 GiB cut miss waits about 40% and ran no faster than
   17 GiB. At this pressure the waits (4-5 ms of a ~118 ms token) are not what limits decode, so the freed
   memory is headroom for the rest of the system, or for deeper pressure than this run applied.
-- Neutral build: generated header unchanged by the auto flip; `sub0_tests` 29,510,661 / 147 with the
-  three fingerprints unchanged, run against a fresh `sub0_core.dll` (see `tests/CMakeLists.txt`).
+- Neutral build: generated header unchanged by the auto flip; `sub0llm_tests` 29,510,661 / 147 with the
+  three fingerprints unchanged, run against a fresh `sub0llm_core.dll` (see `tests/CMakeLists.txt`).
 
 ## Tests
 
-`tests/param_arena_tests.cpp` (own target `sub0_param_arena_tests`, so `sub0_tests` counts are untouched):
+`tests/param_arena_tests.cpp` (own target `sub0llm_param_arena_tests`, so `sub0llm_tests` counts are untouched):
 refusal in a trainable build; in a forward-only build, adoption after nodes exist gives byte-identical arenas
 and bitwise-identical logits, writers convert back, `build_model` after a view re-randomizes on the heap,
 `save_model` from a view does not un-map; `load_model` follows `PARAM_ARENA_MAPPED`.

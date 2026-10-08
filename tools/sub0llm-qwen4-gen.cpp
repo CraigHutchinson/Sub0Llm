@@ -12,11 +12,11 @@
 // have one. There is no end-to-end oracle to diff against: sampling is stochastic and no independent
 // Qwen inference engine exists on this machine. That is stated here rather than papered over.
 //
-// WHY A TOOL AND NOT A TEST -- the same reason sub0llm-qwen4-forward.cpp is one: it links sub0_core,
+// WHY A TOOL AND NOT A TEST -- the same reason sub0llm-qwen4-forward.cpp is one: it links sub0llm_core,
 // so it must be built against the SAME generated config the engine was, i.e. a real
-// `sub0llm-configure` run at the real Qwen4 axes. It cannot join sub0_tests, which is configured for
+// `sub0llm-configure` run at the real Qwen4 axes. It cannot join sub0llm_tests, which is configured for
 // something else entirely, and 18-46 GiB of resident weights is not a unit-test fixture. It
-// additionally links sub0_frontend, where WP5a's engine-free tokenizer lives.
+// additionally links sub0llm_frontend, where WP5a's engine-free tokenizer lives.
 //
 // ------------------------------------------------------------------------------------------------
 // THE FOUR DESIGN DECISIONS, each with the reason it went the way it did

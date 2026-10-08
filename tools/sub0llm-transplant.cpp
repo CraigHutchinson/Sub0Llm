@@ -21,9 +21,9 @@
 // over a sub0_config.hpp, so this tool is compiled against tests/qwen4_real_axes/sub0_config.hpp --
 // the REAL model's axes -- with -DSUB0_QWEN4_LAYERS=4 for the 4-layer sub-stack (docs/WP4_SCOPE.md S7
 // Q3: 3 GDN layers + 1 QSA layer, the real stack's own repeating unit), or -DSUB0_QWEN4_LAYERS=48 for
-// the FULL model (WP5b). It therefore links NO engine library: sub0_core is compiled against the
+// the FULL model (WP5b). It therefore links NO engine library: sub0llm_core is compiled against the
 // BUILD's generated config, and two definitions of sub0::PARAM_LAYOUT in one binary is an ODR
-// violation. Same reasoning as sub0_qwen4_shape_tests.
+// violation. Same reasoning as sub0llm_qwen4_shape_tests.
 //
 // WP5b -- WHY 48 LAYERS IS QUANTIZED-RESIDENT ONLY, and why that is a refusal rather than a warning.
 // All-f32 the full model is 125,711,062,400 floats: 468 GiB of destination blob, 24x this machine's

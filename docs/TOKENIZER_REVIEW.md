@@ -44,7 +44,7 @@ behind a `join_scheme` flag, doubling the surface that must stay correct.
 **Plan:** make JOIN the *only* scheme in the library first (delete the branches; `learn` always
 mints the full 256-byte base + 13 markers), update `tok_lib_tests` (its "current scheme" cases
 currently exercise the legacy `learn(corpus)` with no opts), and confirm green with the
-engine-free `sub0_frontend_tests` (fast, no GPU). Then retire the build/registry plumbing
+engine-free `sub0llm_frontend_tests` (fast, no GPU). Then retire the build/registry plumbing
 (`SUB0_JOIN_TOKENIZER`, the `j` tag, `--join`) in a second commit, since that needs a full
 configure+build. Net: ~one parallel code path and several conditionals deleted, no behaviour
 change for current (JOIN) models.
@@ -179,7 +179,7 @@ distinct bytes** (unambiguously open vs. close) — they don't need that trick. 
 the JOIN tax on the zero-gap case: every glued punctuation boundary pays a `JOIN` to cancel the
 decoder's pending-space state (see `encode_join`'s `tile_ws`, `src/tokenizer.cpp:468-492`). Traced
 through by hand: `f(x)` costs **7 tokens for 4 characters** (`f`, JOIN, `(`, JOIN, `x`, JOIN, `)`).
-This is not hypothetical — it's directly visible in this session's own `sub0_frontend_tests` output
+This is not hypothetical — it's directly visible in this session's own `sub0llm_frontend_tests` output
 tokenizing `"std::vector<int>"` at 22 tokens (`{st} <J> {d} <J> {:} <J> {:} <J> <[...]> <J> {<} <J>
 {i} <J> {nt} <J> {>}`), matching the 9-day-old dogfood memory's finding almost exactly (was 24 tok
 then — the gap hasn't materially closed, this specific pathology is still open).
@@ -421,7 +421,7 @@ only changes) but NOT another `tokenizer.tok` magic-number bump.
 inverted the open/close `dps` assignment (`dps = !is_close_bracket(...)` instead of
 `dps = is_close_bracket(...)`), which broke round-trips for any bracket immediately followed by
 *another* bracket of a different family (e.g. `"{code}[index]"` — a `}` immediately followed by a
-`[`). Caught immediately by `sub0_frontend_tests`' full-source dogfood test and both 4000-iteration
+`[`). Caught immediately by `sub0llm_frontend_tests`' full-source dogfood test and both 4000-iteration
 fuzz suites going red (not by the pinned worked-example cases, which happened to avoid this exact
 adjacency) — direct validation of why this project keeps the generative fuzz net alongside curated
 examples, per this file's own opening framing.
@@ -432,12 +432,12 @@ Targeted `normalize_text`'s rare-lead-byte scan and `truecase_tokenize`'s alpha-
 per §3's original framing. This project's existing SIMD convention is `#pragma omp simd`
 auto-vectorization hints over plain loops (see `src/backend_cpu.cpp`), not hand-written intrinsics
 — followed here rather than introducing a new pattern. One real, important discovery along the way:
-`sub0_frontend` (the static lib `casing.hpp`/`tokenizer.cpp` actually compile as, used by both the
-configurator and — via `sub0_core` — the runtime engine) never received an OpenMP flag; only
-`sub0_core` links `SUB0_OPENMP_TARGET` (`cmake/OpenMP.cmake`). Every `#pragma omp simd` in this
+`sub0llm_frontend` (the static lib `casing.hpp`/`tokenizer.cpp` actually compile as, used by both the
+configurator and — via `sub0llm_core` — the runtime engine) never received an OpenMP flag; only
+`sub0llm_core` links `SUB0_OPENMP_TARGET` (`cmake/OpenMP.cmake`). Every `#pragma omp simd` in this
 header was **silently inert** until `-fopenmp-simd` (simd-pragma recognition only, no threading
 runtime — safe and free to add regardless of the full OpenMP probe's outcome) was added to
-`sub0_frontend`'s compile options in `CMakeLists.txt`.
+`sub0llm_frontend`'s compile options in `CMakeLists.txt`.
 
 **`normalize_text` — real, measured win, ~20% faster.** Rewrote as a two-pass: a branchless
 `#pragma omp simd` classify pass flags the two rare lead bytes (`0xE2`, backtick) across the whole

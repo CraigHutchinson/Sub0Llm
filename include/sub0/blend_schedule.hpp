@@ -26,7 +26,7 @@
 // Engine-free (TokView/window-sampler/std only, mirroring blend.hpp's own testability property) so the
 // scheduler math is unit-testable with no model and no JSON parser -- the simdjson-based parser that turns
 // a schedule file into a ScheduleSpec lives in blend_schedule.cpp, out-of-line, for the same DLL-boundary
-// reason registry.hpp documents for read_config_json (simdjson types never cross sub0_core.dll).
+// reason registry.hpp documents for read_config_json (simdjson types never cross sub0llm_core.dll).
 
 #pragma once
 
@@ -48,7 +48,7 @@
 namespace sub0 {
 
 // Export macro for parse_blend_schedule_json's out-of-line definition (src/blend_schedule.cpp, compiled
-// once into sub0_core) -- self-contained copy of core.hpp's own SUB0_API, matching registry.hpp's own
+// once into sub0llm_core) -- self-contained copy of core.hpp's own SUB0_API, matching registry.hpp's own
 // precedent for read_config_json (this header is deliberately engine-free, no core.hpp dependency).
 #ifndef SUB0_API
   #if defined(_WIN32)
@@ -115,7 +115,7 @@ struct ScheduleSpec {
 // content_embed value, more than one corpus-typed source -- see blend_schedule.cpp for the exact checks),
 // with a human-readable reason in `error`. Non-fatal issues (a declared source never given a positive
 // weight anywhere) are appended to `warnings` instead of failing the parse. Does NOT log anything itself
-// (see this header's own top comment for why -- a sub0_core.dll/sub0_train.dll logger-instance mismatch)
+// (see this header's own top comment for why -- a sub0llm_core.dll/sub0llm_train.dll logger-instance mismatch)
 // -- the caller decides how to surface `error`/`warnings`.
 [[nodiscard]] SUB0_API bool parse_blend_schedule_json(const std::filesystem::path& path, ScheduleSpec& out,
                                                        std::string& error,

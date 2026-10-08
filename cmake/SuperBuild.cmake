@@ -51,7 +51,7 @@ set(_sub0_forward
 # Component: host (clang) -- the engine core, the CPU backend, the stage libraries, the
 # driver and the tests. This is the entire product today. The CUDA component slots in
 # next to it later as a second ExternalProject_Add that drives nvcc (a -DCMAKE_CUDA_*
-# toolchain) and emits sub0_backend_cuda.dll into the same shared bin dir; it is built
+# toolchain) and emits sub0llm_backend_cuda.dll into the same shared bin dir; it is built
 # BEFORE the host so the host links/copies it.
 ExternalProject_Add(sub0_host
   SOURCE_DIR   "${CMAKE_SOURCE_DIR}"

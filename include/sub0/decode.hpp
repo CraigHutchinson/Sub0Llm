@@ -7,9 +7,9 @@
 // marker so it is never emitted (see commit a016d17 -- sampling past EOS is out-of-distribution
 // garbage, since no training document continues past its own end).
 //
-// Header-only, no library of its own: sub0_gen and sub0_train each already privately link
-// sub0_backend_cuda and declare their own extern "C" seam into it (see CMakeLists.txt) -- moving the
-// CUDA link edge into sub0_core would break its "ALWAYS the CPU backend" invariant (see sub0_core's
+// Header-only, no library of its own: sub0llm_gen and sub0llm_train each already privately link
+// sub0llm_backend_cuda and declare their own extern "C" seam into it (see CMakeLists.txt) -- moving the
+// CUDA link edge into sub0llm_core would break its "ALWAYS the CPU backend" invariant (see sub0llm_core's
 // own CMakeLists.txt comment), so this header instead declares the (small, decode-only) seam ONCE and
 // drops into whichever TU includes it, compiled against that TU's own SUB0_BUILD_CUDA setting.
 //

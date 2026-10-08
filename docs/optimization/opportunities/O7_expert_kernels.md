@@ -283,7 +283,7 @@ task brief's explicit "do NOT run real-model decode timing"):**
   `if constexpr (USE_MOE_QUANT && MOE_QUANT_DOT)`, and the neutral config has `NUM_EXPERTS = 0` /
   `MOE_QUANT_DOT = false`, so the whole branch — and every template this package touches
   (`gemv_fast`/`gemv_avx2_fast`/`gemv_avx2_vnni`/`group_cached`/`group_v_cached`) — is discarded, never
-  instantiated, in that build. **Verified directly, not just argued**: `sub0_tests.exe` was built and run
+  instantiated, in that build. **Verified directly, not just argued**: `sub0llm_tests.exe` was built and run
   BOTH with this package's `moe_quant_dot.hpp` and with the byte-identical pre-O7 original (`git show
   main:include/sub0/moe_quant_dot.hpp`, swapped in, rebuilt, tested, then restored) — the neutral build's
   own printed fingerprints (`forward hash=5a7382ea70d3913b`, `grad hash=7f44bdae18c313dd`, `decode

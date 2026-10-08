@@ -228,7 +228,7 @@ operation/format matrix.
 ### Phase 5 — production integration, only after I06
 
 1. Complete I07a's neutral CUDA export cleanup without changing CUDA behavior.
-2. Close I07b.0 with a POD smoke DLL loaded by production `sub0_gen` in `src/gen_stage.cpp`, exercised
+2. Close I07b.0 with a POD smoke DLL loaded by production `sub0llm_gen` in `src/gen_stage.cpp`, exercised
    through `sub0llm-gen`. CPU-only needs no Intel tools; CUDA remains CUDA-specific; Intel cannot enter
    training paths. `tools/sub0llm-qwen4-gen.cpp` is a direct CPU/WP5 oracle and is not proof of this seam.
 3. Land I07b and I11 together through that same production stage using I01's admitted dense control.

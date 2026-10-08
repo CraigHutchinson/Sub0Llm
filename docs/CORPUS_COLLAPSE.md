@@ -217,7 +217,7 @@ Reviewed before implementation, not discovered after:
   prediction on the SAME real documents; not accuracy alone), performance (wall-clock for `build_dataset` at
   a couple of `n_docs` sizes), memory (peak `Dataset` footprint vs corpus.tok's own mmap footprint). Do not
   touch the production `fineweb_edu_workflow` corpus/schedule until this is clean.
-- Full `ctest`/`sub0_tests` regression suite green on both CPU-only (`tok_cpu`) and CUDA (`gsm8k`) build
+- Full `ctest`/`sub0llm_tests` regression suite green on both CPU-only (`tok_cpu`) and CUDA (`gsm8k`) build
   configs.
 
 ### Implementation order

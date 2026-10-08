@@ -6,7 +6,7 @@
 // reach it, and shipped with no correctness check at all. AGENTS.md 6 requires new math carry a
 // numerical check rather than "it compiles".
 //
-// Engine-free (links sub0_frontend only), so these run everywhere and stay fast.
+// Engine-free (links sub0llm_frontend only), so these run everywhere and stay fast.
 
 #include <catch2/catch_test_macros.hpp>
 

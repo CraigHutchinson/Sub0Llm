@@ -38,11 +38,11 @@ that turns runtime-discovered facts into compile-time constants.
 
 | Layer | Lives in | Used by |
 |---|---|---|
-| **frontend** (pre-model): config decisions, tokenizer, casing, unigram, memplan, registry | `sub0_frontend` (static) | every stage tool + the engine build |
+| **frontend** (pre-model): config decisions, tokenizer, casing, unigram, memplan, registry | `sub0llm_frontend` (static) | every stage tool + the engine build |
 | **build facts** (CMake-known: device caps, output paths, git sha) | `configure_file` → `sub0_build_facts.hpp` | baked into `sub0llm-configure` |
 | **config emit** (smart derivation → `constexpr`) | `sub0::config` (pure, unit-tested) + the configurator's emitter | `sub0llm-configure` |
-| **engine** (compute) | `sub0_core` = `engine_core` + `backend_cpu` (+ `backend_cuda`) | tune / train / gen |
-| **stages** | `sub0_train`, `sub0_gen` | the stage executables |
+| **engine** (compute) | `sub0llm_core` = `engine_core` + `backend_cpu` (+ `backend_cuda`) | tune / train / gen |
+| **stages** | `sub0llm_train`, `sub0llm_gen` | the stage executables |
 
 ## Decisions on the open forks
 
@@ -70,7 +70,7 @@ that turns runtime-discovered facts into compile-time constants.
   edge, no reconfigure-on-appearance magic, nothing to get out of sync.
 - **`frontend_cuda` / `backend_cpu` discipline.** Keep `backend_*` strictly *compute*. Pre-model device
   facts come from CMake (`configure_file`), so a runtime `frontend_cuda` probe is only needed for the
-  fully-decoupled state-1 self-probe — defer it. `sub0_frontend` holds the shared pre-model logic.
+  fully-decoupled state-1 self-probe — defer it. `sub0llm_frontend` holds the shared pre-model logic.
 
 ## Staged implementation plan
 
@@ -106,10 +106,10 @@ that turns runtime-discovered facts into compile-time constants.
    2026-07-02) made it an explicit on-demand target instead. Both modes still ran the configurator
    *through CMake*, which is the part now removed entirely.
    </details>
-3. **Extract `sub0_frontend`** (config_util/memplan/casing/tokenizer/unigram/registry) so the tools and
-   the engine share one site. ✅ **DONE** — the static lib `sub0_frontend` (was `sub0_tok`) compiles the
+3. **Extract `sub0llm_frontend`** (config_util/memplan/casing/tokenizer/unigram/registry) so the tools and
+   the engine share one site. ✅ **DONE** — the static lib `sub0llm_frontend` (was `sub0_tok`) compiles the
    tokenizer/unigram and exposes the header-only pre-model logic via its PUBLIC include; the configurator
-   and the engine both link it, and the engine-free `sub0_frontend_tests` target covers it.
+   and the engine both link it, and the engine-free `sub0llm_frontend_tests` target covers it.
 4. **Split the driver** into thin `sub0llm-{configure,train,gen,tune}` exes over shared runners. ✅
    **DONE** — `include/sub0/cli_stages.hpp` defines each `run_*` once; the umbrella `sub0llm` dispatches
    to them and the stage exes are thin `main()`s; diagnostics (vocab/bench/models/report/memplan) stay
@@ -121,7 +121,7 @@ that turns runtime-discovered facts into compile-time constants.
    instead). `frontend_cuda` self-probe ⏳ still pending, deferred per the "`frontend_cuda` / `backend_cpu`
    discipline" fork above.
 
-Stages 1-4 are done — the user-callable stage tools, the `sub0_frontend` extraction, and the shrunk,
+Stages 1-4 are done — the user-callable stage tools, the `sub0llm_frontend` extraction, and the shrunk,
 non-mirroring CMake are all in place, plus the `workflow.ps1` convenience wrapper from item 5. Remaining:
 only the state-1 `frontend_cuda` self-probe, deferred (not blocking).
 
@@ -132,7 +132,7 @@ doesn't define: `config_util`, `memplan`, `registry`, `casing`, `tokenizer`, `un
 + std-only today). Its separation buys two things beyond tidiness:
 
 ### 1. Testability — the immediate, measured payoff
-Header-only + std-only ⇒ it runs in the **fast engine-free** `sub0_frontend_tests` target (no engine build, no
+Header-only + std-only ⇒ it runs in the **fast engine-free** `sub0llm_frontend_tests` target (no engine build, no
 GPU). First slice **done** (`tests/frontend_tests.cpp`): `memplan` (the VRAM clamp/cap math — monotone
 footprint, `max_batch_for_vram` inversion, the clamp invariant) and `registry` (`corpus_tag` / `model_dir`
 identity + `compatible()` — the `models --prune` rule) — the two areas this session changed, previously
@@ -140,15 +140,15 @@ tested only via the slow engine-linked target (`memplan`) or **not at all** (`re
 assertions. **Gaps still open**: `casing` edge cases (only covered indirectly via the tokenizer), registry
 meta read/write + `scan` (needs a temp-dir I/O fixture), the configurator's header *emit* (integration only).
 
-### 2. `sub0_frontend` lib (Stage 3) — one named home + one test target
-Extract a `sub0_frontend` static lib (the headers above) that both the configurator and the stage tools
-link, plus a single `sub0_frontend_tests`. Low-risk (a CMake + include reshuffle; the engine-free test
+### 2. `sub0llm_frontend` lib (Stage 3) — one named home + one test target
+Extract a `sub0llm_frontend` static lib (the headers above) that both the configurator and the stage tools
+link, plus a single `sub0llm_frontend_tests`. Low-risk (a CMake + include reshuffle; the engine-free test
 target already proves the value). `frontend_cuda` (a runtime device probe) is only needed for the fully
 decoupled state-1 self-probe and stays deferred — CMake bakes the device facts today.
 
 ### Tokenizer / vocab as engine-free frontend tools — judgement: **YES**, for diagnostics + interchange
-A `sub0llm-tokenizer` tool (links `sub0_frontend`, **not** the engine) is worth building:
-- **Why engine-free is the point.** Inspecting/exporting a tokenizer needs only `sub0_frontend`. Today
+A `sub0llm-tokenizer` tool (links `sub0llm_frontend`, **not** the engine) is worth building:
+- **Why engine-free is the point.** Inspecting/exporting a tokenizer needs only `sub0llm_frontend`. Today
   `sub0llm vocab` lives in the *train* stage lib, so you must build the whole engine to print a vocab
   table — wrong coupling. Moving it frees diagnostics from the engine and from a configured build.
 - **Diagnostics**: `encode "text"` (show the token stream — debug the CamelCase-shatter / indented-code
@@ -165,5 +165,5 @@ A `sub0llm-tokenizer` tool (links `sub0_frontend`, **not** the engine) is worth 
 
 **Workflow integration**: after a configure run, `sub0llm-tokenizer vocab/encode` sanity-checks the
 tokenization *before* committing to a long train; `export` feeds external comparison + the viz scrubber.
-Sequencing: do the `sub0_frontend` lib first (gives the tool + its tests a home), then the tool absorbing
+Sequencing: do the `sub0llm_frontend` lib first (gives the tool + its tests a home), then the tool absorbing
 `vocab` off the engine, then `encode/decode/roundtrip/export`.

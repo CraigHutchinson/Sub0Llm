@@ -446,7 +446,7 @@ the selected FFN activation/gating, final normalization and vocabulary head. Fre
 dense artifact/config in I01; do not silently assume Qwen3.5 is an ordinary-attention control.
 Support exactly that config, reject other feature combinations, and cover setup/failure paths. Keep FP32 correctness mode and
 separately gated reduced precision. Wire a small supported dense model into the existing generation
-consumer (`sub0_gen` in `src/gen_stage.cpp`, exercised by `sub0llm-gen`) with explicit artifact
+consumer (`sub0llm_gen` in `src/gen_stage.cpp`, exercised by `sub0llm-gen`) with explicit artifact
 validation; do not advertise Qwen4 while I12–I14 are missing. `tools/sub0llm-qwen4-gen.cpp` remains a
 direct CPU/WP5 oracle and does not satisfy the production device-seam consumer gate.
 

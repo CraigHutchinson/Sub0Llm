@@ -91,8 +91,8 @@ already at this host's ~19-20 GB/s stride ceiling for this layout.
   +-127 activations); all `Q8Isa` forms bit-identical; `gemv_plane<T,false>` == today's path exactly; `<T,true>` bit-exact
   across 1/2/4 threads on 37 rows; inert for non-Q8_0; Plane overload == loose overload; REAL Q8_0 shard bytes.
 - Neutral build (`--dmodel 196 --layers 11 --heads 7 --kv-heads 7 --seq 256`; only diff is `BACKBONE_Q8_FAST = false`):
-  `sub0_tests` **29,510,661 / 147**, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` / `d1625d19ed2258f1`;
-  `sub0_frontend_tests` **231,180 / 304** = 230,939 / 300 + 241 / 4 (all new cases). Builds confirmed successful
+  `sub0llm_tests` **29,510,661 / 147**, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` / `d1625d19ed2258f1`;
+  `sub0llm_frontend_tests` **231,180 / 304** = 230,939 / 300 + 241 / 4 (all new cases). Builds confirmed successful
   before every count.
 
 ## 7. G-PPL (real 48-layer artifact, `ppl_blend_v2`, 9,631 tokens)

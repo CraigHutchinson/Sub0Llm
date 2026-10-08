@@ -7,7 +7,7 @@
     {
       "id": "G-HASH",
       "label": "neutral-build decode fingerprint unchanged",
-      "stage": "sub0_tests @ d196check",
+      "stage": "sub0llm_tests @ d196check",
       "metric": "decode hash",
       "op": "eq",
       "threshold": "d1625d19ed2258f1",
@@ -16,8 +16,8 @@
     },
     {
       "id": "G-SUITE-ENGINE",
-      "label": "sub0_tests assertion count",
-      "stage": "sub0_tests @ d196check",
+      "label": "sub0llm_tests assertion count",
+      "stage": "sub0llm_tests @ d196check",
       "metric": "assertions",
       "op": "eq",
       "threshold": 29510661,
@@ -26,8 +26,8 @@
     },
     {
       "id": "G-SUITE-FRONTEND",
-      "label": "sub0_frontend_tests assertion count",
-      "stage": "sub0_frontend_tests @ d196check",
+      "label": "sub0llm_frontend_tests assertion count",
+      "stage": "sub0llm_frontend_tests @ d196check",
       "metric": "assertions",
       "op": "gte",
       "threshold": 231180,

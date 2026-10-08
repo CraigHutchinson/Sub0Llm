@@ -7,7 +7,7 @@
 // tests the combine op + copy fidelity.
 //
 // Tagged "[.spellspike]" (hidden): trains hundreds of steps, so NOT in the default ctest sweep --
-// invoke with `sub0_tests "[spellspike]"`. This is a SPIKE: assertions only guard "it ran + finite
+// invoke with `sub0llm_tests "[spellspike]"`. This is a SPIKE: assertions only guard "it ran + finite
 // numbers"; the reported metrics (via WARN) are the deliverable.
 
 #include <catch2/catch_test_macros.hpp>

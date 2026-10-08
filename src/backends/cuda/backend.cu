@@ -6741,7 +6741,7 @@ static sub0::memplan::Dims live_footprint_dims() {
 }
 
 // The context length this backend was BUILT for -- the upper bound every measurement entry point here
-// enforces via its `T > SEQ_LEN` guard. Exists for sub0-cuda-selftest, which is deliberately compiled
+// enforces via its `T > SEQ_LEN` guard. Exists for sub0llm-cuda-selftest, which is deliberately compiled
 // without the generated config (it is a thin clang driver whose job is to exercise the clang<->nvcc
 // seam) and so cannot read SEQ_LEN directly. Without it that tool hardcoded the fineweb T=256 and every
 // call silently returned 1 on a shorter build -- 6 of its 8 checks no-oped while it still exited 0.

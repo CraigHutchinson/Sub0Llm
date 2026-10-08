@@ -526,7 +526,7 @@ TEST_CASE("moeq (B38): forward_row_via_run_ex<UseSimd=true> builds, runs, and st
     // parameter actually controls (the shared-expert gate logit, moe_math.hpp): instantiate both arms
     // over the SAME real sidecar bytes and SAME input row, and require (a) both compile/run/produce
     // finite output -- the templating itself is exercised, not merely assumed to compile because
-    // `sub0_core` happened to link somewhere else, (b) the two arms' outputs are close (tolerance, NOT
+    // `sub0llm_core` happened to link somewhere else, (b) the two arms' outputs are close (tolerance, NOT
     // bit-exact -- reassociating a sum changes the last bits by construction, same as every other
     // reordering this project has already accepted, e.g. B24/B31's own precedent), and (c) the routed
     // experts' own output (expert_ffn_row_source, untouched by `UseSimd`) is IDENTICAL between the two
@@ -1138,7 +1138,7 @@ bool o8_gemv_plane_range(std::uint32_t type_raw, std::span<const std::uint8_t> r
 }
 
 // Runs the row-chunk list across `threads` real std::thread workers (a STATIC round-robin split of the
-// chunk list, not OpenMP's schedule(dynamic) -- sub0_frontend_tests does not link the full OpenMP
+// chunk list, not OpenMP's schedule(dynamic) -- sub0llm_frontend_tests does not link the full OpenMP
 // runtime, only -fopenmp-simd, so this is genuine concurrency without depending on libomp). Each thread
 // only ever writes rows that belong to ITS OWN chunks, which are disjoint by construction, so this is
 // also a real (if small) check that no data race corrupts a neighbouring row.

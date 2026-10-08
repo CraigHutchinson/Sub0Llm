@@ -1,5 +1,5 @@
 // sub0/log.hpp — a tiny process-wide logging wrapper for the whole project (frontend + engine + tools).
-// Header-only + std-only, so it lives in the sub0_frontend layer and is engine-free testable.
+// Header-only + std-only, so it lives in the sub0llm_frontend layer and is engine-free testable.
 //
 // Two output kinds:
 //   * LEVELED diagnostics -- log::error / warn / info / debug -- prefixed with "[level] ", filtered by a

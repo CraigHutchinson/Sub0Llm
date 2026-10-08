@@ -24,7 +24,7 @@
 // later stages (AGENTS.md sec 8: land the stage that is actually wired up).
 //
 // Engine-free: this header and its .cpp depend on std + simdjson + sub0/qwen_unicode.hpp only, no
-// generated config and no engine, so it lives in sub0_frontend and is unit-testable without a
+// generated config and no engine, so it lives in sub0llm_frontend and is unit-testable without a
 // compiled model -- the same seam gguf.hpp and transplant.hpp already use.
 
 #pragma once

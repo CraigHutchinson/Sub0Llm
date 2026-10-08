@@ -592,7 +592,7 @@ predicted; a sum mutant would land at `~2.0`, outside it, since `hc_count=4`). A
 assertions, green.
 
 **Two-scale identity check** (AGENTS.md S7): at `HC_COUNT == 0` (neutral), the full default engine test
-suite (`sub0_tests`) is assertion- AND hash-identical to `main` at BOTH shapes:
+suite (`sub0llm_tests`) is assertion- AND hash-identical to `main` at BOTH shapes:
 
 | shape | assertions | test cases | forward hash | grad hash | decode hash |
 |---|---|---|---|---|---|
@@ -602,7 +602,7 @@ suite (`sub0_tests`) is assertion- AND hash-identical to `main` at BOTH shapes:
 identical before Stage 0's own two new test cases (137 cases, 4,504,571 / 11,810,663 assertions
 respectively -- exactly 12 fewer, matching the 2 new test cases' own 12 assertions and nothing else)
 through every subsequent commit in this pass, verified by rebuilding each side at the same generated
-config header and diffing `sub0_tests`' own summary line.
+config header and diffing `sub0llm_tests`' own summary line.
 
 **Real GR-ON build, forward/forward_one parity** (this doc's own scope: a small correctness-fixture-scale
 config, not production dims): `D_MODEL=16, N_LAYERS=2, N_HEADS=2, SEQ_LEN=32, HC_COUNT=4, HC_LOWRANK=6` --
@@ -620,7 +620,7 @@ nonzero-`HC_COUNT` build rather than only reasoning about it: two pre-existing g
 consistency check) had no GR term at all and failed a REAL assertion at `HC_COUNT=4`, not a hypothetical
 one -- fixed the same pass, per AGENTS.md S10's own lesson about a diff not showing you every consumer.
 
-**Scope confirmed, not merely assumed**: the full, untagged default `sub0_tests` suite at this same
+**Scope confirmed, not merely assumed**: the full, untagged default `sub0llm_tests` suite at this same
 GR-ON build reaches `backward_node`'s loud `abort()` on the first GR node a training-path test tries to
 differentiate through (many of that suite's test cases call `train_batch`/`backward`) -- exactly Stage
 1's own declared scope boundary (S6), confirmed by actually hitting it rather than only documenting it.

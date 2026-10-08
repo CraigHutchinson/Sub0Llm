@@ -1,6 +1,6 @@
 // sub0llm-tokenizer — an engine-free frontend tool over a built tokenizer.tok: WS7's interchange
 // export (see docs/TOKENIZER_REVIEW.md's WS7 section and docs/WORKFLOW_ARCHITECTURE.md's
-// "Tokenizer / vocab as engine-free frontend tools" section). Links sub0_frontend only, never the
+// "Tokenizer / vocab as engine-free frontend tools" section). Links sub0llm_frontend only, never the
 // engine -- inspecting/exporting a tokenizer needs nothing more. `encode`/`decode`/`roundtrip`/
 // `vocab` are explicitly out of scope for this pass (see WORKFLOW_ARCHITECTURE.md's own staged
 // sequencing); this tool currently has exactly one subcommand, `export`.

@@ -9,8 +9,8 @@ Generated 2026-10-08T06:52:38Z -- label `O14-regime2-verify`
 | `G-PPL` | mapped17 vs heap17, 2000 tokens | +0.0000 nats/token (95% CI +0.0000..+0.0000), ppl x1.0000, top-1 agree 100.0% | PASS |
 | `G-PPL` | mapped26 vs heap17, 2000 tokens | +0.0000 nats/token (95% CI +0.0000..+0.0000), ppl x1.0000, top-1 agree 100.0% | PASS |
 | `G-HASH` | neutral-build decode fingerprint unchanged | n/a | n/a |
-| `G-SUITE-ENGINE` | sub0_tests assertion count | n/a | n/a |
-| `G-SUITE-FRONTEND` | sub0_frontend_tests assertion count | n/a | n/a |
+| `G-SUITE-ENGINE` | sub0llm_tests assertion count | n/a | n/a |
+| `G-SUITE-FRONTEND` | sub0llm_frontend_tests assertion count | n/a | n/a |
 | `G-PARITY` | forward vs forward_one bit-exact | n/a | n/a |
 | `G-QUALITY` | logit L2-relative vs the unfused path | n/a | n/a |
 | `G-COMPETITOR` | llama.cpp gap on the same host and model | n/a | n/a |

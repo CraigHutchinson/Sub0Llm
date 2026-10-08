@@ -271,7 +271,7 @@ diagnostic/directory-naming identity, not the checkpoint-format gate (`ARCH_FING
   `main` (a parallel extraction effort, merged after this branch was first started) with REAL per-table
   embedding values and their real flattened/concatenated form read directly from the
   `Qwen/Qwen3.8-Flash-Next` checkpoint. `tests/ngram_qwen4_fixture_tests.cpp` (part of
-  `sub0_frontend_tests`, engine-free) verifies this project's "concat" ordering convention (table/head
+  `sub0llm_frontend_tests`, engine-free) verifies this project's "concat" ordering convention (table/head
   index MAJOR, in-row index MINOR — see §4) reproduces the real module's own `.flatten(-2)` output
   bit-for-bit when fed that fixture's real per-head embeddings, i.e. the fusion/ordering CONVENTION
   matches even though the hash formula and table sizes deliberately do not (§7's scope boundary; Qwen4's

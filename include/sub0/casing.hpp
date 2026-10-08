@@ -419,11 +419,11 @@ inline std::vector<std::size_t> camel_segments(std::string_view w) {
 // dominant cost is per-word case CLASSIFICATION (emit_word below: a lowercase copy, an `attested`
 // hash lookup), which is inherently NOT a SIMD target (branchy, allocates, hashes). Two rewrites
 // were tried and measured, not assumed: (1) a whole-text is_alpha/is_upper mask precomputed up
-// front -- net SLOWER, since `sub0_frontend` (this header's actual compile target) gets no OpenMP
-// flag by default (only `sub0_core` does, see cmake/OpenMP.cmake) so the `#pragma omp simd` was
+// front -- net SLOWER, since `sub0llm_frontend` (this header's actual compile target) gets no OpenMP
+// flag by default (only `sub0llm_core` does, see cmake/OpenMP.cmake) so the `#pragma omp simd` was
 // inert, and the extra two n-sized allocations were pure overhead; (2) bulk-appending each run via
 // `resize`+store instead of one `push_back` per byte, even after adding `-fopenmp-simd` to
-// `sub0_frontend` and gating it behind a length threshold (push_back wins for the length-1 runs
+// `sub0llm_frontend` and gating it behind a length threshold (push_back wins for the length-1 runs
 // that dominate real prose) -- an INTERLEAVED same-process A/B (this laptop has real thermal
 // confounds on separate sequential process runs, see the project's own perf-testing notes) showed
 // the "improved" version within +-3% of the original, i.e. noise, not a real win. Not worth the

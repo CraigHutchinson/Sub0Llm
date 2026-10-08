@@ -193,8 +193,8 @@ every consumer. No per-token allocation. The reactive default and the pipelined 
 | Revisions | Sub0Llm `baf33b9` (local main); runtime MemPage pin `213acdd` (unchanged). Packaging-only lower commits, not pinned: MemPage `ef40370`, TieredCache `53f91e2` (5/5 and 11/11 CTest on Windows Clang and WSL GCC 15). |
 | Artifact | `qwen4_full48_q_bf16.bin` + `.moeq` (39,848,247,352 bytes, 73,728 planes, 512 experts, top-10). |
 | Output parity | Reactive, pipelined and mempage give byte-identical 6-token `forward_one` logits: SHA-256 `99BFC58A...` with `--backbone-quant-dot 0`, and `D1F29B19...` under the recommended defaults (mempage at both 30 and 10 readers). |
-| Adapter suite | `sub0_storage_moe_io_tests`: 642 assertions / 5 cases on Windows Clang and WSL GCC 15, including the real-sidecar case (encoded bytes and dequantized values vs `moeq::Store`). |
-| Default build | Neutral d196 suites exact: `sub0_tests` 29,510,661/147, `sub0_frontend_tests` 231,180/304. |
+| Adapter suite | `sub0llm_storage_moe_io_tests`: 642 assertions / 5 cases on Windows Clang and WSL GCC 15, including the real-sidecar case (encoded bytes and dequantized values vs `moeq::Store`). |
+| Default build | Neutral d196 suites exact: `sub0llm_tests` 29,510,661/147, `sub0llm_frontend_tests` 231,180/304. |
 | Review | `cpp-review` pass: no MUST findings. The retire-at-prefetch invariant is documented at its call site. |
 
 Performance (`run_perf_suite.py`, arms built once, rotated, 20 s cooldown, per-sample contention gate;
@@ -401,7 +401,7 @@ unbuffered reads plateau on this host: Sub0MemPage `docs/investigations/unbuffer
 |---|---|
 | Revisions | Sub0Llm `f048990`; Sub0TieredCache `65e59d5` (local, not yet published); Sub0MemPage pin `213acdd` |
 | Output parity | 6-token logits byte-identical to reactive (`D1F29B19...`); perplexity 11.930422 across every arm below |
-| Suites | `sub0_storage_moe_cache_tests` 124/4 (includes the real sidecar); TieredCache 11/11 on Windows and Linux |
+| Suites | `sub0llm_storage_moe_cache_tests` 124/4 (includes the real sidecar); TieredCache 11/11 on Windows and Linux |
 
 Long decode (2,000 G-PPL tokens) from an evicted cache, 2 rotated rounds:
 
@@ -506,10 +506,10 @@ Historical S1a fixture steps completed; this manifest does not certify the new S
 | Compilers | Windows: `clang++` 22.1.6 (LLVM), `-march=native`, `-std=gnu++26`. Linux (WSL): `g++-15` (Ubuntu 15.2.0-14ubuntu1~24~ppa1), `-std=gnu++26` |
 | Build tools | CMake 4.2.3, Ninja |
 | OS | Windows 11 Home 10.0.26220 (host: Core Ultra 9 275HX); WSL2 Ubuntu 24.04 on the same host |
-| Toggle-OFF gate (before, this machine) | `sub0_tests` 29,510,661/147 (fingerprints forward `5a7382ea70d3913b`, grad `7f44bdae18c313dd`, decode `d1625d19ed2258f1`); `sub0_frontend_tests` 228,198/295 |
-| Toggle-OFF gate (after, same machine) | Identical: `sub0_tests` 29,510,661/147, same three fingerprints; `sub0_frontend_tests` 228,198/295 |
-| Toggle-ON gate, Windows | `sub0_storage_tiered_cache_tests`: 17 assertions / 2 test cases, all passed. `sub0_tests` re-run in the same (toggle-ON) build tree: unchanged, 29,510,661/147, same fingerprints |
-| Toggle-ON gate, Linux (WSL/g++-15) | `sub0_storage_tiered_cache_tests`: 17 assertions / 2 test cases, all passed |
+| Toggle-OFF gate (before, this machine) | `sub0llm_tests` 29,510,661/147 (fingerprints forward `5a7382ea70d3913b`, grad `7f44bdae18c313dd`, decode `d1625d19ed2258f1`); `sub0llm_frontend_tests` 228,198/295 |
+| Toggle-OFF gate (after, same machine) | Identical: `sub0llm_tests` 29,510,661/147, same three fingerprints; `sub0llm_frontend_tests` 228,198/295 |
+| Toggle-ON gate, Windows | `sub0llm_storage_tiered_cache_tests`: 17 assertions / 2 test cases, all passed. `sub0llm_tests` re-run in the same (toggle-ON) build tree: unchanged, 29,510,661/147, same fingerprints |
+| Toggle-ON gate, Linux (WSL/g++-15) | `sub0llm_storage_tiered_cache_tests`: 17 assertions / 2 test cases, all passed |
 | Mutation check | Deliberate off-by-one row offset in `FlatFileResolver`'s `base_offset` (adapter's `create()`) -> rebuilt -> test correctly FAILED (11/12 assertions, 1/2 cases, the out-of-bounds last-row read); reverted -> rebuilt -> back to 17/2 |
 | `cpp-review` | One real gap found and fixed (doc-only): `resolve_rows()` silently narrows `Table`'s own thread-safety guarantee (the adapter's `lease_scratch_` has no lock of its own) -- documented with an explicit `@note`; also documented why `table_`'s member-declaration position relative to `backend_`/`resolver_`/the storage vectors is load-bearing for destruction order. No behavior change |
 | Boy-scout fix (pre-existing, found while bringing up the Linux run) | Root `CMakeLists.txt` applied Clang's `-fconstexpr-steps` unconditionally under `if(NOT MSVC)`, which fails outright on GCC (`unrecognized command-line option`) for every TU in the tree. Scoped to `$<CXX_COMPILER_ID:Clang>`; verified a no-op for the existing Clang/Windows build (both suites reproduce exactly) and verified positively unblocking the WSL/GCC 15 configure+build |

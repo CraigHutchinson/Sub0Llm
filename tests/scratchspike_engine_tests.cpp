@@ -11,7 +11,7 @@
 // supplies the binding table with NO engine or decode.hpp change. This validates the compression
 // mechanism (an OOV costs 1 scratch token per reference, its bytes recovered on demand) BEFORE any
 // content-derived-embedding engine work. Tagged "[.scratchspike]" (hidden): trains hundreds of steps,
-// so NOT in the default ctest sweep -- invoke with `sub0_tests "[scratchspike]"`.
+// so NOT in the default ctest sweep -- invoke with `sub0llm_tests "[scratchspike]"`.
 
 #include <catch2/catch_test_macros.hpp>
 

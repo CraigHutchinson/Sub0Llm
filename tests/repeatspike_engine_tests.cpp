@@ -3,7 +3,7 @@
 // the bound slot -- no request from the model) beat raw FUZZY copying (all three mentions spelled out,
 // answer via plain in-context lookup), on HELD-OUT OOVs never bound in training? Tagged "[.repeatspike]"
 // (hidden): trains two separate models, not in the default ctest sweep -- invoke with
-// `sub0_tests "[repeatspike]"`.
+// `sub0llm_tests "[repeatspike]"`.
 
 #include <catch2/catch_test_macros.hpp>
 

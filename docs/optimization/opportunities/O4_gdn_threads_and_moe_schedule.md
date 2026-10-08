@@ -52,7 +52,7 @@ was never part of the answer.
 Both arms built from the same build dir, binaries copied out, then run alternately with the arm order
 reversed on even rounds. Real 48-layer artifact, `--tokens 6`, flags
 `--moe-quant-dot 1 --decode-gemv-threads 8 --moe-decode-threads 10 --decode-omp-spin 1 --profile-phases 1`.
-The two arms' `sub0_core.dll` differ in size, which is the check that they really are two builds (§10.2).
+The two arms' `sub0llm_core.dll` differ in size, which is the check that they really are two builds (§10.2).
 
 | round | order | base s/token | O4 s/token |
 |---|---|---:|---:|
@@ -81,7 +81,7 @@ the agent's number: it measured at 8 threads, where two of ten experts must queu
 bad draw cannot be rebalanced. At 10 threads each expert already has its own thread, so there is nothing
 for work-stealing to fix. See §5 for the direct 8-thread check.
 
-**Neutral gates, rebuilt from this merge:** `sub0_tests` 28,969,623 / 147 and `sub0_frontend_tests`
+**Neutral gates, rebuilt from this merge:** `sub0llm_tests` 28,969,623 / 147 and `sub0llm_frontend_tests`
 144,457 / 263, both exact; fingerprints `45ab9af849227297` / `9b83bc6a4d6b8574` / `816c4a54ad49b8cf`
 unchanged. Note what these do and do not prove: the neutral config has `DECODE_GEMV_THREADS = 1` and only
 `decode.cpp` passes a thread count, so the suites verify the `Threads <= 1` path is byte-identical. The

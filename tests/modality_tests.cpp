@@ -1,5 +1,5 @@
 // modality_tests.cpp — engine-free tests for sub0::modality: the per-codepoint spacing-modality
-// calibration (scan, merge, serialize, contradiction flagging). Links sub0_frontend only.
+// calibration (scan, merge, serialize, contradiction flagging). Links sub0llm_frontend only.
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/modality.hpp"

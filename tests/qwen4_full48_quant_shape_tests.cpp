@@ -3,10 +3,10 @@
 // model's layout with exactly those tensors removed, and nothing else moved.
 //
 // WHY A THIRD SHAPE TARGET, and not another case in qwen4_real_shape_tests.cpp. Same reason that file
-// is its own binary rather than a case in sub0_tests, one level further in: layout.hpp is closed over a
+// is its own binary rather than a case in sub0llm_tests, one level further in: layout.hpp is closed over a
 // single sub0_config.hpp, and MOE_QUANT_EXPERTS changes what make_param_layout() emits, so the all-f32
 // 48-layer PARAM_LAYOUT and the quantized-resident one are two different definitions of sub0::
-// PARAM_LAYOUT and cannot share a translation unit. The sibling target (sub0_qwen4_shape_tests) owns
+// PARAM_LAYOUT and cannot share a translation unit. The sibling target (sub0llm_qwen4_shape_tests) owns
 // the f32 form; this one owns the quantized-resident form; full48_totals.hpp carries the literals both
 // of them, and tools/sub0llm-transplant.cpp's own 48-layer target, are held to.
 //

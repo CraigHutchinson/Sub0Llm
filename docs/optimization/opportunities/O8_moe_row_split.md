@@ -161,7 +161,7 @@ subset of an unmodified kernel's output rows a given call produces, and which th
 
 ## 4. Correctness
 
-**Unit test** (`tests/moe_quant_tests.cpp`, `[o8]`), two cases, added to `sub0_frontend_tests`:
+**Unit test** (`tests/moe_quant_tests.cpp`, `[o8]`), two cases, added to `sub0llm_frontend_tests`:
 
 1. *"row-sliced gemv_plane agrees EXACTLY with the whole-plane result, real sidecar bytes, at several
    thread counts."* Opens the real `.moeq` sidecar (env override `SUB0_QWEN4_MOEQ_PATH`, graceful
@@ -174,7 +174,7 @@ subset of an unmodified kernel's output rows a given call produces, and which th
    the test file — deliberately, so a shared-helper bug can't hide from both sides;
    `[[independent-reimplementation-catches-identity-swap-bugs]]`) split into row chunks and run across
    **1, 2, 4, and 8 real `std::thread` workers** (a static round-robin split of the chunk list — genuine
-   concurrency, not a simulated schedule; `sub0_frontend_tests` links only `sub0_frontend`, not the full
+   concurrency, not a simulated schedule; `sub0llm_frontend_tests` links only `sub0llm_frontend`, not the full
    OpenMP runtime, so `std::thread` is what proves both the math AND the absence of a cross-chunk race).
    `REQUIRE(split[r] == reference[r])` for every row, every plane, every thread count — exact equality,
    not a tolerance.
@@ -212,8 +212,8 @@ Built and run from `out/build/o8` (neutral recipe `--corpus data/gsm8k.txt --dmo
 
 | suite | assertions/cases | fingerprints |
 |---|---|---|
-| `sub0_tests` | **29,510,661 / 147** (exact) | forward `5a7382ea70d3913b`, grad `7f44bdae18c313dd`, decode `d1625d19ed2258f1` — all unchanged |
-| `sub0_frontend_tests` | **228,198 / 295** = 208,910/293 (unchanged baseline) + 19,288/2 (the two new `[o8]` cases, real sidecar bytes exercised not skipped) | — |
+| `sub0llm_tests` | **29,510,661 / 147** (exact) | forward `5a7382ea70d3913b`, grad `7f44bdae18c313dd`, decode `d1625d19ed2258f1` — all unchanged |
+| `sub0llm_frontend_tests` | **228,198 / 295** = 208,910/293 (unchanged baseline) + 19,288/2 (the two new `[o8]` cases, real sidecar bytes exercised not skipped) | — |
 
 `MOE_ROW_SPLIT` is `if constexpr`-gated at its one call site and requires `MOE_QUANT_DOT` (which itself
 requires `MOE_QUANT_EXPERTS`, off by default) — structurally unreachable from the neutral build, and the

@@ -3,7 +3,7 @@
 // Muon->AdamW mid-training because the optimizer choice had no persisted, read-back-on-resume home
 // (see registry.hpp's RunConfig doc comment). These tests prove the write/read round-trip itself is
 // correct; train_stage.cpp's own resume path is where the fix is actually wired in (not covered
-// here -- this target links sub0_core/sub0_frontend only, not sub0_train).
+// here -- this target links sub0llm_core/sub0llm_frontend only, not sub0llm_train).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -20,7 +20,7 @@ namespace {
 // A scratch directory unique to this ScratchDir INSTANCE, cleaned up on scope exit -- config.json
 // writes are real file I/O (deliberately: this is exactly the path train_stage.cpp uses).
 // `catch_discover_tests` registers each TEST_CASE as its own ctest entry, invoked as a SEPARATE
-// `sub0_tests.exe --test-case=...` process -- `ctest -j` runs several of those concurrently. A fixed
+// `sub0llm_tests.exe --test-case=...` process -- `ctest -j` runs several of those concurrently. A fixed
 // literal path here (the original form) let two concurrently-running RunConfig test PROCESSES race on
 // the same file, an observed flake (a test fails only under -j, passes in isolation or serially). A
 // random suffix per instance closes it without needing a platform-specific process-id API.
@@ -157,7 +157,7 @@ TEST_CASE("RunConfig: corpus text with characters needing JSON escaping round-tr
 }
 
 // The concrete incident this struct exists to prevent, expressed as a data-level regression test
-// (the actual resume-time RECONCILIATION logic lives in train_stage.cpp/sub0_train, not tested
+// (the actual resume-time RECONCILIATION logic lives in train_stage.cpp/sub0llm_train, not tested
 // here -- this proves the persisted value a resume would read back is exactly what was written,
 // i.e. the round-trip itself introduces no silent value drift for the field that mattered).
 TEST_CASE("RunConfig: optimizer choice survives the round-trip distinctly from the default", "[registry][run_config]") {

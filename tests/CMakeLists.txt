@@ -30,7 +30,7 @@ if(NOT SUB0_BUILD_SPIKE_TESTS)
   set(SUB0_SPIKE_FRONTEND_TEST_SOURCES "")
 endif()
 
-add_executable(sub0_tests
+add_executable(sub0llm_tests
   tokenizer_tests.cpp
   engine_tests.cpp
   arch_identity_tests.cpp
@@ -62,13 +62,13 @@ add_executable(sub0_tests
 )
 
 # Tests compile against the engine API and the generated config header.
-target_include_directories(sub0_tests PRIVATE
+target_include_directories(sub0llm_tests PRIVATE
   "${CMAKE_SOURCE_DIR}/include"
   "${GEN_DIR}")
-target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2WithMain)
+target_link_libraries(sub0llm_tests PRIVATE sub0llm_core sub0llm_frontend Catch2::Catch2WithMain)
 
-# Engine-free FRONTEND tests: link ONLY sub0_frontend + Catch2, NOT the engine. The tokenizer + the
-# pre-model logic are config-independent, so this target builds and runs without sub0_core / the
+# Engine-free FRONTEND tests: link ONLY sub0llm_frontend + Catch2, NOT the engine. The tokenizer + the
+# pre-model logic are config-independent, so this target builds and runs without sub0llm_core / the
 # generated header -- fast to iterate, and unaffected when a training run locks the engine DLLs.
 #   tok_lib_tests.cpp        — pinned tokenizer worked examples (one construct per assertion)
 #   tok_roundtrip_fuzz.cpp   — generative net: dogfood the project's own source + random
@@ -76,9 +76,9 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #                              lets it read the real tree for the dogfood/pattern cases.
 #   tok_interchange_tests.cpp — WS7: to_interchange()'s struct-producing export shape
 #   ws6_simd_differential_tests.cpp — WS6: scalar-vs-SIMD-rewrite byte/token-identical differential
-#   spellspike_tests.cpp     — spelling-curriculum generator structure (engine-free; the model harness is in sub0_tests)
+#   spellspike_tests.cpp     — spelling-curriculum generator structure (engine-free; the model harness is in sub0llm_tests)
 #   blend_tests.cpp          — weighted per-window corpus blender (engine-free; rng-neutrality + window bounds)
-#   scratchspike_tests.cpp   — scratch-token (context-translation) curriculum structure (engine-free; harness in sub0_tests)
+#   scratchspike_tests.cpp   — scratch-token (context-translation) curriculum structure (engine-free; harness in sub0llm_tests)
 #   config_tests.cpp         — pure config decisions (sub0::config): autosize/tune-cache/precision/vocab-curve
 #   frontend_tests.cpp       — memplan VRAM math (clamp + tuner cap) + registry identity/compat (prune)
 #   gguf_tests.cpp           — GGUF header/KV/tensor-table parsing + Llama-MHA import-compat report
@@ -147,11 +147,11 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #                              the three errors no shape or statistical check can see (an alpha/beta
 #                              identity swap, a down-the-middle q|gate split, a swapped indexer concat).
 #                              Skips gracefully if the fixtures are absent.
-add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ngram_qwen4_fixture_tests.cpp gdn_qwen4_fixture_tests.cpp gated_residual_qwen4_fixture_tests.cpp moe_qwen4_fixture_tests.cpp qsa_qwen4_fixture_tests.cpp transplant_tests.cpp transplant_fixture_tests.cpp moe_quant_tests.cpp backbone_quant_dot_tests.cpp backbone_quant_tests.cpp hidden_dump_tests.cpp qwen_tokenizer_tests.cpp fp8_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
-target_include_directories(sub0_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
-target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)
-catch_discover_tests(sub0_frontend_tests)
+add_executable(sub0llm_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ngram_qwen4_fixture_tests.cpp gdn_qwen4_fixture_tests.cpp gated_residual_qwen4_fixture_tests.cpp moe_qwen4_fixture_tests.cpp qsa_qwen4_fixture_tests.cpp transplant_tests.cpp transplant_fixture_tests.cpp moe_quant_tests.cpp backbone_quant_dot_tests.cpp backbone_quant_tests.cpp hidden_dump_tests.cpp qwen_tokenizer_tests.cpp fp8_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
+target_include_directories(sub0llm_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(sub0llm_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(sub0llm_frontend_tests PRIVATE sub0llm_frontend Catch2::Catch2WithMain)
+catch_discover_tests(sub0llm_frontend_tests)
 
 # WP4b's headline gate (docs/WP4_SCOPE.md S6): this engine's own make_param_layout(), evaluated at
 # Qwen3.8-Flash-Next's REAL RunConfig axes, must produce the REAL model's tensor count and float total.
@@ -161,12 +161,12 @@ catch_discover_tests(sub0_frontend_tests)
 # evaluating a different config means compiling it again against a different one, and two definitions of
 # sub0::PARAM_LAYOUT in one binary is an ODR violation. Its include path therefore carries
 # tests/qwen4_real_axes/ INSTEAD of ${GEN_DIR} -- the same "separate binary because the seam is compiled
-# differently" reasoning sub0_eval_seam_tests already uses. Links no engine library: nothing here runs.
-add_executable(sub0_qwen4_shape_tests qwen4_real_shape_tests.cpp)
-target_include_directories(sub0_qwen4_shape_tests PRIVATE
+# differently" reasoning sub0llm_eval_seam_tests already uses. Links no engine library: nothing here runs.
+add_executable(sub0llm_qwen4_shape_tests qwen4_real_shape_tests.cpp)
+target_include_directories(sub0llm_qwen4_shape_tests PRIVATE
   "${CMAKE_SOURCE_DIR}/tests/qwen4_real_axes"
   "${CMAKE_SOURCE_DIR}/include")
-target_link_libraries(sub0_qwen4_shape_tests PRIVATE Catch2::Catch2WithMain)
+target_link_libraries(sub0llm_qwen4_shape_tests PRIVATE Catch2::Catch2WithMain)
 # The real axes make PARAM_LAYOUT ~74.8k tensors (512 experts x 48 layers dominates), and layout.hpp
 # walks that table several times at compile time (make_param_layout, DECAY_RANGES, MUON_RANGES,
 # MUON_MAX_MN/MM, total_param_floats). That blows clang's default 1,048,576-step constant-evaluation
@@ -174,9 +174,9 @@ target_link_libraries(sub0_qwen4_shape_tests PRIVATE Catch2::Catch2WithMain)
 # so the fix is a budget, not a redesign. Recorded here because a REAL engine build at these axes will
 # need the same flag: it is a property of the model's size, not of this test.
 if(NOT MSVC)
-  target_compile_options(sub0_qwen4_shape_tests PRIVATE -fconstexpr-steps=1000000000)
+  target_compile_options(sub0llm_qwen4_shape_tests PRIVATE -fconstexpr-steps=1000000000)
 endif()
-catch_discover_tests(sub0_qwen4_shape_tests)
+catch_discover_tests(sub0llm_qwen4_shape_tests)
 
 # WP5b (docs/WP4_SCOPE.md WP5b): the SAME real 48-layer axes with the routed experts kept
 # quantized-resident (-DSUB0_MOE_QUANT_EXPERTS=1). A third target for exactly the reason there are
@@ -189,79 +189,79 @@ catch_discover_tests(sub0_qwen4_shape_tests)
 # PARAM_LAYOUT from ~74.8k entries to 1,074, so the constexpr-steps budget below is generosity, not
 # necessity -- but it is set anyway, because the sibling needs it and a build that differs only in a
 # resource limit is a build whose failure mode is confusing.
-add_executable(sub0_qwen4_full48_quant_shape_tests qwen4_full48_quant_shape_tests.cpp)
-target_include_directories(sub0_qwen4_full48_quant_shape_tests PRIVATE
+add_executable(sub0llm_qwen4_full48_quant_shape_tests qwen4_full48_quant_shape_tests.cpp)
+target_include_directories(sub0llm_qwen4_full48_quant_shape_tests PRIVATE
   "${CMAKE_SOURCE_DIR}/tests/qwen4_real_axes"
   "${CMAKE_SOURCE_DIR}/include")
-target_compile_definitions(sub0_qwen4_full48_quant_shape_tests PRIVATE
+target_compile_definitions(sub0llm_qwen4_full48_quant_shape_tests PRIVATE
   SUB0_QWEN4_LAYERS=48 SUB0_MOE_QUANT_EXPERTS=1)
-target_link_libraries(sub0_qwen4_full48_quant_shape_tests PRIVATE Catch2::Catch2WithMain)
+target_link_libraries(sub0llm_qwen4_full48_quant_shape_tests PRIVATE Catch2::Catch2WithMain)
 if(NOT MSVC)
-  target_compile_options(sub0_qwen4_full48_quant_shape_tests PRIVATE -fconstexpr-steps=1000000000)
+  target_compile_options(sub0llm_qwen4_full48_quant_shape_tests PRIVATE -fconstexpr-steps=1000000000)
 endif()
-catch_discover_tests(sub0_qwen4_full48_quant_shape_tests)
+catch_discover_tests(sub0llm_qwen4_full48_quant_shape_tests)
 
 # Eval-seam integration tests: the held-out NELBO evaluation driven end-to-end through a MOCK device
 # backend, so the device dispatch (window batching, ids/targets pairing, group recombination) is
 # covered on EVERY machine rather than only where a GPU happens to be present.
 #
-# Its own executable, and deliberately NOT part of sub0_tests: SUB0_BUILD_MOCK_DEVICE reroutes the
-# inline sub0_dev_* seam to the mock, and sub0_tests both links sub0_backend_cuda and contains
+# Its own executable, and deliberately NOT part of sub0llm_tests: SUB0_BUILD_MOCK_DEVICE reroutes the
+# inline sub0_dev_* seam to the mock, and sub0llm_tests both links sub0llm_backend_cuda and contains
 # cuda_tests.cpp, which needs the real one. Two definitions of the same inline functions in one binary
 # is an ODR violation, so they must stay separate binaries. For the same reason this target links
-# sub0_core only -- never sub0_train, which is compiled against the real seam.
-add_executable(sub0_eval_seam_tests eval_seam_tests.cpp mock_device_backend.cpp)
-target_include_directories(sub0_eval_seam_tests PRIVATE
+# sub0llm_core only -- never sub0llm_train, which is compiled against the real seam.
+add_executable(sub0llm_eval_seam_tests eval_seam_tests.cpp mock_device_backend.cpp)
+target_include_directories(sub0llm_eval_seam_tests PRIVATE
   "${CMAKE_SOURCE_DIR}/include"
   "${GEN_DIR}")
-target_compile_definitions(sub0_eval_seam_tests PRIVATE SUB0_BUILD_MOCK_DEVICE=1)
-target_link_libraries(sub0_eval_seam_tests PRIVATE sub0_core Catch2::Catch2WithMain)
+target_compile_definitions(sub0llm_eval_seam_tests PRIVATE SUB0_BUILD_MOCK_DEVICE=1)
+target_link_libraries(sub0llm_eval_seam_tests PRIVATE sub0llm_core Catch2::Catch2WithMain)
 if(OpenMP_CXX_FOUND)
-  target_link_libraries(sub0_eval_seam_tests PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(sub0llm_eval_seam_tests PRIVATE OpenMP::OpenMP_CXX)
 endif()
-set_target_properties(sub0_eval_seam_tests PROPERTIES
+set_target_properties(sub0llm_eval_seam_tests PROPERTIES
   BUILD_RPATH "$ORIGIN"
   INSTALL_RPATH "$ORIGIN")
-catch_discover_tests(sub0_eval_seam_tests
-  DL_PATHS "$<TARGET_FILE_DIR:sub0_core>"
+catch_discover_tests(sub0llm_eval_seam_tests
+  DL_PATHS "$<TARGET_FILE_DIR:sub0llm_core>"
   DISCOVERY_MODE PRE_TEST)
 
 # GPU backend smoke test: compiled + linked only when the CUDA backend is built. The
-# nvcc-built sub0_backend_cuda.dll sits next to sub0_core.dll; its CUDA runtime deps are
+# nvcc-built sub0llm_backend_cuda.dll sits next to sub0llm_core.dll; its CUDA runtime deps are
 # covered by the toolkit bin added to DL_PATHS below.
 if(SUB0_BUILD_CUDA)
-  target_sources(sub0_tests PRIVATE cuda_tests.cpp)
-  target_link_libraries(sub0_tests PRIVATE sub0_backend_cuda)
+  target_sources(sub0llm_tests PRIVATE cuda_tests.cpp)
+  target_link_libraries(sub0llm_tests PRIVATE sub0llm_backend_cuda)
   # ...and compile the NEUTRAL seam (include/sub0/device_backend.hpp) in its device configuration.
   # Without this the target linked the CUDA backend while every sub0_dev_* in the header still
   # resolved to the no-device fail-fast stub, so anything driving a device through the seam rather
   # than through a hand-written extern "C" silently took the CPU fallback and "passed". Every other
   # test here already passes use_gpu=false explicitly, so nothing else changes behaviour.
-  target_compile_definitions(sub0_tests PRIVATE SUB0_BUILD_CUDA)
+  target_compile_definitions(sub0llm_tests PRIVATE SUB0_BUILD_CUDA)
   # Gated DeltaNet Stage 3's CUDA fixture test (cuda_tests.cpp) needs the same SUB0_SOURCE_DIR-relative
-  # fixture path gdn_qwen4_fixture_tests.cpp (sub0_frontend_tests) already uses -- that target defines it
-  # for itself (line ~101 above); sub0_tests never needed it before this test existed.
-  target_compile_definitions(sub0_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  # fixture path gdn_qwen4_fixture_tests.cpp (sub0llm_frontend_tests) already uses -- that target defines it
+  # for itself (line ~101 above); sub0llm_tests never needed it before this test existed.
+  target_compile_definitions(sub0llm_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 endif()
 
-# O14: the parameter arena as a read-only file view. Its own executable so sub0_tests keeps its exact
+# O14: the parameter arena as a read-only file view. Its own executable so sub0llm_tests keeps its exact
 # assertion counts; the positive cases only run in a forward-only build (see the file's header comment).
-add_executable(sub0_param_arena_tests param_arena_tests.cpp)
-target_include_directories(sub0_param_arena_tests PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
-target_link_libraries(sub0_param_arena_tests PRIVATE sub0_core Catch2::Catch2WithMain)
-set_target_properties(sub0_param_arena_tests PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
-catch_discover_tests(sub0_param_arena_tests
-  DL_PATHS "$<TARGET_FILE_DIR:sub0_core>"
+add_executable(sub0llm_param_arena_tests param_arena_tests.cpp)
+target_include_directories(sub0llm_param_arena_tests PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+target_link_libraries(sub0llm_param_arena_tests PRIVATE sub0llm_core Catch2::Catch2WithMain)
+set_target_properties(sub0llm_param_arena_tests PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+catch_discover_tests(sub0llm_param_arena_tests
+  DL_PATHS "$<TARGET_FILE_DIR:sub0llm_core>"
   DISCOVERY_MODE PRE_TEST)
 
-# Find the sub0_core shared lib next to the test binary at runtime.
-set_target_properties(sub0_tests PROPERTIES
+# Find the sub0llm_core shared lib next to the test binary at runtime.
+set_target_properties(sub0llm_tests PROPERTIES
   BUILD_RPATH "$ORIGIN"
   INSTALL_RPATH "$ORIGIN")
 
 # On Windows the loader has no rpath; DL_PATHS adds the needed DLL directories to the search
-# path used during test discovery and execution: sub0_core.dll (and sub0_backend_cuda.dll) sit
-# next to the test binary, and when the CUDA backend is built sub0_backend_cuda.dll additionally
+# path used during test discovery and execution: sub0llm_core.dll (and sub0llm_backend_cuda.dll) sit
+# next to the test binary, and when the CUDA backend is built sub0llm_backend_cuda.dll additionally
 # needs the CUDA runtime DLLs (cudart/cublas) from the toolkit bin.
 #
 # DISCOVERY_MODE PRE_TEST: enumerate the test cases at `ctest` time, NOT during the build. Running
@@ -269,11 +269,11 @@ set_target_properties(sub0_tests PROPERTIES
 # loadable in the build shell's environment (a missing/unfindable cublas surfaced as a cryptic
 # 0xc000007b and FAILED the build). Deferring to test time -- where DL_PATHS is applied -- keeps
 # the build robust on any host.
-set(_sub0_test_dl_paths "$<TARGET_FILE_DIR:sub0_core>")
+set(_sub0_test_dl_paths "$<TARGET_FILE_DIR:sub0llm_core>")
 if(SUB0_BUILD_CUDA AND CUDAToolkit_BIN_DIR)
   list(APPEND _sub0_test_dl_paths "${CUDAToolkit_BIN_DIR}")
 endif()
-catch_discover_tests(sub0_tests
+catch_discover_tests(sub0llm_tests
   DL_PATHS ${_sub0_test_dl_paths}
   DISCOVERY_MODE PRE_TEST)
 
@@ -284,7 +284,7 @@ catch_discover_tests(sub0_tests
 # a sub0llm-configure constexpr, per AGENTS.md sec 8/sec 2's "only add surface that's consumed" and the
 # plan's own step 5. OFF: nothing here is fetched or built, and SUB0_STORAGE_TIEREDCACHE_ROW_BYTES etc.
 # below are never evaluated. ON: FetchContent's the two pinned sibling libraries and builds ONE isolated
-# test target (sub0_storage_tiered_cache_tests) against include/sub0/ngram_tiered_storage.hpp, which
+# test target (sub0llm_storage_tiered_cache_tests) against include/sub0/ngram_tiered_storage.hpp, which
 # nothing in src/ or tools/ includes yet (Stage 3 of docs/NGRAM_TABLE_TIERED_STORAGE.md sec 5 is the
 # future engine-wiring step -- this is S1's correctness slice only).
 option(SUB0_STORAGE_TIEREDCACHE
@@ -302,11 +302,11 @@ if(SUB0_STORAGE_TIEREDCACHE)
   # tests/ngram_tiered_storage_tests.cpp: S1's own gate (docs/STORAGE_STACK_PLAN.md step 6) -- byte-for-
   # byte adapter-vs-resident-reference-vs-generator-oracle agreement, duplicates/non-monotonic order,
   # row 0 + the last row, an out-of-range id failing the whole request, and one fetch for duplicate rows.
-  add_executable(sub0_storage_tiered_cache_tests ngram_tiered_storage_tests.cpp)
-  target_include_directories(sub0_storage_tiered_cache_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
-  target_link_libraries(sub0_storage_tiered_cache_tests PRIVATE
+  add_executable(sub0llm_storage_tiered_cache_tests ngram_tiered_storage_tests.cpp)
+  target_include_directories(sub0llm_storage_tiered_cache_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  target_link_libraries(sub0llm_storage_tiered_cache_tests PRIVATE
     Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache Catch2::Catch2WithMain)
-  catch_discover_tests(sub0_storage_tiered_cache_tests)
+  catch_discover_tests(sub0llm_storage_tiered_cache_tests)
 endif()
 
 # tests/moe_io_mempage_tests.cpp: S1b (docs/STORAGE_STACK_PLAN.md) -- the MemPage routed-MoE plane
@@ -314,10 +314,10 @@ endif()
 # SUB0_QWEN4_MOEQ_PATH. MemPage only: variable plane shapes do not go through TieredCache. Built with
 # the storage tests, and in any engine build configured --moe-io-mode mempage (root CMakeLists.txt).
 if(SUB0_STORAGE_TIEREDCACHE OR SUB0_MOE_MEMPAGE_ENABLED)
-  add_executable(sub0_storage_moe_io_tests moe_io_mempage_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_mempage.cpp")
-  target_include_directories(sub0_storage_moe_io_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
-  target_link_libraries(sub0_storage_moe_io_tests PRIVATE Sub0MemPage::Sub0MemPage Catch2::Catch2WithMain)
-  catch_discover_tests(sub0_storage_moe_io_tests)
+  add_executable(sub0llm_storage_moe_io_tests moe_io_mempage_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_mempage.cpp")
+  target_include_directories(sub0llm_storage_moe_io_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  target_link_libraries(sub0llm_storage_moe_io_tests PRIVATE Sub0MemPage::Sub0MemPage Catch2::Catch2WithMain)
+  catch_discover_tests(sub0llm_storage_moe_io_tests)
 endif()
 
 # tests/moe_io_tiered_tests.cpp: the owned routed-expert cache (include/sub0/moe_io_tiered.hpp), one
@@ -326,30 +326,30 @@ endif()
 # configured --moe-io-mode cache.
 if(SUB0_STORAGE_TIEREDCACHE OR SUB0_MOE_TIERED_ENABLED)
   include("${CMAKE_SOURCE_DIR}/cmake/TieredCache.cmake")
-  add_executable(sub0_storage_moe_cache_tests moe_io_tiered_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_tiered.cpp"
+  add_executable(sub0llm_storage_moe_cache_tests moe_io_tiered_tests.cpp "${CMAKE_SOURCE_DIR}/src/moe_io_tiered.cpp"
     "${CMAKE_SOURCE_DIR}/src/residency.cpp")
-  target_include_directories(sub0_storage_moe_cache_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
-  target_link_libraries(sub0_storage_moe_cache_tests PRIVATE
+  target_include_directories(sub0llm_storage_moe_cache_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  target_link_libraries(sub0llm_storage_moe_cache_tests PRIVATE
     Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache Catch2::Catch2WithMain)
-  catch_discover_tests(sub0_storage_moe_cache_tests)
+  catch_discover_tests(sub0llm_storage_moe_cache_tests)
 endif()
 
-# Windows loads a test's sub0_core.dll from the test's OWN directory before anywhere else, and these tests
+# Windows loads a test's sub0llm_core.dll from the test's OWN directory before anywhere else, and these tests
 # build into this directory while the DLL builds into the root one. Nothing used to refresh the copy here:
-# found 2026-10-08, when this directory's sub0_core.dll was dated 2026-09-23, so every engine-suite run in
+# found 2026-10-08, when this directory's sub0llm_core.dll was dated 2026-09-23, so every engine-suite run in
 # between had exercised a two-week-old engine and could not have caught a regression in it. Each target
-# here that links sub0_core now depends on a fresh copy.
+# here that links sub0llm_core now depends on a fresh copy.
 if(WIN32)
-  add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sub0_core.dll"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:sub0_core> "${CMAKE_CURRENT_BINARY_DIR}/sub0_core.dll"
-    DEPENDS sub0_core
-    COMMENT "Refreshing tests/sub0_core.dll")
-  add_custom_target(sub0_core_beside_tests DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/sub0_core.dll")
+  add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sub0llm_core.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:sub0llm_core> "${CMAKE_CURRENT_BINARY_DIR}/sub0llm_core.dll"
+    DEPENDS sub0llm_core
+    COMMENT "Refreshing tests/sub0llm_core.dll")
+  add_custom_target(sub0llm_core_beside_tests DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/sub0llm_core.dll")
   get_property(_sub0_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
   foreach(_target IN LISTS _sub0_test_targets)
     get_target_property(_libs ${_target} LINK_LIBRARIES)
-    if(_libs AND "sub0_core" IN_LIST _libs)
-      add_dependencies(${_target} sub0_core_beside_tests)
+    if(_libs AND "sub0llm_core" IN_LIST _libs)
+      add_dependencies(${_target} sub0llm_core_beside_tests)
     endif()
   endforeach()
 endif()

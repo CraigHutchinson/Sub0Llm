@@ -1,5 +1,5 @@
 // tests/fp8_tests.cpp -- correctness gate for sub0/fp8.hpp (B33, docs/BACKBONE_PRECISION.md S2d).
-// Engine-free (sub0_frontend_tests), same rigor B24 applied to bf16.hpp's own RNE hand-verification:
+// Engine-free (sub0llm_frontend_tests), same rigor B24 applied to bf16.hpp's own RNE hand-verification:
 // exhaustive round-trip over the whole 256-code-point domain, both RNE tie-breaking directions, exact
 // small values, subnormal exactness, and overflow/NaN saturation.
 

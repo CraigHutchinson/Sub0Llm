@@ -956,7 +956,7 @@ TEST_CASE("CUDA attention kernels stay within their register/spill budget", "[cu
 // mismatch is a genuine kernel bug, not argmax noise under near-uniform logits.
 // Hidden (like [.bench]): 150 single-threaded CPU training steps (batch=1, no thread parallelism
 // across a single window) make this the slowest case in the suite (~4min at d768) despite being a
-// correctness gate, not a benchmark. Run explicitly when touching GPU decode: `sub0_tests
+// correctness gate, not a benchmark. Run explicitly when touching GPU decode: `sub0llm_tests
 // "*forward_one decode*"`.
 TEST_CASE("CUDA forward_one decode matches full forward once the model is trained (non-random weights)",
          "[cuda][.slow]") {

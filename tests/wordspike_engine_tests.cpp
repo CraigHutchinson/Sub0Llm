@@ -16,7 +16,7 @@
 //      see eval_arm's header comment for why asking free generation to produce the collapse point itself
 //      would test an unsupported claim (mask=0 means neither arm ever trains that position at all).
 // Tagged "[.wordspike]": trains two separate models, not in the default ctest sweep -- invoke with
-// `sub0_tests "[wordspike]"`.
+// `sub0llm_tests "[wordspike]"`.
 
 #include <catch2/catch_test_macros.hpp>
 

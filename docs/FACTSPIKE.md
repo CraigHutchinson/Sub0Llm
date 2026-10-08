@@ -122,7 +122,7 @@ a failed experiment.
 - Phase A: configurator's own report confirms forced multi-piece vocabulary.
 - Phase B pilot: drilled-subject baseline accuracy judged clearly above chance before Phase C.
 - Phase C: baseline/scratch/held-out accuracy + wall-clock reported here, honestly, whichever way it lands.
-- Full `ctest`/`sub0_tests` regression green throughout.
+- Full `ctest`/`sub0llm_tests` regression green throughout.
 
 ## Status log
 

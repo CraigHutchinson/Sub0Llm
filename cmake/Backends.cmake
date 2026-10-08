@@ -16,11 +16,11 @@
 # that CPU engine and ADDITIONALLY builds the CUDA backend so the training loop runs on
 # the device (the train-stage fast-path) -- generation/eval stay on the CPU engine until
 # a full GPU engine lands (Phase 3 / HYBRID). So SUB0_COMPUTE drives whether the CUDA
-# backend is built (SUB0_BUILD_CUDA, derived below), not which engine sub0_core compiles.
+# backend is built (SUB0_BUILD_CUDA, derived below), not which engine sub0llm_core compiles.
 #
 # Outputs (consumed by the top-level build):
 #   SUB0_COMPUTE_RESOLVED - the concrete mode after AUTO resolution
-#   SUB0_BACKEND_SOURCES  - the engine translation unit(s) for sub0_core (always CPU)
+#   SUB0_BACKEND_SOURCES  - the engine translation unit(s) for sub0llm_core (always CPU)
 #   SUB0_BUILD_CUDA       - whether to build the CUDA device-training backend (derived)
 
 set(SUB0_COMPUTE "AUTO" CACHE STRING "Compute backend: AUTO / CPU / GPU / HYBRID")
@@ -93,7 +93,7 @@ if(SUB0_COMPUTE STREQUAL "AUTO")
   endif()
 endif()
 
-# The engine sub0_core compiles is ALWAYS the CPU backend (the sub0:: API + parity reference).
+# The engine sub0llm_core compiles is ALWAYS the CPU backend (the sub0:: API + parity reference).
 # GPU mode additionally builds the CUDA device-training backend; SUB0_BUILD_CUDA is DERIVED from
 # the resolved mode (it is not an independent toggle), so SUB0_COMPUTE is the single switch.
 include("${CMAKE_SOURCE_DIR}/src/backends/cpu/CMakeLists.txt")

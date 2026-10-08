@@ -19,7 +19,7 @@
 // via a hyper-connection stream rather than Nanbeige's single learned `concat_proj` linear -- so there is
 // no `concat_proj`-equivalent stage in this fixture to compare against, and this file does not attempt
 // one. Engine-free (this project's own `sub0::` concat convention is re-expressed inline below, not
-// exercised through the compiled engine) -- part of sub0_frontend_tests, per its own SUB0_SOURCE_DIR use.
+// exercised through the compiled engine) -- part of sub0llm_frontend_tests, per its own SUB0_SOURCE_DIR use.
 
 #include <catch2/catch_test_macros.hpp>
 

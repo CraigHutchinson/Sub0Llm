@@ -1,6 +1,6 @@
 // tests/mock_device_backend.cpp -- a TEST-ONLY implementation of the device seam whose "device" is
 // the CPU engine. Selected by defining SUB0_BUILD_MOCK_DEVICE (see include/sub0/device_backend.hpp,
-// which checks it BEFORE SUB0_BUILD_CUDA); linked only into the sub0_eval_seam_tests target.
+// which checks it BEFORE SUB0_BUILD_CUDA); linked only into the sub0llm_eval_seam_tests target.
 //
 // WHY THIS EXISTS
 //

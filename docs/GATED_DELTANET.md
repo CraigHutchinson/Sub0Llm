@@ -621,7 +621,7 @@ operations this project already chose for attention itself.
 
   **Two-scale identity check** (AGENTS.md §7, reusing this project's own precedent of an odd/
   non-dividing layer count as the second shape): at `GDN_FULL_ATTN_STRIDE == 0` (neutral), the full
-  default engine test suite (`sub0_tests`) is assertion- AND hash-identical to `main` at BOTH shapes —
+  default engine test suite (`sub0llm_tests`) is assertion- AND hash-identical to `main` at BOTH shapes —
   not just the same count, the same computed forward/gradient/decode content hash:
   | shape | assertions | test cases | forward hash | grad hash | decode hash |
   |---|---|---|---|---|---|
@@ -629,7 +629,7 @@ operations this project already chose for attention itself.
   | d132 L11 H4 kv2 seq96 (odd/ragged) | 11,952,837 | 137 | `11510f553cc233d9` | `1b4bbb318f886909` | `278d7ccd2c6e3ab3` |
 
   identical on `main` and on this Stage-1 commit at both shapes (verified by building each side of the
-  diff at the same generated config header and diffing `sub0_tests`' own `arch_identity_tests.cpp`
+  diff at the same generated config header and diffing `sub0llm_tests`' own `arch_identity_tests.cpp`
   output, not just "still green"). Two PRE-EXISTING `layout_tests.cpp` cases hard-coded the pre-Stage-1
   assumption that every layer has an identical tensor set (the `NUM_PARAMS` formula, and the decay/
   ternary-flag consistency loop) — both updated to be `GDN_SCHEDULE`-aware, verified as no-ops at stride

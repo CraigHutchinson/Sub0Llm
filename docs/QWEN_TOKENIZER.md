@@ -3,7 +3,7 @@
 Status: **DONE.** `sub0::qwen_tok` encodes and decodes exactly like the real
 Qwen3.8-Flash-Next tokenizer, gated case-by-case against the real thing.
 
-**3041 assertions across 9 test cases, all passing** (`sub0_frontend_tests "[qwen_tok]"`), of which
+**3041 assertions across 9 test cases, all passing** (`sub0llm_frontend_tests "[qwen_tok]"`), of which
 1936 are fixture rows produced BY the real tokenizer: 269 encode+decode cases, 269 pre-tokenization
 cases, 1389 NFC cases, 9 decode-only cases.
 
@@ -34,7 +34,7 @@ the default build's test suite is byte-for-byte unchanged (AGENTS.md §4 — ver
 | `scripts/qwen_tokenizer_fixture.py` | regenerates `tests/fixtures/qwen_tokenizer/` |
 | `tests/qwen_tokenizer_tests.cpp` | the gate |
 
-Engine-free, in `sub0_frontend`, like `gguf.hpp` and `transplant.hpp`: no generated config, no engine,
+Engine-free, in `sub0llm_frontend`, like `gguf.hpp` and `transplant.hpp`: no generated config, no engine,
 unit-testable without a compiled model, and usable by a future CLI tool without linking the engine.
 
 **Out of scope, deliberately** (AGENTS.md §8 — land the stage that is wired up): no chat-template /
@@ -282,8 +282,8 @@ huggingface-cli download Qwen/Qwen3.8-Flash-Next vocab.json merges.txt tokenizer
 # ...or point at an existing copy:
 export SUB0_QWEN_TOKENIZER_DIR=<dir containing those three files>
 
-cmake --build out/build/native --target sub0_frontend_tests
-./out/build/native/tests/sub0_frontend_tests "[qwen_tok]"
+cmake --build out/build/native --target sub0llm_frontend_tests
+./out/build/native/tests/sub0llm_frontend_tests "[qwen_tok]"
 ```
 
 Regenerating the generated artifacts (both refuse to emit if the reference disagrees):

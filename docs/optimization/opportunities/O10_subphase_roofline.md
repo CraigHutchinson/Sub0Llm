@@ -21,8 +21,8 @@ build and every other caller (batched `forward()`, CUDA reference, tests) compil
 implementation is `prof::StageProbe<Stage, N>`, a stage-to-phase map that calls `switch_to`. The probe is passed by
 value; nothing is allocated (AGENTS.md section 1).
 
-Gates for the diff: neutral `sub0_tests` **29,510,661 / 147**, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` /
-`d1625d19ed2258f1`; `sub0_frontend_tests` **230,939 / 300** (both unchanged, no cases added). `--stage ppl` on the real
+Gates for the diff: neutral `sub0llm_tests` **29,510,661 / 147**, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` /
+`d1625d19ed2258f1`; `sub0llm_frontend_tests` **230,939 / 300** (both unchanged, no cases added). `--stage ppl` on the real
 build: **ppl 14.7035** without the profiler and **14.7035 (identical mean NLL 2.6881, top-1 0.4876)** with
 `--profile-phases 1`, so the hooks are value-neutral. Long-run decode over the ppl text: 6.86 tok/s without, 6.95 with (noise; no
 visible profiler cost).
@@ -144,8 +144,8 @@ Decode passes `DECODE_GEMV_THREADS` and a `thread_local` buffer. The batched `qs
 from `scratch_floats`, which grew by `idx_qk_out()`. There were three test call sites; the first build missed
 them because the consumer grep covered `include/` and `src/` only.
 
-- **Bit-exact.** The real-model G-PPL gives ppl 14.7035, identical. Neutral: `sub0_tests` 29,510,661 / 147
-  with all fingerprints unchanged; `sub0_frontend_tests` 230,939 / 300, which covers the QSA fixture tests.
+- **Bit-exact.** The real-model G-PPL gives ppl 14.7035, identical. Neutral: `sub0llm_tests` 29,510,661 / 147
+  with all fingerprints unchanged; `sub0llm_frontend_tests` 230,939 / 300, which covers the QSA fixture tests.
 - **Phase.** Warm `--tokens 6` profiles give `QSA: indexer` **9.45 -> 0.8-1.2 ms/token**. The same session
   measured other phases 5-10% slower than this doc's baseline (GDN in-proj 21.7-23.7 against 19.45 ms), and
   totals of 0.121-0.133 s/token. The host was in its slow state, so no absolute tok/s claim is made from

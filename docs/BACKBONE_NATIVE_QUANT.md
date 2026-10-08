@@ -719,7 +719,7 @@ found. The accuracy tradeoff (§4/§5b's own numbers, unchanged by this phase si
 not touched: Q8_0 0.20%, Q4_K 3.85%, Q5_K 1.99%, Q6_K 0.12%) would also need re-measuring against a
 per-256 scheme before adopting it, per the same discipline §5b already established.
 
-### 12h. Test counts (`sub0_frontend_tests`, this host, `out/build/o5p2`)
+### 12h. Test counts (`sub0llm_frontend_tests`, this host, `out/build/o5p2`)
 
 - `[backbonequant]` alone: **3,891 assertions in 10 test cases** (phase 1 was 2,848/6 — the 4 new cases
   are the non-256-aligned-row fallback, `gemv_plane<Threads>` bit-exactness, `KScaleTable` vs.
@@ -907,9 +907,9 @@ resident size if wired in — about 58% of §7's full four-format potential (5.5
 - **AGENTS.md §4 — zero effect on existing output when the flag is omitted.** Ran the real 4-layer
   transplant twice, identical arguments except one run added `--backbone-quant`: the resulting `.bin` and
   `.moeq` files are byte-for-byte identical (`cmp` confirmed) between the two runs.
-- **Suites** (`out/build/o5p2b`, this host, `sub0_core.dll` beside the test binaries): `sub0_tests`
-  **28,969,623 / 147**, exactly unchanged from `main` (this package touches nothing `sub0_tests` depends
-  on — no engine, no `src/` file). `sub0_frontend_tests` **145,636 / 275**, i.e. `main`'s 145,500/267 plus
+- **Suites** (`out/build/o5p2b`, this host, `sub0llm_core.dll` beside the test binaries): `sub0llm_tests`
+  **28,969,623 / 147**, exactly unchanged from `main` (this package touches nothing `sub0llm_tests` depends
+  on — no engine, no `src/` file). `sub0llm_frontend_tests` **145,636 / 275**, i.e. `main`'s 145,500/267 plus
   exactly this package's own 136 assertions / 8 test cases in `[backbonequantsidecar]`, nothing else moved.
 
 ### 13e. What phase 2b-2 (kernel wiring) inherits, named rather than re-derived
@@ -1123,7 +1123,7 @@ reverted (AGENTS.md §14's own "never fully back a change out").
 **Pass 3 — re-verify gates and re-measure the corrected default.** Full rebuild, full suite:
 `[backbonequant]` **6,884 assertions in 17 test cases** (phase 2a's own 3,891/10 plus 7 new pass-4 cases);
 `~[backbonequant]` **141,609 assertions in 257 test cases** — bit-for-bit the required baseline, confirming
-nothing leaked; full `sub0_frontend_tests` **148,493 assertions in 274 test cases**. Real-artifact
+nothing leaked; full `sub0llm_frontend_tests` **148,493 assertions in 274 test cases**. Real-artifact
 DRAM-streamed re-measurement (default AVX2 dispatch, `--seconds 0.5`), 8 threads:
 
 | Format | OLD (per-32, §12) | NEW (per-256, pass 4, plain-AVX2 default) | Target |
@@ -1185,7 +1185,7 @@ own bar.
 
 - `[backbonequant]`: 6,884 / 17 (was 3,891 / 10 before this pass; +7 new cases, all pass-4).
 - `~[backbonequant]`: 141,609 / 257 — **exactly** the required baseline, unchanged.
-- Full `sub0_frontend_tests`: 148,493 / 274.
+- Full `sub0llm_frontend_tests`: 148,493 / 274.
 - New pass-4 test cases: `super_fusable()` accepts only Q4_K/Q5_K/Q6_K at a 256-aligned width; the fused
   super unpackers decode the SAME weights `gguf::to_f32` does (lossless activation); the AVX2 super path
   agrees EXACTLY with the portable super path; the AVX-VNNI super path agrees EXACTLY with both (gated on
@@ -1385,8 +1385,8 @@ vocabulary per AGENTS.md S7):**
 
 | Suite | Assertions / cases | vs. recorded baseline |
 |---|---:|---|
-| `sub0_tests` | **29,510,661 / 147** | EXACT match; decode fingerprint hash `d1625d19ed2258f1` bit-identical to the historically recorded value |
-| `sub0_frontend_tests` | **149,177 / 288** | baseline 148,922/285 + 255 assertions / 3 cases -- 2 new GDN-permutation/gather-direction proof cases, 1 new caller-owned-`gsum16` case, and 6 assertions from PRE-EXISTING role-enumerating cases (`bbq: every role has a name...`, `role_pattern reads from transplant::recipe_for...`) automatically covering the 3 new `Role` enumerators -- accounted for exactly, nothing unexplained |
+| `sub0llm_tests` | **29,510,661 / 147** | EXACT match; decode fingerprint hash `d1625d19ed2258f1` bit-identical to the historically recorded value |
+| `sub0llm_frontend_tests` | **149,177 / 288** | baseline 148,922/285 + 255 assertions / 3 cases -- 2 new GDN-permutation/gather-direction proof cases, 1 new caller-owned-`gsum16` case, and 6 assertions from PRE-EXISTING role-enumerating cases (`bbq: every role has a name...`, `role_pattern reads from transplant::recipe_for...`) automatically covering the 3 new `Role` enumerators -- accounted for exactly, nothing unexplained |
 | Real 4- and 48-layer artifact, default-off `forward`/`forward_one` | L2-relative **0**, argmax **6/6** | exact, both scales |
 
 **Quality, opt-in, real 48-layer artifact** (`REAL_AXES` + `--backbone-quant-dot 1`, the paired sidecar
@@ -1605,9 +1605,9 @@ Q8_0 down, Q6_K outlier at layer 2) now read native planes behind the same `--ba
   (`tests/backbone_quant_dot_tests.cpp`).
 
 **Gates, default off (exact):**
-- `sub0_tests` 29,510,661 / 147, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` /
+- `sub0llm_tests` 29,510,661 / 147, fingerprints `5a7382ea70d3913b` / `7f44bdae18c313dd` /
   `d1625d19ed2258f1`;
-- `sub0_frontend_tests` 208,910 / 293 (+2,092 / +1: the q|gate split proof).
+- `sub0llm_frontend_tests` 208,910 / 293 (+2,092 / +1: the q|gate split proof).
 
 **A/B.** Three arms, six rotating rounds, round 1 discarded, full recommended flags. The arms are
 default, the previous native build (head + GDN, §17) and this one:

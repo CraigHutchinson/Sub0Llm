@@ -18,7 +18,7 @@
 // id comes from the bounded pool's deprecation -- see SentinelBindings' comment). Training drives the
 // low-level forward/backward API single-threaded (set_sentinel_bindings is per-window state, and
 // ConvPool's enc_w_grad has no per-thread reduction), same shape as the persistent spike's own loop.
-// Tagged [.pairspike] (hidden): trains 9 models. Invoke: `sub0_tests "[pairspike]"`.
+// Tagged [.pairspike] (hidden): trains 9 models. Invoke: `sub0llm_tests "[pairspike]"`.
 
 #include <catch2/catch_test_macros.hpp>
 

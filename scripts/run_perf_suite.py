@@ -11,7 +11,7 @@ Policy it enforces: docs/OPTIMIZATION_PROCESS.md. Gates: docs/optimization/kpi_g
 
 Stages (each skippable, so iteration stays fast):
 
-  1. suites   -- sub0_tests + sub0_frontend_tests at the neutral config  (G-HASH, G-SUITE-*)
+  1. suites   -- sub0llm_tests + sub0llm_frontend_tests at the neutral config  (G-HASH, G-SUITE-*)
   2. quality  -- forward/forward_one parity + logit stats, real artifact (G-PARITY, G-QUALITY)
   3. perf     -- interleaved multi-arm decode throughput, real artifact  (G-PERF)
   4. compete  -- llama.cpp on the same host and model                    (G-COMPETITOR, soft)

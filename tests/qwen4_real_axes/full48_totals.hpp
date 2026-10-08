@@ -14,7 +14,7 @@
 //
 // WHO ASSERTS WHAT:
 //   * tests/qwen4_real_shape_tests.cpp        -- compiled at N_LAYERS = 48 in BOTH residency forms
-//                                                (targets sub0_qwen4_shape_tests / _q)
+//                                                (targets sub0llm_qwen4_shape_tests / _q)
 //   * tools/sub0llm-transplant.cpp            -- compiled at N_LAYERS = 48, quantized-resident
 //                                                (target sub0llm-transplant-q48)
 

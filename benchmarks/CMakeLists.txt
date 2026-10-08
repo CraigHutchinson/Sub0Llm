@@ -2,7 +2,7 @@
 #
 # Catch2 is already the project's test framework and builds cleanly on this clang-on-Windows toolchain
 # (Google Benchmark's cmake injects MSVC /W4 /MP into clang++ and mis-probes std::regex). Scope: HOST /
-# CPU hot paths -- device (CUDA) throughput uses cudaEvent timing in sub0-cuda-selftest.
+# CPU hot paths -- device (CUDA) throughput uses cudaEvent timing in sub0llm-cuda-selftest.
 #
 #   frontend_bench.cpp — the engine-free frontend the configurator runs over the WHOLE corpus at ingest.
 #   moe_expert_bench.cpp — one routed MoE expert's decode cost, split into disk / dequant / transpose /
@@ -21,10 +21,10 @@ CPMAddPackage("gh:catchorg/Catch2@3.7.1")   # no-op if the tests already fetched
 
 add_executable(sub0_frontend_bench frontend_bench.cpp)
 target_include_directories(sub0_frontend_bench PRIVATE "${CMAKE_SOURCE_DIR}/include")
-target_link_libraries(sub0_frontend_bench PRIVATE sub0_frontend Catch2::Catch2WithMain)
+target_link_libraries(sub0_frontend_bench PRIVATE sub0llm_frontend Catch2::Catch2WithMain)
 
 # Header-only too (gguf.hpp + transplant.hpp + moe_quant.hpp + moe_math.hpp), and deliberately linked
-# against NOTHING: no sub0_core, no sub0_frontend, no generated sub0_config.hpp. Every dimension comes
+# against NOTHING: no sub0llm_core, no sub0llm_frontend, no generated sub0_config.hpp. Every dimension comes
 # from the real sidecar's own header at runtime, which is what lets this measure a real 48-layer artifact
 # from a build configured for anything at all. Release already supplies -O3 -g (see the top-level
 # CMAKE_CXX_FLAGS_RELEASE comment on why -g stays in Release), so a profiler resolves its symbols; add

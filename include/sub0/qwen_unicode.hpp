@@ -19,7 +19,7 @@
 // continuation-byte validation that a tokenizer facing arbitrary user input needs and that
 // modality's corpus-scanning use never did.
 //
-// Engine-free (std + modality.hpp + the generated table header only), so it lives in sub0_frontend
+// Engine-free (std + modality.hpp + the generated table header only), so it lives in sub0llm_frontend
 // and is unit-testable with no compiled model, exactly like gguf.hpp and transplant.hpp.
 
 #pragma once

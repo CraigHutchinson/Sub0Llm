@@ -175,14 +175,14 @@ compiled and ran through `sub0llm-qwen4-gen`/`sub0llm-qwen4-forward` at the real
     forced into the anticipated band.
   - `forward()` vs `forward_one()` parity stayed **bit-exact (0) under BF16** at both scales -- the decode
     path and the batched path read the bf16 arena identically.
-- **Neutral suites:** `sub0_frontend_tests` (engine-free, unaffected by `PARAM_DTYPE`) -- **120,889
+- **Neutral suites:** `sub0llm_frontend_tests` (engine-free, unaffected by `PARAM_DTYPE`) -- **120,889
   assertions / 244 cases, all green**, under both an F32- and a BF16-tagged generated config, after fixing
-  2 real template-deduction regressions the interrupted work introduced (see §1e). `sub0_tests` (the
+  2 real template-deduction regressions the interrupted work introduced (see §1e). `sub0llm_tests` (the
   engine-linked, gradient/backward suite) **cannot run under BF16 at all, by design**: it requires a
   trainable (non-`FORWARD_ONLY`) build, and `PARAM_DTYPE == BF16` is gated to require `FORWARD_ONLY` --
   the two are mutually exclusive on purpose (§1c). Confirmed this is a pre-existing architectural fact,
   not a B24 regression: the SAME suite also fails to run against an F32 `FORWARD_ONLY` (MoE-on) config,
-  crashing before Catch2 even starts. `sub0_tests` DOES pass fully at a small trainable F32 config with
+  crashing before Catch2 even starts. `sub0llm_tests` DOES pass fully at a small trainable F32 config with
   this branch's changes (**5,869,947 assertions / 147 cases, all green**) -- confirming the training path
   is untouched. The real substitute robustness gate -- `sub0llm-qwen4-gen`/`sub0llm-qwen4-forward`
   exercising embed / GDN / Gated-Residual / MoE-routing+experts / QSA / tied-head / save+load under BF16
@@ -512,7 +512,7 @@ support at these dims that nothing had exercised before, named here rather than 
   an available alternative, not yet built) could plausibly close some or all of this gap -- untested here.
 - **Generation-quality qualitative check: NOT run.** `sub0llm-qwen4-gen`'s real Qwen tokenizer files
   (`data/qwen_tokenizer/` or `$SUB0_QWEN_TOKENIZER_DIR`) are absent from this environment -- the same gap
-  `sub0_frontend_tests`' own qwen-tokenizer test cases already report as "skipping" in this environment.
+  `sub0llm_frontend_tests`' own qwen-tokenizer test cases already report as "skipping" in this environment.
   The logit-level L2/argmax comparison above is the substitute quantitative signal; no qualitative
   "is the generated English still coherent" read was possible here. Flagged rather than glossed over: a
   0.43 L2-relative diff with only half the rows' argmax agreeing is a real, material risk to generation
@@ -522,16 +522,16 @@ support at these dims that nothing had exercised before, named here rather than 
 worktree -- a DIFFERENT vocab/config than the session's own established `d196check` baseline, so the
 absolute counts below do not match 28,969,623/147 and 120,889/244; the counts are compared BEFORE vs AFTER
 this change at the SAME fresh config instead, which is the actual AGENTS.md S4 gate):**
-- `sub0_frontend_tests`: **120,889 assertions / 244 cases**, all green -- exact match to the session's own
+- `sub0llm_frontend_tests`: **120,889 assertions / 244 cases**, all green -- exact match to the session's own
   established baseline (this suite is engine/config-independent, so it should and does match regardless of
   which engine config is active).
-- `sub0_tests` (default F32/trainable, unmodified `PARAM_DTYPE`): **20,586,739 assertions / 147 cases**,
+- `sub0llm_tests` (default F32/trainable, unmodified `PARAM_DTYPE`): **20,586,739 assertions / 147 cases**,
   all green, identical hashes (`arch_identity_tests`' own forward/grad/decode fingerprints) -- confirmed
   BYTE-IDENTICAL to a baseline run with this change's files reverted (via a tagged `git stash`) at the
   exact same fresh config, satisfying AGENTS.md S4 directly rather than by inference: the default F32
   build is provably unaffected by this change.
 
-**Not run, and why**: `sub0_tests` cannot link against a FORWARD_ONLY (MoE/Gated-Residual/QSA-on) or
+**Not run, and why**: `sub0llm_tests` cannot link against a FORWARD_ONLY (MoE/Gated-Residual/QSA-on) or
 real-axes config at all, by the same pre-existing architectural fact §1d's own gate already documented
 for BF16 -- `sub0llm-qwen4-forward`'s own `forward`/`forward_one` parity gate is what substitutes, exactly
 as it did for Phase 1.

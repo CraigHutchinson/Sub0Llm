@@ -2,12 +2,12 @@
 // real axes, loads the real transplanted weights through the real load_model(), and runs Model::forward
 // on them (docs/WP4_SCOPE.md S6, WP4d).
 //
-// WHY A TOOL AND NOT A TEST. Every other real-axes target in this repo (sub0_qwen4_shape_tests,
+// WHY A TOOL AND NOT A TEST. Every other real-axes target in this repo (sub0llm_qwen4_shape_tests,
 // sub0llm-transplant) deliberately links NO engine, because layout.hpp is closed over one
 // sub0_config.hpp and two definitions of sub0::PARAM_LAYOUT in one binary is an ODR violation. This one
-// is the opposite: it links sub0_core, so it must be built against the SAME generated config the engine
+// is the opposite: it links sub0llm_core, so it must be built against the SAME generated config the engine
 // was -- i.e. against a real `sub0llm-configure` run at the real axes, not the hand-written
-// tests/qwen4_real_axes/sub0_config.hpp. It cannot join sub0_tests for the same reason sub0_tests cannot
+// tests/qwen4_real_axes/sub0_config.hpp. It cannot join sub0llm_tests for the same reason sub0llm_tests cannot
 // be built at these axes: 43.4 GiB of resident weights is not a unit-test fixture.
 //
 // WHAT IT CHECKS, in order, each printed with its actual number rather than a pass/fail:

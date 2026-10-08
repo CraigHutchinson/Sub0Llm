@@ -422,12 +422,12 @@ real, proving the output genuinely depends on WHICH experts were consulted, not 
 output comes out; (2) a second, fixture-free test confirms `router_topk_row`'s selected SET tracks the
 input (an input favoring low expert indices selects `{0,1}`; the same router favoring high indices selects
 `{2,3}`), and that `norm_topk_prob=true` renormalizes the selected weights to sum to exactly 1. All 2 test
-cases: 44 assertions, green. Full `sub0_frontend_tests` suite (which these fixture tests join, the same
+cases: 44 assertions, green. Full `sub0llm_frontend_tests` suite (which these fixture tests join, the same
 placement `gdn`/`gr` fixture tests use): 192 test cases / 114,748 assertions, all green (190 pre-existing +
 2 new).
 
 **Two-scale identity check** (AGENTS.md S7): at `NUM_EXPERTS == 0` (neutral), the full default engine test
-suite (`sub0_tests`) is assertion- AND hash-identical across every commit in this pass, at BOTH shapes:
+suite (`sub0llm_tests`) is assertion- AND hash-identical across every commit in this pass, at BOTH shapes:
 
 | shape | assertions | test cases | forward hash | grad hash | decode hash |
 |---|---|---|---|---|---|
@@ -452,7 +452,7 @@ calling `sub0::moe::forward`) and the raw-pointer decode path (`sub0::moe::forwa
 confirming both call sites agree on a real forward pass. `[layout]` at this same MoE-ON build: 478,614
 assertions / 13 test cases, all green.
 
-**Scope confirmed, not merely assumed**: the full, untagged default `sub0_tests` suite at this same MoE-ON
+**Scope confirmed, not merely assumed**: the full, untagged default `sub0llm_tests` suite at this same MoE-ON
 build reaches `backward_node`'s loud `abort()` ("fatal: Mixture of Experts has no backward pass yet...") on
 the first `Op::Moe` node a training-path test tries to differentiate through -- exactly Stage 1's own
 declared scope boundary (S6), confirmed by actually hitting it rather than only documenting it, the same

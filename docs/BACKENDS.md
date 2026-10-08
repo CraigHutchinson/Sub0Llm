@@ -10,7 +10,7 @@ mechanically as they are next touched (each migration shrinks the scattered lega
 The CPU engine (`src/backends/cpu/backend.cpp`) is **always the engine**: the whole `sub0::` API (graph,
 forward/backward, sampling, AdamW/Muon, the binding mechanisms) compiles for every build. A device
 backend is an **add-on accelerator** reached through an `extern "C"` seam across a DLL boundary
-(`sub0_backend_cuda.dll`), selected at **build time** (`SUB0_COMPUTE=AUTO/CPU/GPU/HYBRID`,
+(`sub0llm_backend_cuda.dll`), selected at **build time** (`SUB0_COMPUTE=AUTO/CPU/GPU/HYBRID`,
 `cmake/Backends.cmake`) per the project's compile-time-decision philosophy — no runtime backend
 registry, no vtables on hot paths.
 
@@ -33,7 +33,7 @@ Three things made that seam CUDA-locked rather than device-neutral:
 
 `include/sub0/device_backend.hpp` is the single home of the production seam declarations. The names say
 *device*, not *cuda*. The seam stays `extern "C"` + POD types only (it crosses a DLL boundary; the same
-reasoning `registry.hpp` documents for keeping simdjson types inside `sub0_core`).
+reasoning `registry.hpp` documents for keeping simdjson types inside `sub0llm_core`).
 
 Production surface (the ~20 functions consumers actually use), grouped:
 
@@ -122,7 +122,7 @@ implementation TU + a CMake branch, not a plugin system.
    exempt per-backend diagnostic files, `cuda_selftest.cpp`/`cuda_tests.cpp`). Found and fixed a real
    pre-existing bug along the way: `train_stage.cpp`'s `hybrid_train` branch called the raw
    `sub0_cuda_upload_params` unconditionally, but that name was only ever declared under
-   `SUB0_BUILD_CUDA` -- a genuine `-DSUB0_COMPUTE=CPU` build of `sub0_train` failed to compile
+   `SUB0_BUILD_CUDA` -- a genuine `-DSUB0_COMPUTE=CPU` build of `sub0llm_train` failed to compile
    ("undeclared identifier"), reproduced via `git stash` on the original code before fixing. Verified on
    real hardware in both configurations after: CPU-only default suite green (117 cases, 9,192,142
    assertions), CUDA `[cuda]`-tagged suite green (41 cases, 2,029,105 assertions). What's left in

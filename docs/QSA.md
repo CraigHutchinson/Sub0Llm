@@ -707,11 +707,11 @@ tracks the score and FLIPS when the query flips, that the incomplete TAIL surviv
 and that `min(block_topk, num_blocks)` keeps everything when there are fewer blocks than the budget;
 (3) the bitwise batched-vs-incremental check above, itself guarded by `REQUIRE(total_dropped > 0)` so it
 cannot pass vacuously on a dense mutant. `[qsa]` tag: **4 test cases / 349 assertions**, green. Full
-`sub0_frontend_tests`: **196 test cases / 115,097 assertions** (192 / 114,748 before — exactly +4 cases
+`sub0llm_frontend_tests`: **196 test cases / 115,097 assertions** (192 / 114,748 before — exactly +4 cases
 and +349 assertions, nothing else).
 
 **Two-scale identity check** (AGENTS.md §7): at the neutral setting the full default engine test suite
-(`sub0_tests`) is HASH-identical to pre-QSA `main` at BOTH shapes, through every commit in this pass:
+(`sub0llm_tests`) is HASH-identical to pre-QSA `main` at BOTH shapes, through every commit in this pass:
 
 | shape | assertions (before → after) | test cases | forward hash | grad hash | decode hash |
 |---|---|---|---|---|---|
@@ -746,7 +746,7 @@ observed 1337 − 1001.
   `forward_one`'s QSA path is deliberately reached through a single named `do_full_attn_mixer()` lambda
   that both the GDN-on and GDN-off dispatch paths call, rather than duplicated in each.
 
-**Scope confirmed, not merely assumed**: the full, untagged `sub0_tests` suite at a QSA-ON build reaches
+**Scope confirmed, not merely assumed**: the full, untagged `sub0llm_tests` suite at a QSA-ON build reaches
 `backward_node`'s loud `abort()` ("fatal: Qwen Sparse Attention has no backward pass yet...") on the first
 `Op::Qsa` node a training-path test tries to differentiate through — exactly Stage 1's declared scope
 boundary (§6), confirmed by hitting it rather than only documenting it.

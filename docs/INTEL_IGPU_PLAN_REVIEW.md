@@ -119,7 +119,7 @@ justified. Public POD/ABI layouts receive another review when actual declaration
    then executes the representative chain and capacity work.
 
 10. **[MUST / consumer identity, resolved] “Real generation stage” could refer to two different paths.**
-    I07b.0/I11/I15 now target production `sub0_gen`/`src/gen_stage.cpp` through `sub0llm-gen`.
+    I07b.0/I11/I15 now target production `sub0llm_gen`/`src/gen_stage.cpp` through `sub0llm-gen`.
     `tools/sub0llm-qwen4-gen.cpp` remains a direct CPU/WP5 oracle until I17b's explicit full integration.
 
 11. **[MUST / full-model delivery, resolved] The plan omitted WP5c's measured sampler stack hazard.**
