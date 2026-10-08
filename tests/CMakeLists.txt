@@ -333,3 +333,23 @@ if(SUB0_STORAGE_TIEREDCACHE OR SUB0_MOE_TIERED_ENABLED)
     Sub0MemPage::Sub0MemPage Sub0TieredCache::Sub0TieredCache Catch2::Catch2WithMain)
   catch_discover_tests(sub0_storage_moe_cache_tests)
 endif()
+
+# Windows loads a test's sub0_core.dll from the test's OWN directory before anywhere else, and these tests
+# build into this directory while the DLL builds into the root one. Nothing used to refresh the copy here:
+# found 2026-10-08, when this directory's sub0_core.dll was dated 2026-09-23, so every engine-suite run in
+# between had exercised a two-week-old engine and could not have caught a regression in it. Each target
+# here that links sub0_core now depends on a fresh copy.
+if(WIN32)
+  add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sub0_core.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:sub0_core> "${CMAKE_CURRENT_BINARY_DIR}/sub0_core.dll"
+    DEPENDS sub0_core
+    COMMENT "Refreshing tests/sub0_core.dll")
+  add_custom_target(sub0_core_beside_tests DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/sub0_core.dll")
+  get_property(_sub0_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_target IN LISTS _sub0_test_targets)
+    get_target_property(_libs ${_target} LINK_LIBRARIES)
+    if(_libs AND "sub0_core" IN_LIST _libs)
+      add_dependencies(${_target} sub0_core_beside_tests)
+    endif()
+  endforeach()
+endif()
