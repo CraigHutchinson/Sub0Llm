@@ -1072,3 +1072,5 @@ Uncached is now the default within `--moe-io-mode cache`. Record: STORAGE_STACK_
 **2026-10-08 Claude Code — O14 regime-2 re-measurement (cache 17 heap arena / 17 mapped / 26 mapped, ballast room 10), active (CPU + locked ballast, ~55 min).** `out/build/wp5c_full48`. Do not start timing runs or heavy builds until this is marked done.
 
 **2026-10-08 Claude Code — O14 regime-2 re-measurement done; CPU and ballast released.** Mapped arena is bit-exact, 6-9 GiB less peak, speed unchanged; now the auto default for inference builds. Next in this tree: renaming library and test targets to the `sub0llm` prefix (touches every CMake file; full rebuilds).
+
+**2026-10-08 Claude Code — session work pushed; nothing held.** `origin/main` = `47a4cc4` (O12 and O14 defaults, O13 convergence doc, perf-suite regime-2 options, stale test-DLL fix, `sub0llm` prefix rename). Build dirs made before the rename hold old-named binaries: delete `sub0_*.dll` / `sub0_*tests.exe` there or rebuild from clean.
