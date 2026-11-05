@@ -86,6 +86,8 @@ nothing on 2026-11-05.
    tooling are Windows mechanisms). Clang 22 (`C:\Program Files\LLVM\bin`), CMake 4 or newer, Ninja, Python 3,
    Git. The CPU needs AVX2 and FMA; the dev CPU also has AVX-VNNI and VNNI-INT8, and `-march=native` uses them.
    Compiler and shell details are in [agent-memory/host-compilers-available.md](agent-memory/host-compilers-available.md).
+   Git LFS is also needed: two small tracked data files (`data/english.txt`, `data/tokenizer_calibration.txt`)
+   live in LFS, so run `git lfs install` before cloning.
 2. **Clone** `https://github.com/CraigHutchinson/Sub0Llm`. Sub0MemPage and Sub0TieredCache are fetched by CMake at
    the commits pinned in `cmake/MemPage.cmake` and `cmake/TieredCache.cmake`; no sibling checkout is required.
 3. **Restore the agent's memory** so a new session starts with the same standing preferences and warnings:
