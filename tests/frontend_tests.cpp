@@ -1,7 +1,7 @@
 // frontend_tests.cpp — engine-free unit tests for the FRONTEND (pre-model) logic that the configurator
 // and the stage tools share but the engine doesn't define: the device-memory planner (sub0/memplan.hpp)
 // and the model registry's identity/compat rules (sub0/registry.hpp). Both are header-only and std-only,
-// so they run in the fast engine-free sub0_tok_tests target -- no engine build, no GPU. This is the
+// so they run in the fast engine-free sub0llm_frontend_tests target -- no engine build, no GPU. This is the
 // payoff of the frontend separation: pre-model logic gets covered without the engine. These two areas
 // were directly behind this session's work (the gpu_batch VRAM clamp + `models --prune`).
 

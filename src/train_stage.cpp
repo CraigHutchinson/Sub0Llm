@@ -1,4 +1,4 @@
-// train_stage.cpp — backend stage "train" (libsub0_train).
+// train_stage.cpp — backend stage "train" (libsub0llm_train).
 //
 // Owns the training-time orchestration: corpus loading, a held-out validation
 // split, minibatch sampling, the AdamW update schedule, automatic stopping and

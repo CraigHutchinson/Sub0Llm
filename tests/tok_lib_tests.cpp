@@ -1,7 +1,7 @@
 // tok_lib_tests.cpp — pure sub0::tok library tests, with NO dependency on the engine
 // or the baked production tokenizer.tok. The tokenizer was factored into a reusable
 // library precisely so it can be exercised on small in-memory test corpora here,
-// deterministically and fast. This target (sub0_tok_tests) links only sub0_tok +
+// deterministically and fast. This target (sub0llm_frontend_tests) links only sub0llm_frontend +
 // Catch2, so it builds and runs even while the engine DLLs are locked by a training run.
 //
 // The contract under test is the round-trip: detokenize(encode(x)) == normalize_text(x)

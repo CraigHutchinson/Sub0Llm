@@ -12,8 +12,8 @@ project(sub0llm VERSION 0.1.0 LANGUAGES CXX)
 #   generated/sub0_config.hpp   (constexpr dims + corpus-derived vocab)
 #        |
 #        v
-#   libsub0_core (shared)   --->  libsub0_train (shared)  \
-#                           --->  libsub0_gen   (shared)   >--> sub0llm (driver)
+#   libsub0llm_core (shared)   --->  libsub0llm_train (shared)  \
+#                           --->  libsub0llm_gen   (shared)   >--> sub0llm (driver)
 # ---------------------------------------------------------------------------
 
 # C++26, adopted deliberately ahead of full compiler support: this project tracks the newer standard

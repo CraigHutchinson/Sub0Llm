@@ -1,6 +1,6 @@
 // driver.cpp — the umbrella "sub0llm" executable: a thin dispatcher over the per-stage CLI runners in
 // sub0/cli_stages.hpp. It parses only argv[1] (the command) and forwards the rest to the matching
-// runner, which dispatches into the stage shared libraries (libsub0_train, libsub0_gen). The same
+// runner, which dispatches into the stage shared libraries (libsub0llm_train, libsub0llm_gen). The same
 // runners back the dedicated per-stage executables (sub0llm-train / -gen / -tune), so the arg parsing
 // and stage dispatch are defined ONCE. No model logic lives here.
 

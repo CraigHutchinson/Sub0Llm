@@ -17,7 +17,7 @@
 
 #include <CLI/CLI.hpp>
 
-// Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
+// Entry points provided by the stage libraries (libsub0llm_train, libsub0llm_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, double epochs, int batch, float lr, unsigned seed, int keep,
                                 int optimizer, int resume_mode, const char* blend_config_path,

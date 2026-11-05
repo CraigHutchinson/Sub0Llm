@@ -1,6 +1,6 @@
 // config_tests.cpp — unit tests for the pure configuration-decision logic (sub0/config_util.hpp),
 // factored out of the configurator's main() so it is testable without I/O. Linked into the engine-free
-// sub0_tok_tests target. Covers: auto-sizing (the ladder + the 0=auto/pin resolution), the tune-cache
+// sub0llm_frontend_tests target. Covers: auto-sizing (the ladder + the 0=auto/pin resolution), the tune-cache
 // parse (defaults + each key + the derived GPU batch), and precision resolution (codes + capability).
 
 #include <catch2/catch_test_macros.hpp>

@@ -1,4 +1,4 @@
-// engine_core.cpp — backend-agnostic part of the engine core (part of libsub0_core).
+// engine_core.cpp — backend-agnostic part of the engine core (part of libsub0llm_core).
 //
 // Holds everything that does NOT depend on how the math is executed: model
 // serialization (the checkpoint header + the flat parameter blob), the runtime BPE

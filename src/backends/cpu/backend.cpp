@@ -1,4 +1,4 @@
-// backend.cpp — CPU compute backend for the engine core (part of libsub0_core).
+// backend.cpp — CPU compute backend for the engine core (part of libsub0llm_core).
 //
 // Implements the differentiable math: the autograd ops, reverse-mode backward, the
 // batched forward pass, the data-parallel minibatch (train_batch) and the AdamW

@@ -71,7 +71,9 @@ REAL_AXES = """--dmodel 2560 --layers 48 --heads 24 --seq 128 --kv-heads 2 --hea
 --qsa-indexer-budget 2048 --qsa-indexer-compress-ratio 4 --tie-embeddings 0 --d-ff 640
 --moe-quant-experts 1 --num-experts 512 --experts-per-tok 10 --prec-param 1 --vocab-exact 248320""".split()
 
-ARTIFACT = r"D:\ModelWeights\Sub0Llm-Qwen4-full48-bf16\qwen4_full48_q_bf16.bin"
+# The real 48-layer model blob; its .bbq/.bbq.pair/.moeq sidecars sit beside it. SUB0_QWEN4_MODEL overrides the
+# default, which is where this project's dev machine keeps it (docs/HANDOVER.md, "Resuming on a new machine").
+ARTIFACT = os.environ.get("SUB0_QWEN4_MODEL", r"D:\ModelWeights\Sub0Llm-Qwen4-full48-bf16\qwen4_full48_q_bf16.bin")
 CONTENTION_RE = re.compile(r"sub0llm|clang|ninja|cmake", re.I)
 
 

@@ -1,4 +1,4 @@
-// sub0/core.hpp — public API of the shared engine core (libsub0_core).
+// sub0/core.hpp — public API of the shared engine core (libsub0llm_core).
 //
 // The engine core holds the differentiable substrate that both backend stages
 // (train, gen) share: the autograd node types, the model forward pass, the

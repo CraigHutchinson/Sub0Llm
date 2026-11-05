@@ -1,4 +1,4 @@
-// gen_stage.cpp — backend stage "gen" (libsub0_gen).
+// gen_stage.cpp — backend stage "gen" (libsub0llm_gen).
 //
 // Owns autoregressive sampling: load a trained model, encode the prompt, and
 // repeatedly run the engine forward pass, sampling the next token with

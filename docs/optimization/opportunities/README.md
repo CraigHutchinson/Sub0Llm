@@ -119,16 +119,9 @@ default-off.
 | ID | Item | Status |
 |---|---|---|
 | P1 | **Make the codified optimization workflow lean enough to be part of the DEFAULT development workflow** — do after the O2 work lands | backlog |
-| P2 | **Rename the `sub0llm_tests` target to `sub0llm_tests`**, matching the `sub0llm-*` tool naming | backlog |
+| P2 | Rename every library, DLL, test binary and CMake target to the `sub0llm` prefix (`sub0_tests` -> `sub0llm_tests`, `sub0_core.dll` -> `sub0llm_core.dll`, ...) | **done 2026-10-08** (`47a4cc4`) |
 
-**P2 — rename `sub0llm_tests` → `sub0llm_tests`.** Do it in one commit, on a quiet tree, with no delegated
-track mid-flight: every agent brief, gate and script names the target. The build-affecting consumers are
-`tests/CMakeLists.txt` (the target itself), `scripts/run_perf_suite.py`, `docs/optimization/kpi_gates.json`
-(G-HASH and G-SUITE-ENGINE name the stage) and `.vscode/settings.json`. About 27 more docs mention it by
-name: update the living ones (AGENTS.md, OPTIMIZATION_PROCESS.md, the briefs) and leave dated historical
-records as written. Verify with `git grep sub0llm_tests`, which should then show only historical records.
-Open question for the user: rename `sub0llm_frontend_tests` → `sub0llm_frontend_tests` at the same time
-(22 files), so the two suites stay consistent?
+**P2 — done.** The user's rule is that every artifact carries the `sub0llm` prefix, so a bare `sub0_core.dll` cannot collide with another Sub0 library's. One mechanical whole-word rename over 85 tracked files; the work log and perf history keep the old names as history. The frontend suite was renamed with the rest (`sub0llm_frontend_tests`), which settles the open question this item carried. Build directories created before the rename still hold `sub0_*` binaries: delete them or rebuild from clean.
 
 **P1 — what to fold in, from what the O1/O2 session actually needed** (keep it lean: one command per
 question, defaults that are right, no ritual):
