@@ -7,6 +7,20 @@ compiled model), which stay as-is. Nothing here is committed engineering work; i
 the corpus/data-sourcing and architecture decisions are headed, so each near-term step can be judged
 against a destination instead of picked in isolation.
 
+## STATUS 2026-11-05 — the pivot's decode work: where it stands
+
+The direction below was followed. The real Qwen3.8-Flash-Next model (a Qwen4-architecture preview) runs on
+this engine end to end on a CPU-first, RAM-constrained laptop, at about 7-8.5 tok/s in long runs with the
+native-quant backbone, a file-mapped parameter arena and the other measured optimizations on by default.
+The owned expert cache (Sub0MemPage and Sub0TieredCache) is about 11% faster than memory-mapped experts under
+memory pressure and is opt-in. The quality gate is paired perplexity on a pinned 9,631-token text.
+
+What is next, in the project owner's terms: a memory planner that sizes context memory per conversation and
+splits RAM between it and the expert cache; promoting the cache to the default; then the n-gram table as the
+storage stack's core use case. The full state, the resume steps and the ranked open work are in
+[HANDOVER.md](HANDOVER.md); how the work is done is in [WORKING_PRACTICES.md](WORKING_PRACTICES.md); every
+decode optimization is in [optimization/opportunities/README.md](optimization/opportunities/README.md).
+
 ## STATUS 2026-08-30 — from-scratch training work CLOSED OUT; pivoting to supporting existing models
 
 Everything below this line documents where the from-scratch training line of work (corpus sourcing,

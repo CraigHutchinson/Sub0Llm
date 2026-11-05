@@ -9,6 +9,10 @@ of the rule.
 If you're an agent (or a human) about to add a new op, optimizer, config knob, or file format change
 to this engine: read this first.
 
+**Starting a new session, or on a new machine?** Read `docs/HANDOVER.md` (current state, how to resume,
+the open work) and `docs/WORKING_PRACTICES.md` (the project owner's standing directions, how to measure,
+how to delegate, the environment traps) before anything else. Neither is repeated here.
+
 **More than one agent may be working on this repo at the same time.** Before touching a shared file
 (`backend_cpu.cpp`, `layout.hpp`, `engine_core.cpp`, `core.hpp`, and any `*_math.hpp` are the usual
 ones) or starting a CPU-heavy build/test/benchmark run, check `docs/ACTIVE_WORK_LOG.md` for an

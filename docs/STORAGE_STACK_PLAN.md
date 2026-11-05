@@ -129,6 +129,8 @@ work package. Dependency pins advance only after consumer CI is green.
 
 ## Current checkpoint
 
+Updated 2026-11-05. **Since the notes below were written:** the owned expert cache (`--moe-io-mode cache`) shipped and is about 11% faster than reactive mmap under memory pressure; `--moe-io-mode` still defaults to `reactive`, and promoting `cache` waits on the memory planner (see "Follow-ups" and [`optimization/opportunities/O13_storage_convergence.md`](optimization/opportunities/O13_storage_convergence.md)). The parameter arena is now a file view (O14). Entries below keep the date they were written.
+
 Updated 2026-09-29. **S1a (E1 adapter fixture) and S1b (E2 routed-MoE byte transport) are done; S1c
 (E1 frozen-table model wiring) remains** -- see "S1b closure record" and "S1 acceptance manifest (Llm
 side)" below. Llm's first production consumer of Sub0MemPage is the opt-in decode transport
