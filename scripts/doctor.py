@@ -15,14 +15,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
-# ANSI colors
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-CYAN = "\033[96m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RESET = "\033[0m"
+# ANSI colors -- disabled when piped or when NO_COLOR is set (https://no-color.org).
+_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+GREEN = "\033[92m" if _COLOR else ""
+YELLOW = "\033[93m" if _COLOR else ""
+RED = "\033[91m" if _COLOR else ""
+CYAN = "\033[96m" if _COLOR else ""
+BOLD = "\033[1m" if _COLOR else ""
+DIM = "\033[2m" if _COLOR else ""
+RESET = "\033[0m" if _COLOR else ""
 
 
 def check_mark(ok: bool, warn: bool = False) -> str:
@@ -185,9 +186,9 @@ def main() -> int:
     english_txt = repo_root / "data" / "english.txt"
     if english_txt.exists():
         with open(english_txt, "rb") as f:
-            header = f.read(50)
-            if b"oid sha256" in header:
-                print(f"  {check_mark(False, warn=True)} Tracked test data: {YELLOW}LFS pointer stub detected (run 'git lfs pull'){RESET}")
+            header = f.read(200)
+            if header.startswith(b"version https://git-lfs"):
+                print(f"  {check_mark(False, warn=True)} Tracked test data: {YELLOW}LFS pointer text, not real content. data/english.txt is exempt from the LFS filter (.gitattributes), so 'git lfs pull' will not fix it; restore the real 9,742-byte file (tracked in a follow-up issue){RESET}")
                 warnings += 1
             else:
                 print(f"  {check_mark(True)} Tracked test data: {GREEN}Hydrated real files{RESET}")

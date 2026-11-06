@@ -152,6 +152,15 @@ TEST_CASE("transplant: every destination has a well-formed recipe", "[transplant
     CHECK(expert_slice == 3);  // MoE gate/up/down
     CHECK(per_head == 2);      // QSA query and gate halves of the fused attn_q
 
+    // Dense gated-FFN (SwiGLU) destinations: GGUF stores [out,in], the destination wants [in,out], so all
+    // three are transposes -- a Copy here would load the right bytes in the wrong order.
+    CHECK(recipe_for(Dest::FfnGate).op == Op::Transpose);
+    CHECK(recipe_for(Dest::FfnUp).op   == Op::Transpose);
+    CHECK(recipe_for(Dest::FfnDown).op == Op::Transpose);
+    CHECK(std::string(recipe_for(Dest::FfnGate).src) == "blk.%d.ffn_gate.weight");
+    CHECK(std::string(recipe_for(Dest::FfnUp).src)   == "blk.%d.ffn_up.weight");
+    CHECK(std::string(recipe_for(Dest::FfnDown).src) == "blk.%d.ffn_down.weight");
+
     // The two same-shaped, opposite-treatment embeddings -- the single easiest thing to get backwards
     // in this whole table, since token_embd.weight and output.weight declare IDENTICAL dims.
     CHECK(recipe_for(Dest::TokEmb).op == Op::Copy);
