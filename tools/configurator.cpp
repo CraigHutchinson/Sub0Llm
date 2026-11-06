@@ -753,6 +753,7 @@ int main(int argc, char** argv) {
     std::string dump_vocab; // prefix for the readable vocabulary-analysis dumps (empty = off)
     std::string model_profile;
     std::string profile_dir;
+    std::string models_dir;
     bool list_profiles = false;
 
     app.add_option("--profile,--model-profile", model_profile,
@@ -761,6 +762,9 @@ int main(int argc, char** argv) {
     app.add_option("--profile-dir", profile_dir,
                    "Directory searched for <name>.profile files (default: $SUB0_PROFILE_DIR, else the source "
                    "tree's profiles/ baked in at build time)");
+    app.add_option("--models-dir", models_dir,
+                   "Directory holding downloaded model weights, one sub-folder per profile's model-dir "
+                   "(default: $SUB0_MODELS_DIR; none = weights are not looked for)");
     app.add_flag("--list-profiles", list_profiles, "List the profiles found in the profile directory and exit");
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation; required unless --vocab-exact is used)")
@@ -1115,6 +1119,25 @@ int main(int argc, char** argv) {
             else dir = SUB0_DEFAULT_PROFILE_DIR;
 #endif
         }
+        fs::path models = models_dir;
+        if (models.empty()) { if (const char* env = std::getenv("SUB0_MODELS_DIR"); env && *env) models = env; }
+        // One human line for a profile's weights; never an error -- configuring needs no weights.
+        auto model_line = [&](const sub0::profile::Profile& pr) -> std::string {
+            using sub0::profile::ModelState;
+            const sub0::profile::ModelStatus ms = sub0::profile::model_status(pr, models);
+            switch (ms.state) {
+                case ModelState::NoMetadata:  return {};
+                case ModelState::NoModelsDir:
+                    return "model: models directory not set (--models-dir or $SUB0_MODELS_DIR)";
+                case ModelState::Missing:
+                    return std::format("model: NOT FOUND in {} -- fetch with: python3 scripts/models.py fetch {}",
+                                       ms.path.string(), pr.name);
+                case ModelState::Present:
+                    return std::format("model: found, {} .gguf, {:.1f} GiB, in {}", ms.gguf_files,
+                                       static_cast<double>(ms.bytes) / (1024.0 * 1024.0 * 1024.0), ms.path.string());
+            }
+            return {};
+        };
         const sub0::profile::Discovered found = sub0::profile::discover(dir);
         for (const std::string& e : found.errors) std::println(stderr, "configure warning: skipped profile: {}", e);
 
@@ -1125,6 +1148,7 @@ int main(int argc, char** argv) {
                 std::string names = pr.name;
                 for (const auto& al : pr.aliases) names += ", " + al;
                 std::println("  {}   [{}]", names, fs::path(pr.source).filename().string());
+                if (const std::string m = model_line(pr); !m.empty()) std::println("      {}", m);
             }
             return 0;
         }
@@ -1155,6 +1179,8 @@ int main(int argc, char** argv) {
             }
             prof = *it;
         }
+
+        if (const std::string m = model_line(prof); !m.empty()) std::println(stderr, "configure note: {}: {}", prof.name, m);
 
         // The options a profile may set, mapped to the variables they fill. Deliberately the architecture
         // axes only (AGENTS section 8): add a key here when a profile needs one.

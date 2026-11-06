@@ -1,5 +1,7 @@
 # Architecture profile for `sub0llm-configure --profile qwen3.6-35b`. Format: include/sub0/profile.hpp.
-# TODO(source): dims are not yet tied to a fetched config.json -- see issue #7.
+# Dims checked 2026-11-06 against Qwen/Qwen3.6-35B-A3B config.json (hidden 2048, 40 layers, 16 heads, 2 KV heads,
+# moe_intermediate_size = shared_expert_intermediate_size = 512, 256 experts / 8 per token, GDN 16/32x128).
+# d-ff was 1436 before this check, which matched nothing in config.json.
 name = qwen3.6-35b
 alias = qwen3.6-35b-a3b
 
@@ -28,7 +30,13 @@ dmodel = 2048
 layers = 40
 heads = 16
 kv-heads = 2
-d-ff = 1436
+d-ff = 512
 num-experts = 256
 experts-per-tok = 8
 moe-quant-experts = 1
+
+# Weights (metadata only; see scripts/models.py)
+model-card = Qwen/Qwen3.6-35B-A3B
+model-source = unsloth/Qwen3.6-35B-A3B-GGUF
+model-dir = Qwen3.6-35B-A3B-GGUF
+model-include = *UD-Q4_K_M.gguf     # choose the quant to suit your RAM

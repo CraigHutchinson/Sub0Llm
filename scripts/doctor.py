@@ -193,6 +193,13 @@ def main() -> int:
             else:
                 print(f"  {check_mark(True)} Tracked test data: {GREEN}Hydrated real files{RESET}")
 
+    # Model weights directory (profiles' model-dir folders live under it; see scripts/models.py)
+    models = os.environ.get("SUB0_MODELS_DIR")
+    if models and Path(models).is_dir():
+        print(f"  {check_mark(True)} Models directory: {GREEN}{models}{RESET} {DIM}(scripts/models.py status){RESET}")
+    else:
+        print(f"  {check_mark(False, warn=True)} Models directory: {YELLOW}$SUB0_MODELS_DIR not set or missing{RESET} {DIM}(only needed to transplant/run real models){RESET}")
+
     # 4. Built Executables Status
     print(f"\n{BOLD}[4] Sub0Llm Build Status{RESET}")
     native_dir = repo_root / "out" / "build" / "native"

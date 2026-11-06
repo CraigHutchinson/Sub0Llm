@@ -209,6 +209,10 @@ failure. It caps ctest at 8 parallel jobs (`JOBS=n` to change): `-j$(nproc)` was
 Architecture presets are files: `sub0llm-configure --list-profiles` shows what `profiles/*.profile` offers; add or
 edit a file (format in `include/sub0/profile.hpp`) rather than the C++. `--profile <name|path|->`, `--profile-dir`
 and `$SUB0_PROFILE_DIR` choose where it looks; explicit flags always override a profile.
+Model weights: set `SUB0_MODELS_DIR` (or `--models-dir`). A profile's `model-*` keys say which weights it is for;
+`sub0llm-configure --list-profiles` and `python3 scripts/models.py status` report found / NOT FOUND, `models.py check`
+compares the profile's dims with the model's Hugging Face `config.json` (the source of truth; run it after editing a
+profile), and `models.py fetch <profile>` lists the download and only downloads with `--yes`.
 Read a large diff with `git diff --stat` first, then per-file, rather than inline. See also
 [CORPUS_WORKFLOW.md](CORPUS_WORKFLOW.md) for the corpus-acquisition gap.
 

@@ -68,3 +68,35 @@ TEST_CASE("profile: discover finds *.profile, defaults the name to the stem, rep
     CHECK(discover(dir / "missing").profiles.empty());   // a missing directory is empty, not an error
     fs::remove_all(dir);
 }
+
+TEST_CASE("profile: model-* keys are metadata, not options", "[profile]") {
+    const auto r = parse("model-card = A/b\nmodel-source = u/b-GGUF\nmodel-dir = d\nmodel-include = *.gguf\ndmodel = 8\n", "t");
+    REQUIRE(r.ok);
+    CHECK(r.profile.model_card == "A/b");
+    CHECK(r.profile.model_source == "u/b-GGUF");
+    CHECK(r.profile.model_dir == "d");
+    CHECK(r.profile.model_include == "*.gguf");
+    CHECK(r.profile.values.size() == 1);            // only dmodel is a configurator option
+    CHECK_FALSE(parse("model-dir = a\nmodel-dir = b\n", "t").ok);
+}
+
+TEST_CASE("profile: model_status distinguishes no metadata, no models dir, missing and present", "[profile]") {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "sub0_profile_model_status_test";
+    fs::remove_all(root);
+    Profile none;
+    CHECK(model_status(none, root).state == ModelState::NoMetadata);
+    Profile p;
+    p.model_dir = "M";
+    CHECK(model_status(p, {}).state == ModelState::NoModelsDir);
+    CHECK(model_status(p, root).state == ModelState::Missing);
+    fs::create_directories(root / "M" / "UD-IQ1_S");
+    CHECK(model_status(p, root).state == ModelState::Missing);        // folder exists but holds no .gguf
+    std::ofstream(root / "M" / "UD-IQ1_S" / "a.gguf") << std::string(100, 'x');
+    std::ofstream(root / "M" / "readme.txt") << "ignored";
+    const ModelStatus st = model_status(p, root);
+    CHECK(st.state == ModelState::Present);                           // found recursively
+    CHECK(st.gguf_files == 1);
+    CHECK(st.bytes == 100);
+    fs::remove_all(root);
+}

@@ -1,5 +1,7 @@
 # Architecture profile for `sub0llm-configure --profile qwen3.8-flash-next`. Format: include/sub0/profile.hpp.
-# TODO(source): dims are not yet tied to a fetched config.json -- see issue #7.
+# Dims checked 2026-11-06 against Qwen/Qwen3.8-Flash-Next config.json (hidden 2560, 48 layers, 24 heads, 2 KV heads,
+# head_dim 256, moe_intermediate_size = shared_expert_intermediate_size = 640, 512 experts / 10 per token, GDN 16/48x128).
+# hc-count/hc-lowrank and qsa-indexer-* are engine-side choices with no config.json counterpart.
 name = qwen3.8-flash-next
 alias = qwen4-preview, qwen4
 
@@ -34,3 +36,9 @@ d-ff = 640
 moe-quant-experts = 1
 num-experts = 512
 experts-per-tok = 10
+
+# Weights (metadata only; see scripts/models.py)
+model-card = Qwen/Qwen3.8-Flash-Next
+model-source = unsloth/Qwen3.8-Flash-Next-GGUF
+model-dir = Qwen3.8-Flash-Next-GGUF
+model-include = UD-IQ1_S/*     # the tier docs/HANDOVER.md transplants from

@@ -11,12 +11,19 @@
 //     alias = qwen3.8-dense, other   (optional; comma-separated extra names)
 //     dmodel = 5120                  (any other key = a sub0llm-configure long option WITHOUT the "--")
 //     rope-theta = 1e7
+//     model-source  = unsloth/Qwen3.8-27B-GGUF   (optional: Hugging Face repo that holds the model's GGUF)
+//     model-card    = Qwen/Qwen3.8-27B           (optional: HF repo whose config.json is the source of truth for the dims)
+//     model-dir     = Qwen3.8-27B-GGUF           (optional: folder under the models directory)
+//     model-include = *UD-Q4_K_M*.gguf           (optional: glob of the files to fetch / expect)
+// The four model-* keys are metadata, not configurator options: they say which weights a profile is
+// for, so tooling can report whether they are on this machine (see model_status) and fetch them.
 // An option given explicitly on the command line always wins over the profile's value.
 
 #pragma once
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -32,6 +39,7 @@ struct Profile {
     std::string name;                                            // primary name ("" until resolved)
     std::vector<std::string> aliases;
     std::string source;                                          // file path, or "<stdin>"
+    std::string model_source, model_card, model_dir, model_include;          // optional weights metadata ("" = none)
     std::vector<std::pair<std::string, std::string>> values;     // option (no dashes) -> value, file order
 };
 
@@ -83,6 +91,12 @@ inline std::string trim(std::string_view v) {
         if (key == "name") {
             if (!r.profile.name.empty()) return fail("'name' given twice");
             r.profile.name = val;
+        } else if (key == "model-source" || key == "model-card" || key == "model-dir" || key == "model-include") {
+            std::string& slot = key == "model-source" ? r.profile.model_source
+                              : key == "model-card"   ? r.profile.model_card
+                              : key == "model-dir"    ? r.profile.model_dir : r.profile.model_include;
+            if (!slot.empty()) return fail("'" + key + "' given twice");
+            slot = val;
         } else if (key == "alias") {
             std::istringstream parts(val);
             std::string a;
@@ -135,6 +149,34 @@ struct Discovered {
     }
     std::sort(d.profiles.begin(), d.profiles.end(), [](const Profile& a, const Profile& b) { return a.name < b.name; });
     return d;
+}
+
+// Where a profile's weights stand on this machine. Never fatal: configuring needs no weights.
+enum class ModelState { NoMetadata, NoModelsDir, Missing, Present };
+struct ModelStatus {
+    ModelState state = ModelState::NoMetadata;
+    std::filesystem::path path;      // <models dir>/<model-dir> (empty for NoMetadata / NoModelsDir)
+    int gguf_files = 0;
+    std::uintmax_t bytes = 0;        // total size of the .gguf files found under `path`
+};
+
+// Looks for `<models_dir>/<profile.model_dir>` holding at least one .gguf (searched recursively, so a
+// quant sub-folder such as UD-IQ1_S counts). An empty `models_dir` means none is configured.
+[[nodiscard]] inline ModelStatus model_status(const Profile& p, const std::filesystem::path& models_dir) {
+    ModelStatus st;
+    if (p.model_dir.empty()) return st;
+    if (models_dir.empty()) { st.state = ModelState::NoModelsDir; return st; }
+    st.path = models_dir / p.model_dir;
+    st.state = ModelState::Missing;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(st.path, ec)) return st;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(st.path, ec)) {
+        if (!e.is_regular_file(ec) || e.path().extension() != ".gguf") continue;
+        ++st.gguf_files;
+        st.bytes += e.file_size(ec);
+    }
+    if (st.gguf_files > 0) st.state = ModelState::Present;
+    return st;
 }
 
 }  // namespace sub0::profile
