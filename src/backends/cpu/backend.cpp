@@ -49,7 +49,9 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#if __has_include(<mdspan>)
 #include <mdspan>
+#endif
 #include <memory>
 #include <mutex>
 #include <print>
@@ -281,7 +283,19 @@ static Node* mk_node(Op op, int r, int c) {
 // 2D row-major view over a Node's flat [rows x cols] span (data or grad). Replaces
 // hand-rolled i*cols+j indexing in the scalar/scatter paths; the hot vectorized
 // kernels keep their __restrict row pointers.
+#if __has_include(<mdspan>)
 using Mat = std::mdspan<float, std::dextents<std::size_t, 2>>;
+#else
+struct Mat {
+    float* data_;
+    std::size_t rows_;
+    std::size_t cols_;
+    constexpr Mat(float* d, std::size_t r, std::size_t c) : data_(d), rows_(r), cols_(c) {}
+    constexpr float& operator[](std::size_t r, std::size_t c) const noexcept {
+        return data_[r * cols_ + c];
+    }
+};
+#endif
 static inline Mat mat(std::span<float> s, int rows, int cols) {
     return Mat(s.data(), static_cast<std::size_t>(rows), static_cast<std::size_t>(cols));
 }

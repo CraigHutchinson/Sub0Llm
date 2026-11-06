@@ -44,7 +44,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#if __has_include(<mdspan>)
 #include <mdspan>
+#endif
 #include <memory>
 #include <print>
 #include <span>
