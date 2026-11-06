@@ -88,6 +88,27 @@ struct GgufCheck {
         compare("gdn-value-head-dim", v / w);
     if (const auto* t = r.find("tokenizer.ggml.tokens"); t && t->array_len > 0)
         compare("vocab-exact", static_cast<double>(t->array_len));
+
+    // QSA indexer axes are engine-side options, so ordinary config-dimension comparisons cannot tell
+    // whether the selected model actually has source tensors for them. GGUF tensor names can: the
+    // Qwen indexer projections carry "indexer" in their names. Compare presence, not a tensor count,
+    // because valid GGUF exports may choose different layer naming/packing details.
+    const auto qsa = profile.find("qsa-indexer-n-heads");
+    if (qsa != profile.end()) {
+        bool profile_has_indexer = qsa->second > 0;
+        bool gguf_has_indexer = false;
+        for (const gguf::TensorInfo& tensor : r.tensors()) {
+            if (tensor.name.find("indexer") != std::string::npos) {
+                gguf_has_indexer = true;
+                break;
+            }
+        }
+        if (profile_has_indexer != gguf_has_indexer) {
+            ++out.compared;
+            out.mismatches.push_back({"qsa-indexer-n-heads", profile_has_indexer ? qsa->second : 0.0,
+                                      gguf_has_indexer ? 1.0 : 0.0});
+        }
+    }
     return out;
 }
 
