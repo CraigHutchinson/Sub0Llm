@@ -747,6 +747,12 @@ int main(int argc, char** argv) {
     int compute     = -1;  // backend to USE: 0=CPU, 1=GPU, 2=HYBRID; -1 = decide from has_cuda
     int cuda_tf32   = 0;   // bake TF32 tensor-core GEMM math on the GPU backend (tuned knob)
     std::string dump_vocab; // prefix for the readable vocabulary-analysis dumps (empty = off)
+    std::string model_profile;
+
+    app.add_option("--profile,--model-profile", model_profile,
+                   "Architecture profile preset: 'qwen3.8-flash-next' (or 'qwen4-preview'), "
+                   "'qwen3.8-27b', 'qwen3.6-35b'. Explicit flags override profile values.")
+       ->capture_default_str();
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation; required unless --vocab-exact is used)")
        ->check(CLI::ExistingFile);
@@ -1090,6 +1096,101 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 1));
 
     CLI11_PARSE(app, argc, argv);
+
+    if (!model_profile.empty()) {
+        std::string p = model_profile;
+        std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        auto is_unset = [&](const std::string& opt_name) {
+            return app.count(opt_name) == 0;
+        };
+
+        if (p == "qwen3.8-flash-next" || p == "qwen4-preview" || p == "qwen4") {
+            if (is_unset("--dmodel")) d_model = 2560;
+            if (is_unset("--layers")) n_layers = 48;
+            if (is_unset("--heads")) n_heads = 24;
+            if (is_unset("--kv-heads")) n_kv_heads = 2;
+            if (is_unset("--head-dim")) head_dim = 256;
+            if (is_unset("--rotary-dim")) rotary_dim = 64;
+            if (is_unset("--rope-theta")) rope_theta = 10000000.0;
+            if (is_unset("--gdn-full-attn-stride")) gdn_full_attn_stride = 4;
+            if (is_unset("--gdn-key-heads")) gdn_key_heads = 16;
+            if (is_unset("--gdn-value-heads")) gdn_value_heads = 48;
+            if (is_unset("--gdn-key-head-dim")) gdn_key_head_dim = 128;
+            if (is_unset("--gdn-value-head-dim")) gdn_value_head_dim = 128;
+            if (is_unset("--hc-count")) hc_count = 4;
+            if (is_unset("--hc-lowrank")) hc_lowrank = 320;
+            if (is_unset("--qsa-indexer-n-heads")) qsa_idx_n_heads = 4;
+            if (is_unset("--qsa-indexer-kv-heads")) qsa_idx_kv_heads = 1;
+            if (is_unset("--qsa-indexer-head-dim")) qsa_idx_head_dim = 128;
+            if (is_unset("--qsa-indexer-budget")) qsa_idx_budget = 2048;
+            if (is_unset("--qsa-indexer-compress-ratio")) qsa_idx_ratio = 4;
+            if (is_unset("--tie-embeddings")) tie_embeddings = 0;
+            if (is_unset("--d-ff")) d_ff_pin = 640;
+            if (is_unset("--moe-quant-experts")) moe_quant_experts = 1;
+            if (is_unset("--num-experts")) num_experts = 512;
+            if (is_unset("--experts-per-tok")) experts_per_tok = 10;
+            if (is_unset("--prec-param")) prec_param = 1;
+            if (is_unset("--vocab-exact") && is_unset("--vocab")) vocab_exact = 248320;
+            if (is_unset("--seq")) seq_len = 128;
+            if (is_unset("--pos-encoding")) pos_encoding = 1;
+        } else if (p == "qwen3.8-27b" || p == "qwen3.8-dense") {
+            if (is_unset("--dmodel")) d_model = 5120;
+            if (is_unset("--layers")) n_layers = 64;
+            if (is_unset("--heads")) n_heads = 40;
+            if (is_unset("--kv-heads")) n_kv_heads = 4;
+            if (is_unset("--head-dim")) head_dim = 256;
+            if (is_unset("--rotary-dim")) rotary_dim = 64;
+            if (is_unset("--rope-theta")) rope_theta = 10000000.0;
+            if (is_unset("--gdn-full-attn-stride")) gdn_full_attn_stride = 4;
+            if (is_unset("--gdn-key-heads")) gdn_key_heads = 16;
+            if (is_unset("--gdn-value-heads")) gdn_value_heads = 48;
+            if (is_unset("--gdn-key-head-dim")) gdn_key_head_dim = 128;
+            if (is_unset("--gdn-value-head-dim")) gdn_value_head_dim = 128;
+            if (is_unset("--qsa-indexer-n-heads")) qsa_idx_n_heads = 4;
+            if (is_unset("--qsa-indexer-kv-heads")) qsa_idx_kv_heads = 1;
+            if (is_unset("--qsa-indexer-head-dim")) qsa_idx_head_dim = 128;
+            if (is_unset("--qsa-indexer-budget")) qsa_idx_budget = 2048;
+            if (is_unset("--qsa-indexer-compress-ratio")) qsa_idx_ratio = 4;
+            if (is_unset("--d-ff")) d_ff_pin = 17408;
+            if (is_unset("--gated-ffn")) gated_ffn = 1;
+            if (is_unset("--num-experts")) num_experts = 0;
+            if (is_unset("--tie-embeddings")) tie_embeddings = 0;
+            if (is_unset("--prec-param")) prec_param = 1;
+            if (is_unset("--vocab-exact") && is_unset("--vocab")) vocab_exact = 248320;
+            if (is_unset("--seq")) seq_len = 128;
+            if (is_unset("--pos-encoding")) pos_encoding = 1;
+        } else if (p == "qwen3.6-35b" || p == "qwen3.6-35b-a3b") {
+            if (is_unset("--dmodel")) d_model = 2048;
+            if (is_unset("--layers")) n_layers = 40;
+            if (is_unset("--heads")) n_heads = 16;
+            if (is_unset("--kv-heads")) n_kv_heads = 2;
+            if (is_unset("--head-dim")) head_dim = 256;
+            if (is_unset("--rotary-dim")) rotary_dim = 64;
+            if (is_unset("--rope-theta")) rope_theta = 10000000.0;
+            if (is_unset("--gdn-full-attn-stride")) gdn_full_attn_stride = 4;
+            if (is_unset("--gdn-key-heads")) gdn_key_heads = 16;
+            if (is_unset("--gdn-value-heads")) gdn_value_heads = 32;
+            if (is_unset("--gdn-key-head-dim")) gdn_key_head_dim = 128;
+            if (is_unset("--gdn-value-head-dim")) gdn_value_head_dim = 128;
+            if (is_unset("--qsa-indexer-n-heads")) qsa_idx_n_heads = 4;
+            if (is_unset("--qsa-indexer-kv-heads")) qsa_idx_kv_heads = 1;
+            if (is_unset("--qsa-indexer-head-dim")) qsa_idx_head_dim = 128;
+            if (is_unset("--qsa-indexer-budget")) qsa_idx_budget = 2048;
+            if (is_unset("--qsa-indexer-compress-ratio")) qsa_idx_ratio = 4;
+            if (is_unset("--d-ff")) d_ff_pin = 1436;
+            if (is_unset("--num-experts")) num_experts = 256;
+            if (is_unset("--experts-per-tok")) experts_per_tok = 8;
+            if (is_unset("--moe-quant-experts")) moe_quant_experts = 1;
+            if (is_unset("--tie-embeddings")) tie_embeddings = 0;
+            if (is_unset("--prec-param")) prec_param = 1;
+            if (is_unset("--vocab-exact") && is_unset("--vocab")) vocab_exact = 248320;
+            if (is_unset("--seq")) seq_len = 128;
+            if (is_unset("--pos-encoding")) pos_encoding = 1;
+        } else {
+            std::println(stderr, "configure error: unknown --profile '{}'. Valid profiles: 'qwen3.8-flash-next', 'qwen3.8-27b', 'qwen3.6-35b'", model_profile);
+            return 2;
+        }
+    }
 
     const bool exact_vocab = vocab_exact > 0;
     if (corpus.empty() != exact_vocab) {
