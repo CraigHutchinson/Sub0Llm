@@ -214,6 +214,8 @@ endif()
 
 add_executable(sub0llm-configure tools/configurator.cpp)
 target_include_directories(sub0llm-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
+# Default --profile directory; --profile-dir / $SUB0_PROFILE_DIR override it at run time.
+target_compile_definitions(sub0llm-configure PRIVATE SUB0_DEFAULT_PROFILE_DIR="${CMAKE_SOURCE_DIR}/profiles")
 target_link_libraries(sub0llm-configure PRIVATE CLI11::CLI11 sub0llm_frontend)
 
 # WS7: engine-free tokenizer inspection/interchange (docs/WORKFLOW_ARCHITECTURE.md's "Tokenizer /

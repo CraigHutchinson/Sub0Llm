@@ -32,6 +32,9 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <sstream>
+#include <iostream>
+#include <functional>
 #include <mutex>
 #include <print>
 #include <queue>
@@ -58,6 +61,7 @@
 #include "sub0/memplan.hpp"  // train_resident_mb: predict the GPU batch footprint to fail misconfig early
 
 #include "sub0/casing.hpp"
+#include "sub0/profile.hpp"  // --profile files (parse + directory discovery)
 #include "sub0/tokenizer.hpp"  // sub0::tok — the shared truecasing + BPE tokenizer (scan/learn/serialize)
 #include "sub0/unigram.hpp"    // sub0::tok::learn_unigram — the Unigram LM vocabulariser (A/B vs BPE)
 #include "sub0/tokmap.hpp"     // sub0::TokWriter — v2 corpus.tok (u64 counts + byte-aligned token width)
@@ -748,11 +752,16 @@ int main(int argc, char** argv) {
     int cuda_tf32   = 0;   // bake TF32 tensor-core GEMM math on the GPU backend (tuned knob)
     std::string dump_vocab; // prefix for the readable vocabulary-analysis dumps (empty = off)
     std::string model_profile;
+    std::string profile_dir;
+    bool list_profiles = false;
 
     app.add_option("--profile,--model-profile", model_profile,
-                   "Architecture profile preset: 'qwen3.8-flash-next' (or 'qwen4-preview'), "
-                   "'qwen3.8-27b', 'qwen3.6-35b'. Explicit flags override profile values.")
-       ->capture_default_str();
+                   "Architecture profile: a name or alias from the profile directory (see --list-profiles), a "
+                   "path to a .profile file, or '-' to read one from stdin. Explicit flags override profile values.");
+    app.add_option("--profile-dir", profile_dir,
+                   "Directory searched for <name>.profile files (default: $SUB0_PROFILE_DIR, else the source "
+                   "tree's profiles/ baked in at build time)");
+    app.add_flag("--list-profiles", list_profiles, "List the profiles found in the profile directory and exit");
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation; required unless --vocab-exact is used)")
        ->check(CLI::ExistingFile);
@@ -1097,70 +1106,95 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
-    if (!model_profile.empty()) {
-        std::string p = model_profile;
-        std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        // A profile only fills what the user did not pass: `set` skips any option present on the command line.
-        // Keyed on each option's primary spelling -- if one ever gains an alias, add it here too.
-        auto set = [&](const char* opt, auto& var, auto val) {
-            if (app.count(opt) == 0) var = static_cast<std::remove_reference_t<decltype(var)>>(val);
-        };
-        // Shared by every Qwen3.x profile: the GDN/QSA mixer geometry and the external-vocabulary setup.
-        auto qwen_common = [&](int gdn_value_heads_v) {
-            set("--head-dim", head_dim, 256);
-            set("--rotary-dim", rotary_dim, 64);
-            set("--rope-theta", rope_theta, 10000000.0);
-            set("--gdn-full-attn-stride", gdn_full_attn_stride, 4);
-            set("--gdn-key-heads", gdn_key_heads, 16);
-            set("--gdn-value-heads", gdn_value_heads, gdn_value_heads_v);
-            set("--gdn-key-head-dim", gdn_key_head_dim, 128);
-            set("--gdn-value-head-dim", gdn_value_head_dim, 128);
-            set("--qsa-indexer-n-heads", qsa_idx_n_heads, 4);
-            set("--qsa-indexer-kv-heads", qsa_idx_kv_heads, 1);
-            set("--qsa-indexer-head-dim", qsa_idx_head_dim, 128);
-            set("--qsa-indexer-budget", qsa_idx_budget, 2048);
-            set("--qsa-indexer-compress-ratio", qsa_idx_ratio, 4);
-            set("--tie-embeddings", tie_embeddings, 0);
-            set("--prec-param", prec_param, 1);
-            if (app.count("--vocab-exact") == 0 && app.count("--vocab") == 0) vocab_exact = 248320;
-            set("--seq", seq_len, 128);
-            set("--pos-encoding", pos_encoding, 1);
-        };
+    if (list_profiles || !model_profile.empty()) {
+        namespace fs = std::filesystem;
+        fs::path dir = profile_dir;
+        if (dir.empty()) {
+            if (const char* env = std::getenv("SUB0_PROFILE_DIR"); env && *env) dir = env;
+#ifdef SUB0_DEFAULT_PROFILE_DIR
+            else dir = SUB0_DEFAULT_PROFILE_DIR;
+#endif
+        }
+        const sub0::profile::Discovered found = sub0::profile::discover(dir);
+        for (const std::string& e : found.errors) std::println(stderr, "configure warning: skipped profile: {}", e);
 
-        if (p == "qwen3.8-flash-next" || p == "qwen4-preview" || p == "qwen4") {
-            qwen_common(48);
-            set("--dmodel", d_model, 2560);
-            set("--layers", n_layers, 48);
-            set("--heads", n_heads, 24);
-            set("--kv-heads", n_kv_heads, 2);
-            set("--hc-count", hc_count, 4);
-            set("--hc-lowrank", hc_lowrank, 320);
-            set("--d-ff", d_ff_pin, 640);
-            set("--moe-quant-experts", moe_quant_experts, 1);
-            set("--num-experts", num_experts, 512);
-            set("--experts-per-tok", experts_per_tok, 10);
-        } else if (p == "qwen3.8-27b" || p == "qwen3.8-dense") {
-            qwen_common(48);
-            set("--dmodel", d_model, 5120);
-            set("--layers", n_layers, 64);
-            set("--heads", n_heads, 40);
-            set("--kv-heads", n_kv_heads, 4);
-            set("--d-ff", d_ff_pin, 17408);
-            set("--gated-ffn", gated_ffn, 1);
-            set("--num-experts", num_experts, 0);
-        } else if (p == "qwen3.6-35b" || p == "qwen3.6-35b-a3b") {
-            qwen_common(32);
-            set("--dmodel", d_model, 2048);
-            set("--layers", n_layers, 40);
-            set("--heads", n_heads, 16);
-            set("--kv-heads", n_kv_heads, 2);
-            set("--d-ff", d_ff_pin, 1436);
-            set("--num-experts", num_experts, 256);
-            set("--experts-per-tok", experts_per_tok, 8);
-            set("--moe-quant-experts", moe_quant_experts, 1);
+        if (list_profiles) {
+            std::println("profile directory: {}", dir.string());
+            if (found.profiles.empty()) std::println("  (no *.profile files found)");
+            for (const auto& pr : found.profiles) {
+                std::string names = pr.name;
+                for (const auto& al : pr.aliases) names += ", " + al;
+                std::println("  {}   [{}]", names, fs::path(pr.source).filename().string());
+            }
+            return 0;
+        }
+
+        // Resolve the argument to a profile: stdin, an explicit file, or a name/alias in the directory.
+        sub0::profile::Profile prof;
+        if (model_profile == "-" || sub0::profile::looks_like_path(model_profile)) {
+            std::ostringstream buf;
+            std::string src = "<stdin>";
+            if (model_profile == "-") {
+                buf << std::cin.rdbuf();
+            } else {
+                std::ifstream f(model_profile);
+                if (!f) { std::println(stderr, "configure error: cannot read profile file '{}'", model_profile); return 2; }
+                buf << f.rdbuf();
+                src = model_profile;
+            }
+            sub0::profile::ParseResult pr = sub0::profile::parse(buf.str(), src);
+            if (!pr.ok) { std::println(stderr, "configure error: {}", pr.error); return 2; }
+            prof = std::move(pr.profile);
         } else {
-            std::println(stderr, "configure error: unknown --profile '{}'. Valid profiles: 'qwen3.8-flash-next', 'qwen3.8-27b', 'qwen3.6-35b'", model_profile);
-            return 2;
+            const auto it = std::find_if(found.profiles.begin(), found.profiles.end(),
+                [&](const sub0::profile::Profile& x) { return sub0::profile::matches(x, model_profile); });
+            if (it == found.profiles.end()) {
+                std::println(stderr, "configure error: unknown --profile '{}' (searched '{}'; see --list-profiles)",
+                             model_profile, dir.string());
+                return 2;
+            }
+            prof = *it;
+        }
+
+        // The options a profile may set, mapped to the variables they fill. Deliberately the architecture
+        // axes only (AGENTS section 8): add a key here when a profile needs one.
+        std::map<std::string, std::function<bool(const std::string&)>> setters;
+        auto reg = [&](const char* key, auto& var) {
+            setters[key] = [&var](const std::string& v) {
+                std::istringstream in(v);
+                in >> var;
+                return !in.fail() && in.peek() == std::char_traits<char>::eof();
+            };
+        };
+        reg("dmodel", d_model);                  reg("layers", n_layers);               reg("heads", n_heads);
+        reg("kv-heads", n_kv_heads);             reg("head-dim", head_dim);             reg("rotary-dim", rotary_dim);
+        reg("rope-theta", rope_theta);           reg("gdn-full-attn-stride", gdn_full_attn_stride);
+        reg("gdn-key-heads", gdn_key_heads);     reg("gdn-value-heads", gdn_value_heads);
+        reg("gdn-key-head-dim", gdn_key_head_dim); reg("gdn-value-head-dim", gdn_value_head_dim);
+        reg("hc-count", hc_count);               reg("hc-lowrank", hc_lowrank);
+        reg("qsa-indexer-n-heads", qsa_idx_n_heads); reg("qsa-indexer-kv-heads", qsa_idx_kv_heads);
+        reg("qsa-indexer-head-dim", qsa_idx_head_dim); reg("qsa-indexer-budget", qsa_idx_budget);
+        reg("qsa-indexer-compress-ratio", qsa_idx_ratio);
+        reg("tie-embeddings", tie_embeddings);   reg("d-ff", d_ff_pin);                 reg("gated-ffn", gated_ffn);
+        reg("moe-quant-experts", moe_quant_experts); reg("num-experts", num_experts);   reg("experts-per-tok", experts_per_tok);
+        reg("prec-param", prec_param);           reg("vocab-exact", vocab_exact);       reg("seq", seq_len);
+        reg("pos-encoding", pos_encoding);
+
+        for (const auto& [key, val] : prof.values) {
+            const auto setter = setters.find(key);
+            if (setter == setters.end()) {
+                std::string valid;
+                for (const auto& kv : setters) valid += (valid.empty() ? "" : ", ") + kv.first;
+                std::println(stderr, "configure error: {}: option '{}' cannot be set by a profile. Valid: {}",
+                             prof.source, key, valid);
+                return 2;
+            }
+            // An explicit command-line flag always wins. A profile's vocab-exact also yields to --vocab.
+            if (app.count("--" + key) != 0 || (key == "vocab-exact" && app.count("--vocab") != 0)) continue;
+            if (!setter->second(val)) {
+                std::println(stderr, "configure error: {}: bad value '{}' for '{}'", prof.source, val, key);
+                return 2;
+            }
         }
     }
 

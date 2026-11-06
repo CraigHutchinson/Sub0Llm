@@ -206,6 +206,9 @@ scripts/verify.sh out/build/<dir>      # prints the build verdict and ctest summ
 
 `scripts/verify.sh` writes full logs to `<dir>/verify_build.log` and `verify_ctest.log`; read those only on a
 failure. It caps ctest at 8 parallel jobs (`JOBS=n` to change): `-j$(nproc)` was OOM-killed on a 29 GiB host.
+Architecture presets are files: `sub0llm-configure --list-profiles` shows what `profiles/*.profile` offers; add or
+edit a file (format in `include/sub0/profile.hpp`) rather than the C++. `--profile <name|path|->`, `--profile-dir`
+and `$SUB0_PROFILE_DIR` choose where it looks; explicit flags always override a profile.
 Read a large diff with `git diff --stat` first, then per-file, rather than inline. See also
 [CORPUS_WORKFLOW.md](CORPUS_WORKFLOW.md) for the corpus-acquisition gap.
 
