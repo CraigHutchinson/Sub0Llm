@@ -124,6 +124,7 @@ enum class Dest {
     GrExitNorm, GrExitDown, GrExitUp,
     MoeRouter, MoeGate, MoeUp, MoeDown,
     MoeSharedGate, MoeSharedUp, MoeSharedDown, MoeSharedGateProj,
+    FfnGate, FfnUp, FfnDown,
     QsaQProj, QsaGateProj, QsaKProj, QsaVProj, QsaOProj, QsaQNorm, QsaKNorm,
     QsaIdxQkProj, QsaIdxQNorm, QsaIdxKNorm,
     Count
@@ -330,6 +331,10 @@ constexpr Recipe recipe_for(Dest d) {
         // Declared [2560] in the file and [D_MODEL, 1] in the layout -- the same 2560 floats in the
         // same order, so a copy. (A "transpose" of an Nx1 is the identity anyway; Copy says why.)
         case Dest::MoeSharedGateProj: return {Op::Copy,       "blk.%d.ffn_gate_inp_shexp.weight"};
+
+        case Dest::FfnGate: return {Op::Transpose, "blk.%d.ffn_gate.weight"};
+        case Dest::FfnUp:   return {Op::Transpose, "blk.%d.ffn_up.weight"};
+        case Dest::FfnDown: return {Op::Transpose, "blk.%d.ffn_down.weight"};
 
         case Dest::QsaQProj:     return {Op::PerHeadHalf, "blk.%d.attn_q.weight", nullptr, 0};
         case Dest::QsaGateProj:  return {Op::PerHeadHalf, "blk.%d.attn_q.weight", nullptr, 1};

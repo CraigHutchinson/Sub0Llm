@@ -131,6 +131,13 @@ agent [fable-subagent-for-big-risky-tasks, which also records that `opus` is the
 - **Start agents from the drive-letter case the repository was opened with.** `D:` against `d:` broke
   worktree creation once.
 - Research delegation does not authorize installs, edits to shared files, or contended hardware measurement.
+- **Subagent brief checklist (token cost).** Every spawn pays about 75k tokens of fixed overhead (tools, MCP,
+  system prompt, memory) before it does any work, so: batch independent questions into ONE spawn; keep a
+  single lookup or command in the primary agent; give the agent a bounded question, a `file:line` citation
+  requirement, "say unknown rather than guess", and a word cap on the report. A small model's claims about
+  repo facts are leads, not findings: re-check each one you act on (a pointer-versus-real-file claim about
+  `data/english.txt` was right but only because it was re-verified). Do not put a history rewrite or push
+  in a delegate's brief; the permission layer blocks it, so do those yourself.
 
 ## 4. Changing code
 
@@ -186,6 +193,28 @@ agent [fable-subagent-for-big-risky-tasks, which also records that `opus` is the
   banners look identical; a stale configurator silently produces the wrong arms.
 - **The real-axes configure recipe must be complete** or the model is rejected without saying which axis is
   wrong; it lives in `scripts/run_perf_suite.py` (`REAL_AXES`) [qwen4-real-axes-configure-recipe].
+
+### Linux verify recipe (keeps build and test output out of context)
+
+```bash
+cmake -S . -B out/build/<dir> -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release \
+      -DSUB0_COMPUTE=CPU -DSUB0_NATIVE=ON -DSUB0_BUILD_TESTS=ON -DSUB0_BUILD_BENCHMARKS=OFF
+cmake --build out/build/<dir> --target sub0llm-configure
+out/build/<dir>/sub0llm-configure --corpus <corpus with <|endoftext|> markers> --dmodel 196 --layers 11 ...
+scripts/verify.sh out/build/<dir>      # prints the build verdict and ctest summary only
+```
+
+`scripts/verify.sh` writes full logs to `<dir>/verify_build.log` and `verify_ctest.log`; read those only on a
+failure. It caps ctest at 8 parallel jobs (`JOBS=n` to change): `-j$(nproc)` was OOM-killed on a 29 GiB host.
+Architecture presets are files: `sub0llm-configure --list-profiles` shows what `profiles/*.profile` offers; add or
+edit a file (format in `include/sub0/profile.hpp`) rather than the C++. `--profile <name|path|->`, `--profile-dir`
+and `$SUB0_PROFILE_DIR` choose where it looks; explicit flags always override a profile.
+Model weights: set `SUB0_MODELS_DIR` (or `--models-dir`). A profile's `model-*` keys say which weights it is for;
+`sub0llm-configure --list-profiles` and `python3 scripts/models.py status` report found / NOT FOUND, `models.py check`
+compares the profile's dims with the model's Hugging Face `config.json` (the source of truth; run it after editing a
+profile), and `models.py fetch <profile>` lists the download and only downloads with `--yes`.
+Read a large diff with `git diff --stat` first, then per-file, rather than inline. See also
+[CORPUS_WORKFLOW.md](CORPUS_WORKFLOW.md) for the corpus-acquisition gap.
 
 ## 7. The dev machine
 

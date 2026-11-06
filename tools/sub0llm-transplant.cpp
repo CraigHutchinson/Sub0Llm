@@ -183,21 +183,27 @@ std::vector<Slot> build_plan() {
         add(Dest::GrFfnDown,   PKind::GrMixDown,     l, WIDE, HC_LOWRANK);
         add(Dest::GrFfnUp,     PKind::GrMixUp,       l, HC_LOWRANK, WIDE);
         add(Dest::GrFfnInject, PKind::GrBlockInject, l, WIDE, HC_COUNT);
-        add(Dest::MoeRouter, PKind::MoeRouter, l, D_MODEL, NUM_EXPERTS);
-        // WP4e: in a MOE_QUANT_EXPERTS build these are not f32 destinations at all -- they go to the
-        // S0Q1 sidecar in their native encoding (write_moe_sidecar below), and make_param_layout()
-        // emits no slot for them, so this mirror must not either.
-        if constexpr (!USE_MOE_QUANT) {
-            for (int e = 0; e < NUM_EXPERTS; ++e) {
-                add(Dest::MoeGate, PKind::MoeGate, l, D_MODEL, D_FF, e);
-                add(Dest::MoeUp,   PKind::MoeUp,   l, D_MODEL, D_FF, e);
-                add(Dest::MoeDown, PKind::MoeDown, l, D_FF, D_MODEL, e);
+        if constexpr (USE_MOE) {
+            add(Dest::MoeRouter, PKind::MoeRouter, l, D_MODEL, NUM_EXPERTS);
+            // WP4e: in a MOE_QUANT_EXPERTS build these are not f32 destinations at all -- they go to the
+            // S0Q1 sidecar in their native encoding (write_moe_sidecar below), and make_param_layout()
+            // emits no slot for them, so this mirror must not either.
+            if constexpr (!USE_MOE_QUANT) {
+                for (int e = 0; e < NUM_EXPERTS; ++e) {
+                    add(Dest::MoeGate, PKind::MoeGate, l, D_MODEL, D_FF, e);
+                    add(Dest::MoeUp,   PKind::MoeUp,   l, D_MODEL, D_FF, e);
+                    add(Dest::MoeDown, PKind::MoeDown, l, D_FF, D_MODEL, e);
+                }
             }
+            add(Dest::MoeSharedGate,     PKind::MoeSharedGate,     l, D_MODEL, D_FF);
+            add(Dest::MoeSharedUp,       PKind::MoeSharedUp,       l, D_MODEL, D_FF);
+            add(Dest::MoeSharedDown,     PKind::MoeSharedDown,     l, D_FF, D_MODEL);
+            add(Dest::MoeSharedGateProj, PKind::MoeSharedGateProj, l, D_MODEL, 1);
+        } else if constexpr (USE_GATED_FFN) {
+            add(Dest::FfnGate, PKind::Wg, l, D_MODEL, D_FF);
+            add(Dest::FfnUp,   PKind::W1, l, D_MODEL, D_FF);
+            add(Dest::FfnDown, PKind::W2, l, D_FF,    D_MODEL);
         }
-        add(Dest::MoeSharedGate,     PKind::MoeSharedGate,     l, D_MODEL, D_FF);
-        add(Dest::MoeSharedUp,       PKind::MoeSharedUp,       l, D_MODEL, D_FF);
-        add(Dest::MoeSharedDown,     PKind::MoeSharedDown,     l, D_FF, D_MODEL);
-        add(Dest::MoeSharedGateProj, PKind::MoeSharedGateProj, l, D_MODEL, 1);
     }
     add(Dest::GrExitNorm, PKind::GrHcNorm,  -1, 1, WIDE);
     add(Dest::GrExitDown, PKind::GrMixDown, -1, WIDE, HC_LOWRANK);

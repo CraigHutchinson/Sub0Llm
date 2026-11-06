@@ -4426,14 +4426,23 @@ extern "C" SUB0_API int sub0_bundle_stage(const char* model_in) {
         return 1;
     }
     const std::filesystem::path self_dir = std::filesystem::path(self_path).parent_path();
+    static constexpr const char* kFiles[] = {
+        "sub0llm.exe", "sub0llm_core.dll", "sub0llm_gen.dll", "sub0llm_train.dll",
+    };
+#elif defined(__linux__)
+    std::error_code ec_self;
+    const std::filesystem::path self_dir = std::filesystem::canonical("/proc/self/exe", ec_self).parent_path();
+    if (ec_self) {
+        sub0::log::error("bundle: could not resolve this executable's own path");
+        return 1;
+    }
+    static constexpr const char* kFiles[] = {
+        "sub0llm", "libsub0llm_core.so", "libsub0llm_gen.so", "libsub0llm_train.so",
+    };
 #else
     sub0::log::error("bundle: not implemented on this platform");
     return 1;
 #endif
-
-    static constexpr const char* kFiles[] = {
-        "sub0llm.exe", "sub0llm_core.dll", "sub0llm_gen.dll", "sub0llm_train.dll",
-    };
     const std::filesystem::path bundle_dir = model_dir / "bin";
     std::error_code ec;
     std::filesystem::create_directories(bundle_dir, ec);

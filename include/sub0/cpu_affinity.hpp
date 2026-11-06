@@ -19,9 +19,11 @@
 
 #pragma once
 
+#if defined(_WIN32)
 #define NOMINMAX                 // keep std::min/std::max, not the windows.h macros
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -42,6 +44,7 @@ struct CoreOrder {
 inline const CoreOrder& detect_core_order() {
     static const CoreOrder order = [] {
         CoreOrder o;
+#if defined(_WIN32)
         DWORD len = 0;
         GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
         if (len == 0) return o;   // API unsupported on this OS -> stay invalid, callers no-op
@@ -72,6 +75,10 @@ inline const CoreOrder& detect_core_order() {
         o.p_core_count = static_cast<int>(std::count_if(cores.begin(), cores.end(),
             [&](const Core& c) { return c.efficiency == top_eff; }));
         o.valid = true;
+#else
+        // Non-Windows: pinning is an optional hint; gracefully degrade to no-op.
+        o.valid = false;
+#endif
         return o;
     }();
     return order;
@@ -81,12 +88,16 @@ inline const CoreOrder& detect_core_order() {
 // exist), wrapping around if `rank` exceeds the logical processor count (more OpenMP threads than cores
 // is legal, just shares a core). Returns false (no-op, thread keeps its current placement) if detection
 // failed or the machine has multiple processor groups.
-inline bool pin_current_thread_p_first(int rank) {
+inline bool pin_current_thread_p_first([[maybe_unused]] int rank) {
+#if defined(_WIN32)
     const CoreOrder& o = detect_core_order();
     if (!o.valid || o.logical_ids.empty() || rank < 0) return false;
     const int logical_id = o.logical_ids[static_cast<std::size_t>(rank) % o.logical_ids.size()];
     const DWORD_PTR mask = static_cast<DWORD_PTR>(1) << logical_id;
     return SetThreadAffinityMask(GetCurrentThread(), mask) != 0;
+#else
+    return false;
+#endif
 }
 
 // Pin the CALLING thread to the whole P-core SET (every logical processor of the top EfficiencyClass),
@@ -96,12 +107,16 @@ inline bool pin_current_thread_p_first(int rank) {
 // threads: master pinned to one CPU 15.7 GB/s (slower than 1 thread's 19.6), master pinned to the P-core
 // set 51-62 GB/s. Same no-op-on-failure contract as pin_current_thread_p_first.
 inline bool pin_current_thread_p_set() {
+#if defined(_WIN32)
     const CoreOrder& o = detect_core_order();
     if (!o.valid || o.p_core_count <= 0) return false;
     DWORD_PTR mask = 0;
     for (int i = 0; i < o.p_core_count; ++i)
         mask |= static_cast<DWORD_PTR>(1) << o.logical_ids[static_cast<std::size_t>(i)];
     return SetThreadAffinityMask(GetCurrentThread(), mask) != 0;
+#else
+    return false;
+#endif
 }
 
 }  // namespace sub0

@@ -32,6 +32,9 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <sstream>
+#include <iostream>
+#include <functional>
 #include <mutex>
 #include <print>
 #include <queue>
@@ -58,6 +61,8 @@
 #include "sub0/memplan.hpp"  // train_resident_mb: predict the GPU batch footprint to fail misconfig early
 
 #include "sub0/casing.hpp"
+#include "sub0/profile.hpp"  // --profile files (parse + directory discovery)
+#include "sub0/gguf_profile_check.hpp"  // compare a profile with the GGUF header on disk
 #include "sub0/tokenizer.hpp"  // sub0::tok — the shared truecasing + BPE tokenizer (scan/learn/serialize)
 #include "sub0/unigram.hpp"    // sub0::tok::learn_unigram — the Unigram LM vocabulariser (A/B vs BPE)
 #include "sub0/tokmap.hpp"     // sub0::TokWriter — v2 corpus.tok (u64 counts + byte-aligned token width)
@@ -747,6 +752,21 @@ int main(int argc, char** argv) {
     int compute     = -1;  // backend to USE: 0=CPU, 1=GPU, 2=HYBRID; -1 = decide from has_cuda
     int cuda_tf32   = 0;   // bake TF32 tensor-core GEMM math on the GPU backend (tuned knob)
     std::string dump_vocab; // prefix for the readable vocabulary-analysis dumps (empty = off)
+    std::string model_profile;
+    std::string profile_dir;
+    std::string models_dir;
+    bool list_profiles = false;
+
+    app.add_option("--profile,--model-profile", model_profile,
+                   "Architecture profile: a name or alias from the profile directory (see --list-profiles), a "
+                   "path to a .profile file, or '-' to read one from stdin. Explicit flags override profile values.");
+    app.add_option("--profile-dir", profile_dir,
+                   "Directory searched for <name>.profile files (default: $SUB0_PROFILE_DIR, else the source "
+                   "tree's profiles/ baked in at build time)");
+    app.add_option("--models-dir", models_dir,
+                   "Directory holding downloaded model weights, one sub-folder per profile's model-dir "
+                   "(default: $SUB0_MODELS_DIR; none = weights are not looked for)");
+    app.add_flag("--list-profiles", list_profiles, "List the profiles found in the profile directory and exit");
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation; required unless --vocab-exact is used)")
        ->check(CLI::ExistingFile);
@@ -1090,6 +1110,140 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 1));
 
     CLI11_PARSE(app, argc, argv);
+
+    if (list_profiles || !model_profile.empty()) {
+        namespace fs = std::filesystem;
+        fs::path dir = profile_dir;
+        if (dir.empty()) {
+            if (const char* env = std::getenv("SUB0_PROFILE_DIR"); env && *env) dir = env;
+#ifdef SUB0_DEFAULT_PROFILE_DIR
+            else dir = SUB0_DEFAULT_PROFILE_DIR;
+#endif
+        }
+        fs::path models = models_dir;
+        if (models.empty()) { if (const char* env = std::getenv("SUB0_MODELS_DIR"); env && *env) models = env; }
+        // One human line for a profile's weights; never an error -- configuring needs no weights.
+        auto model_line = [&](const sub0::profile::Profile& pr) -> std::string {
+            using sub0::profile::ModelState;
+            const sub0::profile::ModelStatus ms = sub0::profile::model_status(pr, models);
+            switch (ms.state) {
+                case ModelState::NoMetadata:  return {};
+                case ModelState::NoModelsDir:
+                    return "model: models directory not set (--models-dir or $SUB0_MODELS_DIR)";
+                case ModelState::Missing:
+                    return std::format("model: NOT FOUND in {} -- fetch with: python3 scripts/models.py fetch {}",
+                                       ms.path.string(), pr.name);
+                case ModelState::Present: {
+                    std::string line = std::format("model: found, {} .gguf, {:.1f} GiB, in {}", ms.gguf_files,
+                                       static_cast<double>(ms.bytes) / (1024.0 * 1024.0 * 1024.0), ms.path.string());
+                    // Compare the profile's dims with the first .gguf's own header (first MiBs only).
+                    std::error_code gec;
+                    std::vector<fs::path> files;
+                    for (const auto& e : fs::recursive_directory_iterator(ms.path, gec))
+                        if (e.is_regular_file(gec) && e.path().extension() == ".gguf") files.push_back(e.path());
+                    std::sort(files.begin(), files.end());
+                    if (files.empty()) return line;
+                    const std::vector<std::uint8_t> head = sub0::profile::read_gguf_prefix(files.front().string());
+                    const sub0::gguf::Reader gr{std::span<const std::uint8_t>(head)};
+                    std::map<std::string, double> dims;
+                    for (const auto& [k, v] : pr.values) { try { dims[k] = std::stod(v); } catch (...) {} }
+                    const auto chk = sub0::profile::check_against_gguf(gr, dims);
+                    if (!chk.readable) return line + " | GGUF header unreadable (a shard or partial download?)";
+                    if (chk.arch.empty()) return line + " | GGUF has no general.architecture, not compared";
+                    line += std::format(" | GGUF {}: {} dims compared, ", chk.arch, chk.compared);
+                    if (chk.mismatches.empty()) return line + "all match";
+                    line += std::format("{} MISMATCH:", chk.mismatches.size());
+                    for (const auto& m : chk.mismatches) line += std::format(" {} profile={} gguf={};", m.key, m.profile, m.gguf);
+                    return line;
+                }
+            }
+            return {};
+        };
+        const sub0::profile::Discovered found = sub0::profile::discover(dir);
+        for (const std::string& e : found.errors) std::println(stderr, "configure warning: skipped profile: {}", e);
+
+        if (list_profiles) {
+            std::println("profile directory: {}", dir.string());
+            if (found.profiles.empty()) std::println("  (no *.profile files found)");
+            for (const auto& pr : found.profiles) {
+                std::string names = pr.name;
+                for (const auto& al : pr.aliases) names += ", " + al;
+                std::println("  {}   [{}]", names, fs::path(pr.source).filename().string());
+                if (const std::string m = model_line(pr); !m.empty()) std::println("      {}", m);
+            }
+            return 0;
+        }
+
+        // Resolve the argument to a profile: stdin, an explicit file, or a name/alias in the directory.
+        sub0::profile::Profile prof;
+        if (model_profile == "-" || sub0::profile::looks_like_path(model_profile)) {
+            std::ostringstream buf;
+            std::string src = "<stdin>";
+            if (model_profile == "-") {
+                buf << std::cin.rdbuf();
+            } else {
+                std::ifstream f(model_profile);
+                if (!f) { std::println(stderr, "configure error: cannot read profile file '{}'", model_profile); return 2; }
+                buf << f.rdbuf();
+                src = model_profile;
+            }
+            sub0::profile::ParseResult pr = sub0::profile::parse(buf.str(), src);
+            if (!pr.ok) { std::println(stderr, "configure error: {}", pr.error); return 2; }
+            prof = std::move(pr.profile);
+        } else {
+            const auto it = std::find_if(found.profiles.begin(), found.profiles.end(),
+                [&](const sub0::profile::Profile& x) { return sub0::profile::matches(x, model_profile); });
+            if (it == found.profiles.end()) {
+                std::println(stderr, "configure error: unknown --profile '{}' (searched '{}'; see --list-profiles)",
+                             model_profile, dir.string());
+                return 2;
+            }
+            prof = *it;
+        }
+
+        if (const std::string m = model_line(prof); !m.empty()) std::println(stderr, "configure note: {}: {}", prof.name, m);
+
+        // The options a profile may set, mapped to the variables they fill. Deliberately the architecture
+        // axes only (AGENTS section 8): add a key here when a profile needs one.
+        std::map<std::string, std::function<bool(const std::string&)>> setters;
+        auto reg = [&](const char* key, auto& var) {
+            setters[key] = [&var](const std::string& v) {
+                std::istringstream in(v);
+                in >> var;
+                return !in.fail() && in.peek() == std::char_traits<char>::eof();
+            };
+        };
+        reg("dmodel", d_model);                  reg("layers", n_layers);               reg("heads", n_heads);
+        reg("kv-heads", n_kv_heads);             reg("head-dim", head_dim);             reg("rotary-dim", rotary_dim);
+        reg("rope-theta", rope_theta);           reg("gdn-full-attn-stride", gdn_full_attn_stride);
+        reg("gdn-key-heads", gdn_key_heads);     reg("gdn-value-heads", gdn_value_heads);
+        reg("gdn-key-head-dim", gdn_key_head_dim); reg("gdn-value-head-dim", gdn_value_head_dim);
+        reg("hc-count", hc_count);               reg("hc-lowrank", hc_lowrank);
+        reg("qsa-indexer-n-heads", qsa_idx_n_heads); reg("qsa-indexer-kv-heads", qsa_idx_kv_heads);
+        reg("qsa-indexer-head-dim", qsa_idx_head_dim); reg("qsa-indexer-budget", qsa_idx_budget);
+        reg("qsa-indexer-compress-ratio", qsa_idx_ratio);
+        reg("tie-embeddings", tie_embeddings);   reg("d-ff", d_ff_pin);                 reg("gated-ffn", gated_ffn);
+        reg("moe-quant-experts", moe_quant_experts); reg("num-experts", num_experts);   reg("experts-per-tok", experts_per_tok);
+        reg("prec-param", prec_param);           reg("vocab-exact", vocab_exact);       reg("seq", seq_len);
+        reg("pos-encoding", pos_encoding);
+
+        for (const auto& [key, val] : prof.values) {
+            const auto setter = setters.find(key);
+            if (setter == setters.end()) {
+                std::string valid;
+                for (const auto& kv : setters) valid += (valid.empty() ? "" : ", ") + kv.first;
+                std::println(stderr, "configure error: {}: option '{}' cannot be set by a profile. Valid: {}",
+                             prof.source, key, valid);
+                return 2;
+            }
+            // An explicit command-line flag always wins. A profile's vocab-exact also yields to --vocab.
+            if (app.count("--" + key) != 0 || (key == "vocab-exact" && app.count("--vocab") != 0)) continue;
+            if (!setter->second(val)) {
+                std::println(stderr, "configure error: {}: bad value '{}' for '{}'", prof.source, val, key);
+                return 2;
+            }
+        }
+    }
 
     const bool exact_vocab = vocab_exact > 0;
     if (corpus.empty() != exact_vocab) {
