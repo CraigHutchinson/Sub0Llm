@@ -20,6 +20,7 @@
 #include "sub0/bf16.hpp"                // sub0::bf16_widen -- the one definition of the bf16 shift
 #include "sub0/gguf_quant_tables.hpp"   // the ggml IQ codebooks -- data only, see that file's header
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -75,20 +76,35 @@ enum class TensorType : std::uint32_t {
 //   IQ2_XXS f16 + 32*u16                                              =  66 / 256
 //   IQ4_NL f16 + 16 packed nibbles                                    =  18 /  32
 struct BlockSpec { std::uint64_t elems = 0, bytes = 0; };
+
+// THE FORMAT REGISTRY, part 1 of 2: every storage format this reader knows, with its block geometry.
+// To add a format: (1) add its enumerator to TensorType, (2) add ONE row here, (3) write its
+// dequantize_* and add ONE row to kDequant below, (4) run quant_registry_tests -- it iterates both tables,
+// so the new format is covered by the generic conformance checks with no new test code. A dot kernel for
+// the format is a separate, optional layer (a Plane in moe_quant_dot.hpp); see docs/QUANT_FORMATS.md.
+struct FormatInfo { TensorType type; const char* name; BlockSpec block; };
+inline constexpr std::array<FormatInfo, 10> kFormats = {{
+    {TensorType::F32,     "F32",     {1, 4}},
+    {TensorType::F16,     "F16",     {1, 2}},
+    {TensorType::BF16,    "BF16",    {1, 2}},
+    {TensorType::Q8_0,    "Q8_0",    {32, 34}},
+    {TensorType::Q4_K,    "Q4_K",    {256, 144}},
+    {TensorType::Q5_K,    "Q5_K",    {256, 176}},
+    {TensorType::Q6_K,    "Q6_K",    {256, 210}},
+    {TensorType::IQ2_XXS, "IQ2_XXS", {256, 66}},
+    {TensorType::IQ1_S,   "IQ1_S",   {256, 50}},
+    {TensorType::IQ4_NL,  "IQ4_NL",  {32, 18}},
+}};
+
+[[nodiscard]] inline constexpr const FormatInfo* find_format(std::uint32_t type_raw) {
+    for (const FormatInfo& f : kFormats)
+        if (static_cast<std::uint32_t>(f.type) == type_raw) return &f;
+    return nullptr;
+}
+
 inline constexpr BlockSpec block_spec(std::uint32_t type_raw) {
-    switch (static_cast<TensorType>(type_raw)) {
-        case TensorType::F32:     return {1, 4};
-        case TensorType::F16:     return {1, 2};
-        case TensorType::BF16:    return {1, 2};
-        case TensorType::Q8_0:    return {32, 34};
-        case TensorType::Q4_K:    return {256, 144};
-        case TensorType::Q5_K:    return {256, 176};
-        case TensorType::Q6_K:    return {256, 210};
-        case TensorType::IQ2_XXS: return {256, 66};
-        case TensorType::IQ1_S:   return {256, 50};
-        case TensorType::IQ4_NL:  return {32, 18};
-        default:                  return {};
-    }
+    const FormatInfo* f = find_format(type_raw);
+    return f ? f->block : BlockSpec{};
 }
 
 // --- parsed structures -------------------------------------------------------------------------
@@ -619,6 +635,37 @@ inline bool dequantize_iq1_s(std::span<const std::uint8_t> raw, std::uint64_t n,
     return true;
 }
 
+// THE FORMAT REGISTRY, part 2 of 2: the dequantiser for each block-quantised format. The plain storage
+// types (F32/F16/BF16) are converted inline by to_f32 and so have no row here. A format listed in kFormats
+// but missing here is a registry error: the static_assert below makes it a compile error, not a silent
+// "cannot import" at run time.
+using DequantFn = bool (*)(std::span<const std::uint8_t>, std::uint64_t, std::vector<float>&);
+struct DequantEntry { TensorType type; DequantFn fn; };
+inline constexpr std::array<DequantEntry, 7> kDequant = {{
+    {TensorType::Q8_0,    &dequantize_q8_0},
+    {TensorType::Q4_K,    &dequantize_q4_k},
+    {TensorType::Q5_K,    &dequantize_q5_k},
+    {TensorType::Q6_K,    &dequantize_q6_k},
+    {TensorType::IQ2_XXS, &dequantize_iq2_xxs},
+    {TensorType::IQ1_S,   &dequantize_iq1_s},
+    {TensorType::IQ4_NL,  &dequantize_iq4_nl},
+}};
+
+[[nodiscard]] inline constexpr DequantFn dequant_fn(std::uint32_t type_raw) {
+    for (const DequantEntry& e : kDequant)
+        if (static_cast<std::uint32_t>(e.type) == type_raw) return e.fn;
+    return nullptr;
+}
+
+// Every block-quantised format in kFormats (block.elems > 1) must have a dequantiser.
+inline constexpr bool every_quantised_format_has_a_dequantiser() {
+    for (const FormatInfo& f : kFormats)
+        if (f.block.elems > 1 && dequant_fn(static_cast<std::uint32_t>(f.type)) == nullptr) return false;
+    return true;
+}
+static_assert(every_quantised_format_has_a_dequantiser(),
+              "a format in kFormats has no row in kDequant (see the registry comment on kFormats)");
+
 // Convert one tensor's raw (still-encoded) bytes to F32, dispatching on its OWN type_raw (never on its
 // name -- see TensorType's comment on unsloth's per-layer mixed quantization). Returns false for any
 // type this reader does not know -- the caller should treat that as "cannot import this tensor yet",
@@ -642,16 +689,8 @@ inline bool to_f32(const TensorInfo& t, std::span<const std::uint8_t> raw, std::
         }
         return true;
     }
-    switch (static_cast<TensorType>(t.type_raw)) {
-        case TensorType::Q8_0:    return dequantize_q8_0(raw, n, out);
-        case TensorType::Q4_K:    return dequantize_q4_k(raw, n, out);
-        case TensorType::Q5_K:    return dequantize_q5_k(raw, n, out);
-        case TensorType::Q6_K:    return dequantize_q6_k(raw, n, out);
-        case TensorType::IQ2_XXS: return dequantize_iq2_xxs(raw, n, out);
-        case TensorType::IQ1_S:   return dequantize_iq1_s(raw, n, out);
-        case TensorType::IQ4_NL:  return dequantize_iq4_nl(raw, n, out);
-        default:                  return false;
-    }
+    const DequantFn fn = dequant_fn(t.type_raw);
+    return fn != nullptr && fn(raw, n, out);
 }
 
 // --- import-compatibility report ------------------------------------------------------------------
