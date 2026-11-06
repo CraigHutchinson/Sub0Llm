@@ -5,6 +5,7 @@
 // quantized vs float tensors, and basic KV-metadata round-tripping).
 
 #include "sub0/gguf.hpp"
+#include "sub0/gguf_profile_check.hpp"
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <cmath>
@@ -828,4 +829,57 @@ TEST_CASE("gguf: to_f32 refuses an unsupported quantized type rather than misrea
     CHECK(r.tensor_byte_size(*t) == 0);
     std::vector<float> out;
     CHECK_FALSE(to_f32(*t, r.tensor_bytes(*t), out));
+}
+
+// --- profile-vs-GGUF compatibility (sub0/gguf_profile_check.hpp) -------------------------------------
+// Key names are the ones read from the real unsloth/Qwen3.8-27B-GGUF header (arch "qwen35").
+namespace {
+std::vector<std::uint8_t> build_qwen35_header() {
+    GgufBuilder b;
+    b.add_string_kv("general.architecture", "qwen35");
+    b.add_u32_kv("qwen35.block_count", 64);
+    b.add_u32_kv("qwen35.embedding_length", 5120);
+    b.add_u32_kv("qwen35.feed_forward_length", 17408);
+    b.add_u32_kv("qwen35.attention.head_count", 24);
+    b.add_u32_kv("qwen35.attention.head_count_kv", 4);
+    b.add_f32_kv("qwen35.rope.freq_base", 10000000.0f);
+    b.add_u32_kv("qwen35.ssm.inner_size", 6144);
+    b.add_u32_kv("qwen35.ssm.time_step_rank", 48);
+    b.add_string_array_kv("tokenizer.ggml.tokens", {"a", "b", "c"});
+    return b.finish();
+}
+}  // namespace
+
+TEST_CASE("gguf profile check: agreeing dims compare clean, a wrong one is reported with both values", "[gguf][profile]") {
+    const auto buf = build_qwen35_header();
+    const Reader r(buf);
+    REQUIRE(r.ok());
+    const std::map<std::string, double> good = {{"dmodel", 5120}, {"layers", 64}, {"heads", 24}, {"kv-heads", 4},
+        {"d-ff", 17408}, {"rope-theta", 1e7}, {"gdn-value-head-dim", 128}, {"vocab-exact", 3}, {"seq", 128}};
+    const auto ok = sub0::profile::check_against_gguf(r, good);
+    CHECK(ok.arch == "qwen35");
+    CHECK(ok.compared == 8);                 // "seq" has no GGUF counterpart: not compared, not a mismatch
+    CHECK(ok.mismatches.empty());
+
+    auto bad = good;
+    bad["heads"] = 40;                       // the real 27B-profile mistake this check exists to catch
+    const auto res = sub0::profile::check_against_gguf(r, bad);
+    REQUIRE(res.mismatches.size() == 1);
+    CHECK(res.mismatches[0].key == "heads");
+    CHECK(res.mismatches[0].profile == 40);
+    CHECK(res.mismatches[0].gguf == 24);
+}
+
+TEST_CASE("gguf profile check: unreadable or architecture-less input is not a mismatch", "[gguf][profile]") {
+    const std::vector<std::uint8_t> junk(64, 0x7f);
+    const Reader bad(junk);
+    CHECK_FALSE(sub0::profile::check_against_gguf(bad, {{"dmodel", 1}}).readable);
+    GgufBuilder b;
+    b.add_u32_kv("qwen35.block_count", 64);                    // no general.architecture
+    const auto buf = b.finish();
+    const Reader r(buf);
+    const auto res = sub0::profile::check_against_gguf(r, {{"layers", 2}});
+    CHECK(res.readable);
+    CHECK(res.compared == 0);
+    CHECK(res.mismatches.empty());
 }

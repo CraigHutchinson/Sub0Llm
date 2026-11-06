@@ -62,6 +62,7 @@
 
 #include "sub0/casing.hpp"
 #include "sub0/profile.hpp"  // --profile files (parse + directory discovery)
+#include "sub0/gguf_profile_check.hpp"  // compare a profile with the GGUF header on disk
 #include "sub0/tokenizer.hpp"  // sub0::tok — the shared truecasing + BPE tokenizer (scan/learn/serialize)
 #include "sub0/unigram.hpp"    // sub0::tok::learn_unigram — the Unigram LM vocabulariser (A/B vs BPE)
 #include "sub0/tokmap.hpp"     // sub0::TokWriter — v2 corpus.tok (u64 counts + byte-aligned token width)
@@ -1132,9 +1133,29 @@ int main(int argc, char** argv) {
                 case ModelState::Missing:
                     return std::format("model: NOT FOUND in {} -- fetch with: python3 scripts/models.py fetch {}",
                                        ms.path.string(), pr.name);
-                case ModelState::Present:
-                    return std::format("model: found, {} .gguf, {:.1f} GiB, in {}", ms.gguf_files,
+                case ModelState::Present: {
+                    std::string line = std::format("model: found, {} .gguf, {:.1f} GiB, in {}", ms.gguf_files,
                                        static_cast<double>(ms.bytes) / (1024.0 * 1024.0 * 1024.0), ms.path.string());
+                    // Compare the profile's dims with the first .gguf's own header (first MiBs only).
+                    std::error_code gec;
+                    std::vector<fs::path> files;
+                    for (const auto& e : fs::recursive_directory_iterator(ms.path, gec))
+                        if (e.is_regular_file(gec) && e.path().extension() == ".gguf") files.push_back(e.path());
+                    std::sort(files.begin(), files.end());
+                    if (files.empty()) return line;
+                    const std::vector<std::uint8_t> head = sub0::profile::read_gguf_prefix(files.front().string());
+                    const sub0::gguf::Reader gr{std::span<const std::uint8_t>(head)};
+                    std::map<std::string, double> dims;
+                    for (const auto& [k, v] : pr.values) { try { dims[k] = std::stod(v); } catch (...) {} }
+                    const auto chk = sub0::profile::check_against_gguf(gr, dims);
+                    if (!chk.readable) return line + " | GGUF header unreadable (a shard or partial download?)";
+                    if (chk.arch.empty()) return line + " | GGUF has no general.architecture, not compared";
+                    line += std::format(" | GGUF {}: {} dims compared, ", chk.arch, chk.compared);
+                    if (chk.mismatches.empty()) return line + "all match";
+                    line += std::format("{} MISMATCH:", chk.mismatches.size());
+                    for (const auto& m : chk.mismatches) line += std::format(" {} profile={} gguf={};", m.key, m.profile, m.gguf);
+                    return line;
+                }
             }
             return {};
         };
