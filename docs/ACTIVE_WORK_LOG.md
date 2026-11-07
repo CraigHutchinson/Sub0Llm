@@ -34,6 +34,9 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
+**2026-11-07 Codex — #62 done.** Opt-in vector float reductions across remaining quant formats; holds dense projection header, proving-ground CLI, fixtures and evidence. All numerical/performance runs and actual chat smoke complete; CPU/files released for PR review. Another 1.72× gain; preserved default and prior IQ1_S artifacts remain intact.
+
+
 **2026-11-07 Codex — #60 done.** IQ1_S format module and fused float projection candidates; holds `include/sub0/quant/iq1_s.hpp`, format registry, `moe_quant_dot.hpp`, `dense_quant.hpp`, proving-ground adapters and kernel fixtures. Measurements and chat smoke complete; CPU and files released for PR review. Native candidate is 2.95× faster; production chat binary preserved.
 
 
