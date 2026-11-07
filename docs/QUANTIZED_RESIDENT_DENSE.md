@@ -118,3 +118,15 @@ CPU, `docs/HANDOVER.md`) bounds decode; not yet measured.
   smallest scale first.
 - Int8-activation versus float-activation dots for the I-quants (the project's MoE precedent is in `MOE_QUANT_DOT.md`).
 - MTP and vision tensors in the repo's other files are out of scope.
+
+
+## First-layer independent parity (2026-11-07)
+
+The earlier 0.797% comparison is now explained: the float diagnostic still allowed CPU_REPACK for
+Q2_K `ssm_out`, bypassing its scalar float-activation dots. With `GGML_CPU_REPACK=OFF`, the diagnostic
+reference and Sub0Llm's actual first-layer output agree at relative L2 8.05504e-7 and max absolute
+1.04904e-5 over all 5120 values. QKV/Z projections, convolution and gated recurrence agree within
+3e-6 relative L2; GDN output projection within 7.104e-7. `tools/reference/README.md` records exact
+source revision, diagnostic modifications and commands. This is an independent first-token/layer
+math and layout check using the actual downloaded weights. The stock reference's quantized-activation
+path still differs by the measured 0.797%; multi-token recurrence and later-layer parity remain.

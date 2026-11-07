@@ -15,10 +15,13 @@ struct Layer {
     const sub0::gguf::Reader& reader;
     std::vector<float> scratch, raw_output, gathered;
     std::array<const sub0::gguf::TensorInfo*, 5> projections{};
+    std::array<std::vector<float>,4> captured_projections;
     std::vector<std::uint32_t> qkv_rows, z_rows, head_rows, out_indices;
     explicit Layer(const sub0::gguf::Reader& r) : reader(r), raw_output(sub0::GDN_CONV_DIM), gathered(sub0::GDN_VALUE_DIM),
         qkv_rows(sub0::GDN_CONV_DIM), z_rows(sub0::GDN_VALUE_DIM), head_rows(sub0::GDN_V_HEADS), out_indices(sub0::GDN_VALUE_DIM) {
         scratch.reserve(256);
+        captured_projections[0].resize(sub0::GDN_CONV_DIM);captured_projections[1].resize(sub0::GDN_VALUE_DIM);
+        captured_projections[2].resize(sub0::GDN_V_HEADS);captured_projections[3].resize(sub0::GDN_V_HEADS);
         const char* names[]{"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight", "blk.0.ssm_out.weight"};
         for (int i=0;i<5;++i) { projections[i]=reader.find_tensor(names[i]); if(!projections[i]) throw std::runtime_error(names[i]); }
         sub0::bbq::gdn_row_permutation(sub0::GDN_CONV_DIM, 2*sub0::GDN_KEY_DIM, sub0::GDN_K_HEADS, sub0::GDN_V_HEADS, sub0::GDN_V_HEAD_DIM,qkv_rows);
@@ -44,6 +47,7 @@ struct Layer {
         }
         if(out>static_cast<int>(self.raw_output.size())) return false;
         if(!self.project(t,x,in,self.raw_output.data(),out))return false;
+        std::copy_n(self.raw_output.data(),out,self.captured_projections[static_cast<int>(role)].data());
         const auto& rows=role==Projection::Qkv?self.qkv_rows:role==Projection::Z?self.z_rows:self.head_rows;
         for(int i=0;i<out;++i)y[i]=self.raw_output[rows[i]];
         return true;
@@ -87,7 +91,21 @@ int main(int argc,char**argv) try {
     for(int i=0;i<sub0::GDN_V_HEADS;++i){dt[i]=dt_raw[layer.head_rows[i]];if(alog_raw[layer.head_rows[i]]>=0)throw std::runtime_error("ssm_a sign");alog[i]=std::log(-alog_raw[layer.head_rows[i]]);}
     const auto gain=layer.load("blk.0.ssm_norm.weight",sub0::GDN_V_HEAD_DIM);
     sub0::gdn::Native native{};native.project=&Layer::callback;native.project_context=&layer;const float* none=nullptr;
-    sub0::gdn::forward<false,1,const float*>(d,1,a.data(),none,none,none,none,conv.data(),dt.data(),alog.data(),gain.data(),none,state.data(),history.data(),mixer.data(),scratch.data(),&native);
+    const auto stages=[&](sub0::gdn::Stage stage) {
+        if(argc!=3)return;
+        if(stage==sub0::gdn::Stage::Recurrence) {
+            std::vector<float> raw_conv(sub0::GDN_CONV_DIM);
+            for(int i=0;i<sub0::GDN_CONV_DIM;++i)raw_conv[layer.qkv_rows[i]]=scratch[sub0::GDN_CONV_DIM+i];
+            dump_stage("conv_output_silu-0",raw_conv);
+            std::vector<float> beta(sub0::GDN_V_HEADS),gate(beta.size());
+            for(int i=0;i<sub0::GDN_V_HEADS;++i){beta[layer.head_rows[i]]=scratch[2*sub0::GDN_CONV_DIM+sub0::GDN_VALUE_DIM+i];gate[layer.head_rows[i]]=scratch[2*sub0::GDN_CONV_DIM+sub0::GDN_VALUE_DIM+sub0::GDN_V_HEADS+i];}
+            dump_stage("beta_sigmoid-0",beta);dump_stage("gate-0",gate);
+        }
+    };
+    sub0::gdn::forward<false,1,const float*>(d,1,a.data(),none,none,none,none,conv.data(),dt.data(),alog.data(),gain.data(),none,state.data(),history.data(),mixer.data(),scratch.data(),&native,stages);
+    const char* projection_names[]{"linear_attn_qkv_mixed-0","z-0","beta-0","alpha-0"};
+    for(int i=0;i<4;++i)dump_stage(projection_names[i],layer.captured_projections[i]);
+    dump_stage("final_output-0",layer.gathered);
     dump_stage("linear_attn_out-0",mixer);
     for(int i=0;i<D_MODEL;++i)h[i]+=mixer[i];
     dump_stage("attn_residual-0",h);

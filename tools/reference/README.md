@@ -32,9 +32,31 @@ reference relative L2 errors at those stages are respectively 2.59317e-6, 0.0083
 llama.cpp checkout. It replaces registered quantized CPU dot functions with float-activation scalar
 dots using official decoders; it is not a production Sub0Llm dependency or an unmodified-reference
 result. Rebuild target `llama`, then compile `capture_llama_layer0_float.cpp` with the same flags
-as the ordinary capture plus `-lggml-cpu`. Its explicit CPU buffer override avoids repacked buffers.
+as the ordinary capture plus `-lggml-cpu`. The explicit CPU buffer override alone does NOT disable repacking: llama.cpp interprets it as permission to select CPU_REPACK.
 The float diagnostic still differs: GDN output relative L2 0.00836949, final output 0.00782898.
 An isolated run feeding the exact diagnostic reference normalized input into Sub0Llm still gave
 GDN relative L2 0.00836924. Thus activation quantization alone and initial normalization rounding
 have not explained the discrepancy. Next compare internal QKV/Z/B/A projections, convolution,
 head permutation and recurrence. No whole-layer correctness claim is supported yet.
+
+
+Resolved first-token discrepancy (2026-11-07): rebuild the diagnostic reference with
+`-DGGML_CPU_REPACK=OFF` as well as applying the float-activation patch. Confirm the run log has no
+CPU_REPACK tensors. The earlier float runs still used a repacked Q2_K kernel for `ssm_out`, which
+bypassed the diagnostic dots. With repacking disabled, the independent first-layer comparison passes:
+
+| Stage | relative L2 |
+|---|---:|
+| raw QKV projection | 2.78010e-6 |
+| raw Z projection | 2.85571e-6 |
+| convolution + SiLU | 2.91136e-6 |
+| recurrence + gated norm, raw head order | 1.10609e-6 |
+| GDN output projection | 7.10384e-7 |
+| FFN output | 1.81880e-6 |
+| complete layer output | 8.05504e-7 |
+
+Final maximum absolute error is 1.04904e-5 across 5120 values. Reproduce the final comparison with
+`python3 tools/reference/compare_hidden.py SUB0.f32 LLAMA_FLOAT_NO_REPACK.f32 --max-relative-l2 0.00001`.
+The ordinary, unmodified reference still differs by 0.797% because its activation quantization differs;
+that remains the expected measured numerical limit of this float-activation proving ground.
+This verifies token 1543 at position zero through one layer, not multi-token recurrence or later layers.

@@ -8,11 +8,12 @@ struct Capture { const char* out; bool captured=false; };
 bool callback(ggml_tensor* t,bool ask,void* data) {
  auto& c=*static_cast<Capture*>(data);
  const bool final=std::strcmp(t->name,"l_out-0")==0 || std::strcmp(t->name,"post_ffn-0")==0;
- const bool wanted=final || std::strcmp(t->name,"attn_norm-0")==0 || std::strcmp(t->name,"linear_attn_out-0")==0 || std::strcmp(t->name,"attn_residual-0")==0 || std::strcmp(t->name,"attn_post_norm-0")==0 || std::strcmp(t->name,"ffn_out-0")==0;
+ const bool inner=std::strcmp(t->name,"linear_attn_qkv_mixed-0")==0 || std::strcmp(t->name,"z-0")==0 || std::strcmp(t->name,"beta-0")==0 || std::strcmp(t->name,"beta_sigmoid-0")==0 || std::strcmp(t->name,"alpha-0")==0 || std::strcmp(t->name,"gate-0")==0 || std::strcmp(t->name,"conv_output_silu-0")==0 || std::strcmp(t->name,"final_output-0")==0;
+ const bool wanted=inner || final || std::strcmp(t->name,"attn_norm-0")==0 || std::strcmp(t->name,"linear_attn_out-0")==0 || std::strcmp(t->name,"attn_residual-0")==0 || std::strcmp(t->name,"attn_post_norm-0")==0 || std::strcmp(t->name,"ffn_out-0")==0;
  if(ask)return wanted;
  std::fprintf(stderr,"capture name=%s type=%d elems=%lld\n",t->name,t->type,(long long)ggml_nelements(t));
- if(t->type!=GGML_TYPE_F32 || ggml_nelements(t)!=5120)return false;
- std::vector<float> values(5120);ggml_backend_tensor_get(t,values.data(),0,values.size()*sizeof(float));
+ if(t->type!=GGML_TYPE_F32 || ggml_nelements(t)<=0 || ggml_nelements(t)>10240)return false;
+ std::vector<float> values(static_cast<std::size_t>(ggml_nelements(t)));ggml_backend_tensor_get(t,values.data(),0,values.size()*sizeof(float));
  const std::string path=final?c.out:std::string(c.out)+"."+t->name;
  FILE* f=std::fopen(path.c_str(),"wb");if(!f)return false;
  const bool written=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();
