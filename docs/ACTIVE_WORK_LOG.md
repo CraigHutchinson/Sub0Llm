@@ -34,6 +34,9 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
+**2026-11-07 Codex — #60 active.** IQ1_S format module and fused float projection candidates; holds `include/sub0/quant/iq1_s.hpp`, format registry, `moe_quant_dot.hpp`, `dense_quant.hpp`, proving-ground adapters and kernel fixtures. Owns CPU during numerical/performance runs; production chat binary preserved.
+
+
 **2026-11-07 Codex — #58 done.** Real dense 27B per-format projection attribution and performance campaign milestones. Holds `tools/dense_qwen_support.hpp`, `tools/sub0llm-dense-token.cpp`, profile fixture and docs; short eight-core model profiling/correctness runs on CrogBuntu1. Two attribution runs completed; CPU and files released. Production chat artifacts remain preserved.
 
 **2026-09-08 Claude Code — shared-tree state flag from earlier today, now RESOLVED.** Found while merging

@@ -83,7 +83,7 @@ using BlockSpec = quant::BlockSpec;
 // the format is a separate, optional layer (a Plane in moe_quant_dot.hpp); see docs/QUANT_FORMATS.md.
 struct FormatInfo { TensorType type; const char* name; BlockSpec block; };
 inline constexpr auto kFormats = [] {
-    std::array<FormatInfo, 10 + quant::kModules.size()> formats = {{
+    std::array<FormatInfo, 9 + quant::kModules.size()> formats = {{
         {TensorType::F32,     "F32",     {1, 4}},
         {TensorType::F16,     "F16",     {1, 2}},
         {TensorType::BF16,    "BF16",    {1, 2}},
@@ -92,12 +92,11 @@ inline constexpr auto kFormats = [] {
         {TensorType::Q5_K,    "Q5_K",    {256, 176}},
         {TensorType::Q6_K,    "Q6_K",    {256, 210}},
         {TensorType::IQ2_XXS, "IQ2_XXS", {256, 66}},
-        {TensorType::IQ1_S,   "IQ1_S",   {256, 50}},
         {TensorType::IQ4_NL,  "IQ4_NL",  {32, 18}},
     }};
     for (std::size_t i = 0; i < quant::kModules.size(); ++i) {
         const auto& module = quant::kModules[i];
-        formats[10 + i] = {module.type, module.name.data(), module.block};
+        formats[9 + i] = {module.type, module.name.data(), module.block};
     }
     return formats;
 }();
@@ -592,33 +591,9 @@ inline bool dequantize_iq2_xxs(std::span<const std::uint8_t> raw, std::uint64_t 
     return true;
 }
 
+// Compatibility adapter; packed fields, geometry and decoder live in the IQ1_S module.
 inline bool dequantize_iq1_s(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
-    const std::uint64_t blocks = begin_blocks(TensorType::IQ1_S, raw, n, out);
-    if (blocks == 0) return n == 0;
-    std::uint64_t w = 0;
-    for (std::uint64_t i = 0; i < blocks; ++i) {
-        const std::uint8_t* blk = raw.data() + i * 50;
-        std::uint16_t d_bits;
-        std::memcpy(&d_bits, blk, 2);
-        const float d = f16_to_f32(d_bits);
-        const std::uint8_t* qs = blk + 2;          // 32 grid-index low bytes
-        for (int ib = 0; ib < 8; ++ib) {
-            std::uint16_t qh;
-            std::memcpy(&qh, blk + 34 + 2 * ib, 2);
-            // qh packs, per 32-element sub-block: three high grid-index bits per 8-element group at
-            // [3l+2 : 3l], a 3-bit scale at [14:12], and the delta's SIGN at bit 15.
-            const float dl = d * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
-            const float delta = (qh & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
-            for (int l = 0; l < 4; ++l) {
-                const std::uint64_t grid = IQ1S_GRID[qs[4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)];
-                for (int j = 0; j < 8 && w < n; ++j, ++w) {
-                    const auto q = static_cast<std::int8_t>((grid >> (8 * j)) & 0xFFu);
-                    out[static_cast<std::size_t>(w)] = dl * (static_cast<float>(q) + delta);
-                }
-            }
-        }
-    }
-    return true;
+    return quant::IQ1S::dequantize(raw,n,out);
 }
 
 // Compatibility forwarding name; the implementation and geometry live in quant/q2_k.hpp.
@@ -634,18 +609,17 @@ inline bool dequantize_q2_k(std::span<const std::uint8_t> raw, std::uint64_t n,
 using DequantFn = bool (*)(std::span<const std::uint8_t>, std::uint64_t, std::vector<float>&);
 struct DequantEntry { TensorType type; DequantFn fn; };
 inline constexpr auto kDequant = [] {
-    std::array<DequantEntry, 7 + quant::kModules.size()> entries = {{
+    std::array<DequantEntry, 6 + quant::kModules.size()> entries = {{
         {TensorType::Q8_0,    &dequantize_q8_0},
         {TensorType::Q4_K,    &dequantize_q4_k},
         {TensorType::Q5_K,    &dequantize_q5_k},
         {TensorType::Q6_K,    &dequantize_q6_k},
         {TensorType::IQ2_XXS, &dequantize_iq2_xxs},
-        {TensorType::IQ1_S,   &dequantize_iq1_s},
         {TensorType::IQ4_NL,  &dequantize_iq4_nl},
     }};
     for (std::size_t i = 0; i < quant::kModules.size(); ++i) {
         const auto& module = quant::kModules[i];
-        entries[7 + i] = {module.type, module.dequantize};
+        entries[6 + i] = {module.type, module.dequantize};
     }
     return entries;
 }();
