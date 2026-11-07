@@ -3,6 +3,7 @@
 #include "sub0/file_map.hpp"
 #include "sub0/dense_quant.hpp"
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <memory>

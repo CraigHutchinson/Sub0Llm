@@ -1,5 +1,13 @@
 # Handover — resuming the Qwen4-Next work in a new session or on a new machine
 
+## Dense 27B IQ1_S candidate — 2026-11-07
+
+[IQ1_S iteration](performance/IQ1S_ITERATION.md), #60: native packed float candidate measures
+0.733 prompt / 0.731 generated tokens/s, 2.95× the previous native build, at unchanged ~5.57 GiB RSS.
+Sixteen-position independent gates, real-row oracle and regression suites pass. The opt-in chat recipe
+is in the report; preserved default artifacts are unchanged pending broader context/quality qualification.
+The clean reference still generates 5.80× faster. Next hotspots: IQ2_XXS, IQ1_M and Q3_K.
+
 ## Dense 27B reference speed — 2026-11-07
 
 [Controlled comparison](performance/QWEN27B_SPEED_COMPARISON.md), issue #56: clean native llama.cpp

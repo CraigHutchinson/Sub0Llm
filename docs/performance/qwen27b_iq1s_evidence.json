@@ -1,0 +1,3130 @@
+{
+  "experiment": {
+    "schema": "qwen-speed-comparison-1",
+    "source_commit": "e1079977bf05a399f3d31bd5fc272aa7d6d25073",
+    "manifest": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "prompt_ids": [
+        248045,
+        846,
+        198,
+        12675,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ],
+      "decode_evaluations": 8,
+      "calibrator": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/perf/sub0llm-bench-denseq",
+      "arms": [
+        {
+          "name": "Sub0 prior native baseline",
+          "command": [
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/sub0-native",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "{tokens}",
+            "--projection-threads",
+            "8",
+            "--continuation-steps",
+            "8",
+            "--timings-file",
+            "{metrics}"
+          ]
+        },
+        {
+          "name": "Sub0 IQ1_S fused scalar",
+          "command": [
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/sub0-iq1s",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "{tokens}",
+            "--projection-threads",
+            "8",
+            "--continuation-steps",
+            "8",
+            "--timings-file",
+            "{metrics}",
+            "--iq1s-kernel",
+            "scalar"
+          ]
+        },
+        {
+          "name": "Sub0 IQ1_S fused native",
+          "command": [
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/sub0-iq1s",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "{tokens}",
+            "--projection-threads",
+            "8",
+            "--continuation-steps",
+            "8",
+            "--timings-file",
+            "{metrics}",
+            "--iq1s-kernel",
+            "native"
+          ]
+        },
+        {
+          "name": "llama native defaults",
+          "command": [
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock-bench",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "{metrics}",
+            "{tokens}",
+            "8",
+            "8",
+            "default"
+          ]
+        }
+      ],
+      "identity_files": {
+        "model": "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+        "sub0_generic": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/sub0-generic",
+        "sub0_native": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/sub0-native",
+        "reference_harness": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock-bench",
+        "calibrator": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/perf/sub0llm-bench-denseq",
+        "reference_libggml-base.so.0.29.0": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock/lib/libggml-base.so.0.29.0",
+        "reference_libggml-cpu.so.0.29.0": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock/lib/libggml-cpu.so.0.29.0",
+        "reference_libggml.so.0.29.0": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock/lib/libggml.so.0.29.0",
+        "reference_libllama.so.0.9.0": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock/lib/libllama.so.0.9.0",
+        "sub0_config.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen35-native/generated/sub0_config.hpp",
+        "sub0_corpus.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen35-native/generated/sub0_corpus.hpp",
+        "sub0_system.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen35-native/generated/sub0_system.hpp",
+        "tools/sub0llm-dense-token.cpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/sub0llm-dense-token.cpp",
+        "tools/qwen_phase_metrics.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/qwen_phase_metrics.hpp",
+        "tools/reference/bench_llama_phases.cpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/reference/bench_llama_phases.cpp",
+        "scripts/compare_qwen_speed.py": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/scripts/compare_qwen_speed.py",
+        "host_roofs_source": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/reference/bench_host_roofs.cpp",
+        "host_roofs_binary": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/host-roofs",
+        "iq1s_candidate": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/sub0-iq1s",
+        "iq1s_kernel_benchmark": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/iq1-native-perf/sub0llm-bench-denseq",
+        "include/sub0/quant/iq1_s.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include/sub0/quant/iq1_s.hpp",
+        "include/sub0/quant/all.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include/sub0/quant/all.hpp",
+        "include/sub0/gguf.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include/sub0/gguf.hpp",
+        "include/sub0/moe_quant_dot.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include/sub0/moe_quant_dot.hpp",
+        "include/sub0/dense_quant.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include/sub0/dense_quant.hpp",
+        "tools/dense_qwen_support.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/dense_qwen_support.hpp",
+        "benchmarks/iq1s_perf.hpp": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/benchmarks/iq1s_perf.hpp"
+      },
+      "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+      "method": "13-token non-thinking Hi prompt; 8 additional greedy evals; EOS ignored for fixed count; CPU-only, eight physical cores on one CCD; pretokenized backend phases; #60 old-native baseline versus fused scalar/native IQ1_S, unchanged activation precision",
+      "correctness_records": {
+        "baseline": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/iq1s-baseline-gate.json",
+        "scalar": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/iq1s-scalar-gate.json",
+        "native": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/iq1s-native-gate.json"
+      }
+    },
+    "identities": {
+      "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+      "sub0_generic": "2658537bdd1586298df0f199b530b53d4cd89632d7063679a04f322e769da52e",
+      "sub0_native": "8a2a013c2c34cd7a8b26e1134508ba2cb848debf34e91ce0f30a8c8cb7073bbc",
+      "reference_harness": "7e9afc993abfa86d91ac86a449543065d33974e369afc2c26601dc4cb0eb78bc",
+      "calibrator": "4007f4995b1be12f3f89544b63bd186681804eb7a9f0a7bf066d39d7607d9060",
+      "reference_libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+      "reference_libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+      "reference_libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+      "reference_libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+      "sub0_config.hpp": "1c17c68b415ed71077d2b8ca87f497993bb2583f28c2aaa2f0472b6f2dfd2401",
+      "sub0_corpus.hpp": "3c8266f575b705cd490bce43fece5415af488498e22f7428d3c0d1829c1aae54",
+      "sub0_system.hpp": "98acc9ac64ccb2823d93bfdfb1bde3ab08b71bc934c36a5cca2f750e57021dfb",
+      "tools/sub0llm-dense-token.cpp": "a6bd1aee58cbcd99e8680f6da94b0d729ce1bd18e6e1311af325709e41ee2820",
+      "tools/qwen_phase_metrics.hpp": "de358d5baadd9114de2bdeb09d21b7131f88f2f8a49cac2f5afcc717f1f4d97c",
+      "tools/reference/bench_llama_phases.cpp": "93d24d864a9496480570ee162ebe24f3d25eb626be37ccfd8e7516490ca41d65",
+      "scripts/compare_qwen_speed.py": "3f7e25584a359b314d4d97a590a815d0c8a6f7cc7e4d3c3da3d07dd5244be6ec",
+      "host_roofs_source": "f128f4c8e6756282f5bc6a64ccb1dcfbcfe182d70a3f18e61ac574af9c1f57f6",
+      "host_roofs_binary": "c014a3551ead77ad67c620f29cd3dd57ca39b70dfd7e9d36a794c48f77f09738",
+      "iq1s_candidate": "610c762e87dbd8b477dc259c411f87ed46ab964a1aab3b8992ec833acaab1bc9",
+      "iq1s_kernel_benchmark": "8f233cf686ea265347dca5d3dda9aa72b91643affe449b7a711a645ce1e014b9",
+      "include/sub0/quant/iq1_s.hpp": "5aedae5bedd5278347a670efc43e5830e0ee245bdbb214f2f1434f7cd5c9894f",
+      "include/sub0/quant/all.hpp": "c4cdf9927449f87a20a248b8dbee2e2a4fa33fba7fa91634bd78281f47543eed",
+      "include/sub0/gguf.hpp": "952397aa05ab7acf1d45bd189a1e59b8e907e5c701b4b4b6bce6c81e19765c8f",
+      "include/sub0/moe_quant_dot.hpp": "c0c4b2fd59e0c1f430b3d95db2c755835a08d11a71f010a02e7dbd10baf44c8a",
+      "include/sub0/dense_quant.hpp": "aa9bf696ef71fd280a0a991868a27cb9b9462a55f9a0c2ebeb588e84c716b790",
+      "tools/dense_qwen_support.hpp": "79ea314b4438cea9ad69455443b1f4b70e37374096cb7877137a378232c4b316",
+      "benchmarks/iq1s_perf.hpp": "e3a67a71af9c967b393c9d27410b863a23783543b9902a4ec32acb10b7344fe9",
+      "correctness_baseline": "4aa71d66ed94e4199884bbc20193f47fbe1d51fb23156287ec6f889f95a2a4be",
+      "correctness_scalar": "4aa71d66ed94e4199884bbc20193f47fbe1d51fb23156287ec6f889f95a2a4be",
+      "correctness_native": "9b2ffc8c8709c1e9dccde0ccbb1d662d28f402508237a480d3e300518a4087c6",
+      "manifest": "b40372f03c0bd6cd539742ffb164b7b1ce613accbb0730cff8f02b56e75fb767"
+    },
+    "host": "CrogBuntu1",
+    "system": "Linux-7.0.0-42-generic-x86_64-with-glibc2.43",
+    "power": {
+      "state": "ac",
+      "saver": false
+    },
+    "cpus": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "thread_environment": {
+      "OMP_NUM_THREADS": "8",
+      "OMP_PROC_BIND": "false",
+      "OMP_DYNAMIC": "false",
+      "OMP_THREAD_LIMIT": "8",
+      "OMP_MAX_ACTIVE_LEVELS": "1"
+    },
+    "governors": {
+      "0": "performance",
+      "1": "performance",
+      "2": "performance",
+      "3": "performance",
+      "4": "performance",
+      "5": "performance",
+      "6": "performance",
+      "7": "performance"
+    },
+    "cache": "warm working weights; no eviction/pressure",
+    "samples": [
+      {
+        "arm": "Sub0 prior native baseline",
+        "round": -1,
+        "warmup": true,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 68.299989,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            4001.237426,
+            3988.418672,
+            3998.942014,
+            3997.909606,
+            4004.747738,
+            4010.124873,
+            4010.621855,
+            4017.687786,
+            4015.577253,
+            4028.643495,
+            4022.781072,
+            4024.832802,
+            4029.36442
+          ],
+          "decode_ms": [
+            4025.417995,
+            4027.937249,
+            4028.624589,
+            4028.165851,
+            4027.542575,
+            4028.099262,
+            4032.608979,
+            4032.424501
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.2492766709501094,
+          "decode_tok_s": 0.2482096251830442,
+          "prefill_s": 52.150889012,
+          "decode_s": 32.230821001,
+          "setup_s": 0.06829998899999999,
+          "setup_plus_prefill_s": 52.219189001,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 84.60281435499928,
+          "peak_rss_mib": 5702.16796875
+        },
+        "quiet": {
+          "samples": [
+            0.00625,
+            0.004377736085053158,
+            0.006566604127579738,
+            0.004066312167657179,
+            0.004688965301656768,
+            0.0046918986549890525,
+            0.0046918986549890525,
+            0.004063769928102532,
+            0.004996876951905059,
+            0.0040650406504065045
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.002302972053822268,
+        "background_selected": 0.00013298265315168887,
+        "tainted": false,
+        "calibration_ns": [
+          4497.671692607,
+          4501.0623853211
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 676.1999999999999,
+        "mean_busy_cores": 7.992641913336568
+      },
+      {
+        "arm": "Sub0 IQ1_S fused scalar",
+        "round": -1,
+        "warmup": true,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 68.905129,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            2909.924277,
+            2892.823247,
+            2899.54847,
+            2902.90217,
+            2939.959334,
+            2910.96935,
+            2910.144223,
+            2908.363948,
+            2902.505172,
+            2907.898267,
+            2911.586383,
+            2911.725583,
+            2911.106645
+          ],
+          "decode_ms": [
+            2928.430516,
+            2914.612538,
+            2915.880743,
+            2916.220801,
+            2918.353117,
+            2917.679733,
+            2916.05511,
+            2917.70916
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.34373840894336616,
+          "decode_tok_s": 0.3426866554921249,
+          "prefill_s": 37.819457068999995,
+          "decode_s": 23.344941717999998,
+          "setup_s": 0.068905129,
+          "setup_plus_prefill_s": 37.888362197999996,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 61.39045636099763,
+          "peak_rss_mib": 5702.28125
+        },
+        "quiet": {
+          "samples": [
+            0.004063769928102532,
+            0.004375,
+            0.004375,
+            0.004688965301656768,
+            0.0065625,
+            0.004690431519699813,
+            0.004686035613870665,
+            0.02474162229877858,
+            0.0065625,
+            0.00344180225281602
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.002995430440297635,
+        "background_selected": 0.0002036120782681866,
+        "tainted": false,
+        "calibration_ns": [
+          4497.374881065651,
+          4497.52534364261
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 490.4900000000001,
+        "mean_busy_cores": 7.989678348630366
+      },
+      {
+        "arm": "Sub0 IQ1_S fused native",
+        "round": -1,
+        "warmup": true,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 69.465203,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            1377.394207,
+            1345.56578,
+            1351.691413,
+            1361.296589,
+            1351.719377,
+            1357.939182,
+            1353.59728,
+            1353.999358,
+            1356.707319,
+            1355.716902,
+            1366.256375,
+            1361.023219,
+            1356.458568
+          ],
+          "decode_ms": [
+            1364.440311,
+            1362.096877,
+            1359.971545,
+            1357.965073,
+            1363.722673,
+            1360.747306,
+            1358.335199,
+            1364.744891
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.7365703854439777,
+          "decode_tok_s": 0.7344824150048055,
+          "prefill_s": 17.649365569,
+          "decode_s": 10.892023875000001,
+          "setup_s": 0.069465203,
+          "setup_plus_prefill_s": 17.718830772,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 28.771353604999604,
+          "peak_rss_mib": 5702.3671875
+        },
+        "quiet": {
+          "samples": [
+            0.004377736085053158,
+            0.004693366708385482,
+            0.0040650406504065045,
+            0.006868560724320949,
+            0.00375234521575985,
+            0.00437636761487965,
+            0.012195121951219513,
+            0.005317485142320926,
+            0.00375234521575985,
+            0.006877149109096593
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0025545144248539926,
+        "background_selected": 8.689984792605649e-05,
+        "tainted": false,
+        "calibration_ns": [
+          4498.42725060827,
+          4500.24924012158
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 229.5499999999998,
+        "mean_busy_cores": 7.9784219801223
+      },
+      {
+        "arm": "llama native defaults",
+        "round": -1,
+        "warmup": true,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 256,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 0,
+          "projection_flops_per_eval": 0,
+          "setup_ms": 529.162614,
+          "batched_prefill": true,
+          "f32_attention": false,
+          "prefill_ms": [
+            786.145538
+          ],
+          "decode_ms": [
+            232.867872,
+            232.225048,
+            233.92636,
+            232.057073,
+            231.986106,
+            232.332597,
+            232.93876,
+            231.73982
+          ],
+          "top_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 16.536378280633325,
+          "decode_tok_s": 4.3009049992255255,
+          "prefill_s": 0.786145538,
+          "decode_s": 1.860073636,
+          "setup_s": 0.529162614,
+          "setup_plus_prefill_s": 1.315308152,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 3.371182969000074,
+          "peak_rss_mib": 6249.67578125
+        },
+        "quiet": {
+          "samples": [
+            0.007507037847982484,
+            0.004379105411323116,
+            0.004377736085053158,
+            0.005007824726134585,
+            0.0034385745545482964,
+            0.00375234521575985,
+            0.006255864873318737,
+            0.004063769928102532,
+            0.0034396497811131957,
+            0.003751172241325414
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.00705205530295891,
+        "background_selected": 0.0022263450834835536,
+        "tainted": false,
+        "calibration_ns": [
+          4498.59449541284,
+          4497.62372093023
+        ],
+        "stdout_sha256": "84a0008e6f21a39d6adf8f01fa9ac9c2956d856bb28f624e2c299b6cf8c9a6d0",
+        "child_cpu_s": 23.050000000000118,
+        "mean_busy_cores": 6.8373624961794865
+      },
+      {
+        "arm": "Sub0 prior native baseline",
+        "round": 0,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 68.917783,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            4022.396077,
+            4021.766919,
+            4019.548517,
+            4025.273575,
+            4026.217331,
+            4027.747922,
+            4026.807173,
+            4058.280883,
+            4044.413511,
+            4036.423399,
+            4037.406562,
+            4034.273439,
+            4034.750552
+          ],
+          "decode_ms": [
+            4033.948971,
+            4031.778803,
+            4029.346275,
+            4029.213789,
+            4030.439872,
+            4029.103776,
+            4030.82006,
+            4032.90772
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.2480191575095008,
+          "decode_tok_s": 0.24808079067350522,
+          "prefill_s": 52.415305860000004,
+          "decode_s": 32.247559266,
+          "setup_s": 0.068917783,
+          "setup_plus_prefill_s": 52.484223643,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 84.89258984600019,
+          "peak_rss_mib": 5702.5234375
+        },
+        "quiet": {
+          "samples": [
+            0.004379105411323116,
+            0.0040650406504065045,
+            0.0043736332396126214,
+            0.0034375,
+            0.00375234521575985,
+            0.003751172241325414,
+            0.00375234521575985,
+            0.0031289111389236545,
+            0.00437636761487965,
+            0.004063769928102532
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0030760729416099263,
+        "background_selected": 0.000132524443397552,
+        "tainted": false,
+        "calibration_ns": [
+          4498.300583657589,
+          4498.97247706422
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 678.4599999999999,
+        "mean_busy_cores": 7.991981411225215
+      },
+      {
+        "arm": "Sub0 IQ1_S fused scalar",
+        "round": 0,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 67.739596,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            2909.087758,
+            2891.836736,
+            2895.881182,
+            2896.712791,
+            2906.751087,
+            2901.718688,
+            2903.03177,
+            2903.043913,
+            2903.30615,
+            2904.083776,
+            2907.371938,
+            2927.025882,
+            2911.730914
+          ],
+          "decode_ms": [
+            2908.576739,
+            2917.064856,
+            2916.001307,
+            2913.05224,
+            2910.935174,
+            2911.552748,
+            2921.600843,
+            2930.957139
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.34426523228303413,
+          "decode_tok_s": 0.34290993561506505,
+          "prefill_s": 37.761582585,
+          "decode_s": 23.329741046,
+          "setup_s": 0.067739596,
+          "setup_plus_prefill_s": 37.829322180999995,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 61.312568750996434,
+          "peak_rss_mib": 5702.6484375
+        },
+        "quiet": {
+          "samples": [
+            0.005310840362386754,
+            0.003751172241325414,
+            0.00781983109164842,
+            0.0046875,
+            0.011267605633802818,
+            0.0059375,
+            0.005315822388993121,
+            0.004377736085053158,
+            0.005,
+            0.00437636761487965
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0031011231370310643,
+        "background_selected": 0.00018348249780914517,
+        "tainted": false,
+        "calibration_ns": [
+          4497.26808866583,
+          4499.43638732089
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 489.88999999999965,
+        "mean_busy_cores": 7.990042008997349
+      },
+      {
+        "arm": "Sub0 IQ1_S fused native",
+        "round": 0,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 69.892883,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            1385.271337,
+            1354.227302,
+            1365.644907,
+            1357.994031,
+            1358.382433,
+            1362.252111,
+            1358.381772,
+            1361.784366,
+            1366.703235,
+            1360.670571,
+            1363.428618,
+            1368.332328,
+            1363.020518
+          ],
+          "decode_ms": [
+            1366.32308,
+            1371.038113,
+            1363.012413,
+            1365.673933,
+            1368.311968,
+            1373.140372,
+            1367.395986,
+            1374.268204
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.7333821170881174,
+          "decode_tok_s": 0.7306493856138416,
+          "prefill_s": 17.726093529,
+          "decode_s": 10.949164069,
+          "setup_s": 0.069892883,
+          "setup_plus_prefill_s": 17.795986412,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 28.899156316998415,
+          "peak_rss_mib": 5702.39453125
+        },
+        "quiet": {
+          "samples": [
+            0.0034396497811131957,
+            0.003753518923991242,
+            0.004375,
+            0.005317485142320926,
+            0.004377736085053158,
+            0.0059412132582864294,
+            0.0034396497811131957,
+            0.0034385745545482964,
+            0.00375,
+            0.003129890453834116
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.002629386368309215,
+        "background_selected": 0.00017301786409588398,
+        "tainted": false,
+        "calibration_ns": [
+          4497.2348623853195,
+          4497.12101354303
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 230.60999999999967,
+        "mean_busy_cores": 7.9798177313693905
+      },
+      {
+        "arm": "llama native defaults",
+        "round": 0,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 256,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 0,
+          "projection_flops_per_eval": 0,
+          "setup_ms": 534.614775,
+          "batched_prefill": true,
+          "f32_attention": false,
+          "prefill_ms": [
+            763.35447
+          ],
+          "decode_ms": [
+            232.149713,
+            232.586598,
+            232.469752,
+            232.477607,
+            232.567411,
+            233.015317,
+            232.112771,
+            241.447827
+          ],
+          "top_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 17.030096122971546,
+          "decode_tok_s": 4.280760079516745,
+          "prefill_s": 0.76335447,
+          "decode_s": 1.868826996,
+          "setup_s": 0.534614775,
+          "setup_plus_prefill_s": 1.297969245,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 3.3588039530004608,
+          "peak_rss_mib": 6249.5390625
+        },
+        "quiet": {
+          "samples": [
+            0.00375,
+            0.003753518923991242,
+            0.00437636761487965,
+            0.004690431519699813,
+            0.004063769928102532,
+            0.005630278385986863,
+            0.0031269543464665416,
+            0.00375234521575985,
+            0.0031269543464665416,
+            0.00375234521575985
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0068933395435442245,
+        "background_selected": 0.0018615040952893705,
+        "tainted": false,
+        "calibration_ns": [
+          4498.388321167879,
+          4498.39132302405
+        ],
+        "stdout_sha256": "84a0008e6f21a39d6adf8f01fa9ac9c2956d856bb28f624e2c299b6cf8c9a6d0",
+        "child_cpu_s": 22.95000000000053,
+        "mean_busy_cores": 6.8327893860845945
+      },
+      {
+        "arm": "Sub0 IQ1_S fused scalar",
+        "round": 1,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 67.129646,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            2919.923146,
+            2892.989086,
+            2901.475127,
+            2907.649064,
+            2907.846356,
+            2909.705644,
+            2912.425387,
+            2914.09608,
+            2912.997644,
+            2915.376358,
+            2922.453523,
+            2919.709824,
+            2915.57915
+          ],
+          "decode_ms": [
+            2918.837937,
+            2919.512401,
+            2920.114056,
+            2921.939728,
+            2924.122082,
+            2923.00458,
+            2923.996229,
+            2928.259469
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.34344082872171156,
+          "decode_tok_s": 0.3421759221864223,
+          "prefill_s": 37.852226389,
+          "decode_s": 23.379786482,
+          "setup_s": 0.06712964599999999,
+          "setup_plus_prefill_s": 37.91935603500001,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 61.45918754800368,
+          "peak_rss_mib": 5702.4296875
+        },
+        "quiet": {
+          "samples": [
+            0.004377736085053158,
+            0.019068458893404187,
+            0.014705882352941176,
+            0.004066312167657179,
+            0.0065686581169846735,
+            0.004690431519699813,
+            0.0040650406504065045,
+            0.004375,
+            0.004066312167657179,
+            0.0068792995622263915
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.002406744991884232,
+        "background_selected": 0.0002033760423022168,
+        "tainted": false,
+        "calibration_ns": [
+          4497.97957198444,
+          4498.21931493815
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 491.03,
+        "mean_busy_cores": 7.989529630805372
+      },
+      {
+        "arm": "Sub0 IQ1_S fused native",
+        "round": 1,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 68.499256,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            1389.382202,
+            1360.039319,
+            1358.728784,
+            1366.331115,
+            1361.632403,
+            1358.800192,
+            1365.06237,
+            1364.578043,
+            1365.229002,
+            1370.780706,
+            1364.510041,
+            1363.761974,
+            1375.090826
+          ],
+          "decode_ms": [
+            1364.766377,
+            1369.421545,
+            1376.395321,
+            1370.042678,
+            1372.352197,
+            1375.348235,
+            1370.720238,
+            1372.459194
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.7318201666124762,
+          "decode_tok_s": 0.7291615350499494,
+          "prefill_s": 17.763926977,
+          "decode_s": 10.971505785,
+          "setup_s": 0.06849925600000001,
+          "setup_plus_prefill_s": 17.832426233,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 28.96344279099867,
+          "peak_rss_mib": 5702.48828125
+        },
+        "quiet": {
+          "samples": [
+            0.005628517823639775,
+            0.003440725680325305,
+            0.0034375,
+            0.005626758361988122,
+            0.00437636761487965,
+            0.003753518923991242,
+            0.00375234521575985,
+            0.01032540675844806,
+            0.005317485142320926,
+            0.003753518923991242
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0026022545674424676,
+        "background_selected": 0.00021578697509739805,
+        "tainted": false,
+        "calibration_ns": [
+          4523.411101474409,
+          4497.9426605504605
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 231.08000000000018,
+        "mean_busy_cores": 7.978333296475921
+      },
+      {
+        "arm": "llama native defaults",
+        "round": 1,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 256,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 0,
+          "projection_flops_per_eval": 0,
+          "setup_ms": 532.951467,
+          "batched_prefill": true,
+          "f32_attention": false,
+          "prefill_ms": [
+            769.256982
+          ],
+          "decode_ms": [
+            241.498544,
+            239.1247,
+            238.481796,
+            234.871029,
+            234.226061,
+            233.313455,
+            232.946856,
+            232.634471
+          ],
+          "top_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 16.899424125083858,
+          "decode_tok_s": 4.239315929737476,
+          "prefill_s": 0.769256982,
+          "decode_s": 1.887096912,
+          "setup_s": 0.532951467,
+          "setup_plus_prefill_s": 1.3022084489999999,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 3.3865136559979874,
+          "peak_rss_mib": 6249.76953125
+        },
+        "quiet": {
+          "samples": [
+            0.0053125,
+            0.005626758361988122,
+            0.0034396497811131957,
+            0.0031289111389236545,
+            0.004686035613870665,
+            0.005628517823639775,
+            0.0031279324366593683,
+            0.003751172241325414,
+            0.003751172241325414,
+            0.003440725680325305
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.007849293563577095,
+        "background_selected": 0.002954209748883439,
+        "tainted": false,
+        "calibration_ns": [
+          4498.31148973351,
+          4498.50608272506
+        ],
+        "stdout_sha256": "84a0008e6f21a39d6adf8f01fa9ac9c2956d856bb28f624e2c299b6cf8c9a6d0",
+        "child_cpu_s": 23.220000000000237,
+        "mean_busy_cores": 6.856608996356587
+      },
+      {
+        "arm": "Sub0 prior native baseline",
+        "round": 1,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 66.790869,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            4023.767282,
+            3998.919969,
+            4007.457049,
+            4010.577338,
+            4011.847856,
+            4017.177239,
+            4024.834958,
+            4023.397346,
+            4026.598972,
+            4026.874605,
+            4026.348137,
+            4031.39894,
+            4051.318167
+          ],
+          "decode_ms": [
+            4031.939987,
+            4033.830786,
+            4029.459087,
+            4040.079909,
+            4030.242753,
+            4041.95645,
+            4037.775911,
+            4043.492092
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.24865859277273267,
+          "decode_tok_s": 0.2477641072064793,
+          "prefill_s": 52.280517857999996,
+          "decode_s": 32.288776975,
+          "setup_s": 0.066790869,
+          "setup_plus_prefill_s": 52.347308727,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 84.78987659000268,
+          "peak_rss_mib": 5702.94921875
+        },
+        "quiet": {
+          "samples": [
+            0.008758210822646231,
+            0.010944340212632896,
+            0.007507037847982484,
+            0.00375,
+            0.003440725680325305,
+            0.0068792995622263915,
+            0.006875,
+            0.004063769928102532,
+            0.004688965301656768,
+            0.0040650406504065045
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0027219515433612247,
+        "background_selected": 0.00017690765420429072,
+        "tainted": false,
+        "calibration_ns": [
+          4498.28163653663,
+          4497.419489753241
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 677.6900000000002,
+        "mean_busy_cores": 7.992581511551634
+      },
+      {
+        "arm": "Sub0 IQ1_S fused native",
+        "round": 2,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 69.509731,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            1377.21692,
+            1350.711559,
+            1349.544932,
+            1353.847247,
+            1353.984051,
+            1351.040866,
+            1356.948838,
+            1358.726118,
+            1355.700444,
+            1389.183457,
+            1356.737189,
+            1354.529227,
+            1359.1969
+          ],
+          "decode_ms": [
+            1358.729324,
+            1357.387969,
+            1362.081411,
+            1355.826557,
+            1356.169671,
+            1357.024195,
+            1356.98531,
+            1362.976614
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.7358198564396577,
+          "decode_tok_s": 0.7361614720925109,
+          "prefill_s": 17.667367748,
+          "decode_s": 10.867181051,
+          "setup_s": 0.069509731,
+          "setup_plus_prefill_s": 17.736877479,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 28.76284588699491,
+          "peak_rss_mib": 5702.4296875
+        },
+        "quiet": {
+          "samples": [
+            0.00375234521575985,
+            0.005630278385986863,
+            0.004063769928102532,
+            0.0059412132582864294,
+            0.003751172241325414,
+            0.0046918986549890525,
+            0.004375,
+            0.003753518923991242,
+            0.0040650406504065045,
+            0.004688965301656768
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0032076374391089785,
+        "background_selected": 0.0002172873842933612,
+        "tainted": false,
+        "calibration_ns": [
+          4497.72660550459,
+          4498.724548049479
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 229.51000000000025,
+        "mean_busy_cores": 7.979391222332869
+      },
+      {
+        "arm": "llama native defaults",
+        "round": 2,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 256,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 0,
+          "projection_flops_per_eval": 0,
+          "setup_ms": 522.931317,
+          "batched_prefill": true,
+          "f32_attention": false,
+          "prefill_ms": [
+            762.862688
+          ],
+          "decode_ms": [
+            233.334185,
+            235.829413,
+            240.724416,
+            239.375586,
+            239.341078,
+            239.31086,
+            240.684308,
+            235.155469
+          ],
+          "top_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 17.041074631769117,
+          "decode_tok_s": 4.202220703977392,
+          "prefill_s": 0.762862688,
+          "decode_s": 1.903755315,
+          "setup_s": 0.5229313170000001,
+          "setup_plus_prefill_s": 1.2857940050000003,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 3.383574637999118,
+          "peak_rss_mib": 6250.00390625
+        },
+        "quiet": {
+          "samples": [
+            0.00625,
+            0.00375234521575985,
+            0.0040650406504065045,
+            0.0040650406504065045,
+            0.004379105411323116,
+            0.003753518923991242,
+            0.005310840362386754,
+            0.004688965301656768,
+            0.003753518923991242,
+            0.0040650406504065045
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.00869243573145552,
+        "background_selected": 0.0011094674556065022,
+        "tainted": false,
+        "calibration_ns": [
+          4497.6409366869,
+          4499.4638439581295
+        ],
+        "stdout_sha256": "84a0008e6f21a39d6adf8f01fa9ac9c2956d856bb28f624e2c299b6cf8c9a6d0",
+        "child_cpu_s": 23.2500000000004,
+        "mean_busy_cores": 6.871431100969986
+      },
+      {
+        "arm": "Sub0 prior native baseline",
+        "round": 2,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 69.693768,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            4023.612012,
+            3997.520721,
+            4013.17264,
+            4007.469032,
+            4010.503024,
+            4013.635556,
+            4037.700184,
+            4024.332927,
+            4025.452243,
+            4035.519193,
+            4026.209598,
+            4034.993546,
+            4032.384838
+          ],
+          "decode_ms": [
+            4029.865343,
+            4036.126528,
+            4036.220641,
+            4034.801425,
+            4032.930223,
+            4033.120041,
+            4032.665752,
+            4033.452204
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.24864913936687508,
+          "decode_tok_s": 0.24791455702463777,
+          "prefill_s": 52.28250551399999,
+          "decode_s": 32.269182156999996,
+          "setup_s": 0.069693768,
+          "setup_plus_prefill_s": 52.352199281999994,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 84.77837758699752,
+          "peak_rss_mib": 5702.51953125
+        },
+        "quiet": {
+          "samples": [
+            0.00375,
+            0.0040650406504065045,
+            0.004688965301656768,
+            0.0031279324366593683,
+            0.003436426116838488,
+            0.002813379180994061,
+            0.004063769928102532,
+            0.00437636761487965,
+            0.0059412132582864294,
+            0.004375
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0025231193723186172,
+        "background_selected": 0.000191669738296659,
+        "tainted": false,
+        "calibration_ns": [
+          4497.7862385321105,
+          4499.372018348619
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 677.5700000000003,
+        "mean_busy_cores": 7.9922501383645175
+      },
+      {
+        "arm": "Sub0 IQ1_S fused scalar",
+        "round": 2,
+        "warmup": false,
+        "native": {
+          "schema": "qwen-phase-1",
+          "workers": 8,
+          "context_capacity": 128,
+          "prompt_tokens": 13,
+          "decode_evaluations": 8,
+          "weight_bytes_per_eval": 5764050576,
+          "projection_flops_per_eval": 51247841280,
+          "setup_ms": 69.475636,
+          "batched_prefill": false,
+          "f32_attention": true,
+          "prefill_ms": [
+            2927.439051,
+            2895.632782,
+            2901.527829,
+            2898.48316,
+            2898.282361,
+            2900.097604,
+            2900.848838,
+            2902.359172,
+            2904.064543,
+            2903.664389,
+            2907.707365,
+            2907.666345,
+            2909.038621
+          ],
+          "decode_ms": [
+            2907.804383,
+            2915.78938,
+            2911.337653,
+            2916.682198,
+            2917.340292,
+            2918.377019,
+            2919.588344,
+            2916.498012
+          ],
+          "top_ids": [
+            8678,
+            198,
+            3710,
+            248046,
+            198,
+            248045,
+            248068,
+            198,
+            248068,
+            198,
+            248046,
+            271,
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ]
+        },
+        "rates": {
+          "prefill_tok_s": 0.3443087297556127,
+          "decode_tok_s": 0.34300291006314304,
+          "prefill_s": 37.75681206,
+          "decode_s": 23.323417281,
+          "setup_s": 0.069475636,
+          "setup_plus_prefill_s": 37.82628769600001,
+          "generated_ids": [
+            12675,
+            1017,
+            0,
+            248046,
+            198,
+            248045,
+            248046,
+            198,
+            248045
+          ],
+          "process_wall_s": 61.30953391400544,
+          "peak_rss_mib": 5702.6328125
+        },
+        "quiet": {
+          "samples": [
+            0.003751172241325414,
+            0.004061230865354577,
+            0.00375234521575985,
+            0.021575984990619138,
+            0.003753518923991242,
+            0.003751172241325414,
+            0.0040650406504065045,
+            0.0050031269543464665,
+            0.00375,
+            0.0031279324366593683
+          ],
+          "seconds": 10
+        },
+        "background_global": 0.0030346923994979055,
+        "background_selected": 0.0002242609582050223,
+        "tainted": false,
+        "calibration_ns": [
+          4498.362136343901,
+          4498.35823503713
+        ],
+        "stdout_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd",
+        "child_cpu_s": 489.81000000000046,
+        "mean_busy_cores": 7.989132663885887
+      }
+    ],
+    "timing_verdict": "descriptive comparison only",
+    "correctness": {
+      "baseline": {
+        "passed": true,
+        "positions": [
+          {
+            "position": 0,
+            "values": 248320,
+            "max_abs": 3.337860107421875e-05,
+            "relative_l2": 1.8574264772755625e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 1,
+            "values": 248320,
+            "max_abs": 0.00010418891906738281,
+            "relative_l2": 6.238193829699804e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 2,
+            "values": 248320,
+            "max_abs": 5.4836273193359375e-05,
+            "relative_l2": 3.766449036417985e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 3,
+            "values": 248320,
+            "max_abs": 7.724761962890625e-05,
+            "relative_l2": 3.5235087585709464e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 4,
+            "values": 248320,
+            "max_abs": 0.00014400482177734375,
+            "relative_l2": 6.108896715245631e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 5,
+            "values": 248320,
+            "max_abs": 0.0004324913024902344,
+            "relative_l2": 4.829584205510693e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 6,
+            "values": 248320,
+            "max_abs": 0.00025272369384765625,
+            "relative_l2": 2.0182631895411793e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 7,
+            "values": 248320,
+            "max_abs": 0.000611618161201477,
+            "relative_l2": 3.3694773672807026e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 8,
+            "values": 248320,
+            "max_abs": 0.0005006790161132812,
+            "relative_l2": 3.1011017747290086e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 9,
+            "values": 248320,
+            "max_abs": 0.0008587241172790527,
+            "relative_l2": 5.237511759891848e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 10,
+            "values": 248320,
+            "max_abs": 0.0014748573303222656,
+            "relative_l2": 8.459360955659011e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 11,
+            "values": 248320,
+            "max_abs": 0.0011764764785766602,
+            "relative_l2": 7.24755755327942e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 12,
+            "values": 248320,
+            "max_abs": 0.0009878873825073242,
+            "relative_l2": 6.940521992565709e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 13,
+            "values": 248320,
+            "max_abs": 0.0003961324691772461,
+            "relative_l2": 2.2586339140455983e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 14,
+            "values": 248320,
+            "max_abs": 0.0003647804260253906,
+            "relative_l2": 1.9361012813479417e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 15,
+            "values": 248320,
+            "max_abs": 0.00038051605224609375,
+            "relative_l2": 1.7621513990684832e-05,
+            "tolerance": 0.001,
+            "passed": true
+          }
+        ],
+        "worst_relative_l2": 8.459360955659011e-05,
+        "binary_sha256": "610c762e87dbd8b477dc259c411f87ed46ab964a1aab3b8992ec833acaab1bc9"
+      },
+      "scalar": {
+        "passed": true,
+        "positions": [
+          {
+            "position": 0,
+            "values": 248320,
+            "max_abs": 3.337860107421875e-05,
+            "relative_l2": 1.8574264772755625e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 1,
+            "values": 248320,
+            "max_abs": 0.00010418891906738281,
+            "relative_l2": 6.238193829699804e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 2,
+            "values": 248320,
+            "max_abs": 5.4836273193359375e-05,
+            "relative_l2": 3.766449036417985e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 3,
+            "values": 248320,
+            "max_abs": 7.724761962890625e-05,
+            "relative_l2": 3.5235087585709464e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 4,
+            "values": 248320,
+            "max_abs": 0.00014400482177734375,
+            "relative_l2": 6.108896715245631e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 5,
+            "values": 248320,
+            "max_abs": 0.0004324913024902344,
+            "relative_l2": 4.829584205510693e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 6,
+            "values": 248320,
+            "max_abs": 0.00025272369384765625,
+            "relative_l2": 2.0182631895411793e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 7,
+            "values": 248320,
+            "max_abs": 0.000611618161201477,
+            "relative_l2": 3.3694773672807026e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 8,
+            "values": 248320,
+            "max_abs": 0.0005006790161132812,
+            "relative_l2": 3.1011017747290086e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 9,
+            "values": 248320,
+            "max_abs": 0.0008587241172790527,
+            "relative_l2": 5.237511759891848e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 10,
+            "values": 248320,
+            "max_abs": 0.0014748573303222656,
+            "relative_l2": 8.459360955659011e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 11,
+            "values": 248320,
+            "max_abs": 0.0011764764785766602,
+            "relative_l2": 7.24755755327942e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 12,
+            "values": 248320,
+            "max_abs": 0.0009878873825073242,
+            "relative_l2": 6.940521992565709e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 13,
+            "values": 248320,
+            "max_abs": 0.0003961324691772461,
+            "relative_l2": 2.2586339140455983e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 14,
+            "values": 248320,
+            "max_abs": 0.0003647804260253906,
+            "relative_l2": 1.9361012813479417e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 15,
+            "values": 248320,
+            "max_abs": 0.00038051605224609375,
+            "relative_l2": 1.7621513990684832e-05,
+            "tolerance": 0.001,
+            "passed": true
+          }
+        ],
+        "worst_relative_l2": 8.459360955659011e-05,
+        "binary_sha256": "610c762e87dbd8b477dc259c411f87ed46ab964a1aab3b8992ec833acaab1bc9"
+      },
+      "native": {
+        "passed": true,
+        "positions": [
+          {
+            "position": 0,
+            "values": 248320,
+            "max_abs": 3.337860107421875e-05,
+            "relative_l2": 1.9904409643550592e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 1,
+            "values": 248320,
+            "max_abs": 9.918212890625e-05,
+            "relative_l2": 5.392751683711596e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 2,
+            "values": 248320,
+            "max_abs": 6.29425048828125e-05,
+            "relative_l2": 4.894644921345854e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 3,
+            "values": 248320,
+            "max_abs": 8.392333984375e-05,
+            "relative_l2": 3.853001766703432e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 4,
+            "values": 248320,
+            "max_abs": 0.0001430511474609375,
+            "relative_l2": 7.341955646047099e-06,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 5,
+            "values": 248320,
+            "max_abs": 0.0003540515899658203,
+            "relative_l2": 3.7547591121193055e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 6,
+            "values": 248320,
+            "max_abs": 0.0002002716064453125,
+            "relative_l2": 1.618706700224237e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 7,
+            "values": 248320,
+            "max_abs": 0.0005702972412109375,
+            "relative_l2": 3.2720310054831146e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 8,
+            "values": 248320,
+            "max_abs": 0.0005598068237304688,
+            "relative_l2": 3.0144573475070587e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 9,
+            "values": 248320,
+            "max_abs": 0.0007352828979492188,
+            "relative_l2": 4.71129878514454e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 10,
+            "values": 248320,
+            "max_abs": 0.0012850761413574219,
+            "relative_l2": 7.030184392280744e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 11,
+            "values": 248320,
+            "max_abs": 0.0014491081237792969,
+            "relative_l2": 7.946293161057383e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 12,
+            "values": 248320,
+            "max_abs": 0.0010253190994262695,
+            "relative_l2": 6.080003538140581e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 13,
+            "values": 248320,
+            "max_abs": 0.0004367828369140625,
+            "relative_l2": 1.8400096745882013e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 14,
+            "values": 248320,
+            "max_abs": 0.00034499168395996094,
+            "relative_l2": 1.7718839810462805e-05,
+            "tolerance": 0.001,
+            "passed": true
+          },
+          {
+            "position": 15,
+            "values": 248320,
+            "max_abs": 0.00026988983154296875,
+            "relative_l2": 1.5240761951478095e-05,
+            "tolerance": 0.001,
+            "passed": true
+          }
+        ],
+        "worst_relative_l2": 7.946293161057383e-05,
+        "binary_sha256": "610c762e87dbd8b477dc259c411f87ed46ab964a1aab3b8992ec833acaab1bc9"
+      }
+    },
+    "summary": {
+      "Sub0 IQ1_S fused native": {
+        "prefill_tok_s": {
+          "samples": [
+            0.7333821170881174,
+            0.7318201666124762,
+            0.7358198564396577
+          ],
+          "median": 0.7333821170881174,
+          "min": 0.7318201666124762,
+          "max": 0.7358198564396577,
+          "robust_cv": 0.003157627819424238
+        },
+        "decode_tok_s": {
+          "samples": [
+            0.7306493856138416,
+            0.7291615350499494,
+            0.7361614720925109
+          ],
+          "median": 0.7306493856138416,
+          "min": 0.7291615350499494,
+          "max": 0.7361614720925109,
+          "robust_cv": 0.0030190776718074905
+        },
+        "setup_s": {
+          "samples": [
+            0.069892883,
+            0.06849925600000001,
+            0.069509731
+          ],
+          "median": 0.069509731,
+          "min": 0.06849925600000001,
+          "max": 0.069892883,
+          "robust_cv": 0.008172397548193598
+        },
+        "setup_plus_prefill_s": {
+          "samples": [
+            17.795986412,
+            17.832426233,
+            17.736877479
+          ],
+          "median": 17.795986412,
+          "min": 17.736877479,
+          "max": 17.832426233,
+          "robust_cv": 0.003035835011548867
+        },
+        "process_wall_s": {
+          "samples": [
+            28.899156316998415,
+            28.96344279099867,
+            28.76284588699491
+          ],
+          "median": 28.899156316998415,
+          "min": 28.76284588699491,
+          "max": 28.96344279099867,
+          "robust_cv": 0.003298059130422311
+        },
+        "peak_rss_mib": {
+          "samples": [
+            5702.39453125,
+            5702.48828125,
+            5702.4296875
+          ],
+          "median": 5702.4296875,
+          "min": 5702.39453125,
+          "max": 5702.48828125,
+          "robust_cv": 9.14042944961783e-06
+        }
+      },
+      "Sub0 IQ1_S fused scalar": {
+        "prefill_tok_s": {
+          "samples": [
+            0.34426523228303413,
+            0.34344082872171156,
+            0.3443087297556127
+          ],
+          "median": 0.34426523228303413,
+          "min": 0.34344082872171156,
+          "max": 0.3443087297556127,
+          "robust_cv": 0.00018732461717772152
+        },
+        "decode_tok_s": {
+          "samples": [
+            0.34290993561506505,
+            0.3421759221864223,
+            0.34300291006314304
+          ],
+          "median": 0.34290993561506505,
+          "min": 0.3421759221864223,
+          "max": 0.34300291006314304,
+          "robust_cv": 0.000401982860231734
+        },
+        "setup_s": {
+          "samples": [
+            0.067739596,
+            0.06712964599999999,
+            0.069475636
+          ],
+          "median": 0.067739596,
+          "min": 0.06712964599999999,
+          "max": 0.069475636,
+          "robust_cv": 0.013349826739445236
+        },
+        "setup_plus_prefill_s": {
+          "samples": [
+            37.829322180999995,
+            37.91935603500001,
+            37.82628769600001
+          ],
+          "median": 37.829322180999995,
+          "min": 37.82628769600001,
+          "max": 37.91935603500001,
+          "robust_cv": 0.00011892699106407498
+        },
+        "process_wall_s": {
+          "samples": [
+            61.312568750996434,
+            61.45918754800368,
+            61.30953391400544
+          ],
+          "median": 61.312568750996434,
+          "min": 61.30953391400544,
+          "max": 61.45918754800368,
+          "robust_cv": 7.33854316415512e-05
+        },
+        "peak_rss_mib": {
+          "samples": [
+            5702.6484375,
+            5702.4296875,
+            5702.6328125
+          ],
+          "median": 5702.6328125,
+          "min": 5702.4296875,
+          "max": 5702.6484375,
+          "robust_cv": 4.0622683875457745e-06
+        }
+      },
+      "Sub0 prior native baseline": {
+        "prefill_tok_s": {
+          "samples": [
+            0.2480191575095008,
+            0.24865859277273267,
+            0.24864913936687508
+          ],
+          "median": 0.24864913936687508,
+          "min": 0.2480191575095008,
+          "max": 0.24865859277273267,
+          "robust_cv": 5.636705423614384e-05
+        },
+        "decode_tok_s": {
+          "samples": [
+            0.24808079067350522,
+            0.2477641072064793,
+            0.24791455702463777
+          ],
+          "median": 0.24791455702463777,
+          "min": 0.2477641072064793,
+          "max": 0.24808079067350522,
+          "robust_cv": 0.0008997329688050488
+        },
+        "setup_s": {
+          "samples": [
+            0.068917783,
+            0.066790869,
+            0.069693768
+          ],
+          "median": 0.068917783,
+          "min": 0.066790869,
+          "max": 0.069693768,
+          "robust_cv": 0.01669344704544559
+        },
+        "setup_plus_prefill_s": {
+          "samples": [
+            52.484223643,
+            52.347308727,
+            52.352199281999994
+          ],
+          "median": 52.352199281999994,
+          "min": 52.347308727,
+          "max": 52.484223643,
+          "robust_cv": 0.00013849918327092628
+        },
+        "process_wall_s": {
+          "samples": [
+            84.89258984600019,
+            84.78987659000268,
+            84.77837758699752
+          ],
+          "median": 84.78987659000268,
+          "min": 84.77837758699752,
+          "max": 84.89258984600019,
+          "robust_cv": 0.00020106671387058202
+        },
+        "peak_rss_mib": {
+          "samples": [
+            5702.5234375,
+            5702.94921875,
+            5702.51953125
+          ],
+          "median": 5702.5234375,
+          "min": 5702.51953125,
+          "max": 5702.94921875,
+          "robust_cv": 1.0155865755702998e-06
+        }
+      },
+      "llama native defaults": {
+        "prefill_tok_s": {
+          "samples": [
+            17.030096122971546,
+            16.899424125083858,
+            17.041074631769117
+          ],
+          "median": 17.030096122971546,
+          "min": 16.899424125083858,
+          "max": 17.041074631769117,
+          "robust_cv": 0.0009557630811797506
+        },
+        "decode_tok_s": {
+          "samples": [
+            4.280760079516745,
+            4.239315929737476,
+            4.202220703977392
+          ],
+          "median": 4.239315929737476,
+          "min": 4.202220703977392,
+          "max": 4.280760079516745,
+          "robust_cv": 0.012973173649576696
+        },
+        "setup_s": {
+          "samples": [
+            0.534614775,
+            0.532951467,
+            0.5229313170000001
+          ],
+          "median": 0.532951467,
+          "min": 0.5229313170000001,
+          "max": 0.534614775,
+          "robust_cv": 0.004627101328159107
+        },
+        "setup_plus_prefill_s": {
+          "samples": [
+            1.297969245,
+            1.3022084489999999,
+            1.2857940050000003
+          ],
+          "median": 1.297969245,
+          "min": 1.2857940050000003,
+          "max": 1.3022084489999999,
+          "robust_cv": 0.004842213230098399
+        },
+        "process_wall_s": {
+          "samples": [
+            3.3588039530004608,
+            3.3865136559979874,
+            3.383574637999118
+          ],
+          "median": 3.383574637999118,
+          "min": 3.3588039530004608,
+          "max": 3.3865136559979874,
+          "robust_cv": 0.0012878061078329616
+        },
+        "peak_rss_mib": {
+          "samples": [
+            6249.5390625,
+            6249.76953125,
+            6250.00390625
+          ],
+          "median": 6249.76953125,
+          "min": 6249.5390625,
+          "max": 6250.00390625,
+          "robust_cv": 5.467289106285794e-05
+        }
+      }
+    }
+  },
+  "kernel_samples": {
+    "format": 2,
+    "exe": "sub0llm-bench-denseq",
+    "power": {
+      "state": "ac",
+      "saver": false
+    },
+    "epochs": 0,
+    "cpu": 0,
+    "seed": 1,
+    "counters": {},
+    "host": "CrogBuntu1",
+    "machine": "x86_64",
+    "system": "Linux 7.0.0-42-generic",
+    "rounds": [
+      {
+        "round": 0,
+        "load": 0.0044,
+        "waited_s": 0.5,
+        "quiet": true,
+        "calibration_start_ns": 2975.5143552311397,
+        "calibration_end_ns": 2976.04950065132
+      },
+      {
+        "round": 1,
+        "load": 0.0044,
+        "waited_s": 0.5,
+        "quiet": true,
+        "calibration_start_ns": 2975.37155963303,
+        "calibration_end_ns": 2976.0214111922096
+      },
+      {
+        "round": 2,
+        "load": 0.0069,
+        "waited_s": 0.5,
+        "quiet": true,
+        "calibration_start_ns": 2975.12542955326,
+        "calibration_end_ns": 2974.75377128954
+      },
+      {
+        "round": 3,
+        "load": 0.0044,
+        "waited_s": 0.5,
+        "quiet": true,
+        "calibration_start_ns": 2975.6582718193704,
+        "calibration_end_ns": 2975.60899956313
+      },
+      {
+        "round": 4,
+        "load": 0.0037,
+        "waited_s": 0.5,
+        "quiet": true,
+        "calibration_start_ns": 2975.86669561442,
+        "calibration_end_ns": 2975.81605839416
+      }
+    ],
+    "samples": {
+      "Q8_0 32x256, hand-written fixed-scale": [
+        5428.915343915341,
+        5428.7684210526295,
+        5430.56084656085,
+        5430.455026455031,
+        5437.3698630137005
+      ],
+      "Q8_0 32x256, denseq": [
+        4778.71555555556,
+        4777.241860465119,
+        4776.03125,
+        4779.851162790699,
+        5049.44339622642
+      ],
+      "Q8_0 32x5120, hand-written fixed-scale": [
+        120205.5,
+        120196.5,
+        120151.5,
+        120168.0,
+        120197.5
+      ],
+      "Q8_0 32x5120, denseq": [
+        120448.1,
+        120478.1,
+        120582.5,
+        120399.272727273,
+        120479.1
+      ],
+      "IQ1_S 32x256, baseline": [
+        9392.30578512397,
+        9387.7520661157,
+        9384.94495412844,
+        9386.14678899082,
+        9386.890909090911
+      ],
+      "IQ1_S 32x256, fused scalar": [
+        5653.5219780219795,
+        5655.45054945055,
+        5652.2475728155305,
+        5656.75862068966,
+        5652.5
+      ],
+      "IQ1_S 32x256, fused native": [
+        647.946659180236,
+        643.778214486244,
+        649.133445945946,
+        648.20550252667,
+        647.0235934664249
+      ],
+      "IQ1_S 32x5120, baseline": [
+        187381.75,
+        187508.66666666698,
+        187773.3,
+        187855.27272727303,
+        187378.6
+      ],
+      "IQ1_S 32x5120, fused scalar": [
+        120498.2,
+        120380.181818182,
+        120475.818181818,
+        120413.0,
+        120441.1
+      ],
+      "IQ1_S 32x5120, fused native": [
+        11743.4891304348,
+        11741.303030303001,
+        11777.623655914,
+        11712.353535353499,
+        11679.6666666667
+      ],
+      "IQ1_S 32x17408, baseline": [
+        642351.25,
+        637314.2,
+        637402.4,
+        637282.2000000001,
+        637632.083333333
+      ],
+      "IQ1_S 32x17408, fused scalar": [
+        410546.08333333296,
+        410719.75,
+        410681.909090909,
+        410567.090909091,
+        410527.66666666704
+      ],
+      "IQ1_S 32x17408, fused native": [
+        40048.5925925926,
+        39764.896551724094,
+        40368.884615384595,
+        39805.185185185204,
+        40040.241379310304
+      ]
+    },
+    "positions": {
+      "Q8_0 32x256, hand-written fixed-scale": [
+        0.1923,
+        0.5,
+        0.7308,
+        0.3462,
+        0.3462
+      ],
+      "Q8_0 32x256, denseq": [
+        0.2692,
+        0.5769,
+        0.6538,
+        0.2692,
+        0.2692
+      ],
+      "Q8_0 32x5120, hand-written fixed-scale": [
+        0.1154,
+        0.6538,
+        0.2692,
+        0.6538,
+        0.7308
+      ],
+      "Q8_0 32x5120, denseq": [
+        0.0385,
+        0.7308,
+        0.3462,
+        0.7308,
+        0.6538
+      ],
+      "IQ1_S 32x256, baseline": [
+        0.6538,
+        0.1923,
+        0.8846,
+        0.8846,
+        0.8077
+      ],
+      "IQ1_S 32x256, fused scalar": [
+        0.7308,
+        0.0385,
+        0.8077,
+        0.8077,
+        0.9615
+      ],
+      "IQ1_S 32x256, fused native": [
+        0.5769,
+        0.1154,
+        0.9615,
+        0.9615,
+        0.8846
+      ],
+      "IQ1_S 32x5120, baseline": [
+        0.4231,
+        0.8846,
+        0.5769,
+        0.4231,
+        0.4231
+      ],
+      "IQ1_S 32x5120, fused scalar": [
+        0.3462,
+        0.8077,
+        0.5,
+        0.5,
+        0.5769
+      ],
+      "IQ1_S 32x5120, fused native": [
+        0.5,
+        0.9615,
+        0.4231,
+        0.5769,
+        0.5
+      ],
+      "IQ1_S 32x17408, baseline": [
+        0.9615,
+        0.2692,
+        0.0385,
+        0.0385,
+        0.0385
+      ],
+      "IQ1_S 32x17408, fused scalar": [
+        0.8846,
+        0.4231,
+        0.1154,
+        0.1923,
+        0.1923
+      ],
+      "IQ1_S 32x17408, fused native": [
+        0.8077,
+        0.3462,
+        0.1923,
+        0.1154,
+        0.1154
+      ]
+    },
+    "calibration_sustained_ns": 3022.03
+  },
+  "real_rows": {
+    "rows": 792,
+    "kernels": [
+      {
+        "kernel": 0,
+        "relative_l2": 1.60658298927e-06,
+        "max_abs": 1.2638304876e-05
+      },
+      {
+        "kernel": 1,
+        "relative_l2": 1.60658298927e-06,
+        "max_abs": 1.2638304876e-05
+      },
+      {
+        "kernel": 2,
+        "relative_l2": 6.02334714003e-07,
+        "max_abs": 2.81501574806e-06
+      }
+    ],
+    "passed": true
+  },
+  "post_profile": {
+    "command": [
+      "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/sub0-iq1s",
+      "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+      "248045,846,198,12675,248046,198,248045,74455,198,248068,271,248069,271",
+      "--projection-threads",
+      "8",
+      "--continuation-steps",
+      "8",
+      "--timings-file",
+      "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/iq1s-post-phases.json",
+      "--iq1s-kernel",
+      "native",
+      "--projection-profile",
+      "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/qwen-perf/iq1s-postprofile.json"
+    ],
+    "binary_sha256": "610c762e87dbd8b477dc259c411f87ed46ab964a1aab3b8992ec833acaab1bc9",
+    "quiet": {
+      "samples": [
+        0.003440725680325305,
+        0.0053141606752110035,
+        0.00437636761487965,
+        0.0034396497811131957,
+        0.0040650406504065045,
+        0.005315822388993121,
+        0.0053125,
+        0.0040650406504065045,
+        0.00437636761487965,
+        0.0050031269543464665
+      ],
+      "seconds": 10
+    },
+    "process": {
+      "elapsed_s": 29.354165691998787,
+      "peak_rss_mib": 5702.23828125,
+      "output_sha256": "547104935044379c9bdf5e0bac3631100a94e9f0a949b792a6d6614ef0c131fd"
+    },
+    "background_global": 0.002577978523947503,
+    "background_selected": 0.0002129199846697611,
+    "profile": {
+      "schema": "qwen-projection-profile-1",
+      "entries": [
+        {
+          "phase": "prefill",
+          "type": 8,
+          "calls": 1248,
+          "failures": 0,
+          "encoded_bytes": 325877760,
+          "logical_flops": 613416960,
+          "wall_ms": 36.355974
+        },
+        {
+          "phase": "prefill",
+          "type": 10,
+          "calls": 91,
+          "failures": 0,
+          "encoded_bytes": 872202240,
+          "logical_flops": 5316280320,
+          "wall_ms": 289.409075
+        },
+        {
+          "phase": "prefill",
+          "type": 11,
+          "calls": 13,
+          "failures": 0,
+          "encoded_bytes": 7101952000,
+          "logical_flops": 33056358400,
+          "wall_ms": 2756.718195
+        },
+        {
+          "phase": "prefill",
+          "type": 16,
+          "calls": 767,
+          "failures": 0,
+          "encoded_bytes": 9523937280,
+          "logical_flops": 73882664960,
+          "wall_ms": 5274.07586
+        },
+        {
+          "phase": "prefill",
+          "type": 17,
+          "calls": 273,
+          "failures": 0,
+          "encoded_bytes": 3408404480,
+          "logical_flops": 23582474240,
+          "wall_ms": 2072.534344
+        },
+        {
+          "phase": "prefill",
+          "type": 18,
+          "calls": 156,
+          "failures": 0,
+          "encoded_bytes": 861020160,
+          "logical_flops": 4498391040,
+          "wall_ms": 390.772992
+        },
+        {
+          "phase": "prefill",
+          "type": 19,
+          "calls": 3432,
+          "failures": 0,
+          "encoded_bytes": 46645248000,
+          "logical_flops": 477647339520,
+          "wall_ms": 2478.226304
+        },
+        {
+          "phase": "prefill",
+          "type": 21,
+          "calls": 13,
+          "failures": 0,
+          "encoded_bytes": 29286400,
+          "logical_flops": 136314880,
+          "wall_ms": 12.658133
+        },
+        {
+          "phase": "prefill",
+          "type": 22,
+          "calls": 117,
+          "failures": 0,
+          "encoded_bytes": 2510643200,
+          "logical_flops": 15676211200,
+          "wall_ms": 1363.093777
+        },
+        {
+          "phase": "prefill",
+          "type": 23,
+          "calls": 26,
+          "failures": 0,
+          "encoded_bytes": 72417280,
+          "logical_flops": 272629760,
+          "wall_ms": 20.333681
+        },
+        {
+          "phase": "prefill",
+          "type": 29,
+          "calls": 325,
+          "failures": 0,
+          "encoded_bytes": 3444080640,
+          "logical_flops": 31488737280,
+          "wall_ms": 2917.059702
+        },
+        {
+          "phase": "decode",
+          "type": 8,
+          "calls": 768,
+          "failures": 0,
+          "encoded_bytes": 200540160,
+          "logical_flops": 377487360,
+          "wall_ms": 21.963139
+        },
+        {
+          "phase": "decode",
+          "type": 10,
+          "calls": 56,
+          "failures": 0,
+          "encoded_bytes": 536739840,
+          "logical_flops": 3271557120,
+          "wall_ms": 181.3599
+        },
+        {
+          "phase": "decode",
+          "type": 11,
+          "calls": 8,
+          "failures": 0,
+          "encoded_bytes": 4370432000,
+          "logical_flops": 20342374400,
+          "wall_ms": 1704.407654
+        },
+        {
+          "phase": "decode",
+          "type": 16,
+          "calls": 472,
+          "failures": 0,
+          "encoded_bytes": 5860884480,
+          "logical_flops": 45466255360,
+          "wall_ms": 3257.736749
+        },
+        {
+          "phase": "decode",
+          "type": 17,
+          "calls": 168,
+          "failures": 0,
+          "encoded_bytes": 2097479680,
+          "logical_flops": 14512291840,
+          "wall_ms": 1275.48956
+        },
+        {
+          "phase": "decode",
+          "type": 18,
+          "calls": 96,
+          "failures": 0,
+          "encoded_bytes": 529858560,
+          "logical_flops": 2768240640,
+          "wall_ms": 241.641209
+        },
+        {
+          "phase": "decode",
+          "type": 19,
+          "calls": 2112,
+          "failures": 0,
+          "encoded_bytes": 28704768000,
+          "logical_flops": 293936824320,
+          "wall_ms": 1522.983012
+        },
+        {
+          "phase": "decode",
+          "type": 21,
+          "calls": 8,
+          "failures": 0,
+          "encoded_bytes": 18022400,
+          "logical_flops": 83886080,
+          "wall_ms": 7.796492
+        },
+        {
+          "phase": "decode",
+          "type": 22,
+          "calls": 72,
+          "failures": 0,
+          "encoded_bytes": 1545011200,
+          "logical_flops": 9646899200,
+          "wall_ms": 842.167001
+        },
+        {
+          "phase": "decode",
+          "type": 23,
+          "calls": 16,
+          "failures": 0,
+          "encoded_bytes": 44564480,
+          "logical_flops": 167772160,
+          "wall_ms": 12.497974
+        },
+        {
+          "phase": "decode",
+          "type": 29,
+          "calls": 200,
+          "failures": 0,
+          "encoded_bytes": 2119434240,
+          "logical_flops": 19377684480,
+          "wall_ms": 1803.931761
+        }
+      ]
+    },
+    "phases": {
+      "schema": "qwen-phase-1",
+      "workers": 8,
+      "context_capacity": 128,
+      "prompt_tokens": 13,
+      "decode_evaluations": 8,
+      "weight_bytes_per_eval": 5764050576,
+      "projection_flops_per_eval": 51247841280,
+      "setup_ms": 68.608269,
+      "batched_prefill": false,
+      "f32_attention": true,
+      "prefill_ms": [
+        1400.25562,
+        1373.471241,
+        1376.986786,
+        1376.888877,
+        1376.917182,
+        1387.576927,
+        1384.76861,
+        1385.81689,
+        1383.792752,
+        1385.472904,
+        1384.762759,
+        1392.59981,
+        1388.124196
+      ],
+      "decode_ms": [
+        1385.771472,
+        1391.093333,
+        1387.564753,
+        1387.497423,
+        1393.670251,
+        1389.305954,
+        1395.004926,
+        1397.259439
+      ],
+      "top_ids": [
+        8678,
+        198,
+        3710,
+        248046,
+        198,
+        248045,
+        248068,
+        198,
+        248068,
+        198,
+        248046,
+        271,
+        12675,
+        1017,
+        0,
+        248046,
+        198,
+        248045,
+        248046,
+        198,
+        248045
+      ]
+    }
+  }
+}

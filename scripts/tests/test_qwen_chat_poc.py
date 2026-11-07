@@ -26,6 +26,16 @@ class ChatTest(unittest.TestCase):
         self.assertIn("assistant\nHello<|im_end|>",chat.render([("user","Hi"),("assistant","Hello"),("user","Again")]))
 
     @patch.object(chat.subprocess, "run")
+    def test_explicit_kernel_reaches_inspection_and_decode_while_default_omits_it(self, run):
+        self.assertNotIn("--iq1s-kernel",self.session().base)
+        run.side_effect=self.backend
+        session=chat.Session("backend","model","tokenizer",8,1,"native")
+        session.turn("Hi")
+        for call in run.call_args_list:
+            args=call.args[0]
+            self.assertEqual(args[args.index("--iq1s-kernel")+1],"native")
+
+    @patch.object(chat.subprocess, "run")
     def test_success_commits_reply_and_eos_reason_then_reset(self, run):
         run.side_effect = self.backend
         session=self.session()

@@ -44,5 +44,94 @@ activation precision or weight values.
   SIMD passes the unchanged independent gate (worst relative L2 0.0000794629).
   Fused scalar is bit-identical to the migrated baseline at all sixteen positions.
 
-Timing results will be appended after staged, interleaved runs. This note does not yet claim a speed win
-or establish full-window quality beyond the tested positions.
+## Controlled performance result
+
+Measured 2026-11-07 on CrogBuntu1, Ryzen 9 8945HX, eight physical cores 0–7. Same downloaded GGUF,
+13 prompt tokens and eight additional greedy evaluations, EOS ignored for fixed-count measurement.
+One discarded warm-up per arm, then three rotating rounds. All twelve measured samples are untainted.
+
+
+| Backend | Prompt tokens/s | Generated tokens/s | Setup + prefill s | Peak RSS GiB |
+|---|---:|---:|---:|---:|
+| Sub0 IQ1_S fused native | 0.733382 | 0.730649 | 17.796 | 5.569 |
+| Sub0 IQ1_S fused scalar | 0.344265 | 0.342910 | 37.829 | 5.569 |
+| Sub0 prior native baseline | 0.248649 | 0.247915 | 52.352 | 5.569 |
+| llama native defaults | 17.030096 | 4.239316 | 1.298 | 6.103 |
+
+The native candidate improves prompt processing **2.949×** and generation **2.947×**.
+The remaining clean llama.cpp generation gap is **5.802×**; prompt processing remains **23.221×** behind.
+Peak RSS remains about 5.57 GiB, below the existing 8 GiB budget.
+
+| Backend | Three prompt rates | Three generation rates | Generation robust CV |
+|---|---|---|---:|
+| Sub0 IQ1_S fused native | 0.733382, 0.731820, 0.735820 | 0.730649, 0.729162, 0.736161 | 0.302% |
+| Sub0 IQ1_S fused scalar | 0.344265, 0.343441, 0.344309 | 0.342910, 0.342176, 0.343003 | 0.040% |
+| Sub0 prior native baseline | 0.248019, 0.248659, 0.248649 | 0.248081, 0.247764, 0.247915 | 0.090% |
+| llama native defaults | 17.030096, 16.899424, 17.041075 | 4.280760, 4.239316, 4.202221 | 1.297% |
+
+The independent correctness records are bound to the final candidate SHA256
+`610c762e87dbd8b477dc259c411f87ed46ab964a1aab3b8992ec833acaab1bc9`.
+The experiment freezes source commit `e107997`, generated profiles, all executable/library/model hashes,
+thread environment, power, governor and calibration. The source tree stayed clean throughout sampling.
+Complete phase times, every raw sample, setup/wall/RSS, calibration and identities are retained in
+[raw evidence](qwen27b_iq1s_evidence.json). Reproduce with the committed comparison driver and its embedded
+`experiment.manifest`, updating local artifact paths. No automatic regression baseline was accepted.
+
+This retains the baseline comparison’s limits: serial Sub0Llm prefill versus batched llama.cpp prefill,
+float versus quantized activations, requested context 128 versus llama.cpp’s padded 256, short workload
+and synthetic post-EOS continuation. All four arms produced the same nine predicted IDs here; that does
+not establish corpus quality or full-window parity.
+
+## Kernel measurements and remaining cost
+
+Five interleaved calibrated rounds, CPU 0, warm-cache 32-row slices. Native benchmark uses Clang 21.1.8,
+`SUB0MATH_NATIVE_ARCH=ON` and the shared rig’s contraction-disabled floating-point options. End-to-end
+candidate is a separate `-O3 -march=native -fopenmp` build, validated independently above. Microkernel
+ratios are not model token rates.
+
+| Width | Baseline median ns | Fused scalar ns | Fused native ns | Native speedup |
+|---:|---:|---:|---:|---:|
+| 256 | 9386.9 | 5653.5 | 647.9 | 14.49× |
+| 5120 | 187508.7 | 120441.1 | 11741.3 | 15.97× |
+| 17408 | 637402.4 | 410567.1 | 40040.2 | 15.92× |
+
+Post-change attribution is diagnostic, not a separate speed trial. Remaining decode shares are:
+
+| Format | Complete decode wall share |
+|---|---:|
+| IQ2_XXS | 29.28% |
+| IQ1_M | 16.21% |
+| Q3_K | 15.32% |
+| IQ1_S | 13.69% |
+| IQ2_XS | 11.46% |
+| IQ2_S | 7.57% |
+| IQ3_XXS | 2.17% |
+| Q2_K | 1.63% |
+| Q8_0 | 0.20% |
+| IQ4_XS | 0.11% |
+| IQ3_S | 0.07% |
+
+IQ1_S’s share falls from ~71% to ~14%. The next target is the remaining scalar float dot/decode path,
+led by IQ2_XXS, IQ1_M and Q3_K. Preserve fused scalar as the bit-identical reference/fallback; evaluate
+vector reduction for the remaining formats and direct packed kernels where the profile warrants them.
+The final goal remains the [performance campaign](QWEN27B_CAMPAIGN.md), not this one-format gain.
+
+## Try the candidate in the chat proving ground
+
+The existing default backend stays preserved while broader context/quality qualification proceeds.
+The chat launcher now forwards an explicit experimental kernel choice; omitting it preserves compatibility
+with the original backend. On this machine:
+
+```sh
+python3 scripts/qwen_chat_poc.py --backend out/build/qwen-perf/sub0-iq1s --iq1s-kernel native
+```
+
+The measured candidate also completed the real two-turn chat smoke test: `Hi` → `Hi there!`,
+then `Repeat my first message.` → `Hi`, both ending at EOS; prompt accounting grew from 13 to 31 tokens.
+The launcher’s explicit kernel forwarding and default omission are covered by its regression tests.
+
+For a fresh build, compile `tools/sub0llm-dense-token.cpp` against the generated dense Qwen profile
+with OpenMP and native CPU flags; its frontend/simdjson link dependencies match the existing mapped PoC.
+The benchmark executable and raw evidence retain exact command/artifact identities for the measured build.
+Promote a proven kernel through generated configuration after broader qualification; the runtime knob
+is explicitly temporary. This increment does not silently replace the preserved production artifact.

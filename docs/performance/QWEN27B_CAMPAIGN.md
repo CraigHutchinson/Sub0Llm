@@ -59,3 +59,4 @@ measurements or change system policy to manufacture a roofline claim.
 |---|---|---|
 | Baseline #56 / PR #57 | merged | Controlled four-arm comparison and raw samples |
 | Projection attribution #58 | complete | [Two real-model runs](QWEN27B_PROJECTION_PROFILE.md): ~99.2% projections, ~71% IQ1_S; unchanged logits |
+| IQ1_S #60 | measured candidate | [2.95× end-to-end gain](IQ1S_ITERATION.md); unchanged activations, broader promotion qualification remains |
