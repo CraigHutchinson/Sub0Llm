@@ -23,15 +23,23 @@ def tooling_script():
     return Path(__file__).resolve().parent.parent / "bench_check.py"
 
 
-def atomic_write_text(path, text):
-    """Writes `text` to `path` through a temp file in the same directory, so a reader never sees half a file."""
+def atomic_write_text(path, text, *, overwrite=True):
+    """Publish complete text atomically. With overwrite=False an existing path is never replaced.
+
+    No-clobber publication uses a hard link in the same directory; unsupported filesystems refuse
+    rather than fall back to a racy exists/replace sequence. Existing callers keep replace semantics.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        os.replace(tmp, path)
+        if overwrite:
+            os.replace(tmp, path)
+        else:
+            os.link(tmp, path)
+            os.unlink(tmp)
     except BaseException:
         try:
             os.unlink(tmp)

@@ -12,7 +12,7 @@ class ShimTest(unittest.TestCase):
     def test_help_lists_every_command(self):
         result = subprocess.run([sys.executable, str(SHIM), "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for command in ("run", "check", "baseline", "auto", "accept", "gate", "install-hooks", "note-checkout"):
+        for command in ("run", "check", "baseline", "auto", "accept", "gate", "install-hooks", "note-checkout", "workload"):
             self.assertIn(command, result.stdout)
 
     def test_missing_arguments_are_a_usage_error(self):

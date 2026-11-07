@@ -77,6 +77,7 @@ still read; they lack calibration and spread, so judging falls back to the suite
 import argparse
 import contextlib
 import os
+import sys
 from pathlib import Path
 
 from . import levels, platform_proc, plan as planning, power, speed
@@ -223,8 +224,13 @@ def measure_and_judge(args):
 
 
 def main():
+    # Keep the legacy benchmark parser/commands unchanged; workload evidence has its own
+    # schema and budgets, reached through the same entry point used by all consumers.
+    if sys.argv[1:2] == ["workload"]:
+        from .workload import main as workload_main
+        return workload_main(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["run", "check", "baseline", "auto", "accept", "gate", "install-hooks", "note-checkout", "selftest", "power"])
+    parser.add_argument("command", choices=["run", "check", "baseline", "auto", "accept", "gate", "install-hooks", "note-checkout", "selftest", "power", "workload"])
     parser.add_argument("--exe", help="benchmark executable (run, auto)")
     parser.add_argument("--out", help="samples file to write (run; optional for auto)")
     parser.add_argument("--results", help="samples file from `run` (check, baseline)")

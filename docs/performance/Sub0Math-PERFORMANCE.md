@@ -667,3 +667,79 @@ Deficiencies against the hand-written reference, kept until closed or accepted w
 | 2026-10-16 | A zero-length branch in `closestPoint(Segment)` measured within noise in this repository's pair, but cost about 1.5x in Sub0Physics' clearance (465 to 552 ns, budget gate) | Consumer gate, then an A/B with the guard removed | A branch-free `max(length², smallest normal)` divisor fixed the consumer (464 ns) but left this pair 1.06x behind the hand-written kernel. So the check moved out: `closestPoint(Segment)` keeps its non-zero-length precondition (parity again), and `Capsule`, the one shape that can be a point, handles that case. Lesson: a change to a hot vocabulary function is measured in its consumers too, and robustness goes where it is needed, not into every caller's inner loop |
 | 2026-10-16 | `std::optional` results in a hot query loop stay in memory on GCC 16: 1.7x on a terrain height lookup, and `optional<float>` is no better | Sub0Physics `page height x1024` | Hot-path queries return a plain aggregate with a status (`HeightSample`); see STYLE_GUIDE. `intersect(Ray, Triangle)` still returns an optional; it is at parity in its pair, where hits are rare. Revisit it with a hit-heavy consumer |
 | 2026-10-16 | The pre-push gate blocked a Python-and-docs-only commit: every benchmark ran 7–28% slower than the previous local record, hand-written references included, with only 4.5% of it explained by the clock | Gate comparison against the record of the parent commit | Hand-written references became environment controls (median change factored out; shift reported). A real +30% on one library benchmark is still caught (+32.7% judged, pair ratio 1.30x) |
+
+## Whole-process workload evidence
+
+A calibrated kernel gate cannot certify a complete invocation's memory budget or that two runs used
+identical data/configuration. The shared adapter adds these checks without introducing a parallel,
+weaker timing judge:
+
+```sh
+python tools/perf/bench_check.py workload measure --spec experiment.json --repo . --out build/evidence-001.json &&
+python tools/perf/bench_check.py workload check --results build/evidence-001.json --max-rss-mib 512
+```
+
+The spec uses argument arrays (no shell), explicit executable paths, nonempty caller-defined identity,
+and named input files. Paths are relative to the spec file, except absolute paths. Example shape
+(replace the executable and input paths with real ones):
+
+```json
+{
+  "command": ["./build/Benchmark", "--filter", "kernel"],
+  "correctness": ["./build/IndependentVerifier"],
+  "identity": {"workload": "fixed fixture", "workers": 1, "precision": "f32"},
+  "inputs": {"data": "fixtures/data.bin", "config": "fixtures/config.json"},
+  "cache": "uncontrolled",
+  "environment": {"OMP_NUM_THREADS": "1"}
+}
+```
+
+`measure` requires at least three samples. The declared independent correctness command must exit zero
+before any measured invocation. Its adequacy remains the caller's responsibility; a successful run
+or listing alone is not a numerical oracle. Each child is bounded by `--timeout` (120 seconds by
+default); timeout/interruption kills its process group and reaps the child. Current RSS collection
+requires Linux `wait4`; other platforms return a structured refusal, not an estimate. RSS is each
+invocation's child high-water mark in MiB, independent of earlier verifier/warmup processes. It is not
+simultaneous aggregate process-tree memory, device memory, or a working-set planner.
+
+The adapter reuses sub0perf's shared repository lock for input hashing, verification, priming and
+measurement, plus its load/power/provenance helpers. It refuses busy rounds above 5% (rather than
+silently measuring them), simulated/untrusted/changing power, failed commands, timeouts, and input,
+spec or executable changes. Unknown power remains labelled. Locking one checkout cannot prevent
+foreign workloads; the load check is not exclusive CPU ownership. `cache: warm` performs one priming
+invocation; `uncontrolled` makes no residency guarantee. Verified cold capture is unsupported.
+
+Records (`sub0perf-workload-1`) retain input/executable SHA256, verifier identity/arguments, explicit
+threading environment, allowed CPU affinity, host/power, source commit/dirty flag, all per-child RSS
+and elapsed samples, output digests, and method/spec identities. Hash large inputs completely before
+and after the run; this I/O happens outside timed samples, inside the shared lock, and can be expensive.
+Scripts and verifier data must be declared as inputs; interpreter hashing alone cannot identify them.
+Caller-declared environment values are stored, so do not put secrets there. Other inherited environment
+is not exhaustive; declare consequential settings. A dirty source tree is diagnostic, not a reviewed
+baseline or proof of which source built an executable. New evidence paths are published atomically
+without overwriting existing paths, including concurrent publishers. No-clobber publication requires
+hard-link support on the output filesystem; it refuses if unavailable.
+
+`check --baseline earlier.json` first refuses incompatible identity/input hashes, verifier identity or
+arguments, cache/warmup method, adapter/timer method, threading environment, affinity, host or power.
+The measured binary may differ between arms; a stable independent verifier must not. Supply the same
+argument/input paths across arms. The worst measured RSS is checked against the explicitly chosen
+absolute budget; there is no automatic budget acceptance.
+
+**Agent/automation contract:** `bench_check.py workload` emits exactly one JSON outcome on stdout
+for an action, including missing/invalid arguments and runtime refusals; helper diagnostics go to
+stderr. `--help` remains human-readable. Outcomes have schema `sub0perf-workload-outcome-1`, a `status`,
+`elapsed_verdict: unjudged`, and `next_action`. Status/exit codes are:
+
+| Status | Exit | Meaning |
+|---|---|---|
+| `recorded` | 0 | Complete evidence published; check its memory budget next |
+| `within-budget` | 0 | RSS budget satisfied; optional compatibility check matched |
+| `over-budget` | 1 | Observed RSS exceeded the explicit budget |
+| `refused` | 2 | Arguments, evidence, oracle, environment or execution invalid; includes `error` |
+
+Neither exit zero nor RSS success is a time-performance pass. Elapsed covers the whole process,
+including startup, with a 10 ms polling bound. It is diagnostic and uncalibrated. Existing
+`run`/`auto`/`gate` timing judgments, confirmation, reproduction and explicit acceptance are unchanged.
+Keep domain-specific quality, denominator, phase, cache and memory-pressure policies in the consumer;
+this shared layer supplies evidence/provenance and absolute RSS checking only.

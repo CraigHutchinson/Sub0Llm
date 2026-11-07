@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/CraigHutchinson/Sub0Math",
-  "commit": "1d20313cbd2ff2753620246b81934d0489a0636f",
+  "commit": "3152af9f92ff9abb3f53eaa6487392ea94ae53a1",
   "files": [
     {
       "upstream": "tools/perf/bench_check.py",
@@ -30,12 +30,12 @@
     {
       "upstream": "tools/perf/sub0perf/cli.py",
       "path": "tools/perf/sub0perf/cli.py",
-      "sha256": "e1ec8b28ae89c3d86819518f623a1e154dd471c8c6a2ba663c9c3d2b1de4c41a"
+      "sha256": "18649ecbfcc71e76c8cccc361bcfc90d8787f1111ebd7cd58955fdf11cf3047b"
     },
     {
       "upstream": "tools/perf/sub0perf/common.py",
       "path": "tools/perf/sub0perf/common.py",
-      "sha256": "d5283b2c2f6e3e4d653a2a5c5480d79d00a3fd29b12714d655bd151e6309d6c8"
+      "sha256": "bfd43d47f34497389c9dabcbf5c7d5d5fb0e95849356d87b8e202c71f6b5ef30"
     },
     {
       "upstream": "tools/perf/sub0perf/confirm.py",
@@ -220,7 +220,7 @@
     {
       "upstream": "tools/perf/sub0perf/tests/test_shim.py",
       "path": "tools/perf/sub0perf/tests/test_shim.py",
-      "sha256": "e12d3dd1e82bdc75fc33d51a30525bf4b93188ef8e4ad997dd2f6f1e1c217861"
+      "sha256": "50fc1d9d69fa3872a8caeacb13408fa79c2b7d82c46b9863283e89c8960e9d90"
     },
     {
       "upstream": "tools/perf/sub0perf/tests/test_speed.py",
@@ -255,12 +255,27 @@
     {
       "upstream": "docs/PERFORMANCE.md",
       "path": "docs/performance/Sub0Math-PERFORMANCE.md",
-      "sha256": "6765a95329c3a9c259ee5beb6bf4f8276313f1042bf0dea10d097af6e1840be2"
+      "sha256": "c22677587ff317c022ef768b75926cd2213b51e86485685da5737b282eec4b34"
     },
     {
       "upstream": "LICENSE.md",
       "path": "tools/perf/LICENSE.Sub0Math.md",
       "sha256": "2cb4d29b56a5114c402f5cdd9cea422e4e31377d64dc14c6e0d1096b7069337a"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/workload.py",
+      "path": "tools/perf/sub0perf/workload.py",
+      "sha256": "be3e291b05c0f230a50ec96a041b46c249b9cfd1b284261655ef99ceb4350994"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_workload.py",
+      "path": "tools/perf/sub0perf/tests/test_workload.py",
+      "sha256": "dea38d57455334c159f0fb309349c7c04888ba29e0c4e48f5d64a053042b6108"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_common.py",
+      "path": "tools/perf/sub0perf/tests/test_common.py",
+      "sha256": "78a0c3b6e5e47a55a504cf35cac823a589d4dedd814c16cfee7f18a0890e8c16"
     }
   ]
 }
