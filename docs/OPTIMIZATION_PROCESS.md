@@ -1,5 +1,9 @@
 # How optimization work is done in Sub0Llm
 
+**2026-11-07 workflow adoption:** [PERFORMANCE.md](PERFORMANCE.md) is the entry point for the pinned
+Sub0Math `sub0perf` rig, quick/full iteration commands, baseline and evidence contracts. The detailed
+model-specific recipes below remain applicable; historical host figures are not portable measurements.
+
 **Status: PROCESS. Binding on all performance work.** Adapted from `Sub0h264`'s proven practice
 (`docs/optimization/execution_plan.md` and `docs/optimization/opportunities/` in that repo), which
 carries substantially more optimization investment than this project does, plus the two rules this
