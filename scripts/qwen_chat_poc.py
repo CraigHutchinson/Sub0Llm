@@ -9,8 +9,10 @@ from pathlib import Path
 
 
 def render(messages):
-    """Verified plain text user/assistant ChatML subset; no tools, vision or thinking options."""
-    return "".join(f"<|im_start|>{role}\n{content}<|im_end|>\n" for role, content in messages) + "<|im_start|>assistant\n"
+    """Embedded template subset: enable_thinking=False, preserve_thinking=False, text only."""
+    if not messages or messages[-1][0] != "user" or any(role not in ("user", "assistant") for role, _ in messages):
+        raise ValueError("chat transcript must contain user/assistant text and end with a user")
+    return "".join(f"<|im_start|>{role}\n{content.strip()}<|im_end|>\n" for role, content in messages) + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
 class Session:
@@ -19,10 +21,12 @@ class Session:
                      "--projection-threads", str(threads), "--continuation-steps", str(maximum - 1)]
         self.messages = []
         self.last_context = None
+        self.last_result = None
 
     def reset(self):
         self.messages.clear()
         self.last_context = None
+        self.last_result = None
 
     def turn(self, user):
         pending = self.messages + [("user", user)]
@@ -46,6 +50,10 @@ class Session:
                 response = output.read_bytes().decode("utf-8")
             except UnicodeDecodeError as error:
                 raise RuntimeError("response cap ended inside a UTF-8 character; increase the token cap") from error
+        finished = re.search(rb"TEXT_RESULT generated=(\d+) finish=(eos|length)", completed.stdout)
+        if finished is None:
+            raise RuntimeError("backend omitted completion diagnostics; rebuild the backend")
+        self.last_result = {"generated_tokens": int(finished.group(1)), "finish_reason": finished.group(2).decode("ascii")}
         self.messages = pending + [("assistant", response)]
         self.last_context = context
         return response
@@ -84,7 +92,7 @@ def main():
             continue
         try:
             response = session.turn(text)
-            print(json.dumps({"assistant": response, "messages": len(session.messages)}, ensure_ascii=False), flush=True)
+            print(json.dumps({"assistant": response, "messages": len(session.messages), **session.last_result}, ensure_ascii=False), flush=True)
         except (RuntimeError, OSError) as error:
             print(json.dumps({"error": str(error)}), flush=True)
             if scripted is not None:

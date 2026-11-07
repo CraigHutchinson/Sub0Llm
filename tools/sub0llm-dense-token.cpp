@@ -62,6 +62,7 @@ int main(int argc,char** argv) try {
     if(!text_mode && !response_file.empty())throw std::runtime_error("response file requires text mode");
     const std::size_t prompt_size=tokens.size();tokens.reserve(prompt_size+generate);
     std::vector<int> generated;
+    bool stopped_eos=false;
     std::size_t position=0;
     auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(dump_prefix=="-")return;const std::string path=dump_prefix+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
     Layer initial(reader,0,projection_threads);const auto* emb=reader.find_tensor("token_embd.weight");
@@ -129,11 +130,12 @@ int main(int argc,char** argv) try {
     std::printf("mapped sequence inference: position=%zu input=%d layers=%d logits=%zu top_token=%zu top_logit=%.9g; raw token interface\n",position,token,N_LAYERS,logits.size(),static_cast<std::size_t>(best-logits.begin()),*best);
     if(text_mode && position+1>=prompt_size) {
         const int next=static_cast<int>(best-logits.begin());
-        if(next==tokenizer.eos_id()) {std::printf("text stop: EOS\n");break;}
+        if(next==tokenizer.eos_id()) {stopped_eos=true;std::printf("text stop: EOS\n");break;}
         generated.push_back(next);std::printf("text continuation: %s\n",tokenizer.decode(generated).c_str());std::fflush(stdout);
     }
     if(position+1==tokens.size() && tokens.size()<prompt_size+static_cast<std::size_t>(generate))tokens.push_back(static_cast<int>(best-logits.begin()));
     }
+    if(text_mode)std::printf("TEXT_RESULT generated=%zu finish=%s\n",generated.size(),stopped_eos?"eos":"length");
     if(!response_file.empty()){
         const std::string decoded=tokenizer.decode(generated);FILE* f=std::fopen(response_file.c_str(),"wb");if(!f)throw std::runtime_error("response file open");
         const bool ok=std::fwrite(decoded.data(),1,decoded.size(),f)==decoded.size();const int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("response file write");
