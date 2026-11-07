@@ -230,3 +230,5 @@ docs/       design notes (tokenizer, configure + workflow architecture, CUDA rev
 are headed: from the current tiny-fluency + knowledge-scale lines toward conversational competence,
 reasoning, tool use, and — as the stretch goal — agentic C++ coding, via a family of small,
 purpose-sized models rather than one large dense one.
+
+Performance iteration uses the shared Sub0Math `sub0perf` rig: see [the codified workflow](docs/PERFORMANCE.md).

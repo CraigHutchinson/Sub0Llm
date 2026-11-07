@@ -1,0 +1,266 @@
+{
+  "repository": "https://github.com/CraigHutchinson/Sub0Math",
+  "commit": "1d20313cbd2ff2753620246b81934d0489a0636f",
+  "files": [
+    {
+      "upstream": "tools/perf/bench_check.py",
+      "path": "tools/perf/bench_check.py",
+      "sha256": "64b26b3dd655b58712893bb15f3afc989039c659c8e6a9f7c8f599719d99564f"
+    },
+    {
+      "upstream": "tools/perf/profile.py",
+      "path": "tools/perf/profile.py",
+      "sha256": "65f95884c5b5b5c8589833cdf9933b86a7babedf2792041667476fce974855e3"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/__init__.py",
+      "path": "tools/perf/sub0perf/__init__.py",
+      "sha256": "dea5cb138e982094ebc34d19b9d00a2f6a9ff1ed3ed98b70c60a9749908a3caa"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/accept.py",
+      "path": "tools/perf/sub0perf/accept.py",
+      "sha256": "84cba700c380a9f379a99665fafbdafc6cb0825139464a32697d2a11c9e9cb0c"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/baseline.py",
+      "path": "tools/perf/sub0perf/baseline.py",
+      "sha256": "5acda30c784a83c5fbfb13d816a9223d06a54aa2ad0f7e24abbaff6c18944dae"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/cli.py",
+      "path": "tools/perf/sub0perf/cli.py",
+      "sha256": "e1ec8b28ae89c3d86819518f623a1e154dd471c8c6a2ba663c9c3d2b1de4c41a"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/common.py",
+      "path": "tools/perf/sub0perf/common.py",
+      "sha256": "d5283b2c2f6e3e4d653a2a5c5480d79d00a3fd29b12714d655bd151e6309d6c8"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/confirm.py",
+      "path": "tools/perf/sub0perf/confirm.py",
+      "sha256": "363ae878da8ad8f8f69054c893930ba277fe7bffba2602b60819afcafd64a380"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/deferral.py",
+      "path": "tools/perf/sub0perf/deferral.py",
+      "sha256": "ee76ce979d1a81bd11d4089d5deff9eec0810e570eb1cba8f1d0d7b3d24c8414"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/gate.py",
+      "path": "tools/perf/sub0perf/gate.py",
+      "sha256": "5c4a263e0b4ddc603d7ca800f2982cbc08f877f6452e4aad44ff115f8e22670e"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/gitstate.py",
+      "path": "tools/perf/sub0perf/gitstate.py",
+      "sha256": "f203f5b8a3fefe86d560d25830a848766db992bfc35f36d502237ef46a517f45"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/hooks.py",
+      "path": "tools/perf/sub0perf/hooks.py",
+      "sha256": "ea2b41bbd30fa8ab2e9381d24e107c575f35de4c884fde5576333b1d67bf5bb6"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/judge.py",
+      "path": "tools/perf/sub0perf/judge.py",
+      "sha256": "1200ef66031f2d290000283249a933ad44be6881bb27e9c30bd6a9a56653e043"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/levels.py",
+      "path": "tools/perf/sub0perf/levels.py",
+      "sha256": "a00aa499ebc86f19e95c9f0c13ae4c9baefeda94f254bf50562fa63350d909b7"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/load.py",
+      "path": "tools/perf/sub0perf/load.py",
+      "sha256": "528c9c3bf542875fd78c48feb846d92274fdfcca7db4b5caf3690e122fe207e9"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/lock.py",
+      "path": "tools/perf/sub0perf/lock.py",
+      "sha256": "293e3522767b5ed6147ce44679a81e51ca3b2cba3bd642247a09de28b43267ed"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/pins.py",
+      "path": "tools/perf/sub0perf/pins.py",
+      "sha256": "5211af4c332993cee7f64d257d494afd24e941ff21de26b16f75fcf13453fda6"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/plan.py",
+      "path": "tools/perf/sub0perf/plan.py",
+      "sha256": "cfba058a0a227d24b10b7fb2501008ea437137457df2cda32aed1c306e3bd151"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/platform_proc.py",
+      "path": "tools/perf/sub0perf/platform_proc.py",
+      "sha256": "09399413039bebca0732e6a3454ce9e27a4776eb1142f8b22895c94cca620e9a"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/power.py",
+      "path": "tools/perf/sub0perf/power.py",
+      "sha256": "6f69e85b38847d42b595ce95fcf91e0e628d74454075fffd433be90b607155d7"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/report.py",
+      "path": "tools/perf/sub0perf/report.py",
+      "sha256": "4e7b3a7b28f845bf92c04c705075419bdf6cf48fa27a3f8e0cd45cd233399b4b"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/reproduce.py",
+      "path": "tools/perf/sub0perf/reproduce.py",
+      "sha256": "6782c3f0ca9fba6c4e78cdce21e9f00dfeda451957a81b5eb61a268243f45ba0"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/runner.py",
+      "path": "tools/perf/sub0perf/runner.py",
+      "sha256": "496451d498499abdcb7aab2ea866224dcea1b793572a59c629a0286ddd211cbd"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/selftest.py",
+      "path": "tools/perf/sub0perf/selftest.py",
+      "sha256": "cc742507cb39aa7fc94b50847b40edef9405551cccda67e6a8a9d1ee7fc39222"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/speed.py",
+      "path": "tools/perf/sub0perf/speed.py",
+      "sha256": "c8dff3879d10d1442eb6b48fac707cb296c42c6a4e647e5fc52dad34c629f42d"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/stats.py",
+      "path": "tools/perf/sub0perf/stats.py",
+      "sha256": "3b9d3de06a9835ef544154dcd305900475364dea64b6f950fca67e9184bf1318"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/__init__.py",
+      "path": "tools/perf/sub0perf/tests/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/helpers.py",
+      "path": "tools/perf/sub0perf/tests/helpers.py",
+      "sha256": "c2284ee1828ea671906b3d80ff1581adeb716293af13feecb608b7ac721b778d"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_accept.py",
+      "path": "tools/perf/sub0perf/tests/test_accept.py",
+      "sha256": "17271d4831675769bf64550bf5a07303ebe9200f0d94432a3c5bfe8bb115fce7"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_baseline.py",
+      "path": "tools/perf/sub0perf/tests/test_baseline.py",
+      "sha256": "f6d046509e088c224d62d5b986f2280682213211b3c4c32341abfa7219534c29"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_confirm.py",
+      "path": "tools/perf/sub0perf/tests/test_confirm.py",
+      "sha256": "c502b91d0ce812f6d58381ad055bfd8323d3c563d0e882ce55129339725cac25"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_gate.py",
+      "path": "tools/perf/sub0perf/tests/test_gate.py",
+      "sha256": "e61a3cff2bab2e2d1b81f2a8c00e60f99830e3c8589827fefe2cf8babee7896e"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_gitstate.py",
+      "path": "tools/perf/sub0perf/tests/test_gitstate.py",
+      "sha256": "89ea2962519fedb3e924d95ba0c7566fb87853febf87e96fed26f1870bf3d321"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_hooks.py",
+      "path": "tools/perf/sub0perf/tests/test_hooks.py",
+      "sha256": "188b1fab0d8a271b6a59c68218aa2ca65fc40c8304c330989cbae87ab985b841"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_judge.py",
+      "path": "tools/perf/sub0perf/tests/test_judge.py",
+      "sha256": "c860faa66da2eb2a5d90f487499f45a9759b5f621ef48420a8df2930bb69529a"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_levels.py",
+      "path": "tools/perf/sub0perf/tests/test_levels.py",
+      "sha256": "d3884a29b570e6ddf4db856ab829e52f44ecf5c41138b0e7469f3c31678fa155"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_lock.py",
+      "path": "tools/perf/sub0perf/tests/test_lock.py",
+      "sha256": "f995093ff1e751aaacba8bd68d119c4d2c8d2b6f0e982803fdfb4ff6d1701710"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_pins.py",
+      "path": "tools/perf/sub0perf/tests/test_pins.py",
+      "sha256": "4b3f3a5db4e9befa4242b867c3290e252e9c7c4e12e32092bf7e9694dcd0564a"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_plan.py",
+      "path": "tools/perf/sub0perf/tests/test_plan.py",
+      "sha256": "91afe09ef2b763c4a91b91e9903459417441647565bff8dc64241ef93f0b5929"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_power.py",
+      "path": "tools/perf/sub0perf/tests/test_power.py",
+      "sha256": "ef6dbe6914e1c9cef01d3f1d8699bf7b5427b7c4633e99de4c3326b2b5e988cb"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_reproduce.py",
+      "path": "tools/perf/sub0perf/tests/test_reproduce.py",
+      "sha256": "468e41561d197560354bd2b5ddc4005f2c36e174dec485c007d8e3c54ccf0c08"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_runner.py",
+      "path": "tools/perf/sub0perf/tests/test_runner.py",
+      "sha256": "1a30c2b98fbd2d725fff03297914b991d75e532f4761c05d4b7e9c676651e133"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_selftest.py",
+      "path": "tools/perf/sub0perf/tests/test_selftest.py",
+      "sha256": "a614bedfa2c6bd1a3d52f39382abdd2cc4b1cf4189044e909fba7816c4eb775d"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_shim.py",
+      "path": "tools/perf/sub0perf/tests/test_shim.py",
+      "sha256": "e12d3dd1e82bdc75fc33d51a30525bf4b93188ef8e4ad997dd2f6f1e1c217861"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_speed.py",
+      "path": "tools/perf/sub0perf/tests/test_speed.py",
+      "sha256": "19be6c73d17d2271b635ac1ab12bb57866a011fe2c2caba3bf958423ae76beaa"
+    },
+    {
+      "upstream": "tools/perf/sub0perf/tests/test_stats.py",
+      "path": "tools/perf/sub0perf/tests/test_stats.py",
+      "sha256": "00619087594ae5cca8256e6147a1f09d9a7da0ed88fddc7b335b2271e36025cd"
+    },
+    {
+      "upstream": "tools/perf/vectorization_report.py",
+      "path": "tools/perf/vectorization_report.py",
+      "sha256": "e87bdc9853761691dbe00fe8ef928a548d310a36fff03e063696f1f8c20d974a"
+    },
+    {
+      "upstream": "tools/perf/bench_runner.hpp",
+      "path": "tools/perf/bench_runner.hpp",
+      "sha256": "045f81fccdab50627cef46da6d106fca11dfaab4da2437c5f2cc9910fc9f0fd3"
+    },
+    {
+      "upstream": "cmake/Sub0MathTooling.cmake",
+      "path": "cmake/Sub0MathTooling.cmake",
+      "sha256": "9063edb8c1ee4ace8781a4cae6543f616006568282487f38f91b5074847b109d"
+    },
+    {
+      "upstream": "tests/vendor/nanobench.h",
+      "path": "tests/vendor/nanobench.h",
+      "sha256": "2cfcdd57044fd0ee11d1be2b5dc545781b05c36049613c0089a73b332afd8c4d"
+    },
+    {
+      "upstream": "docs/PERFORMANCE.md",
+      "path": "docs/performance/Sub0Math-PERFORMANCE.md",
+      "sha256": "6765a95329c3a9c259ee5beb6bf4f8276313f1042bf0dea10d097af6e1840be2"
+    },
+    {
+      "upstream": "LICENSE.md",
+      "path": "tools/perf/LICENSE.Sub0Math.md",
+      "sha256": "2cb4d29b56a5114c402f5cdd9cea422e4e31377d64dc14c6e0d1096b7069337a"
+    }
+  ]
+}

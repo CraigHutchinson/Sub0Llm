@@ -1,0 +1,31 @@
+name: Performance workflow
+on:
+  push:
+    branches: [main]
+    paths: ['tools/perf/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
+  pull_request:
+    paths: ['tools/perf/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
+permissions:
+  contents: read
+jobs:
+  tooling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/check_sub0perf_vendor.py
+      - run: python -m unittest discover -s tools/perf
+      - name: Build and verify real benchmark protocol
+        run: |
+          cmake -S . -B out/perf-ci -DSUB0_PERF_ONLY=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_STANDARD=26 -DSUB0MATH_PERF_ON_BUILD=OFF -DSUB0MATH_PERF_GIT_HOOKS=OFF
+          cmake --build out/perf-ci -j2
+          ctest --test-dir out/perf-ci --output-on-failure
+      - name: Full calibrated sampling (diagnostic on shared hosted hardware)
+        run: python tools/perf/bench_check.py run --exe out/perf-ci/sub0llm-bench-denseq --out out/perf-ci/perf/samples.json --rounds 3 --settle 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sub0perf-samples
+          path: out/perf-ci/perf/samples.json

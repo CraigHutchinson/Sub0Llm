@@ -1,6 +1,10 @@
 {
     "version": 8,
-    "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
+    },
     "configurePresets": [
         {
             "name": "base",
@@ -19,14 +23,18 @@
             "displayName": "Debug",
             "description": "Unoptimized build with debug info; generic CPU.",
             "inherits": "base",
-            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
         },
         {
             "name": "release",
             "displayName": "Release (portable)",
             "description": "Optimized build that runs on any x86-64 CPU. Use when the build host differs from the run host.",
             "inherits": "base",
-            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
         },
         {
             "name": "native",
@@ -37,23 +45,68 @@
                 "CMAKE_BUILD_TYPE": "Release",
                 "SUB0_NATIVE": "ON"
             }
+        },
+        {
+            "name": "perf",
+            "displayName": "Shared sub0perf iteration",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "SUB0_PERF_ONLY": "ON"
+            }
+        },
+        {
+            "name": "perf-profile",
+            "inherits": "perf",
+            "cacheVariables": {
+                "SUB0MATH_PROFILE_FLAGS": "ON",
+                "SUB0MATH_PERF_ON_BUILD": "OFF"
+            }
         }
     ],
     "buildPresets": [
-        { "name": "debug",   "configurePreset": "debug" },
-        { "name": "release", "configurePreset": "release" },
-        { "name": "native",  "configurePreset": "native" }
+        {
+            "name": "debug",
+            "configurePreset": "debug"
+        },
+        {
+            "name": "release",
+            "configurePreset": "release"
+        },
+        {
+            "name": "native",
+            "configurePreset": "native"
+        },
+        {
+            "name": "perf",
+            "configurePreset": "perf"
+        },
+        {
+            "name": "perf-profile",
+            "configurePreset": "perf-profile"
+        }
     ],
     "testPresets": [
         {
             "name": "native",
             "configurePreset": "native",
-            "output": { "outputOnFailure": true }
+            "output": {
+                "outputOnFailure": true
+            }
         },
         {
             "name": "debug",
             "configurePreset": "debug",
-            "output": { "outputOnFailure": true }
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "perf",
+            "configurePreset": "perf",
+            "output": {
+                "outputOnFailure": true
+            }
         }
     ]
 }

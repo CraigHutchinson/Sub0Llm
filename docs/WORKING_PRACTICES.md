@@ -1,5 +1,9 @@
 # Working practices — how this project is worked on
 
+**2026-11-07 workflow adoption:** [PERFORMANCE.md](PERFORMANCE.md) is the entry point for the pinned
+Sub0Math `sub0perf` rig, quick/full iteration commands, baseline and evidence contracts. The detailed
+model-specific recipes below remain applicable; historical host figures are not portable measurements.
+
 Standing directions from the project owner, the measurement and delegation habits that came out of real
 mistakes, and the environment traps of the dev machine. Until 2026-11-05 most of this lived only in an AI
 agent's local memory, which does not travel with the repository. It is written here so any session on any
