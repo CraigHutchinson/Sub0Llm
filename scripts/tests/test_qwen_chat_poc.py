@@ -69,3 +69,23 @@ class ChatTest(unittest.TestCase):
             session=self.session()
             with self.assertRaises(RuntimeError):session.turn("Hi")
             self.assertEqual(session.messages, [])
+
+    @patch.object(chat.subprocess, "run")
+    def test_only_final_completion_diagnostic_is_accepted(self, run):
+        def with_quoted_diagnostic(args, **kwargs):
+            result=self.backend(args, **kwargs)
+            if "--inspect-context" not in args:
+                result.stdout=b"TEXT_RESULT generated=100 finish=length\nquoted text\nTEXT_RESULT generated=1 finish=eos\n"
+            return result
+        run.side_effect=with_quoted_diagnostic
+        session=self.session();session.turn("Hi")
+        self.assertEqual(session.last_result, {"generated_tokens":1,"finish_reason":"eos"})
+
+    def test_cli_can_use_local_model_default_for_context_inspection(self):
+        import contextlib
+        import io
+        import sys
+        output=io.StringIO()
+        with patch.object(sys,"argv",[str(path),"--turn","/context"]),contextlib.redirect_stdout(output):
+            self.assertEqual(chat.main(),0)
+        self.assertIn('"messages": 0',output.getvalue())

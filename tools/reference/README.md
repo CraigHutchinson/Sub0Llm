@@ -84,3 +84,11 @@ This command returns 0 only when every requested complete finite vector passes, 
 failure, and 2 on invalid/missing data. Use it as a declared workload correctness command; checking
 only the first position is insufficient. The expected vocabulary size is explicit. Tests in
 `tools/reference/tests` exercise late failures, absent/nonfinite/mismatched dumps and invalid limits.
+
+
+The token capture harness accepts `MODEL.gguf PREFIX [COMMA_SEPARATED_TOKENS [THREADS]]`; workers
+are 1..8 (default two). Invalid counts are rejected before loading a model. For the chat PoC,
+`check_chat_template.py TOKENIZER_DIR/chat_template.jinja` renders the actual exported template in
+Jinja2's sandbox with `enable_thinking=False,preserve_thinking=False` and checks the supported
+one/three-message and Unicode/whitespace cases against the wrapper. Jinja2 is a dev-only dependency;
+the runtime wrapper remains stdlib-only. The legacy format-detection API is not a full Jinja oracle.

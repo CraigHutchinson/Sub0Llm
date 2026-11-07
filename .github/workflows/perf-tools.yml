@@ -2,9 +2,9 @@ name: Performance workflow
 on:
   push:
     branches: [main]
-    paths: ['tools/perf/**', 'tools/reference/**', 'tools/perf_extensions/**', 'perf/workloads/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
+    paths: ['tools/perf/**', 'scripts/qwen_chat_poc.py', 'scripts/tests/**', 'tools/sub0llm-dense-token.cpp', 'tools/sub0llm-export-tokenizer.cpp', 'tools/dense_qwen_support.hpp', 'tools/reference/**', 'tools/perf_extensions/**', 'perf/workloads/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
   pull_request:
-    paths: ['tools/perf/**', 'tools/reference/**', 'tools/perf_extensions/**', 'perf/workloads/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
+    paths: ['tools/perf/**', 'scripts/qwen_chat_poc.py', 'scripts/tests/**', 'tools/sub0llm-dense-token.cpp', 'tools/sub0llm-export-tokenizer.cpp', 'tools/dense_qwen_support.hpp', 'tools/reference/**', 'tools/perf_extensions/**', 'perf/workloads/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
 permissions:
   contents: read
 jobs:

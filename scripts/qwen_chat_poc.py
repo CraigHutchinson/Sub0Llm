@@ -50,7 +50,7 @@ class Session:
                 response = output.read_bytes().decode("utf-8")
             except UnicodeDecodeError as error:
                 raise RuntimeError("response cap ended inside a UTF-8 character; increase the token cap") from error
-        finished = re.search(rb"TEXT_RESULT generated=(\d+) finish=(eos|length)", completed.stdout)
+        finished = re.search(rb"(?:^|\n)TEXT_RESULT generated=(\d+) finish=(eos|length)\n\Z", completed.stdout)
         if finished is None:
             raise RuntimeError("backend omitted completion diagnostics; rebuild the backend")
         self.last_result = {"generated_tokens": int(finished.group(1)), "finish_reason": finished.group(2).decode("ascii")}
@@ -62,10 +62,11 @@ class Session:
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("model", type=Path)
+    local_model = root.parent.parent / "Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf"
+    parser.add_argument("model", type=Path, nargs="?", default=local_model, help="GGUF model; defaults to the sibling Models download")
     parser.add_argument("--backend", type=Path, default=root / "out/build/qwen35-native/sub0llm-dense-token")
     parser.add_argument("--tokenizer-dir", type=Path, default=root / "out/build/qwen35-native/tokenizer")
-    parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=8)
     parser.add_argument("--turn", action="append", help="Scripted turn or /reset or /context; repeatable")
     args = parser.parse_args()
