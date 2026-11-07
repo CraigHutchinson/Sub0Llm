@@ -60,3 +60,27 @@ Final maximum absolute error is 1.04904e-5 across 5120 values. Reproduce the fin
 The ordinary, unmodified reference still differs by 0.797% because its activation quantization differs;
 that remains the expected measured numerical limit of this float-activation proving ground.
 This verifies token 1543 at position zero through one layer, not multi-token recurrence or later layers.
+
+
+## Full-sequence F32 attention gate (2026-11-07)
+
+The pinned llama.cpp `src/llama-graph.cpp::build_attn_mha` casts F32 K/V inputs to F16 when flash
+attention is enabled. F32 cache settings alone do not prevent this. The all-layer/token harness now
+sets `cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_DISABLED`; combine it with the scalar diagnostic patch,
+`GGML_CPU_REPACK=OFF`, and F32 KV caches. Confirm the run log says `flash_attn = disabled`.
+The existing GDN-only first-layer checks do not execute ordinary attention and are unaffected.
+
+A nine-position plain ChatML diagnostic now passes unchanged Sub0Llm outputs at every position, with
+worst relative-logit L2 3.44317e-5 at the unchanged 0.001 threshold. Automatic flash attention had
+produced three failures above 0.001; those were cross-precision comparisons, not evidence of state
+corruption. Complete results and scope are in `docs/QWEN27B_NATIVE_TOKEN.md`.
+
+```sh
+python3 tools/reference/compare_sequence.py ACTUAL_PREFIX REFERENCE_PREFIX \
+  --positions 9 --expected-values 248320 --max-relative-l2 0.001
+```
+
+This command returns 0 only when every requested complete finite vector passes, 1 on numerical
+failure, and 2 on invalid/missing data. Use it as a declared workload correctness command; checking
+only the first position is insufficient. The expected vocabulary size is explicit. Tests in
+`tools/reference/tests` exercise late failures, absent/nonfinite/mismatched dumps and invalid limits.
