@@ -1,31 +1,61 @@
 // Mapped full-model raw-token sequence proving ground, with persistent GDN/KV state.
 #include "dense_qwen_support.hpp"
 #include <charconv>
+#include "sub0/qwen_tokenizer.hpp"
+#include <CLI/CLI.hpp>
+#include <filesystem>
 using namespace sub0::dense_probe;
 int main(int argc,char** argv) try {
-    if(argc<2||argc>5){std::fprintf(stderr,"usage: %s MODEL.gguf [TOKEN_IDS [DUMP_PREFIX [CONTINUATION_STEPS]]]\n",argv[0]);return 2;}
+    std::string model,prompt="1543",dump_prefix="-",text;
+    std::string tokenizer_dir=(std::filesystem::path(argv[0]).parent_path()/"tokenizer").string();
+    int generate=0;
+    CLI::App app{"Mapped Qwen raw-token or text sequence proving ground"};
+    app.add_option("model",model,"GGUF model")->required();
+    auto* raw_option=app.add_option("tokens",prompt,"Comma-separated raw token IDs (default 1543)");
+    app.add_option("dump,--dump-prefix",dump_prefix,"Dump prefix, or - to disable");
+    app.add_option("steps,--continuation-steps",generate,"Greedy feedback positions after prompt")->check(CLI::Range(0,SEQ_LEN));
+    auto* text_option=app.add_option("--text",text,"Literal prompt text; no chat template or implicit special tokens");
+    app.add_option("--tokenizer-dir",tokenizer_dir,"Tokenizer exported from this GGUF");
+    try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
+    const bool text_mode=text_option->count()!=0;
+    if(text_mode&&raw_option->count())throw std::runtime_error("choose text or raw token input");
     static_assert(sub0::GDN_DIMS.output_gate_silu && USE_ATTENTION_GATE && !sub0::USE_MOE);
+    sub0::qwen_tok::Tokenizer tokenizer;
     std::vector<int> tokens;
-    const std::string prompt=argc>=3?argv[2]:"1543";
     std::size_t begin=0;
-    while(begin<=prompt.size()) {
+    if(!text_mode) while(begin<=prompt.size()) {
         const auto end=prompt.find(',',begin);const auto stop=end==std::string::npos?prompt.size():end;
         int id=-1;const auto result=std::from_chars(prompt.data()+begin,prompt.data()+stop,id);
         if(result.ec!=std::errc{}||result.ptr!=prompt.data()+stop||id<0||id>=VOCAB)throw std::runtime_error("invalid token");
         tokens.push_back(id);if(end==std::string::npos)break;begin=end+1;
     }
-    int generate=0;
-    if(argc==5){const std::string n=argv[4];auto r=std::from_chars(n.data(),n.data()+n.size(),generate);if(r.ec!=std::errc{}||r.ptr!=n.data()+n.size()||generate<0)throw std::runtime_error("invalid generation count");}
-    if(tokens.size()>SEQ_LEN || static_cast<std::size_t>(generate)>SEQ_LEN-tokens.size())throw std::runtime_error("context window exceeded");
-    const std::size_t prompt_size=tokens.size();tokens.reserve(prompt_size+generate);
-    sub0::FileMap file;std::string error;if(!file.open(argv[1],error))throw std::runtime_error(error);
+    if(!text_mode && (tokens.size()>SEQ_LEN || static_cast<std::size_t>(generate)>SEQ_LEN-tokens.size()))
+        throw std::runtime_error("context window exceeded");
+    sub0::FileMap file;std::string error;if(!file.open(model,error))throw std::runtime_error(error);
     const sub0::gguf::Reader reader({file.data(),file.size()});
     const auto* arch=reader.find("general.architecture");if(!reader.ok()||!arch||arch->s!="qwen35")throw std::runtime_error("requires qwen35 GGUF");
     const auto* epsilon=reader.find("qwen35.attention.layer_norm_rms_epsilon");
-    if(!epsilon || epsilon->kind!=sub0::gguf::Value::Kind::Float || std::abs(epsilon->f-1e-6)>1e-12)
-        throw std::runtime_error("requires qwen35 RMS epsilon 1e-6");
+    if(!epsilon || epsilon->kind!=sub0::gguf::Value::Kind::Float || std::abs(epsilon->f-1e-6)>1e-12)throw std::runtime_error("requires qwen35 RMS epsilon 1e-6");
+    if(text_mode){
+        const std::filesystem::path dir=tokenizer_dir;
+        if(!tokenizer.load((dir/"vocab.json").string(),(dir/"merges.txt").string(),(dir/"tokenizer_config.json").string(),&error))throw std::runtime_error(error);
+        const auto* eos=reader.find("tokenizer.ggml.eos_token_id");
+        if(!eos || (eos->kind!=sub0::gguf::Value::Kind::UInt && eos->kind!=sub0::gguf::Value::Kind::Int))throw std::runtime_error("missing model EOS");
+        const auto model_eos=eos->kind==sub0::gguf::Value::Kind::UInt?eos->u:static_cast<std::uint64_t>(eos->i);
+        if(static_cast<std::uint64_t>(tokenizer.eos_id())!=model_eos)throw std::runtime_error("tokenizer EOS differs from model");
+        const auto* types=reader.find("tokenizer.ggml.token_type");
+        if(!types || static_cast<std::size_t>(tokenizer.vocab_size())!=static_cast<std::size_t>(std::count_if(types->ia32.begin(),types->ia32.end(),[](int type){return type!=5;})))
+            throw std::runtime_error("tokenizer vocabulary differs from model");
+        tokenizer.encode(text,tokens);
+        std::fprintf(stderr,"text prompt tokens:");for(int id:tokens)std::fprintf(stderr," %d",id);std::fprintf(stderr,"\n");
+    }
+    if(tokens.empty())throw std::runtime_error("empty prompt");
+    for(int id:tokens)if(id<0||id>=VOCAB)throw std::runtime_error("token outside model vocabulary");
+    if(tokens.size()>SEQ_LEN || static_cast<std::size_t>(generate)>SEQ_LEN-tokens.size())throw std::runtime_error("context window exceeded");
+    const std::size_t prompt_size=tokens.size();tokens.reserve(prompt_size+generate);
+    std::vector<int> generated;
     std::size_t position=0;
-    auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(argc<4 || std::string(argv[3])=="-")return;const std::string path=std::string(argv[3])+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
+    auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(dump_prefix=="-")return;const std::string path=dump_prefix+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
     Layer initial(reader);const auto* emb=reader.find_tensor("token_embd.weight");
     if(!emb||emb->dims.size()!=2||emb->dims[0]!=D_MODEL||emb->dims[1]!=VOCAB)throw std::runtime_error("embedding dimensions");
     const auto spec=sub0::gguf::block_spec(emb->type_raw);auto decode=sub0::gguf::dequant_fn(emb->type_raw);
@@ -89,6 +119,11 @@ int main(int argc,char** argv) try {
     for(float v:logits)if(!std::isfinite(v))throw std::runtime_error("nonfinite logits");
     dump(".logits",logits);const auto best=std::max_element(logits.begin(),logits.end());
     std::printf("mapped sequence inference: position=%zu input=%d layers=%d logits=%zu top_token=%zu top_logit=%.9g; raw token interface\n",position,token,N_LAYERS,logits.size(),static_cast<std::size_t>(best-logits.begin()),*best);
+    if(text_mode && position+1>=prompt_size) {
+        const int next=static_cast<int>(best-logits.begin());
+        if(next==tokenizer.eos_id()) {std::printf("text stop: EOS\n");break;}
+        generated.push_back(next);std::printf("text continuation: %s\n",tokenizer.decode(generated).c_str());std::fflush(stdout);
+    }
     if(position+1==tokens.size() && tokens.size()<prompt_size+static_cast<std::size_t>(generate))tokens.push_back(static_cast<int>(best-logits.begin()));
     }
 } catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}

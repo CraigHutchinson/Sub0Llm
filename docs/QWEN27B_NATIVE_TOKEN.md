@@ -106,3 +106,26 @@ headers/library, no diagnostic patch needed for tokenization). This is sample co
 vocabulary or chat-template validation. The mapped runner still accepts raw IDs; direct text/chat
 integration is the next step. Signed GGUF metadata arrays are retained with length validation; the
 full frontend suite passes 220412 assertions / 327 cases after this change.
+
+## Literal text input and decoded output
+
+After exporting this model's tokenizer, the mapped runner accepts `--text` and decodes greedy
+predictions. For the durable build, tokenizer defaults to the sibling `tokenizer/` directory:
+
+```sh
+out/build/qwen35-native/sub0llm-dense-token MODEL.gguf --text 'Hi'
+out/build/qwen35-native/sub0llm-dense-token MODEL.gguf --text 'Hi' --continuation-steps 1
+```
+
+Use `--tokenizer-dir DIRECTORY` for another export location, and `--dump-prefix PREFIX` for numeric
+dumps. Raw positional IDs/dump/continuation arguments remain supported. Text and raw IDs are mutually
+exclusive; empty prompts and context overflow are rejected. EOS predictions stop text generation and
+are not included in decoded continuation. Vocabulary count and EOS are checked against GGUF metadata;
+use tokenizer files exported from the same model. No chat template or implicit BOS is added.
+
+Verified `Hi` -> ID 12675 -> next ID 11 -> decoded comma. All 248320 logits match the independent
+float-activation reference at relative L2 8.83061e-5 and max absolute 0.00204515. Existing raw-sequence
+checks remain documented above. The runner now links the existing frontend and CLI11 libraries;
+prefer the explicit CMake target for rebuilding. Direct compile requires the same frontend/simdjson
+libraries and CLI11 headers as the project. Structured chat templating/service and broader EOS/context
+behavior remain follow-ups under #43.
