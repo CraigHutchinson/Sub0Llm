@@ -16,3 +16,6 @@ set_tests_properties(sub0llm-perf-workload PROPERTIES WORKING_DIRECTORY "${PROJE
 
 add_test(NAME sub0llm-reference-gates COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s tools/reference/tests)
 set_tests_properties(sub0llm-reference-gates PROPERTIES WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+add_test(NAME sub0llm-chat-state COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s scripts/tests)
+set_tests_properties(sub0llm-chat-state PROPERTIES WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")

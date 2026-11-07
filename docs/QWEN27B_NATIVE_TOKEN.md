@@ -122,8 +122,8 @@ Independent llama.cpp tokenization agrees on the four checked samples: `Hello, w
 9419,11,1814,0), contractions/digits/newlines, multilingual text with emoji, and chat special tokens.
 The reference harness is `tools/reference/tokenize_llama.cpp` (compile against the pinned llama.cpp
 headers/library, no diagnostic patch needed for tokenization). This is sample coverage, not exhaustive
-vocabulary or chat-template validation. The mapped runner still accepts raw IDs; direct text/chat
-integration is the next step. Signed GGUF metadata arrays are retained with length validation; the
+vocabulary or chat-template validation. The mapped runner accepts raw IDs and literal text; the bounded chat wrapper uses the verified
+non-thinking template subset in `docs/QWEN_CHAT_POC.md`. Signed GGUF metadata arrays are retained with length validation; the
 full frontend suite passes 220412 assertions / 327 cases after this change.
 
 ## Literal text input and decoded output
@@ -145,5 +145,5 @@ use tokenizer files exported from the same model. No chat template or implicit B
 Verified `Hi` -> ID 12675 -> next ID 11 -> decoded comma. The prior literal-text oracle figures used auto-flash and are superseded by the corrected sequence
 check above. Existing raw-sequence behavior remains available. The runner now links the existing frontend and CLI11 libraries;
 prefer the explicit CMake target for rebuilding. Direct compile requires the same frontend/simdjson
-libraries and CLI11 headers as the project. Structured chat templating/service and broader EOS/context
-behavior remain follow-ups under #43.
+libraries and CLI11 headers as the project. The console chat/context proving ground and actual EOS examples are documented in
+`docs/QWEN_CHAT_POC.md`; resident service and general engine-loader integration remain separate.

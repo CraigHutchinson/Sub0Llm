@@ -33,6 +33,10 @@ int main(int argc,char**argv) try {
     }
     vocab<<'}';config<<"}}";rules<<"#version: 0.2\n";for(const auto& merge:merges->sa)rules<<merge<<'\n';
     vocab.close();rules.close();config.close();if(!vocab||!rules||!config)throw std::runtime_error("tokenizer write failure");
+    if(const auto* chat=reader.find("tokenizer.chat_template");chat && chat->kind==sub0::gguf::Value::Kind::String){
+        std::ofstream chat_file(dir/"chat_template.jinja",std::ios::binary);chat_file<<chat->s;chat_file.close();
+        if(!chat_file)throw std::runtime_error("chat template write failure");
+    }
     sub0::qwen_tok::Tokenizer tokenizer;
     if(!tokenizer.load((dir/"vocab.json").string(),(dir/"merges.txt").string(),(dir/"tokenizer_config.json").string(),&error))throw std::runtime_error(error);
     std::printf("embedded tokenizer loaded: vocab=%d eos=%d pad=%d\n",tokenizer.vocab_size(),tokenizer.eos_id(),tokenizer.pad_id());

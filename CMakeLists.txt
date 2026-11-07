@@ -336,7 +336,7 @@ add_executable(sub0llm-model-probe EXCLUDE_FROM_ALL tools/sub0llm-model-probe.cp
 add_executable(sub0llm-dense-layer EXCLUDE_FROM_ALL tools/sub0llm-dense-layer.cpp)
 target_include_directories(sub0llm-dense-layer PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 add_executable(sub0llm-dense-token EXCLUDE_FROM_ALL tools/sub0llm-dense-token.cpp)
-target_link_libraries(sub0llm-dense-token PRIVATE sub0llm_frontend CLI11::CLI11)
+target_link_libraries(sub0llm-dense-token PRIVATE sub0llm_frontend CLI11::CLI11 ${SUB0_OPENMP_TARGET})
 target_include_directories(sub0llm-dense-token PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 target_link_libraries(sub0llm-model-probe PRIVATE sub0llm_core)
 target_include_directories(sub0llm_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")

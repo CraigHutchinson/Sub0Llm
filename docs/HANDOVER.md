@@ -1,5 +1,22 @@
 # Handover — resuming the Qwen4-Next work in a new session or on a new machine
 
+## Local dense 27B milestone — 2026-11-07
+
+The downloaded Qwen3.8-27B has a working bounded console chat PoC on CrogBuntu1. Start with
+[QWEN_CHAT_POC.md](QWEN_CHAT_POC.md): the default script finds the existing sibling Models download
+and uses preserved `out/build/qwen35-native/` artifacts. Actual turns: `Hi` -> `Hi there!`, then
+`Repeat my first message.` -> `Hi`; both ended at EOS. Context accounting, reset and overflow refusal
+are verified. Six CTest checks and the full 16-position independent F32 logit gate pass; one complete
+turn observed 5.60 GiB RSS under the declared 8 GiB budget. #43/PR #47 owns this milestone.
+
+#54/PR #55 corrected the reference's automatic-flash F16 casts; no production arithmetic or numerical
+tolerance changed. This is a 128-position mapped proving ground with process-per-turn replay,
+not the general engine loader or a resident server. Broader integration/performance is still #29;
+quant module work remains incremental under #18. Use [PERFORMANCE.md](PERFORMANCE.md) for new
+correctness/performance/memory iterations. The older handover below describes the separate
+Qwen4-Next/MoE track and its historical host measurements.
+
+
 Performance-workflow update (2026-11-07, #48): start with [PERFORMANCE.md](PERFORMANCE.md).
 It codifies the pinned Sub0Math `sub0perf` rig and the `perf`/`perf-profile` presets.
 
