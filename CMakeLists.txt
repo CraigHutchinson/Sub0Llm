@@ -231,6 +231,8 @@ target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0llm_frontend)
 # no CLI11 dependency -- it takes one plain --gguf <dir> argument), same "reads only what a design pass
 # needs, never a bulk payload load" reasoning as sub0llm-tokenizer above.
 add_executable(sub0llm-backbone-census tools/sub0llm-backbone-census.cpp)
+add_executable(sub0llm-dense-probe tools/sub0llm-dense-probe.cpp)
+target_include_directories(sub0llm-dense-probe PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_include_directories(sub0llm-backbone-census PRIVATE "${CMAKE_SOURCE_DIR}/include")
 
 # WP4c: the offline weight transplant (docs/WP4_SCOPE.md S4). Unusual in exactly one way, and the

@@ -1,6 +1,6 @@
 # Dense models used as-is: quantised-resident weights
 
-Status: DESIGN (nothing implemented). Tracking: issue #15. Facts below were read from the real
+Status: scalar mapped-projection baseline implemented; engine integration pending. Tracking: issue #15. Facts below were read from the real
 `unsloth/Qwen3.8-27B-GGUF` `UD-IQ1_S` file (5.77 GiB) on 2026-11-06 (AGENTS section 9), not recalled.
 
 ## Goal
@@ -53,6 +53,15 @@ is FFN gate/up/down (3.4 GiB, 59%), then `attn_qkv` (479 MiB), `ssm_out`, `attn_
 5. Defaults follow AGENTS section 4: off while evaluated, auto-on for the class it was proven on.
 
 ## Memory budget (to confirm by measurement)
+
+Initial proving ground (2026-11-07): `sub0llm-dense-probe MODEL.gguf TENSOR` maps the GGUF and
+uses `denseq::project` to decode one block at a time into caller-reserved scratch, without expanding
+the matrix. The real Q3_K `output.weight` (5120 x 248320, 546,304,000 encoded bytes) completed with
+256 floats of scratch and peak RSS 568,128 KiB. First/middle/last outputs match a whole-row
+dequantize-then-dot check exactly. Real IQ1_S `blk.0.ffn_gate.weight` and IQ1_M
+`blk.1.attn_gate.weight` also pass those row checks. These checks establish projection ordering and
+bounded scratch; they share the scalar decoders and do not establish independent ggml parity.
+This baseline is not yet connected to engine parameter loading or token generation.
 
 Weights 5.76 GiB + KV/GDN state + activations for one stream. Target well under 29 GiB, leaving the rest for context
 and page cache. Per token the engine reads roughly the file size, so memory bandwidth (about 79 GB/s on this
