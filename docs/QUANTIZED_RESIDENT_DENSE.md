@@ -84,8 +84,11 @@ CPU, `docs/HANDOVER.md`) bounds decode; not yet measured.
   https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py .
   The primitive now accepts `Dims::output_gate_silu`, including backward recomputation and derivative.
   Seven GDN cases pass (1,962 assertions), including finite-difference checks for both activations.
-  Generated-config selection and compatibility discrimination remain before engine inference can
-  select SiLU safely; existing engine configs still select the sigmoid default.
+  The configurator now emits `SUB0_GDN_OUTPUT_SILU`, selected by `gdn-output-silu = 1` in the
+  27B profile. Both engine forward paths receive it through `GDN_DIMS`. Nonlegacy model artifacts
+  append an eight-byte third architecture word; sigmoid artifacts retain their exact prior layout.
+  SiLU checkpoints use v8 with the extra word; legacy checkpoints retain v7. Generated profile and
+  override checks pass. Actual artifact load/rejection tests and whole-engine numerical parity remain.
 
 - Does the dense decode path support Qwen3.5-style GDN + gated FFN at d5120 (the `qwen35` arch)? Run it at the
   smallest scale first.

@@ -199,7 +199,7 @@ constexpr std::uint32_t CKPT_MAGIC   = 0x4B433053u;  // "S0CK"
 // run under a format we no longer test is not something to trust.
 // History, for the record: v2 added best_step, v3 drawn_tokens, v4 drawn_names, v5 the architecture
 // fingerprint. Bump this on any layout change and the guard below does the rest.
-constexpr std::uint32_t CKPT_VERSION = 7u;  // v7 adds the SECOND architecture fingerprint word
+constexpr std::uint32_t CKPT_VERSION = sub0::ARCH_FINGERPRINT3 != 0 ? 8u : 7u;  // v7 adds the SECOND architecture fingerprint word
                                             // (layout.hpp ARCH_FINGERPRINT2 -- currently only Gated
                                             // DeltaNet's stride, always 0 today; see
                                             // docs/GATED_DELTANET.md). A version bump here is safe by
@@ -624,6 +624,7 @@ bool save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     const std::uint64_t nfloat = sub0::trainable_floats();
     wr(os, nfloat);
     wr(os, sub0::ARCH_FINGERPRINT);   // v5+; see CKPT_VERSION
+    if constexpr (sub0::ARCH_FINGERPRINT3 != 0) wr(os, sub0::ARCH_FINGERPRINT3);
     wr(os, sub0::ARCH_FINGERPRINT2);  // v7+; Gated DeltaNet's stride (always 0 today) -- CKPT_VERSION
 
     wr(os, static_cast<std::int64_t>(rs.step));
@@ -728,12 +729,13 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     // outright (a fresh run, not a partial read), so by the time this line runs the field is always
     // present -- unlike engine_core.cpp's model.bin trailer, which DOES tolerate a short/missing read
     // because that format has no version gate at all.
+    const std::uint64_t arch3 = sub0::ARCH_FINGERPRINT3 != 0 ? rd<std::uint64_t>(is) : 0;
     const std::uint64_t arch2 = rd<std::uint64_t>(is);
     if (!ok || nfloat != sub0::trainable_floats()) {
         sub0::log::warn("ignoring checkpoint '{}' (built for a different config)", path);
         return false;
     }
-    if (arch != sub0::ARCH_FINGERPRINT || arch2 != sub0::ARCH_FINGERPRINT2) {
+    if (arch != sub0::ARCH_FINGERPRINT || arch2 != sub0::ARCH_FINGERPRINT2 || arch3 != sub0::ARCH_FINGERPRINT3) {
         const sub0::ArchAxes got = sub0::arch_axes_of(arch);
         const sub0::ArchAxes2 got2 = sub0::arch_axes2_of(arch2);
         sub0::log::warn("ignoring checkpoint '{}': built with a different architecture in a way nfloat "

@@ -312,8 +312,13 @@ inline constexpr int GDN_CONV_DIM  = 2 * GDN_KEY_DIM + GDN_VALUE_DIM;
 // This build's GDN dims, per S3a's mapping: hidden_size=D_MODEL (in AND out -- see gdn_math.hpp's own
 // note on hidden_size playing double duty), with GDN's own four head axes above. Valid (never divides
 // by zero, etc.) even when USE_GATED_DELTANET is false -- it just describes a shape nothing builds.
+// Legacy generated headers omit this macro and retain the sigmoid gate.
+#ifndef SUB0_GDN_OUTPUT_SILU
+#define SUB0_GDN_OUTPUT_SILU 0
+#endif
+inline constexpr bool GDN_OUTPUT_SILU = SUB0_GDN_OUTPUT_SILU != 0;
 inline constexpr gdn::Dims GDN_DIMS{D_MODEL, GDN_K_HEADS, GDN_V_HEADS,
-                                    GDN_K_HEAD_DIM, GDN_V_HEAD_DIM, GDN_CONV_KERNEL};
+                                    GDN_K_HEAD_DIM, GDN_V_HEAD_DIM, GDN_CONV_KERNEL, GDN_OUTPUT_SILU};
 static_assert(GDN_DIMS.conv_dim() == GDN_CONV_DIM,
               "GDN_CONV_DIM must equal gdn::Dims::conv_dim() -- two derivations of one width");
 
@@ -895,6 +900,8 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT2 =
     arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK, QSA_INDEXER_BUDGET,
                       QSA_INDEXER_COMPRESS_RATIO, USE_GATED_DELTANET ? GDN_K_HEADS : 0,
                       ROTARY_DIM == D_HEAD ? 0 : ROTARY_DIM);
+// Optional third word: emitted only for a nonlegacy GDN gate. Default model bytes stay unchanged.
+inline constexpr std::uint64_t ARCH_FINGERPRINT3 = USE_GATED_DELTANET && GDN_OUTPUT_SILU ? 1u : 0u;
 inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0, 0, 0, 0, 0);
 
 // MODEL_ARCH_ID -- the FULL architecture identity: every axis that makes two models different things,
@@ -934,6 +941,7 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(USE_GATED_FFN));
     mix(static_cast<std::uint64_t>(USE_TIED_EMBEDDINGS));
     mix(static_cast<std::uint64_t>(USE_QK_NORM));
+    if constexpr (ARCH_FINGERPRINT3 != 0) mix(ARCH_FINGERPRINT3);
     mix(ARCH_FINGERPRINT);      // folds in LoopSplit's schedule and ROPE_THETA
     mix(static_cast<std::uint64_t>(DEPTH_ATTN_STRIDE));   // adds no parameters; changes computation
     mix(static_cast<std::uint64_t>(ROPE_SCALING));

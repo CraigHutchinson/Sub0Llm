@@ -20,6 +20,9 @@
 //   uint64 tokenizer_fp       which vocab these weights were trained against (0 = unknown)
 //   uint64 arch_fingerprint   the shape-NEUTRAL, computation-changing axes (LoopSplit, ROPE_THETA)
 //   uint64 arch_fingerprint2  the second such word (GDN stride, experts_per_tok, QSA, rotary_dim)
+//   uint64 arch_fingerprint3  optional: present only for nonlegacy GDN activation (SiLU = 1).
+// Legacy sigmoid files retain exactly three trailing records. Extended files have a different
+// total size, so a legacy loader's dtype/size guard rejects them before reading model weights.
 
 #pragma once
 
@@ -69,13 +72,14 @@ enum class ParamDtype : std::int32_t { F32 = 0, BF16 = 1, FP8 = 2 };
 }
 
 // Total on-disk size of a well-formed model file at a given element width: header + blob + the three
-// 8-byte trailers. Used BOTH as a write-side expectation and, on the read side, as an INDEPENDENT
+// 8-byte trailers, plus one for a nonlegacy activation. Used BOTH as a write-side expectation and, on the read side, as an INDEPENDENT
 // cross-check of the declared tag -- see load_model's own comment for why an independent check matters
 // here specifically (the tag lives in bytes that were structure padding in every file written before
 // B24, and padding was never guaranteed to be zero).
 [[nodiscard]] constexpr std::uint64_t model_file_bytes(std::uint64_t header_bytes,
-                                                       std::uint64_t param_floats, int elem_bytes) {
-    return header_bytes + param_floats * static_cast<std::uint64_t>(elem_bytes) + 3u * 8u;
+                                                       std::uint64_t param_floats, int elem_bytes,
+                                                       bool extended_arch = ARCH_FINGERPRINT3 != 0) {
+    return header_bytes + param_floats * static_cast<std::uint64_t>(elem_bytes) + 3u * 8u + (extended_arch ? 8u : 0u);
 }
 
 // NOTE: adding a field here changes sizeof(Header) and breaks resuming EVERY existing checkpoint

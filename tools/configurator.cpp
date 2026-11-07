@@ -613,6 +613,7 @@ int main(int argc, char** argv) {
     // CUDA (backend_cuda.cu keeps its own static_assert) -- so a GDN build works for gen/eval/report but
     // NOT for train/tune. See docs/GATED_DELTANET.md.
     int gdn_full_attn_stride = 0;
+    int gdn_output_silu = 0;
     // Gated DeltaNet's OWN head geometry (WP4b blocker B, docs/WP4_SCOPE.md S2). Until this pass these
     // four were ALIASED onto --kv-heads / --heads / D_HEAD / D_HEAD, which cannot express the real
     // Qwen4-preview model (16 / 48 / 128 / 128 against attention's 2 / 24 / 256). Each is 0 = "alias to
@@ -805,6 +806,7 @@ int main(int argc, char** argv) {
                    "attention). Stage 1: CPU forward only -- gen/eval/report work, train/tune do not "
                    "(no backward pass yet, and no CUDA build)")
        ->capture_default_str()->check(CLI::Range(0, 1024));
+    app.add_option("--gdn-output-silu", gdn_output_silu, "GDN output gate: 0 sigmoid, 1 SiLU (qwen35)")->check(CLI::Range(0, 1));
     app.add_option("--gdn-key-heads", gdn_key_heads,
                    "Gated DeltaNet: linear-attention KEY/query head count, independent of --kv-heads "
                    "(0 = alias to --kv-heads, the previous behaviour). Real Qwen4-preview: 16")
@@ -1220,6 +1222,7 @@ int main(int argc, char** argv) {
         reg("dmodel", d_model);                  reg("layers", n_layers);               reg("heads", n_heads);
         reg("kv-heads", n_kv_heads);             reg("head-dim", head_dim);             reg("rotary-dim", rotary_dim);
         reg("rope-theta", rope_theta);           reg("gdn-full-attn-stride", gdn_full_attn_stride);
+        reg("gdn-output-silu", gdn_output_silu);
         reg("gdn-key-heads", gdn_key_heads);     reg("gdn-value-heads", gdn_value_heads);
         reg("gdn-key-head-dim", gdn_key_head_dim); reg("gdn-value-head-dim", gdn_value_head_dim);
         reg("hc-count", hc_count);               reg("hc-lowrank", hc_lowrank);
@@ -2131,6 +2134,7 @@ int main(int argc, char** argv) {
     // Gated DeltaNet Stage 1: every Nth layer (0-indexed, N = stride) stays softmax attention; the rest
     // become GDN layers (layout.hpp's GDN_SCHEDULE, op_gdn/gdn_math.hpp's CPU forward). 0 = off, every
     // layer softmax attention. See docs/GATED_DELTANET.md.
+    cos << "#define SUB0_GDN_OUTPUT_SILU " << gdn_output_silu << "\n";
     cos << "constexpr int  GDN_FULL_ATTN_STRIDE = " << gdn_full_attn_stride << ";\n";
     // Gated DeltaNet's OWN four head axes (WP4b blocker B, docs/WP4_SCOPE.md S2): the linear-attention
     // key/value head counts and per-head widths, no longer aliased onto N_KV_HEADS/N_HEADS/D_HEAD.

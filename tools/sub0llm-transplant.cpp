@@ -928,6 +928,10 @@ int main(int argc, char** argv) {
         os.write(reinterpret_cast<const char*>(&tok_fp), sizeof tok_fp);
         os.write(reinterpret_cast<const char*>(&arch), sizeof arch);
         os.write(reinterpret_cast<const char*>(&arch2), sizeof arch2);
+        if constexpr (ARCH_FINGERPRINT3 != 0) {
+            const std::uint64_t arch3 = ARCH_FINGERPRINT3;
+            os.write(reinterpret_cast<const char*>(&arch3), sizeof arch3);
+        }
         os.flush();
         if (!os) { std::println(stderr, "error: trailer write failed"); return 4; }
         os.close();

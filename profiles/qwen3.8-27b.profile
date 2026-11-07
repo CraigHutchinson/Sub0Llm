@@ -10,6 +10,7 @@ head-dim = 256
 rotary-dim = 64
 rope-theta = 10000000
 gdn-full-attn-stride = 4
+gdn-output-silu = 1
 gdn-key-heads = 16
 gdn-key-head-dim = 128
 gdn-value-head-dim = 128
