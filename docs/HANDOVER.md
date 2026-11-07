@@ -1,5 +1,12 @@
 # Handover — resuming the Qwen4-Next work in a new session or on a new machine
 
+## Dense 27B all-format candidate — 2026-11-07
+
+[Float reduction iteration](performance/FLOAT_REDUCTION_ITERATION.md), #62: 1.269 prompt /
+1.264 generated tokens/s, another 1.72× over the IQ1_S build at unchanged ~5.57 GiB RSS.
+The clean reference still generates 3.39× faster. New candidate/explicit chat recipe and raw evidence
+are in the report; defaults remain preserved pending #63. Current largest costs are IQ1_S and IQ2_XXS.
+
 ## Dense 27B IQ1_S candidate — 2026-11-07
 
 [IQ1_S iteration](performance/IQ1S_ITERATION.md), #60: native packed float candidate measures
