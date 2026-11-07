@@ -10,3 +10,6 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME sub0llm-perf-tooling COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s tools/perf)
 set_tests_properties(sub0llm-perf-tooling PROPERTIES WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 add_test(NAME sub0llm-perf-provenance COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check_sub0perf_vendor.py")
+
+add_test(NAME sub0llm-perf-workload COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s tools/perf_extensions/tests)
+set_tests_properties(sub0llm-perf-workload PROPERTIES WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")

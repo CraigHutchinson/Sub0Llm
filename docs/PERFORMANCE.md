@@ -112,3 +112,57 @@ Profiler tools must be installed separately; unavailable counters/profilers are 
 verifies vendored provenance, runs upstream synthetic gate tests, builds/checks the real fixture protocol,
 and uploads full-suite three-round samples. Shared hosted CI samples are diagnostics, not a host baseline
 or an enforced hardware performance verdict.
+
+## Sub0Llm workload extensions
+
+The adapter at `tools/perf_extensions/workload.py` reuses the shared lock, load, power, atomic-write
+and Git provenance helpers. It leaves the pinned shared package unchanged. This first extension
+adds correctness-gated workload identities and Linux child peak-RSS budgets, which the kernel gate
+cannot certify. Use the checked-in process smoke example after building the perf preset:
+
+```sh
+python3 tools/perf_extensions/workload.py measure \
+  --spec perf/workloads/denseq-process.json --repo . --out out/denseq-process.json && \
+python3 tools/perf_extensions/workload.py check \
+  --results out/denseq-process.json --max-rss-mib 256
+```
+
+Use a new output path for each run; existing evidence is never overwritten. Choose the RSS budget before running. `measure` requires three or more samples, runs the declared
+correctness command first, and refuses command failure, timeout, contention above 5%, simulated power,
+battery/saver, power changes, or input/binary changes during the run. An optional priming invocation
+supports `cache: warm`; `uncontrolled` makes no cache guarantee. Verified cold capture is refused.
+All paths are relative to the spec file except absolute paths; executables require explicit paths.
+Commands run without a shell, with bounded runtime. Specify model/config/tokenizer/prompt/oracle-script
+files under `inputs` and hash their complete bytes before/after (large GGUFs incur that I/O cost outside
+timing). Put workers, context length, seed, precision and implementation route in `identity`. The
+chosen correctness command must implement an independent check at unchanged thresholds; exit zero
+alone does not prove the chosen check is adequate. For #29, use the independent numerical gate, not
+`--inspect-context` or successful token generation. A failed oracle prevents any measured invocation.
+
+Records include all elapsed/RSS samples, output digests, measured/oracle binary SHA256, input hashes,
+command arguments, adapter/spec identities, relevant threading environment, allowed CPU affinity,
+source commit/dirty flag, host and power. Caller-declared environment values are stored: do not put
+secrets there. Other inherited environment is not exhaustively captured; declare consequential
+settings. Non-executable scripts/interpreted programs and correctness data must appear in `inputs`.
+With `check --baseline PRIOR.json`, different workload/model/config/prompt hashes, oracle identity or
+arguments, cache regime, adapter/timer method, affinity, environment, host and power are incompatible.
+The measured binary hash may differ (it is an A/B arm); workload arguments must match. Use the same
+script and input paths across arms. RSS uses each child's own Linux `wait4` high-water mark, so a
+large correctness check or warmup does not contaminate measured samples. It includes process startup;
+for commands with descendants it is not a sum of simultaneous process-tree memory. Invoke the engine
+directly and use separate tools for aggregate service/process-tree/GPU memory.
+
+**Elapsed time is deliberately unjudged.** It includes startup, model loading and all work inside
+the invocation, sampled with a 10 ms polling bound. It is not calibrated decode/prefill/turn latency,
+model tok/s or a new time-regression gate. `check` only gates the maximum observed RSS against the
+explicit absolute budget and optionally validates compatibility; success is not a performance pass.
+Continue using shared sub0perf for calibrated timing, confirmation and reproduction. A record from
+a dirty tree remains labelled as such and is diagnostic, not a reviewed baseline.
+
+Remaining extensions to evaluate in subsequent issues are phase-native prefill/decode metrics and
+token denominators, multi-worker topology/memory-pressure metadata, and verified Linux cache control.
+A generic shared metric/metadata protocol should be proposed upstream to Sub0Math once a second
+consumer needs it; engine-specific token/context/cache policy belongs in this adapter. Extend the
+existing shared confirmation/acceptance path when integrating timing metrics, rather than introducing
+a weaker parallel time judge. Current #50 adds the identity/RSS layer only; #29/#43 numerical failures
+remain independent blockers to model performance claims.

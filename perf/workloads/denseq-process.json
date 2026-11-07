@@ -1,0 +1,14 @@
+{
+  "command": ["../../out/build/perf/sub0llm-bench-denseq", "--exact", "Q8_0 32x5120, denseq"],
+  "correctness": ["../../out/build/perf/sub0llm-bench-denseq", "--list"],
+  "identity": {
+    "kind": "synthetic Q8_0 projection process smoke",
+    "width": 5120,
+    "rows": 32,
+    "workers": 1,
+    "interpretation": "whole invocation including startup, fixtures and nanobench; no model tok/s"
+  },
+  "inputs": {"fixture_source": "../../benchmarks/dense_quant_perf.cpp"},
+  "cache": "uncontrolled",
+  "environment": {"OMP_NUM_THREADS": "1"}
+}
