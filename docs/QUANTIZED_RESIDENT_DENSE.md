@@ -62,6 +62,11 @@ remain mapped and use 256-float block scratch. Existing GDN head permutation hel
 GGUF versus grouped engine axes. Observed output mean 0.00184919118, RMS 0.225238821, all finite;
 initial peak RSS 117460 KiB. This is a partial first-layer proving ground, with no later layers,
 logits or text. Independent real-layer parity is pending, especially the head-layout conventions.
+Independent reference (llama.cpp `cf659f240b232e15700b1721bbb43c1d973c52e9`): all 1494 sampled
+first/middle/last quant blocks match ggml bit for bit. The actual layer-0 output differs by relative
+L2 0.00796917 (cosine 0.99996848); this is unresolved, not a passed layer gate. Reference harnesses
+and reproduction notes are in `tools/reference/`. Activation quantization differs between the two
+paths, so stage captures are needed before attributing the remaining error.
 The callback's output/state/history match dense weights exactly at a synthetic shape; the eight GDN
 cases pass 1966 assertions. Full-model engine parameter loading remains unconnected.
 

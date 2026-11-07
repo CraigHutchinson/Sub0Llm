@@ -56,7 +56,7 @@ void norm(const std::vector<float>& x,const std::vector<float>& gain,std::vector
 }
 }
 int main(int argc,char**argv) try {
-    if(argc!=2){std::fprintf(stderr,"usage: %s MODEL.gguf\n",argv[0]);return 2;}
+    if(argc!=2 && argc!=3){std::fprintf(stderr,"usage: %s MODEL.gguf [HIDDEN.f32]\n",argv[0]);return 2;}
     static_assert(sub0::GDN_DIMS.output_gate_silu,"generate the Qwen35 SiLU profile");
     sub0::FileMap file;std::string error;if(!file.open(argv[1],error))throw std::runtime_error(error);
     const sub0::gguf::Reader reader({file.data(),file.size()});
@@ -87,5 +87,10 @@ int main(int argc,char**argv) try {
     for(int i=0;i<D_FF;++i){const float s=gate[i]>=0?1.f/(1.f+std::exp(-gate[i])):std::exp(gate[i])/(1.f+std::exp(gate[i]));up[i]*=gate[i]*s;}
     if(!layer.project(reader.find_tensor("blk.0.ffn_down.weight"),up.data(),D_FF,down.data(),D_MODEL))throw std::runtime_error("FFN output projection");
     double sum=0,sq=0;for(int i=0;i<D_MODEL;++i){h[i]+=down[i];if(!std::isfinite(h[i]))throw std::runtime_error("nonfinite layer output");sum+=h[i];sq+=h[i]*h[i];}
+    if(argc==3) {
+        FILE* dump=std::fopen(argv[2],"wb");if(!dump)throw std::runtime_error("cannot open hidden dump");
+        const bool written=std::fwrite(h.data(),sizeof(float),h.size(),dump)==h.size();
+        const int closed=std::fclose(dump);if(!written||closed!=0)throw std::runtime_error("hidden dump write failed");
+    }
     std::printf("partial layer-0 inference: token=%zu width=%d mean=%.9g rms=%.9g; mapped GDN+FFN, no later layers or logits\n",token,D_MODEL,sum/D_MODEL,std::sqrt(sq/D_MODEL));
 } catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}
