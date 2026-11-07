@@ -482,6 +482,8 @@ TEST_CASE("gguf: block_spec sizes every real-file format, and tensor_byte_size f
     const Case cases[] = {
         {0, 1, 4}, {1, 1, 2}, {30, 1, 2}, {8, 32, 34}, {12, 256, 144},
         {13, 256, 176}, {14, 256, 210}, {16, 256, 66}, {19, 256, 50}, {20, 32, 18},
+        {10, 256, 84}, {11, 256, 110}, {17, 256, 74}, {18, 256, 98},
+        {21, 256, 110}, {22, 256, 82}, {23, 256, 136}, {29, 256, 56},
     };
     for (const Case& c : cases) {
         const BlockSpec b = block_spec(c.type);
@@ -489,10 +491,8 @@ TEST_CASE("gguf: block_spec sizes every real-file format, and tensor_byte_size f
         CHECK(b.elems == c.elems);
         CHECK(b.bytes == c.bytes);
     }
-    // Anything else still reports "unknown" -- Q4_0 (2) and Q2_K (10) are real ggml formats this
-    // reader deliberately does not implement, so they must stay refusals rather than mis-sized reads.
+    // Q4_0 remains unsupported and must report unknown rather than a guessed block size.
     CHECK(block_spec(2).elems == 0);
-    CHECK(block_spec(10).elems == 0);
 
     GgufBuilder b;
     b.add_tensor("q4k", {512}, 12);      // 2 super-blocks
@@ -739,7 +739,7 @@ TEST_CASE("gguf: dequantize_iq2_xxs expands grid magnitudes with the sign codebo
     CHECK(out[1] == 1.0f);
     CHECK(out[6] == 1.0f);
     CHECK(out[7] == -1.0f);
-    CHECK(out[8] == 3.0f); // scale nibble covers the whole 32-element group
+    CHECK(out[8] == 1.0f);
 
     // The 4-bit scale nibble: db = d * (0.5 + s) * 0.25, so s = 3 gives db = 0.875 and every
     // magnitude-8 element becomes 7.0.
@@ -929,7 +929,7 @@ TEST_CASE("gguf: IQ3_XXS module expands paired grids, sign groups, and scale", "
     CHECK(out[1] == 3.0f);
     CHECK(out[6] == 3.0f);
     CHECK(out[7] == -3.0f);
-    CHECK(out[8] == 1.0f);
+    CHECK(out[8] == 3.0f); // scale nibble covers the whole 32-element group
 
     CHECK_FALSE(IQ3XXS::dequantize(std::span<const std::uint8_t>(raw.data(), raw.size() - 1), 256, out));
 }
