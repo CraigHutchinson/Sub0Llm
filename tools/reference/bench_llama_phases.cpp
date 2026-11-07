@@ -16,6 +16,7 @@ int main(int argc,char**argv) try {
     std::vector<llama_token> tokens;std::string prompt=argv[3];std::size_t begin=0;
     while(begin<=prompt.size()){auto end=prompt.find(',',begin);const auto stop=end==std::string::npos?prompt.size():end;const auto value=prompt.substr(begin,stop-begin);tokens.push_back(integer(value.c_str(),0,1000000));if(end==std::string::npos)break;begin=end+1;}
     if(tokens.empty()||tokens.size()+steps>128)throw std::runtime_error("context limit");
+    llama_log_set([](ggml_log_level,const char*,void*){},nullptr);
     llama_backend_init();const auto setup=sub0::phase::Clock::now();
     auto mp=llama_model_default_params();mp.n_gpu_layers=0;
     std::unique_ptr<llama_model,decltype(&llama_model_free)> model(llama_model_load_from_file(argv[1],mp),llama_model_free);
