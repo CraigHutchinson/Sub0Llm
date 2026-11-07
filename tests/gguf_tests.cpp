@@ -834,7 +834,7 @@ TEST_CASE("gguf: to_f32 refuses an unsupported quantized type rather than misrea
 // --- profile-vs-GGUF compatibility (sub0/gguf_profile_check.hpp) -------------------------------------
 // Key names are the ones read from the real unsloth/Qwen3.8-27B-GGUF header (arch "qwen35").
 namespace {
-std::vector<std::uint8_t> build_qwen35_header() {
+std::vector<std::uint8_t> build_qwen35_header(bool with_indexer = false) {
     GgufBuilder b;
     b.add_string_kv("general.architecture", "qwen35");
     b.add_u32_kv("qwen35.block_count", 64);
@@ -846,6 +846,7 @@ std::vector<std::uint8_t> build_qwen35_header() {
     b.add_u32_kv("qwen35.ssm.inner_size", 6144);
     b.add_u32_kv("qwen35.ssm.time_step_rank", 48);
     b.add_string_array_kv("tokenizer.ggml.tokens", {"a", "b", "c"});
+    if (with_indexer) b.add_tensor("blk.0.attn_indexer.q_proj.weight", {5120, 128});
     return b.finish();
 }
 }  // namespace
@@ -868,6 +869,24 @@ TEST_CASE("gguf profile check: agreeing dims compare clean, a wrong one is repor
     CHECK(res.mismatches[0].key == "heads");
     CHECK(res.mismatches[0].profile == 40);
     CHECK(res.mismatches[0].gguf == 24);
+}
+
+TEST_CASE("gguf profile check: QSA indexer axis must agree with source tensors", "[gguf][profile]") {
+    const std::map<std::string, double> with_qsa = {{"qsa-indexer-n-heads", 4}};
+    const std::map<std::string, double> without_qsa = {{"qsa-indexer-n-heads", 0}};
+
+    const auto no_indexer_buf = build_qwen35_header();
+    const Reader no_indexer(no_indexer_buf);
+    const auto missing = sub0::profile::check_against_gguf(no_indexer, with_qsa);
+    REQUIRE(missing.mismatches.size() == 1);
+    CHECK(missing.mismatches[0].key == "qsa-indexer-n-heads");
+    CHECK(missing.mismatches[0].profile == 4);
+    CHECK(missing.mismatches[0].gguf == 0);
+
+    const auto indexer_buf = build_qwen35_header(/*with_indexer=*/true);
+    const Reader indexer(indexer_buf);
+    CHECK(sub0::profile::check_against_gguf(indexer, with_qsa).mismatches.empty());
+    CHECK(sub0::profile::check_against_gguf(indexer, without_qsa).mismatches.size() == 1);
 }
 
 TEST_CASE("gguf profile check: unreadable or architecture-less input is not a mismatch", "[gguf][profile]") {

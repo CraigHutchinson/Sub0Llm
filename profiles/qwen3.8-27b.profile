@@ -1,7 +1,7 @@
 # Architecture profile for `sub0llm-configure --profile qwen3.8-27b`. Format: include/sub0/profile.hpp.
 # Dims checked 2026-11-06 against Qwen/Qwen3.8-27B config.json (hidden 5120, 64 layers, 24 heads, 4 KV heads,
 # head_dim 256, intermediate 17408, vocab 248320, GDN 16/48x128, full-attention every 4th layer, rope_theta 1e7).
-# qsa-indexer-* are engine-side choices with no config.json counterpart.
+# No qsa-indexer-* axes: the real 27B GGUF has no indexer.* tensors, and no hc_* gated-residual tensors either (issue #25).
 name = qwen3.8-27b
 alias = qwen3.8-dense
 
@@ -13,11 +13,6 @@ gdn-full-attn-stride = 4
 gdn-key-heads = 16
 gdn-key-head-dim = 128
 gdn-value-head-dim = 128
-qsa-indexer-n-heads = 4
-qsa-indexer-kv-heads = 1
-qsa-indexer-head-dim = 128
-qsa-indexer-budget = 2048
-qsa-indexer-compress-ratio = 4
 tie-embeddings = 0
 prec-param = 1
 vocab-exact = 248320      # skipped when --vocab or --vocab-exact is given
