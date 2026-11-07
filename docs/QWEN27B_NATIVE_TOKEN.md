@@ -83,3 +83,8 @@ The reference token harness accepts an optional comma-separated prompt after its
 uses F32 KV caches to match this path. These are two-position checks, not long-context validation;
 context-limit rejection is checked separately. Chat/backend integration (#43), longer sequence and
 reset tests, normal engine-loader integration and broad merge gates remain.
+
+Broad frontend regression gate: native Clang full frontend suite passes 220407 assertions in 326
+cases after updating the recipe-count expectation for ordinary-attention query/gate halves. Some
+optional external-fixture checks skip when their model/tokenizer artifacts are absent; actual 27B
+checks above are separate. Default-engine regression is tracked in the active PR before merge.
