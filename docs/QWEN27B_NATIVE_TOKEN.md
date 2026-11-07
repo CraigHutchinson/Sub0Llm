@@ -88,3 +88,21 @@ Broad frontend regression gate: native Clang full frontend suite passes 220407 a
 cases after updating the recipe-count expectation for ordinary-attention query/gate halves. Some
 optional external-fixture checks skip when their model/tokenizer artifacts are absent; actual 27B
 checks above are separate. Default-engine regression is tracked in the active PR before merge.
+
+## Embedded tokenizer preparation
+
+`sub0llm-export-tokenizer MODEL.gguf DIRECTORY [TEXT]` exports the downloaded model's own vocabulary,
+merge ranks, token-type classifications and EOS/pad IDs into the existing Qwen tokenizer loader's
+three-file format. It omits unused padding rows. The verified qwen35 model exports 248077 usable
+entries, EOS 248046 and pad 248055. No tokenizer download is required. The optional text argument
+prints comma-separated IDs usable by `sub0llm-dense-token`, then a decoded round trip.
+
+A durable export and executable are under `out/build/qwen35-native/tokenizer` and
+`out/build/qwen35-native/sub0llm-export-tokenizer`. The CMake target links the existing frontend library.
+Independent llama.cpp tokenization agrees on the four checked samples: `Hello, world!` (IDs
+9419,11,1814,0), contractions/digits/newlines, multilingual text with emoji, and chat special tokens.
+The reference harness is `tools/reference/tokenize_llama.cpp` (compile against the pinned llama.cpp
+headers/library, no diagnostic patch needed for tokenization). This is sample coverage, not exhaustive
+vocabulary or chat-template validation. The mapped runner still accepts raw IDs; direct text/chat
+integration is the next step. Signed GGUF metadata arrays are retained with length validation; the
+full frontend suite passes 220412 assertions / 327 cases after this change.

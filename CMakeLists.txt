@@ -232,6 +232,8 @@ target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0llm_frontend)
 # needs, never a bulk payload load" reasoning as sub0llm-tokenizer above.
 add_executable(sub0llm-backbone-census tools/sub0llm-backbone-census.cpp)
 add_executable(sub0llm-dense-probe tools/sub0llm-dense-probe.cpp)
+add_executable(sub0llm-export-tokenizer tools/sub0llm-export-tokenizer.cpp)
+target_link_libraries(sub0llm-export-tokenizer PRIVATE sub0llm_frontend)
 target_include_directories(sub0llm-dense-probe PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_include_directories(sub0llm-backbone-census PRIVATE "${CMAKE_SOURCE_DIR}/include")
 

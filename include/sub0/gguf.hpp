@@ -127,6 +127,7 @@ struct Value {
     bool                       b = false;
     std::string                s;
     std::vector<std::string>   sa;
+    std::vector<std::int32_t>  ia32; // retained Int32 arrays (e.g. tokenizer.ggml.token_type)
     std::uint64_t               array_len = 0;   // set for StringArray/OtherArray
 };
 
@@ -274,10 +275,16 @@ private:
                     for (std::uint64_t i = 0; i < len; ++i) { std::string s; if (!read_string(s)) return false; v.sa.push_back(std::move(s)); }
                     return true;
                 }
-                // Non-string array: skip the payload (fixed-width elements), just record the count.
+                // Retain signed token-type arrays; other fixed-width arrays only need their count.
                 v.kind = Value::Kind::OtherArray; v.array_len = len;
                 const std::size_t w = value_width(elem_type);
                 if (w == 0) return false;                       // nested Array-of-Array: not in the spec
+                if (len > (buf_.size() - pos_) / w) return false;
+                if (elem_type == ValueType::Int32) {
+                    v.ia32.resize(static_cast<std::size_t>(len));
+                    for (auto& value : v.ia32) if (!read_pod(value)) return false;
+                    return true;
+                }
                 if (!need(w * static_cast<std::size_t>(len))) return false;
                 pos_ += w * static_cast<std::size_t>(len);
                 return true;

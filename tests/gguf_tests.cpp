@@ -47,9 +47,9 @@ public:
         for (const auto& v : values) push_string(v);
         ++kv_count_;
     }
-    void add_u32_array_kv(const std::string& key, const std::vector<std::uint32_t>& values) {
+    void add_u32_array_kv(const std::string& key, const std::vector<std::uint32_t>& values, ValueType type = ValueType::UInt32) {
         push_string(key); push_pod<std::uint32_t>(static_cast<std::uint32_t>(ValueType::Array));
-        push_pod<std::uint32_t>(static_cast<std::uint32_t>(ValueType::UInt32));
+        push_pod<std::uint32_t>(static_cast<std::uint32_t>(type));
         push_pod<std::uint64_t>(values.size());
         for (auto v : values) push_pod(v);
         ++kv_count_;
@@ -231,6 +231,19 @@ TEST_CASE("gguf: parses a non-string array KV without materializing it", "[gguf]
     CHECK(tt->kind == Value::Kind::OtherArray);
     CHECK(tt->array_len == 4);
     CHECK(r.find("general.architecture")->s == "llama");
+}
+
+TEST_CASE("gguf: retains signed tokenizer type arrays and preserves following metadata", "[gguf]") {
+    GgufBuilder b;
+    b.add_u32_array_kv("tokenizer.ggml.token_type", {1, 3, 5, 0xffffffffu}, ValueType::Int32);
+    b.add_string_kv("general.architecture", "qwen35");
+    const auto bytes = b.finish();
+    const Reader r(bytes);
+    REQUIRE(r.ok());
+    REQUIRE(r.find("tokenizer.ggml.token_type") != nullptr);
+    CHECK(r.find("tokenizer.ggml.token_type")->ia32 == std::vector<std::int32_t>{1, 3, 5, -1});
+    REQUIRE(r.find("general.architecture") != nullptr);
+    CHECK(r.find("general.architecture")->s == "qwen35");
 }
 
 TEST_CASE("gguf: parses the tensor table (name, dims, type, offset)", "[gguf]") {
