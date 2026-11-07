@@ -2,7 +2,7 @@
 
 Sub0Llm adopts Sub0Math's shared `sub0perf` implementation and measurement methodology. This is the
 entry point for new performance work. The preserved [upstream methodology](performance/Sub0Math-PERFORMANCE.md)
-is pinned at `1d20313cbd2ff2753620246b81934d0489a0636f`; code, tests, runner, CMake helpers and nanobench
+is pinned at `3152af9f92ff9abb3f53eaa6487392ea94ae53a1`; code, tests, runner, CMake helpers and nanobench
 are vendored unchanged with hashes in `tools/perf/UPSTREAM.json` and the upstream MIT license. No
 Sub0Math runtime library or network fetch is needed. `scripts/check_sub0perf_vendor.py` verifies the
 snapshot; update source, hashes and documentation together in a reviewed PR rather than silently forking it.
@@ -115,10 +115,12 @@ or an enforced hardware performance verdict.
 
 ## Sub0Llm workload extensions
 
-The adapter at `tools/perf_extensions/workload.py` reuses the shared lock, load, power, atomic-write
-and Git provenance helpers. It leaves the pinned shared package unchanged. This first extension
-adds correctness-gated workload identities and Linux child peak-RSS budgets, which the kernel gate
-cannot certify. Use the checked-in process smoke example after building the perf preset:
+The implementation now lives upstream in Sub0Math's `sub0perf.workload`, reached with
+`python3 tools/perf/bench_check.py workload measure|check`. The former
+`tools/perf_extensions/workload.py` path is a compatibility shim. The pinned shared package remains
+byte-identical to the pushed upstream commit; local code owns only workload specs and model policy.
+This extension adds correctness-gated workload identities and Linux child peak-RSS budgets, which
+the kernel gate cannot certify. Use the checked-in process smoke example after building the perf preset:
 
 ```sh
 python3 tools/perf_extensions/workload.py measure \
@@ -161,8 +163,18 @@ a dirty tree remains labelled as such and is diagnostic, not a reviewed baseline
 
 Remaining extensions to evaluate in subsequent issues are phase-native prefill/decode metrics and
 token denominators, multi-worker topology/memory-pressure metadata, and verified Linux cache control.
-A generic shared metric/metadata protocol should be proposed upstream to Sub0Math once a second
-consumer needs it; engine-specific token/context/cache policy belongs in this adapter. Extend the
+The generic evidence layer has been contributed in [Sub0Math PR #2](https://github.com/CraigHutchinson/Sub0Math/pull/2);
+engine-specific token/context/cache policy stays here. Extend the
 existing shared confirmation/acceptance path when integrating timing metrics, rather than introducing
-a weaker parallel time judge. Current #50 adds the identity/RSS layer only; #29/#43 numerical failures
+a weaker parallel time judge. The original #50 and upstream-adoption #52 add the identity/RSS layer only; #29/#43 numerical failures
 remain independent blockers to model performance claims.
+
+
+Shared workload outcomes use `sub0perf-workload-outcome-1` with `status`, `next_action` and stable
+exit codes (0 recorded/within-budget, 1 over-budget, 2 refused). Helpers log to stderr; stdout contains
+one JSON outcome for normal completion/refusal. Shared records use `sub0perf-workload-1`. Regenerate
+older local `sub0llm-workload-1` records; they are deliberately refused as incompatible rather than
+silently compared across implementations. No-clobber atomic publication requires hard-link support
+on the output filesystem and refuses if unavailable. See the pinned upstream method for the complete
+schema/validation contract. This removes duplicated implementation and behavioral tests; consumer
+checks verify the compatibility entry point while shared tests verify the behavior.

@@ -16,10 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python scripts/check_sub0perf_vendor.py
-      - run: python -m unittest discover -s tools/perf
-      - run: python -m unittest discover -s tools/perf_extensions/tests
-      - name: Build and verify real benchmark protocol
+      - name: Build and verify tooling, provenance and benchmark protocol
         run: |
           cmake -S . -B out/perf-ci -DSUB0_PERF_ONLY=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_STANDARD=26 -DSUB0MATH_PERF_ON_BUILD=OFF -DSUB0MATH_PERF_GIT_HOOKS=OFF
           cmake --build out/perf-ci -j2
