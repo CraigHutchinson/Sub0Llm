@@ -76,6 +76,14 @@ CPU, `docs/HANDOVER.md`) bounds decode; not yet measured.
 
 ## Open questions
 
+- **Verified correctness blocker (#45, 2026-11-07):** the actual downloaded GGUF reports
+  `general.architecture=qwen35` and RMS epsilon `1e-6`. The existing GDN primitive targets
+  Qwen4-preview: its output gate is sigmoid and its forward RMS epsilon is `1e-5`.
+  Transformers' `Qwen3_5RMSNormGated` instead applies SiLU after RMS normalization (epsilon `1e-6`):
+  https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py .
+  Resolve the activation/epsilon choices consistently across forward, decode, recomputation and
+  configuration compatibility before interpreting generated tokens as correct model inference.
+
 - Does the dense decode path support Qwen3.5-style GDN + gated FFN at d5120 (the `qwen35` arch)? Run it at the
   smallest scale first.
 - Int8-activation versus float-activation dots for the I-quants (the project's MoE precedent is in `MOE_QUANT_DOT.md`).
