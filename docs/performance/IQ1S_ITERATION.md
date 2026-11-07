@@ -135,3 +135,6 @@ with OpenMP and native CPU flags; its frontend/simdjson link dependencies match 
 The benchmark executable and raw evidence retain exact command/artifact identities for the measured build.
 Promote a proven kernel through generated configuration after broader qualification; the runtime knob
 is explicitly temporary. This increment does not silently replace the preserved production artifact.
+
+Follow-up implementation is tracked in [#62](https://github.com/CraigHutchinson/Sub0Llm/issues/62);
+context/quality qualification and default promotion are tracked in [#63](https://github.com/CraigHutchinson/Sub0Llm/issues/63).
