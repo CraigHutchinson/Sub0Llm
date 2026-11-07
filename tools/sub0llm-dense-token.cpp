@@ -7,7 +7,7 @@
 #include "qwen_phase_metrics.hpp"
 using namespace sub0::dense_probe;
 int main(int argc,char** argv) try {
-    std::string model,prompt="1543",dump_prefix="-",text,response_file,timings_file;
+    std::string model,prompt="1543",dump_prefix="-",text,response_file,timings_file,projection_profile_file;
     bool inspect_context=false;
     std::string tokenizer_dir=(std::filesystem::path(argv[0]).parent_path()/"tokenizer").string();
     int generate=0;
@@ -21,12 +21,16 @@ int main(int argc,char** argv) try {
     app.add_option("--tokenizer-dir",tokenizer_dir,"Tokenizer exported from this GGUF");
     app.add_option("--projection-threads",projection_threads,"Independent output-row workers (OpenMP)")->check(CLI::Range(1,8));
     app.add_option("--timings-file",timings_file,"Native setup/prefill/decode metrics; suppress progress output; no dumps");
+    app.add_option("--projection-profile",projection_profile_file,"Diagnostic per-format projection attribution; requires timings");
     app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
     app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
     const bool measure=!timings_file.empty();
+    if(!projection_profile_file.empty() && !measure)throw std::runtime_error("projection profile requires timings");
     if(measure && (inspect_context || dump_prefix!="-"))throw std::runtime_error("timings require inference without dumps");
     sub0::phase::Metrics metrics;
+    sub0::phase::ProjectionProfile projection_profile;
+    auto* profiler=projection_profile_file.empty()?nullptr:&projection_profile;
     const bool text_mode=text_option->count()!=0;
     if(text_mode&&raw_option->count())throw std::runtime_error("choose text or raw token input");
     static_assert(sub0::GDN_DIMS.output_gate_silu && USE_ATTENTION_GATE && !sub0::USE_MOE);
@@ -71,7 +75,7 @@ int main(int argc,char** argv) try {
     bool stopped_eos=false;
     std::size_t position=0;
     auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(dump_prefix=="-")return;const std::string path=dump_prefix+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
-    Layer initial(reader,0,projection_threads);const auto* emb=reader.find_tensor("token_embd.weight");
+    Layer initial(reader,0,projection_threads,profiler);const auto* emb=reader.find_tensor("token_embd.weight");
     if(!emb||emb->dims.size()!=2||emb->dims[0]!=D_MODEL||emb->dims[1]!=VOCAB)throw std::runtime_error("embedding dimensions");
     const auto spec=sub0::gguf::block_spec(emb->type_raw);auto decode=sub0::gguf::dequant_fn(emb->type_raw);
     if(!decode||D_MODEL%spec.elems)throw std::runtime_error("embedding format");
@@ -94,12 +98,13 @@ int main(int argc,char** argv) try {
     }
     if(measure){metrics.reserve(prompt_size,generate);metrics.setup_ms=sub0::phase::milliseconds(setup_begin);}
     for(position=0;position<tokens.size();++position) {
+    projection_profile.decoding=position>=prompt_size;
     const auto token_begin=measure?sub0::phase::Clock::now():sub0::phase::Clock::time_point{};
     const int token=tokens[position];
     if(!decode(bytes.subspan(static_cast<std::size_t>(token)*row_bytes,row_bytes),D_MODEL,h))throw std::runtime_error("embedding decode");
     const auto& d=sub0::GDN_DIMS;
     for(int l=0;l<N_LAYERS;++l){
-        Layer layer(reader,l,projection_threads);norm(h,layer.load("blk.0.attn_norm.weight",D_MODEL),a);
+        Layer layer(reader,l,projection_threads,profiler);norm(h,layer.load("blk.0.attn_norm.weight",D_MODEL),a);
         if(sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
             std::vector<float> qg(2*sub0::D_Q),q(sub0::D_Q),k(sub0::D_KV),v(sub0::D_KV),att(sub0::D_Q);
             if(!layer.project(layer.find("blk.0.attn_q.weight"),a.data(),D_MODEL,qg.data(),2*sub0::D_Q)||!layer.project(layer.find("blk.0.attn_k.weight"),a.data(),D_MODEL,k.data(),sub0::D_KV)||!layer.project(layer.find("blk.0.attn_v.weight"),a.data(),D_MODEL,v.data(),sub0::D_KV))throw std::runtime_error("full attention projection");
@@ -153,6 +158,7 @@ int main(int argc,char** argv) try {
     if(position+1==tokens.size() && tokens.size()<prompt_size+static_cast<std::size_t>(generate))tokens.push_back(static_cast<int>(best-logits.begin()));
     }
     if(measure)metrics.write(timings_file,projection_threads,SEQ_LEN,false,true);
+    if(profiler)profiler->write(projection_profile_file);
     if(text_mode)std::printf("TEXT_RESULT generated=%zu finish=%s\n",generated.size(),stopped_eos?"eos":"length");
     if(!response_file.empty()){
         const std::string decoded=tokenizer.decode(generated);FILE* f=std::fopen(response_file.c_str(),"wb");if(!f)throw std::runtime_error("response file open");

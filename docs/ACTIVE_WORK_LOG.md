@@ -34,6 +34,8 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
+**2026-11-07 Codex — #58 done.** Real dense 27B per-format projection attribution and performance campaign milestones. Holds `tools/dense_qwen_support.hpp`, `tools/sub0llm-dense-token.cpp`, profile fixture and docs; short eight-core model profiling/correctness runs on CrogBuntu1. Two attribution runs completed; CPU and files released. Production chat artifacts remain preserved.
+
 **2026-09-08 Claude Code — shared-tree state flag from earlier today, now RESOLVED.** Found while merging
 WP5c: the SHARED working tree (`D:\Craig\GitHub\Sub0Llm`, not a `.claude/worktrees/*` one) had
 `feature/wp5c-qwen-generation` checked out (not `main`) — apparently WP5c's own resumed subagent session

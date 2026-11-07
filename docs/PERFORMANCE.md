@@ -7,6 +7,8 @@ are vendored unchanged with hashes in `tools/perf/UPSTREAM.json` and the upstrea
 Sub0Math runtime library or network fetch is needed. `scripts/check_sub0perf_vendor.py` verifies the
 snapshot; update source, hashes and documentation together in a reviewed PR rather than silently forking it.
 
+For the local dense 27B objective and staged milestones, see [the performance campaign](performance/QWEN27B_CAMPAIGN.md).
+
 ## Everyday workflow
 
 ```sh
