@@ -1,64 +1,7 @@
 // Real GGUF layer-0 proving ground: embedding -> GDN mixer -> dense SwiGLU FFN.
 // Partial inference only: no later layers, output head, tokenizer or generated text.
-#include "sub0/dense_quant.hpp"
-#include "sub0/file_map.hpp"
-#include "sub0/backbone_quant.hpp"
-#include "sub0/layout.hpp"
-#include <array>
-#include <cstdio>
-#include <stdexcept>
-#include <string>
-
-namespace {
-using sub0::gdn::Projection;
-struct Layer {
-    const sub0::gguf::Reader& reader;
-    std::vector<float> scratch, raw_output, gathered;
-    std::array<const sub0::gguf::TensorInfo*, 5> projections{};
-    std::array<std::vector<float>,4> captured_projections;
-    std::vector<std::uint32_t> qkv_rows, z_rows, head_rows, out_indices;
-    explicit Layer(const sub0::gguf::Reader& r) : reader(r), raw_output(sub0::GDN_CONV_DIM), gathered(sub0::GDN_VALUE_DIM),
-        qkv_rows(sub0::GDN_CONV_DIM), z_rows(sub0::GDN_VALUE_DIM), head_rows(sub0::GDN_V_HEADS), out_indices(sub0::GDN_VALUE_DIM) {
-        scratch.reserve(256);
-        captured_projections[0].resize(sub0::GDN_CONV_DIM);captured_projections[1].resize(sub0::GDN_VALUE_DIM);
-        captured_projections[2].resize(sub0::GDN_V_HEADS);captured_projections[3].resize(sub0::GDN_V_HEADS);
-        const char* names[]{"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight", "blk.0.ssm_out.weight"};
-        for (int i=0;i<5;++i) { projections[i]=reader.find_tensor(names[i]); if(!projections[i]) throw std::runtime_error(names[i]); }
-        sub0::bbq::gdn_row_permutation(sub0::GDN_CONV_DIM, 2*sub0::GDN_KEY_DIM, sub0::GDN_K_HEADS, sub0::GDN_V_HEADS, sub0::GDN_V_HEAD_DIM,qkv_rows);
-        sub0::bbq::gdn_row_permutation(sub0::GDN_VALUE_DIM,0,sub0::GDN_K_HEADS,sub0::GDN_V_HEADS,sub0::GDN_V_HEAD_DIM,z_rows);
-        sub0::bbq::gdn_row_permutation(sub0::GDN_V_HEADS,0,sub0::GDN_K_HEADS,sub0::GDN_V_HEADS,1,head_rows);
-        sub0::bbq::gdn_out_gather_index(sub0::GDN_K_HEADS,sub0::GDN_V_HEADS,sub0::GDN_V_HEAD_DIM,out_indices);
-    }
-    std::vector<float> load(const char* name, std::size_t count) const {
-        const auto* t=reader.find_tensor(name); std::vector<float> values;
-        if(!t || t->element_count()!=count || !sub0::gguf::to_f32(*t,reader.tensor_bytes(*t),values)) throw std::runtime_error(name);
-        return values;
-    }
-    bool project(const sub0::gguf::TensorInfo* t, const float* x,int in,float* y,int out) {
-        return t && t->dims.size()==2 && t->dims[0]==static_cast<std::uint64_t>(in) && t->dims[1]==static_cast<std::uint64_t>(out) &&
-            sub0::denseq::project(t->type_raw,reader.tensor_bytes(*t),{x,static_cast<std::size_t>(in)},{y,static_cast<std::size_t>(out)},scratch);
-    }
-    static bool callback(void* context,Projection role,const float* x,int in,float* y,int out) {
-        auto& self=*static_cast<Layer*>(context); const auto* t=self.projections[static_cast<int>(role)];
-        if(role==Projection::Out) {
-            if(in!=sub0::GDN_VALUE_DIM || out!=D_MODEL) return false;
-            for(int i=0;i<in;++i) self.gathered[i]=x[self.out_indices[i]];
-            return self.project(t,self.gathered.data(),in,y,out);
-        }
-        if(out>static_cast<int>(self.raw_output.size())) return false;
-        if(!self.project(t,x,in,self.raw_output.data(),out))return false;
-        std::copy_n(self.raw_output.data(),out,self.captured_projections[static_cast<int>(role)].data());
-        const auto& rows=role==Projection::Qkv?self.qkv_rows:role==Projection::Z?self.z_rows:self.head_rows;
-        for(int i=0;i<out;++i)y[i]=self.raw_output[rows[i]];
-        return true;
-    }
-};
-void norm(const std::vector<float>& x,const std::vector<float>& gain,std::vector<float>& out) {
-    float ms=0;for(float v:x)ms+=v*v;
-    const float scale=1.f/std::sqrt(ms/x.size()+1e-6f);
-    for(std::size_t i=0;i<x.size();++i)out[i]=x[i]*scale*gain[i];
-}
-}
+#include "dense_qwen_support.hpp"
+using namespace sub0::dense_probe;
 int main(int argc,char**argv) try {
     if(argc!=2 && argc!=3){std::fprintf(stderr,"usage: %s MODEL.gguf [HIDDEN.f32]\n",argv[0]);return 2;}
     static_assert(sub0::GDN_DIMS.output_gate_silu,"generate the Qwen35 SiLU profile");
