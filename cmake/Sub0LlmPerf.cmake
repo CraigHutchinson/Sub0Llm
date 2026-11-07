@@ -19,3 +19,7 @@ set_tests_properties(sub0llm-reference-gates PROPERTIES WORKING_DIRECTORY "${PRO
 
 add_test(NAME sub0llm-chat-state COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s scripts/tests)
 set_tests_properties(sub0llm-chat-state PROPERTIES WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+add_executable(sub0llm-phase-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/phase_fixture.cpp")
+add_test(NAME sub0llm-native-phase-contract COMMAND "${Python3_EXECUTABLE}"
+  "${PROJECT_SOURCE_DIR}/tools/reference/tests/check_phase_fixture.py" $<TARGET_FILE:sub0llm-phase-fixture>)
