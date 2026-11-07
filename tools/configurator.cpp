@@ -1228,7 +1228,6 @@ int main(int argc, char** argv) {
         reg("qsa-indexer-compress-ratio", qsa_idx_ratio);
         reg("tie-embeddings", tie_embeddings);   reg("d-ff", d_ff_pin);                 reg("gated-ffn", gated_ffn);
         reg("attention-gate", attention_gate);
-        reg("attention-gate", attention_gate);
         reg("moe-quant-experts", moe_quant_experts); reg("num-experts", num_experts);   reg("experts-per-tok", experts_per_tok);
         reg("prec-param", prec_param);           reg("vocab-exact", vocab_exact);       reg("seq", seq_len);
         reg("pos-encoding", pos_encoding);
