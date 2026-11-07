@@ -9,11 +9,17 @@ permissions:
   contents: read
 jobs:
   tooling:
+    name: tooling (${{ matrix.isa }})
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
-        native: ['OFF', 'ON']
+        include:
+          - isa: generic
+            cxx_flags: ''
+          - isa: avx2
+            cxx_flags: '-mavx2'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,12 +27,12 @@ jobs:
           python-version: '3.12'
       - name: Build and verify tooling, provenance and benchmark protocol
         run: |
-          cmake -S . -B out/perf-ci -DSUB0_PERF_ONLY=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_STANDARD=26 -DSUB0MATH_PERF_ON_BUILD=OFF -DSUB0MATH_PERF_GIT_HOOKS=OFF -DSUB0MATH_NATIVE_ARCH=${{ matrix.native }}
+          cmake -S . -B out/perf-ci -DSUB0_PERF_ONLY=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_STANDARD=26 -DSUB0MATH_PERF_ON_BUILD=OFF -DSUB0MATH_PERF_GIT_HOOKS=OFF -DSUB0MATH_NATIVE_ARCH=OFF -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
           cmake --build out/perf-ci -j2
           ctest --test-dir out/perf-ci --output-on-failure
       - name: Full calibrated sampling (diagnostic on shared hosted hardware)
         run: python tools/perf/bench_check.py run --exe out/perf-ci/sub0llm-bench-denseq --out out/perf-ci/perf/samples.json --rounds 3 --settle 0
       - uses: actions/upload-artifact@v4
         with:
-          name: sub0perf-samples-${{ matrix.native }}
+          name: sub0perf-samples-${{ matrix.isa }}
           path: out/perf-ci/perf/samples.json

@@ -122,3 +122,9 @@ new full-engine test run for this tool-only reduction change.
 The actual two-turn chat smoke passes: `Hi` → `Hi there!`, then `Repeat my first message.` → `Hi`,
 both EOS, with prompt accounting 13 → 31 tokens. This is functional context evidence, not the
 full-window/corpus qualification in #63.
+
+Hosted CI now checks explicit generic and AVX2 targets with warnings retained as errors. A hosted
+`-march=native` job hit Clang 18.1.3’s AVX10 feature-combination rejection; its generic sibling was
+cancelled by matrix fail-fast. Pinning the tested ISA makes vector coverage deterministic, and
+independent matrix jobs now finish even if a sibling fails. Local measured binaries still use the
+recorded native CPU flags; no measured artifact or numerical tolerance changed for this CI fix.
