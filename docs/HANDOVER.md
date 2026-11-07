@@ -1,5 +1,8 @@
 # Handover — resuming the Qwen4-Next work in a new session or on a new machine
 
+Performance-workflow update (2026-11-07, #48): start with [PERFORMANCE.md](PERFORMANCE.md).
+It codifies the pinned Sub0Math `sub0perf` rig and the `perf`/`perf-profile` presets.
+
 Written 2026-11-05. Nothing is in flight: the tree was clean, every branch worth keeping is merged or archived,
 no benchmark or agent was running, and no file is held. Last engineering commit before this document:
 `47a4cc4` (2026-10-08). Where a number below carries a date and a host, it is a measurement, not a promise:

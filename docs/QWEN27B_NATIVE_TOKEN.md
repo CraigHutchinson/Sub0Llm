@@ -4,12 +4,10 @@
 embedding, all 64 hybrid GDN/full-attention layers, dense SwiGLU FFNs, final RMSNorm and Q3_K LM head.
 It keeps the original quantized weights mapped. It uses Sub0Llm's GDN math, GGUF decoders and head
 conversion helpers. It is a standalone proving ground; the general engine loader does not yet load
-these mapped tensor views. No tokenizer, sequence cache, context window or autoregressive loop exists
-in this tool. At one position, attention softmax is exactly one, so Q/K normalization and RoPE cannot
-affect attention output; the tool computes V, the fused projection's gate, and output projection.
-This shortcut is valid only for this position-zero, single-token interface.
-
-A local build is preserved under `out/build/qwen35-native/` in the Qwen worktree. Run:
+these mapped tensor views. It supports bounded raw-token/text sequences with persistent GDN and
+F32 K/V state, greedy continuation, exported embedded tokenization and text EOS stopping. The console
+chat proving ground is tracked in #43. This tool still allocates temporary vectors during evaluation;
+it is a correctness proving ground rather than a resident service.
 
 ```sh
 out/build/qwen35-native/sub0llm-dense-token /run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf 1543
@@ -32,22 +30,22 @@ not a controlled performance benchmark.
 
 ## Independent numerical check
 
-Against llama.cpp revision `cf659f240b232e15700b1721bbb43c1d973c52e9`, with the preserved scalar
-float-activation diagnostic patch and `GGML_CPU_REPACK=OFF`:
+Against llama.cpp revision `cf659f240b232e15700b1721bbb43c1d973c52e9`, use all three controls:
+scalar float-activation diagnostic patch, `GGML_CPU_REPACK=OFF`, and
+`LLAMA_FLASH_ATTN_TYPE_DISABLED` with F32 K/V caches. F32 cache configuration alone does not ensure
+F32 attention: the pinned automatic flash path casts K/V to F16 in `build_attn_mha`.
 
-- All 64 hidden vectors are captured; worst layer relative L2 is 0.000290549 (layer 52).
-- Last-layer hidden relative L2: 0.000213061.
-- All 248320 logits: relative L2 0.000107051, maximum absolute difference 0.00251627.
-- Both implementations select top token ID 13.
-- The refactored first-layer tool retains relative L2 8.05504e-7.
+The earlier one/two-position and literal-text logit figures used automatic flash attention. Those
+cross-precision comparisons are superseded by the nine-position F32 attention check below. No
+production math changed. The layer-0 GDN check (relative L2 8.05504e-7) is unaffected by this attention
+setting. Stock llama.cpp quantizes matrix activations and remains a different numerical path.
 
-`tools/reference/capture_llama_token_float.cpp` captures the independent all-layer/logit reference
-for raw token 1543; compile/link like the first-layer float harness. The reference patch is diagnostic,
-not part of production Sub0Llm. Stock llama.cpp quantizes activations and is a different numerical path.
-Use `compare_hidden.py` for vector checks; the measured full-logit check passes relative tolerance 0.001.
-This verifies one input, not vocabulary-wide behavior, multiple positions or a context window. Those
-remain required before chat/backend work (#43), along with independent sequence-state validation,
-full suites and review before merging PR #44. Tracking: #15 and #29.
+`tools/reference/capture_llama_token_float.cpp` explicitly disables flash attention. Compile/link
+like the first-layer float harness. The reference patch is external diagnostic code, not production
+Sub0Llm. `compare_hidden.py` checks one vector; `compare_sequence.py` checks every requested position
+and the vocabulary count and refuses missing/nonfinite/truncated or mismatched dumps. Numerical
+coverage remains finite; a passing sample is not vocabulary-wide or maximum-context validation.
+Tracking: #54, #29, #43.
 
 ## Stateful sequence proving ground (2026-11-07)
 
@@ -71,18 +69,39 @@ back once and computes the following logits. No special-token stopping, tokenize
 is provided. This remains a proving ground with per-layer temporary allocations, not an optimized
 long-running chat service. Subsequent-position dumps use `.posN` before the existing suffixes.
 
-Independent float-activation/F32-cache reference results (all 248320 logits per position):
+Corrected F32 attention reference, 2026-11-07 on CrogBuntu1, all 64 layers and 248320 finite logits
+per position. Raw prompt: `248045,846,198,12675,248046,198,248045,74455,198`.
+This is a plain ChatML diagnostic token sequence; it is not a claim of complete embedded-Jinja rendering.
+Unchanged Sub0Llm outputs pass the existing 0.001 relative-L2 threshold:
 
-| Input sequence | Position | top token (both) | relative L2 | max absolute |
-|---|---:|---:|---:|---:|
-| 1543,88123 | 1 | 198 | 6.10538e-5 | 0.00117445 |
-| 1543 then greedy 13 | 1 | 220 | 3.76653e-5 | 0.00120127 |
+| Position | top token (both) | relative L2 | max absolute |
+|---|---:|---:|---:|
+| 0 | 8678 | 1.7000983e-06 | 3.194809e-05 |
+| 1 | 198 | 6.0709968e-06 | 9.9658966e-05 |
+| 2 | 3710 | 4.1833545e-06 | 5.0067902e-05 |
+| 3 | 248046 | 3.8836839e-06 | 8.5830688e-05 |
+| 4 | 198 | 6.7872393e-06 | 0.00015199184 |
+| 5 | 248045 | 9.9881983e-06 | 0.00013542175 |
+| 6 | 248068 | 5.2306388e-06 | 5.5789948e-05 |
+| 7 | 198 | 3.4431713e-05 | 0.00057816505 |
+| 8 | 248068 | 2.9207262e-05 | 0.00067281723 |
 
-Observed peak RSS is 5834604 KiB (~5.56 GiB). Both relative-logit checks pass tolerance 0.001.
-The reference token harness accepts an optional comma-separated prompt after its dump prefix and
-uses F32 KV caches to match this path. These are two-position checks, not long-context validation;
-context-limit rejection is checked separately. Chat/backend integration (#43), longer sequence and
-reset tests, normal engine-loader integration and broad merge gates remain.
+Worst relative L2: 3.44317e-5. Previously positions 5/7/8 exceeded 0.001 against automatic flash
+attention; the mismatch was in oracle precision, not demonstrated engine-state drift. A wider RMS
+accumulation experiment barely changed that cross-precision error and was not retained. No threshold
+was widened, no production arithmetic changed. Reference was rerun from the checked-in warning-clean harness at two workers; all logit files
+are byte-identical to the initial eight-worker reference capture. Sub0Llm's
+saved sequence used the reviewed row-partitioned projection proving ground in draft #47.
+
+```sh
+python3 tools/reference/compare_sequence.py ACTUAL_PREFIX REFERENCE_PREFIX \
+  --positions 9 --expected-values 248320 --max-relative-l2 0.001
+```
+
+The reference harness accepts comma-separated raw prompt IDs after its dump prefix. Independent
+longer-context/greedy sequence coverage, complete EOS examples and general engine-loader integration
+remain separate work. This resolves the recorded nine-position precision discrepancy, not every task
+in #29 or #43.
 
 Broad frontend regression gate: native Clang full frontend suite passes 220407 assertions in 326
 cases after updating the recipe-count expectation for ordinary-attention query/gate halves. Some
@@ -123,9 +142,8 @@ exclusive; empty prompts and context overflow are rejected. EOS predictions stop
 are not included in decoded continuation. Vocabulary count and EOS are checked against GGUF metadata;
 use tokenizer files exported from the same model. No chat template or implicit BOS is added.
 
-Verified `Hi` -> ID 12675 -> next ID 11 -> decoded comma. All 248320 logits match the independent
-float-activation reference at relative L2 8.83061e-5 and max absolute 0.00204515. Existing raw-sequence
-checks remain documented above. The runner now links the existing frontend and CLI11 libraries;
+Verified `Hi` -> ID 12675 -> next ID 11 -> decoded comma. The prior literal-text oracle figures used auto-flash and are superseded by the corrected sequence
+check above. Existing raw-sequence behavior remains available. The runner now links the existing frontend and CLI11 libraries;
 prefer the explicit CMake target for rebuilding. Direct compile requires the same frontend/simdjson
 libraries and CLI11 headers as the project. Structured chat templating/service and broader EOS/context
 behavior remain follow-ups under #43.

@@ -106,6 +106,15 @@ endif()
 # std::exp/std::erf path. Compile-time only -- the unused branch is eliminated.
 option(SUB0_EXACT_MATH "Use exact std::exp/std::erf instead of the fast approximations" OFF)
 
+# Shared Sub0Math performance rig: standalone kernel iteration needs no corpus, generated
+# model profile, network dependencies or engine build. Normal benchmark builds consume it too.
+option(SUB0_PERF_ONLY "Build only the shared sub0perf quantized projection suite" OFF)
+if(SUB0_PERF_ONLY)
+  enable_testing()
+  include(cmake/Sub0LlmPerf.cmake)
+  return()
+endif()
+
 # --- Dependency management via CPM -----------------------------------------
 include(cmake/get_cpm.cmake)
 
@@ -606,4 +615,5 @@ endif()
 option(SUB0_BUILD_BENCHMARKS "Build the microbenchmark suite (Catch2 benchmarks)" OFF)
 if(SUB0_BUILD_BENCHMARKS)
   add_subdirectory(benchmarks)
+  include(cmake/Sub0LlmPerf.cmake)
 endif()

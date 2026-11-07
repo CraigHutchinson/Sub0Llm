@@ -1,0 +1,47 @@
+{
+  "format": 2,
+  "host": "CrogBuntu1",
+  "machine": "x86_64",
+  "system": "Linux 7.0.0-42-generic",
+  "note": "Medians per op after calibration scaling, with robust CV across interleaved rounds. Regenerate deliberately; say why in the commit. Regressions are accepted with `accept`.",
+  "power": {
+    "state": "ac",
+    "saver": false
+  },
+  "calibration_ns": 4500.871,
+  "epochs": 0,
+  "cpu": 31,
+  "benchmarks": {
+    "Q8_0 32x256, denseq": {
+      "median_ns": 4240.738,
+      "cv": 0.0,
+      "rounds": 3
+    },
+    "Q8_0 32x256, hand-written fixed-scale": {
+      "median_ns": 4501.412,
+      "cv": 0.001,
+      "rounds": 3
+    },
+    "Q8_0 32x5120, denseq": {
+      "median_ns": 90501.588,
+      "cv": 0.0001,
+      "rounds": 3
+    },
+    "Q8_0 32x5120, hand-written fixed-scale": {
+      "median_ns": 93180.766,
+      "cv": 0.0001,
+      "rounds": 3
+    }
+  },
+  "pairs": {
+    "Q8_0 32x256, denseq": {
+      "reference": "Q8_0 32x256, hand-written fixed-scale",
+      "ratio": 0.9421
+    },
+    "Q8_0 32x5120, denseq": {
+      "reference": "Q8_0 32x5120, hand-written fixed-scale",
+      "ratio": 0.9711
+    }
+  },
+  "accepted": []
+}
