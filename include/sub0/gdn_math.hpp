@@ -82,7 +82,13 @@ namespace sub0::gdn {
 // (token, layer) inside forward() -- `x_q` feeds BOTH in_qkv and in_z (the same D_MODEL-wide input row),
 // never re-quantized per projection. `out_gather_buf`/`out_gather_idx` are likewise sized/derived once
 // by the caller, not per token.
+enum class Projection { Qkv, Z, Beta, Alpha, Out };
 struct Native {
+    // Optional float-activation projection backend. Caller supplies engine/grouped output order
+    // and owns all mapped storage and scratch for the duration of forward(). T==1 only.
+    using Project = bool (*)(void*, Projection, const float*, int, float*, int);
+    Project project = nullptr;
+    void* project_context = nullptr;
     // O5 phase 2b-3 phase A: bbqd::Plane, not bbq::Desc+raw span -- see backbone_quant_dot.hpp's own
     // "format-agnostic plane view" comment. Non-owning; the caller's resolved-role table (decode.cpp)
     // outlives every call this pointer is read in.
@@ -280,6 +286,14 @@ inline void forward(const Dims& d, int T,
     const int K = d.conv_kernel;
     const int Hk = d.num_k_heads, Hv = d.num_v_heads, rep = d.rep();
     const int dk = d.head_k_dim, dv = d.head_v_dim;
+    const auto project = [&](Projection role, const float* input, WP weights, int in, int out_width, float* output) {
+        if (native && native->project && T == 1) {
+            if (!native->project(native->project_context, role, input, in, output, out_width)) {
+                std::fprintf(stderr, "fatal: mapped GDN projection rejected geometry or data\n");
+                std::abort();
+            }
+        } else gemv::axpy<Threads>(input, weights, in, out_width, output);
+    };
     constexpr float RMS_EPS = 1e-6f;   // Qwen4ExpTextRMSNormGated's real eps (rms_norm_eps in the manifest)
     constexpr float L2_EPS  = 1e-6f;   // l2norm's real eps
 
@@ -352,12 +366,12 @@ inline void forward(const Dims& d, int T,
             }
         } else {
             probe(Stage::InProj);
-            gemv::axpy<Threads>(xt, w_qkv, hs, conv_dim, qkvr);   // O2: include/sub0/gemv.hpp
-            gemv::axpy<Threads>(xt, w_z, hs, value_dim, zr);
+            project(Projection::Qkv, xt, w_qkv, hs, conv_dim, qkvr);
+            project(Projection::Z, xt, w_z, hs, value_dim, zr);
         }
         probe(Stage::BaProj);
-        gemv::axpy<Threads>(xt, w_b, hs, Hv, br);             // O4: raw b_logit, transformed below
-        gemv::axpy<Threads>(xt, w_a, hs, Hv, gr);             // O4: raw a_logit, transformed below
+        project(Projection::Beta, xt, w_b, hs, Hv, br);
+        project(Projection::Alpha, xt, w_a, hs, Hv, gr);
         for (int hh = 0; hh < Hv; ++hh) {
             br[hh] = detail::sigmoid(br[hh]);
             gr[hh] = -std::exp(a_log[hh]) * detail::softplus(gr[hh] + dt_bias[hh]);
@@ -504,7 +518,7 @@ inline void forward(const Dims& d, int T,
             }
         } else {
             probe(Stage::OutProj);
-            gemv::axpy<Threads>(gated, w_out, value_dim, hs, ot);
+            project(Projection::Out, gated, w_out, value_dim, hs, ot);
         }
     }
 }

@@ -322,6 +322,8 @@ target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
 add_library(sub0llm_core SHARED src/engine_core.cpp src/blend_schedule.cpp ${SUB0_BACKEND_SOURCES})
 add_executable(sub0llm-model-probe EXCLUDE_FROM_ALL tools/sub0llm-model-probe.cpp)
+add_executable(sub0llm-dense-layer EXCLUDE_FROM_ALL tools/sub0llm-dense-layer.cpp)
+target_include_directories(sub0llm-dense-layer PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 target_link_libraries(sub0llm-model-probe PRIVATE sub0llm_core)
 target_include_directories(sub0llm_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0llm_frontend used by the

@@ -54,6 +54,17 @@ is FFN gate/up/down (3.4 GiB, 59%), then `attn_qkv` (479 MiB), `ssm_out`, `attn_
 
 ## Memory budget (to confirm by measurement)
 
+Partial layer execution (2026-11-07): explicit target `sub0llm-dense-layer` runs actual token 1543's
+embedding through RMSNorm, the existing GDN recurrence with mapped float-activation projection
+callbacks, residual and dense SwiGLU FFN for layer 0. Build against the generated 27B SiLU profile,
+then pass the GGUF filename. Small norms/conv/decay parameters are decoded at startup; large matrices
+remain mapped and use 256-float block scratch. Existing GDN head permutation helpers handle tiled
+GGUF versus grouped engine axes. Observed output mean 0.00184919118, RMS 0.225238821, all finite;
+initial peak RSS 117460 KiB. This is a partial first-layer proving ground, with no later layers,
+logits or text. Independent real-layer parity is pending, especially the head-layout conventions.
+The callback's output/state/history match dense weights exactly at a synthetic shape; the eight GDN
+cases pass 1966 assertions. Full-model engine parameter loading remains unconnected.
+
 Initial proving ground (2026-11-07): `sub0llm-dense-probe MODEL.gguf TENSOR` maps the GGUF and
 uses `denseq::project` to decode one block at a time into caller-reserved scratch, without expanding
 the matrix. The real Q3_K `output.weight` (5120 x 248320, 546,304,000 encoded bytes) completed with

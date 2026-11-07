@@ -616,3 +616,34 @@ TEST_CASE("gdn::Native's O9 dispatch checks each plane independently: a Q8_0 in_
     r2.run(off);
     for (int i = 0; i < r.value_dim; ++i) REQUIRE(r2.scratch[static_cast<std::size_t>(2 * r.conv_dim + i)] == zb[i]);
 }
+
+TEST_CASE("GDN float projection callback matches ordinary weights", "[gdn][native]") {
+    const sub0::gdn::Dims d{2,1,1,2,2,2,true};
+    struct Context {
+        std::array<std::vector<float>,5> weights;
+        int calls=0;
+    } context;
+    const int widths[]{d.conv_dim(),d.value_dim(),1,1,2};
+    for(int r=0;r<5;++r) {
+        context.weights[r].resize(2*widths[r]);
+        for(std::size_t i=0;i<context.weights[r].size();++i)context.weights[r][i]=0.02f*static_cast<float>(i+1);
+    }
+    std::vector<float> conv(d.conv_dim()*2,0.2f), bias(1,0.1f), alog(1,-0.3f), norm(2,1.f);
+    const float x[]{0.4f,-0.2f};
+    std::vector<float> state(sub0::gdn::state_floats(d)), hist(sub0::gdn::conv_hist_floats(d)), scratch(sub0::gdn::scratch_floats(d,1)), ref(2), got(2);
+    auto& w=context.weights;
+    sub0::gdn::forward<false,1,const float*>(d,1,x,w[0].data(),w[1].data(),w[2].data(),w[3].data(),conv.data(),bias.data(),alog.data(),norm.data(),w[4].data(),state.data(),hist.data(),ref.data(),scratch.data());
+    const auto ref_state=state,ref_hist=hist;
+    std::fill(state.begin(),state.end(),0.f);std::fill(hist.begin(),hist.end(),0.f);
+    sub0::gdn::Native native;native.project_context=&context;
+    native.project=[](void* ctx,sub0::gdn::Projection role,const float* input,int in,float* out,int width) {
+        auto& c=*static_cast<Context*>(ctx);++c.calls;const auto& weight=c.weights[static_cast<int>(role)];
+        if(weight.size()!=static_cast<std::size_t>(in*width))return false;
+        for(int o=0;o<width;++o){out[o]=0;for(int i=0;i<in;++i)out[o]+=input[i]*weight[i*width+o];}
+        return true;
+    };
+    const float* np=nullptr;
+    sub0::gdn::forward<false,1,const float*>(d,1,x,np,np,np,np,conv.data(),bias.data(),alog.data(),norm.data(),np,state.data(),hist.data(),got.data(),scratch.data(),&native);
+    CHECK(context.calls==5);
+    CHECK(got==ref);CHECK(state==ref_state);CHECK(hist==ref_hist);
+}
