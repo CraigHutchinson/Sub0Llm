@@ -117,6 +117,10 @@ bool save_model(const char* path) {
     // "un-looped" inference had to be.
     const std::uint64_t arch2 = ARCH_FINGERPRINT2;
     os.write((const char*)&arch2, sizeof(arch2));
+    if constexpr (ARCH_FINGERPRINT3 != 0) {
+        const std::uint64_t arch3 = ARCH_FINGERPRINT3;
+        os.write(reinterpret_cast<const char*>(&arch3), sizeof arch3);
+    }
     return os.good();
 }
 
@@ -301,6 +305,14 @@ bool load_model(const char* path) {
                      got2.qsa_indexer_budget, got2.qsa_indexer_compress_ratio,
                      QSA_INDEXER_BUDGET, QSA_INDEXER_COMPRESS_RATIO);
         return false;
+    }
+    if constexpr (ARCH_FINGERPRINT3 != 0) {
+        std::uint64_t arch3 = 0;
+        is.read(reinterpret_cast<char*>(&arch3), sizeof arch3);
+        if (!is || arch3 != ARCH_FINGERPRINT3) {
+            std::println(stderr, "error: missing or incompatible GDN output activation trailer");
+            return false;
+        }
     }
     if (tok_model_conflict()) { warn_tok_model_mismatch(); return false; }
     // WP4e: a MOE_QUANT_EXPERTS build's weights are TWO files -- this blob and `<path>.moeq`, which

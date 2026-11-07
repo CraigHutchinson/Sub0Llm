@@ -10,6 +10,7 @@ head-dim = 256
 rotary-dim = 64
 rope-theta = 10000000
 gdn-full-attn-stride = 4
+gdn-output-silu = 1
 gdn-key-heads = 16
 gdn-key-head-dim = 128
 gdn-value-head-dim = 128
@@ -27,6 +28,7 @@ heads = 24
 kv-heads = 4
 d-ff = 17408
 gated-ffn = 1
+attention-gate = 1
 num-experts = 0
 
 # Weights (metadata only; see scripts/models.py)

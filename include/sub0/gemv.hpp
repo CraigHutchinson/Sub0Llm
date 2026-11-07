@@ -45,6 +45,9 @@ namespace sub0::gemv {
 
 namespace detail {
 
+/// Maximum output span accumulated in a private stack tile on the AVX2 path.
+inline constexpr int kLocalTile = 128;
+
 /// y[o] = sum_i x[i]*W[i*out+o] for o in [o0, o1): the scalar reference every other path must equal.
 template <class WP>
 inline void axpy_range_scalar(const float* x, WP W, int in, int out, int o0, int o1, float* y) noexcept {
@@ -125,9 +128,6 @@ inline void accumulate_avx2(const float* x, const Raw* W, int in, int out, int o
         for (int o = n_vec; o < n; ++o) acc[o] = std::fma(x[i], widen1(w[o]), acc[o]);
     }
 }
-
-/// Outputs at or below this span accumulate in a private stack tile and write `y` once (see axpy).
-inline constexpr int kLocalTile = 128;
 
 template <class Raw>
 inline void axpy_range_avx2(const float* x, const Raw* W, int in, int out, int o0, int o1, float* y) noexcept {

@@ -76,9 +76,9 @@ namespace {
 // configurations of this tool and each has its own pair of literals; anything else is a build mistake,
 // not a supported target, so it is refused here rather than silently producing an artifact no test has
 // ever seen the shape of.
-static_assert(N_LAYERS == 4 || N_LAYERS == 48,
-              "this tool targets either the 4-layer real sub-stack (SUB0_QWEN4_LAYERS=4) or the full "
-              "real model (SUB0_QWEN4_LAYERS=48) -- see the header comment");
+constexpr bool QWEN4_PREVIEW_AXES = D_MODEL == 2560 && (N_LAYERS == 4 || N_LAYERS == 48);
+static_assert(QWEN4_PREVIEW_AXES || (D_MODEL == 5120 && N_LAYERS == 64),
+              "supported profiles are the Qwen4 preview fixtures and Qwen3.8-27B (5120 x 64)");
 static_assert(N_LAYERS != 48 || USE_MOE_QUANT,
               "the full 48-layer model is only expressible quantized-resident: all-f32 it is "
               "125,711,062,400 floats == 468 GiB, which is neither writable nor loadable here "
@@ -90,10 +90,12 @@ static_assert(N_LAYERS != 48 || USE_MOE_QUANT,
 // full48_totals.hpp (48 layers) each state explicitly.
 constexpr int         kExpectNumParams =
     N_LAYERS == 48 ? qwen4_full48::QUANT_NUM_PARAMS
-                    : (USE_MOE_QUANT ? qwen4_sub4::QUANT_NUM_PARAMS : qwen4_sub4::NUM_PARAMS);
+                    : (N_LAYERS == 64 ? NUM_PARAMS
+                       : (USE_MOE_QUANT ? qwen4_sub4::QUANT_NUM_PARAMS : qwen4_sub4::NUM_PARAMS));
 constexpr std::size_t kExpectParamFloats =
     N_LAYERS == 48 ? qwen4_full48::QUANT_PARAM_FLOATS
-                    : (USE_MOE_QUANT ? qwen4_sub4::QUANT_PARAM_FLOATS : qwen4_sub4::PARAM_FLOATS);
+                    : (N_LAYERS == 64 ? PARAM_FLOATS
+                       : (USE_MOE_QUANT ? qwen4_sub4::QUANT_PARAM_FLOATS : qwen4_sub4::PARAM_FLOATS));
 static_assert(NUM_PARAMS == kExpectNumParams);
 static_assert(PARAM_FLOATS == kExpectParamFloats);
 
@@ -101,12 +103,11 @@ static_assert(PARAM_FLOATS == kExpectParamFloats);
 // shape test also asserts"; at N_LAYERS = 48 it says the SAME thing about this build's own first four
 // layers, which is what makes the full artifact and the 4-layer one truncations of one model rather
 // than two independently-plausible files.
-static_assert(PARAM_LAYOUT[USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_TENSORS
+static_assert(!QWEN4_PREVIEW_AXES || (PARAM_LAYOUT[USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_TENSORS
                                           : qwen4_sub4::PREFIX_TENSORS].off ==
-                  (USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_FLOATS : qwen4_sub4::PREFIX_FLOATS),
-              "layers 0-3 must occupy exactly the float span the 48-layer real-shape test also "
-              "asserts -- otherwise this artifact is not a sub-stack of the real model");
-static_assert(MIXER_SCHEDULE[0] == LayerMixer::Gdn && MIXER_SCHEDULE[3] == LayerMixer::Qsa,
+                  (USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_FLOATS : qwen4_sub4::PREFIX_FLOATS)),
+              "layers 0-3 must occupy the Qwen4 preview fixture span");
+static_assert(!QWEN4_PREVIEW_AXES || (MIXER_SCHEDULE[0] == LayerMixer::Gdn && MIXER_SCHEDULE[3] == LayerMixer::Qsa),
               "the 3-GDN-then-1-QSA repeating unit");
 static_assert(N_LAYERS != 48 || MIXER_SCHEDULE[47] == LayerMixer::Qsa,
               "...and the last layer of the full stack closes the 12th repeat");
@@ -153,10 +154,15 @@ std::vector<Slot> build_plan() {
 
     add(Dest::TokEmb, PKind::TokEmb, -1, VOCAB, D_MODEL);
     for (int l = 0; l < N_LAYERS; ++l) {
-        add(Dest::GrAttnNorm,   PKind::GrHcNorm,      l, 1, WIDE);
-        add(Dest::GrAttnDown,   PKind::GrMixDown,     l, WIDE, HC_LOWRANK);
-        add(Dest::GrAttnUp,     PKind::GrMixUp,       l, HC_LOWRANK, WIDE);
-        add(Dest::GrAttnInject, PKind::GrBlockInject, l, WIDE, HC_COUNT);
+        if constexpr (USE_GATED_RESIDUAL) {
+            add(Dest::GrAttnNorm,   PKind::GrHcNorm,      l, 1, WIDE);
+            add(Dest::GrAttnDown,   PKind::GrMixDown,     l, WIDE, HC_LOWRANK);
+            add(Dest::GrAttnUp,     PKind::GrMixUp,       l, HC_LOWRANK, WIDE);
+            add(Dest::GrAttnInject, PKind::GrBlockInject, l, WIDE, HC_COUNT);
+        } else {
+            add(Dest::Ln1, PKind::Ln1, l, 1, D_MODEL);
+            add(Dest::Ln2, PKind::Ln2, l, 1, D_MODEL);
+        }
         if (MIXER_SCHEDULE[static_cast<std::size_t>(l)] == LayerMixer::Qsa) {
             add(Dest::QsaQProj,     PKind::QsaQProj,     l, D_MODEL, D_Q);
             add(Dest::QsaGateProj,  PKind::QsaGateProj,  l, D_MODEL, D_Q);
@@ -168,6 +174,16 @@ std::vector<Slot> build_plan() {
             add(Dest::QsaIdxQkProj, PKind::QsaIdxQkProj, l, D_MODEL, QSA_IDX_QK_OUT);
             add(Dest::QsaIdxQNorm,  PKind::QsaIdxQNorm,  l, 1, QSA_INDEXER_HEAD_DIM);
             add(Dest::QsaIdxKNorm,  PKind::QsaIdxKNorm,  l, 1, QSA_INDEXER_HEAD_DIM);
+        } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
+            add(Dest::AttnQ, PKind::Wq, l, D_MODEL, D_Q);
+            if constexpr (USE_ATTENTION_GATE) add(Dest::AttnQGate, PKind::WqGate, l, D_MODEL, D_Q);
+            add(Dest::AttnK, PKind::Wk, l, D_MODEL, D_KV);
+            add(Dest::AttnV, PKind::Wv, l, D_MODEL, D_KV);
+            add(Dest::AttnO, PKind::Wo, l, D_Q, D_MODEL);
+            if constexpr (USE_QK_NORM) {
+                add(Dest::AttnQNorm, PKind::QNorm, l, 1, D_HEAD);
+                add(Dest::AttnKNorm, PKind::KNorm, l, 1, D_HEAD);
+            }
         } else {
             add(Dest::GdnInProjQkv, PKind::GdnInProjQkv, l, D_MODEL, GDN_CONV_DIM);
             add(Dest::GdnInProjZ,   PKind::GdnInProjZ,   l, D_MODEL, GDN_VALUE_DIM);
@@ -179,10 +195,12 @@ std::vector<Slot> build_plan() {
             add(Dest::GdnNorm,      PKind::GdnNorm,      l, 1, GDN_V_HEAD_DIM);
             add(Dest::GdnOutProj,   PKind::GdnOutProj,   l, GDN_VALUE_DIM, D_MODEL);
         }
-        add(Dest::GrFfnNorm,   PKind::GrHcNorm,      l, 1, WIDE);
-        add(Dest::GrFfnDown,   PKind::GrMixDown,     l, WIDE, HC_LOWRANK);
-        add(Dest::GrFfnUp,     PKind::GrMixUp,       l, HC_LOWRANK, WIDE);
-        add(Dest::GrFfnInject, PKind::GrBlockInject, l, WIDE, HC_COUNT);
+        if constexpr (USE_GATED_RESIDUAL) {
+            add(Dest::GrFfnNorm,   PKind::GrHcNorm,      l, 1, WIDE);
+            add(Dest::GrFfnDown,   PKind::GrMixDown,     l, WIDE, HC_LOWRANK);
+            add(Dest::GrFfnUp,     PKind::GrMixUp,       l, HC_LOWRANK, WIDE);
+            add(Dest::GrFfnInject, PKind::GrBlockInject, l, WIDE, HC_COUNT);
+        }
         if constexpr (USE_MOE) {
             add(Dest::MoeRouter, PKind::MoeRouter, l, D_MODEL, NUM_EXPERTS);
             // WP4e: in a MOE_QUANT_EXPERTS build these are not f32 destinations at all -- they go to the
@@ -205,9 +223,13 @@ std::vector<Slot> build_plan() {
             add(Dest::FfnDown, PKind::W2, l, D_FF,    D_MODEL);
         }
     }
-    add(Dest::GrExitNorm, PKind::GrHcNorm,  -1, 1, WIDE);
-    add(Dest::GrExitDown, PKind::GrMixDown, -1, WIDE, HC_LOWRANK);
-    add(Dest::GrExitUp,   PKind::GrMixUp,   -1, HC_LOWRANK, WIDE);
+    if constexpr (USE_GATED_RESIDUAL) {
+        add(Dest::GrExitNorm, PKind::GrHcNorm,  -1, 1, WIDE);
+        add(Dest::GrExitDown, PKind::GrMixDown, -1, WIDE, HC_LOWRANK);
+        add(Dest::GrExitUp,   PKind::GrMixUp,   -1, HC_LOWRANK, WIDE);
+    } else {
+        add(Dest::LnF, PKind::LnF, -1, 1, D_MODEL);
+    }
     // No LnF slot: the real model has no final norm, so make_param_layout() emits none under
     // USE_GATED_RESIDUAL (see its own comment there and transplant.hpp's Synthetic note).
     add(Dest::LmHead, PKind::LmHead, -1, D_MODEL, VOCAB);
@@ -906,6 +928,10 @@ int main(int argc, char** argv) {
         os.write(reinterpret_cast<const char*>(&tok_fp), sizeof tok_fp);
         os.write(reinterpret_cast<const char*>(&arch), sizeof arch);
         os.write(reinterpret_cast<const char*>(&arch2), sizeof arch2);
+        if constexpr (ARCH_FINGERPRINT3 != 0) {
+            const std::uint64_t arch3 = ARCH_FINGERPRINT3;
+            os.write(reinterpret_cast<const char*>(&arch3), sizeof arch3);
+        }
         os.flush();
         if (!os) { std::println(stderr, "error: trailer write failed"); return 4; }
         os.close();

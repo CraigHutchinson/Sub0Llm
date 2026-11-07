@@ -1,6 +1,6 @@
 # Dense models used as-is: quantised-resident weights
 
-Status: DESIGN (nothing implemented). Tracking: issue #15. Facts below were read from the real
+Status: scalar mapped-projection baseline implemented; engine integration pending. Tracking: issue #15. Facts below were read from the real
 `unsloth/Qwen3.8-27B-GGUF` `UD-IQ1_S` file (5.77 GiB) on 2026-11-06 (AGENTS section 9), not recalled.
 
 ## Goal
@@ -54,6 +54,31 @@ is FFN gate/up/down (3.4 GiB, 59%), then `attn_qkv` (479 MiB), `ssm_out`, `attn_
 
 ## Memory budget (to confirm by measurement)
 
+Partial layer execution (2026-11-07): explicit target `sub0llm-dense-layer` runs actual token 1543's
+embedding through RMSNorm, the existing GDN recurrence with mapped float-activation projection
+callbacks, residual and dense SwiGLU FFN for layer 0. Build against the generated 27B SiLU profile,
+then pass the GGUF filename. Small norms/conv/decay parameters are decoded at startup; large matrices
+remain mapped and use 256-float block scratch. Existing GDN head permutation helpers handle tiled
+GGUF versus grouped engine axes. Observed output mean 0.00184919118, RMS 0.225238821, all finite;
+initial peak RSS 117460 KiB. This is a partial first-layer proving ground, with no later layers,
+logits or text. Independent real-layer parity is pending, especially the head-layout conventions.
+Independent reference (llama.cpp `cf659f240b232e15700b1721bbb43c1d973c52e9`): all 1494 sampled
+first/middle/last quant blocks match ggml bit for bit. The actual layer-0 output differs by relative
+L2 0.00796917 (cosine 0.99996848); this is unresolved, not a passed layer gate. Reference harnesses
+and reproduction notes are in `tools/reference/`. Activation quantization differs between the two
+paths, so stage captures are needed before attributing the remaining error.
+The callback's output/state/history match dense weights exactly at a synthetic shape; the eight GDN
+cases pass 1966 assertions. Full-model engine parameter loading remains unconnected.
+
+Initial proving ground (2026-11-07): `sub0llm-dense-probe MODEL.gguf TENSOR` maps the GGUF and
+uses `denseq::project` to decode one block at a time into caller-reserved scratch, without expanding
+the matrix. The real Q3_K `output.weight` (5120 x 248320, 546,304,000 encoded bytes) completed with
+256 floats of scratch and peak RSS 568,128 KiB. First/middle/last outputs match a whole-row
+dequantize-then-dot check exactly. Real IQ1_S `blk.0.ffn_gate.weight` and IQ1_M
+`blk.1.attn_gate.weight` also pass those row checks. These checks establish projection ordering and
+bounded scratch; they share the scalar decoders and do not establish independent ggml parity.
+This baseline is not yet connected to engine parameter loading or token generation.
+
 Weights 5.76 GiB + KV/GDN state + activations for one stream. Target well under 29 GiB, leaving the rest for context
 and page cache. Per token the engine reads roughly the file size, so memory bandwidth (about 79 GB/s on this
 CPU, `docs/HANDOVER.md`) bounds decode; not yet measured.
@@ -67,7 +92,41 @@ CPU, `docs/HANDOVER.md`) bounds decode; not yet measured.
 
 ## Open questions
 
+- **Verified correctness blocker (#45, 2026-11-07):** the actual downloaded GGUF reports
+  `general.architecture=qwen35` and RMS epsilon `1e-6`. The existing GDN primitive targets
+  Qwen4-preview: its output gate defaults to sigmoid. Correction to the initial report:
+  forward and backward already use RMS epsilon `1e-6`; there is no GDN epsilon mismatch.
+  Transformers' `Qwen3_5RMSNormGated` instead applies SiLU after RMS normalization (epsilon `1e-6`):
+  https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py .
+  The primitive now accepts `Dims::output_gate_silu`, including backward recomputation and derivative.
+  Seven GDN cases pass (1,962 assertions), including finite-difference checks for both activations.
+  The configurator now emits `SUB0_GDN_OUTPUT_SILU`, selected by `gdn-output-silu = 1` in the
+  27B profile. Both engine forward paths receive it through `GDN_DIMS`. Nonlegacy model artifacts
+  append an eight-byte third architecture word; sigmoid artifacts retain their exact prior layout.
+  SiLU checkpoints use v8 with the extra word; legacy checkpoints retain v7. Generated profile and
+  override checks pass. Actual small-engine save/load checks pass: each gate variant loads its own
+  artifact and rejects the other; SiLU rejects a missing or altered third word. At d32/L4/H2/KV1,
+  GDN K1/V2 x 16, ff64, vocab512, seq8, f32 parameters, three-token forward/decode maximum absolute
+  logit differences are 1.19209e-7 (SiLU) and 5.96046e-8 (sigmoid). These are random-weight engine
+  checks, not independent real-model parity. The artifacts are 303168 and 303160 bytes respectively.
+  `sub0llm-model-probe` preserves this harness as an explicit build target: run `save MODEL.bin` to
+  save and check forward/decode, and `load MODEL.bin` in each separately configured binary to check
+  acceptance (exit 0) or refusal (exit 6). Generate the small axes above using the Qwen profile with
+  explicit dimension overrides and `--gdn-output-silu 1|0`. Real-weight model parity remains pending.
+
 - Does the dense decode path support Qwen3.5-style GDN + gated FFN at d5120 (the `qwen35` arch)? Run it at the
   smallest scale first.
 - Int8-activation versus float-activation dots for the I-quants (the project's MoE precedent is in `MOE_QUANT_DOT.md`).
 - MTP and vision tensors in the repo's other files are out of scope.
+
+
+## First-layer independent parity (2026-11-07)
+
+The earlier 0.797% comparison is now explained: the float diagnostic still allowed CPU_REPACK for
+Q2_K `ssm_out`, bypassing its scalar float-activation dots. With `GGML_CPU_REPACK=OFF`, the diagnostic
+reference and Sub0Llm's actual first-layer output agree at relative L2 8.05504e-7 and max absolute
+1.04904e-5 over all 5120 values. QKV/Z projections, convolution and gated recurrence agree within
+3e-6 relative L2; GDN output projection within 7.104e-7. `tools/reference/README.md` records exact
+source revision, diagnostic modifications and commands. This is an independent first-token/layer
+math and layout check using the actual downloaded weights. The stock reference's quantized-activation
+path still differs by the measured 0.797%; multi-token recurrence and later-layer parity remain.

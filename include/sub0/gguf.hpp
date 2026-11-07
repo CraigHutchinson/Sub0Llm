@@ -19,6 +19,7 @@
 
 #include "sub0/bf16.hpp"                // sub0::bf16_widen -- the one definition of the bf16 shift
 #include "sub0/gguf_quant_tables.hpp"   // the ggml IQ codebooks -- data only, see that file's header
+#include "sub0/quant/all.hpp"          // incrementally migrated format modules
 
 #include <array>
 #include <cstdint>
@@ -31,6 +32,7 @@
 #include <vector>
 
 namespace sub0::gguf {
+using quant::f16_to_f32;
 
 // --- wire format enums (as defined by the GGUF spec, not this project) -----------------------
 
@@ -55,10 +57,7 @@ enum class ValueType : std::uint32_t {
 // mixed quantization gives the SAME logical tensor different formats at different layers (layers 0/3's
 // ffn_gate_exps is IQ1_S, layers 1/2's is IQ2_XXS -- observed directly in the real file). The
 // per-TensorInfo dispatch every function here uses already has that shape.
-enum class TensorType : std::uint32_t {
-    F32 = 0, F16 = 1, Q8_0 = 8,
-    Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ1_S = 19, IQ4_NL = 20, BF16 = 30,
-};
+using TensorType = quant::TensorType;
 
 // One quantization format's block geometry: `elems` elements encoded in `bytes` bytes. The plain
 // storage types are expressed as a degenerate 1-element "block" so ONE rule sizes every format and
@@ -75,7 +74,7 @@ enum class TensorType : std::uint32_t {
 //   IQ1_S  f16 + 32 grid-index bytes + 8*u16 qh                       =  50 / 256
 //   IQ2_XXS f16 + 32*u16                                              =  66 / 256
 //   IQ4_NL f16 + 16 packed nibbles                                    =  18 /  32
-struct BlockSpec { std::uint64_t elems = 0, bytes = 0; };
+using BlockSpec = quant::BlockSpec;
 
 // THE FORMAT REGISTRY, part 1 of 2: every storage format this reader knows, with its block geometry.
 // To add a format: (1) add its enumerator to TensorType, (2) add ONE row here, (3) write its
@@ -83,18 +82,25 @@ struct BlockSpec { std::uint64_t elems = 0, bytes = 0; };
 // so the new format is covered by the generic conformance checks with no new test code. A dot kernel for
 // the format is a separate, optional layer (a Plane in moe_quant_dot.hpp); see docs/QUANT_FORMATS.md.
 struct FormatInfo { TensorType type; const char* name; BlockSpec block; };
-inline constexpr std::array<FormatInfo, 10> kFormats = {{
-    {TensorType::F32,     "F32",     {1, 4}},
-    {TensorType::F16,     "F16",     {1, 2}},
-    {TensorType::BF16,    "BF16",    {1, 2}},
-    {TensorType::Q8_0,    "Q8_0",    {32, 34}},
-    {TensorType::Q4_K,    "Q4_K",    {256, 144}},
-    {TensorType::Q5_K,    "Q5_K",    {256, 176}},
-    {TensorType::Q6_K,    "Q6_K",    {256, 210}},
-    {TensorType::IQ2_XXS, "IQ2_XXS", {256, 66}},
-    {TensorType::IQ1_S,   "IQ1_S",   {256, 50}},
-    {TensorType::IQ4_NL,  "IQ4_NL",  {32, 18}},
-}};
+inline constexpr auto kFormats = [] {
+    std::array<FormatInfo, 10 + quant::kModules.size()> formats = {{
+        {TensorType::F32,     "F32",     {1, 4}},
+        {TensorType::F16,     "F16",     {1, 2}},
+        {TensorType::BF16,    "BF16",    {1, 2}},
+        {TensorType::Q8_0,    "Q8_0",    {32, 34}},
+        {TensorType::Q4_K,    "Q4_K",    {256, 144}},
+        {TensorType::Q5_K,    "Q5_K",    {256, 176}},
+        {TensorType::Q6_K,    "Q6_K",    {256, 210}},
+        {TensorType::IQ2_XXS, "IQ2_XXS", {256, 66}},
+        {TensorType::IQ1_S,   "IQ1_S",   {256, 50}},
+        {TensorType::IQ4_NL,  "IQ4_NL",  {32, 18}},
+    }};
+    for (std::size_t i = 0; i < quant::kModules.size(); ++i) {
+        const auto& module = quant::kModules[i];
+        formats[10 + i] = {module.type, module.name.data(), module.block};
+    }
+    return formats;
+}();
 
 [[nodiscard]] inline constexpr const FormatInfo* find_format(std::uint32_t type_raw) {
     for (const FormatInfo& f : kFormats)
@@ -121,6 +127,7 @@ struct Value {
     bool                       b = false;
     std::string                s;
     std::vector<std::string>   sa;
+    std::vector<std::int32_t>  ia32; // retained Int32 arrays (e.g. tokenizer.ggml.token_type)
     std::uint64_t               array_len = 0;   // set for StringArray/OtherArray
 };
 
@@ -268,10 +275,16 @@ private:
                     for (std::uint64_t i = 0; i < len; ++i) { std::string s; if (!read_string(s)) return false; v.sa.push_back(std::move(s)); }
                     return true;
                 }
-                // Non-string array: skip the payload (fixed-width elements), just record the count.
+                // Retain signed token-type arrays; other fixed-width arrays only need their count.
                 v.kind = Value::Kind::OtherArray; v.array_len = len;
                 const std::size_t w = value_width(elem_type);
                 if (w == 0) return false;                       // nested Array-of-Array: not in the spec
+                if (len > (buf_.size() - pos_) / w) return false;
+                if (elem_type == ValueType::Int32) {
+                    v.ia32.resize(static_cast<std::size_t>(len));
+                    for (auto& value : v.ia32) if (!read_pod(value)) return false;
+                    return true;
+                }
                 if (!need(w * static_cast<std::size_t>(len))) return false;
                 pos_ += w * static_cast<std::size_t>(len);
                 return true;
@@ -337,33 +350,6 @@ private:
 };
 
 // --- dequantization (raw tensor bytes -> F32) -----------------------------------------------------
-
-// IEEE-754 binary16 -> binary32. Standard sign/exponent/mantissa bit-manipulation (subnormal- and
-// inf/nan-aware) -- ggml's f16 scale factors (Q8_0's block delta) and any F16-stored tensor both need
-// this; there is no <stdfloat> std::float16_t support on this toolchain yet.
-inline float f16_to_f32(std::uint16_t h) {
-    std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
-    std::uint32_t exp  = (h >> 10) & 0x1Fu;
-    std::uint32_t mant = h & 0x3FFu;
-    std::uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;                                    // +-0
-        } else {                                             // subnormal half -> normalized float
-            int e = -1;
-            do { mant <<= 1; ++e; } while (!(mant & 0x400u));
-            mant &= 0x3FFu;
-            bits = sign | (static_cast<std::uint32_t>(127 - 15 - e) << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1Fu) {
-        bits = sign | 0x7F800000u | (mant << 13);           // inf / nan (mantissa preserved -> nan payload)
-    } else {
-        bits = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
-    }
-    float f;
-    std::memcpy(&f, &bits, sizeof f);
-    return f;
-}
 
 // Dequantize a ggml block_q8_0 buffer: each 32-element block is a little-endian f16 scale `d`
 // followed by 32 int8 quants `q`; value[i] = q[i] * d. `raw` must be at least
@@ -635,21 +621,34 @@ inline bool dequantize_iq1_s(std::span<const std::uint8_t> raw, std::uint64_t n,
     return true;
 }
 
+// Compatibility forwarding name; the implementation and geometry live in quant/q2_k.hpp.
+inline bool dequantize_q2_k(std::span<const std::uint8_t> raw, std::uint64_t n,
+                            std::vector<float>& out) {
+    return quant::Q2K::dequantize(raw, n, out);
+}
+
 // THE FORMAT REGISTRY, part 2 of 2: the dequantiser for each block-quantised format. The plain storage
 // types (F32/F16/BF16) are converted inline by to_f32 and so have no row here. A format listed in kFormats
 // but missing here is a registry error: the static_assert below makes it a compile error, not a silent
 // "cannot import" at run time.
 using DequantFn = bool (*)(std::span<const std::uint8_t>, std::uint64_t, std::vector<float>&);
 struct DequantEntry { TensorType type; DequantFn fn; };
-inline constexpr std::array<DequantEntry, 7> kDequant = {{
-    {TensorType::Q8_0,    &dequantize_q8_0},
-    {TensorType::Q4_K,    &dequantize_q4_k},
-    {TensorType::Q5_K,    &dequantize_q5_k},
-    {TensorType::Q6_K,    &dequantize_q6_k},
-    {TensorType::IQ2_XXS, &dequantize_iq2_xxs},
-    {TensorType::IQ1_S,   &dequantize_iq1_s},
-    {TensorType::IQ4_NL,  &dequantize_iq4_nl},
-}};
+inline constexpr auto kDequant = [] {
+    std::array<DequantEntry, 7 + quant::kModules.size()> entries = {{
+        {TensorType::Q8_0,    &dequantize_q8_0},
+        {TensorType::Q4_K,    &dequantize_q4_k},
+        {TensorType::Q5_K,    &dequantize_q5_k},
+        {TensorType::Q6_K,    &dequantize_q6_k},
+        {TensorType::IQ2_XXS, &dequantize_iq2_xxs},
+        {TensorType::IQ1_S,   &dequantize_iq1_s},
+        {TensorType::IQ4_NL,  &dequantize_iq4_nl},
+    }};
+    for (std::size_t i = 0; i < quant::kModules.size(); ++i) {
+        const auto& module = quant::kModules[i];
+        entries[7 + i] = {module.type, module.dequantize};
+    }
+    return entries;
+}();
 
 [[nodiscard]] inline constexpr DequantFn dequant_fn(std::uint32_t type_raw) {
     for (const DequantEntry& e : kDequant)

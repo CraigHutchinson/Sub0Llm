@@ -613,6 +613,7 @@ int main(int argc, char** argv) {
     // CUDA (backend_cuda.cu keeps its own static_assert) -- so a GDN build works for gen/eval/report but
     // NOT for train/tune. See docs/GATED_DELTANET.md.
     int gdn_full_attn_stride = 0;
+    int gdn_output_silu = 0;
     // Gated DeltaNet's OWN head geometry (WP4b blocker B, docs/WP4_SCOPE.md S2). Until this pass these
     // four were ALIASED onto --kv-heads / --heads / D_HEAD / D_HEAD, which cannot express the real
     // Qwen4-preview model (16 / 48 / 128 / 128 against attention's 2 / 24 / 256). Each is 0 = "alias to
@@ -720,6 +721,7 @@ int main(int argc, char** argv) {
     // etc. to opt out (e.g. importing a GGUF of a different shape).
     int gated_ffn    = 1;       // 1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the
                                  // plain 2-matrix GELU+bias FFN -- matches the GGUF/Llama-family convention
+    int attention_gate = 0;     // 1 = Qwen attention output sigmoid-gated by a second Q projection
     int tie_embeddings = 1;    // 1 = the LM head reuses tok_emb (transposed) instead of its own
                                  // matrix+bias -- a real param-count win at this project's small-model scale
     int qk_norm      = 1;       // 1 = RMSNorm applied per-head to Q/K right after their projection,
@@ -804,6 +806,7 @@ int main(int argc, char** argv) {
                    "attention). Stage 1: CPU forward only -- gen/eval/report work, train/tune do not "
                    "(no backward pass yet, and no CUDA build)")
        ->capture_default_str()->check(CLI::Range(0, 1024));
+    app.add_option("--gdn-output-silu", gdn_output_silu, "GDN output gate: 0 sigmoid, 1 SiLU (qwen35)")->check(CLI::Range(0, 1));
     app.add_option("--gdn-key-heads", gdn_key_heads,
                    "Gated DeltaNet: linear-attention KEY/query head count, independent of --kv-heads "
                    "(0 = alias to --kv-heads, the previous behaviour). Real Qwen4-preview: 16")
@@ -1044,6 +1047,9 @@ int main(int argc, char** argv) {
                    "2-matrix GELU+bias FFN -- matches the GGUF/Llama-family convention, for "
                    "importing open weights of that shape (CPU and GPU)")
        ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--attention-gate", attention_gate,
+                   "1 = Qwen full-attention query projection includes a separate sigmoid output gate")
+       ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--tie-embeddings", tie_embeddings,
                    "1 = the LM head reuses the token embedding matrix (transposed) instead of its own "
                    "matrix+bias -- fewer params, no separate head weight")
@@ -1216,6 +1222,7 @@ int main(int argc, char** argv) {
         reg("dmodel", d_model);                  reg("layers", n_layers);               reg("heads", n_heads);
         reg("kv-heads", n_kv_heads);             reg("head-dim", head_dim);             reg("rotary-dim", rotary_dim);
         reg("rope-theta", rope_theta);           reg("gdn-full-attn-stride", gdn_full_attn_stride);
+        reg("gdn-output-silu", gdn_output_silu);
         reg("gdn-key-heads", gdn_key_heads);     reg("gdn-value-heads", gdn_value_heads);
         reg("gdn-key-head-dim", gdn_key_head_dim); reg("gdn-value-head-dim", gdn_value_head_dim);
         reg("hc-count", hc_count);               reg("hc-lowrank", hc_lowrank);
@@ -1223,6 +1230,7 @@ int main(int argc, char** argv) {
         reg("qsa-indexer-head-dim", qsa_idx_head_dim); reg("qsa-indexer-budget", qsa_idx_budget);
         reg("qsa-indexer-compress-ratio", qsa_idx_ratio);
         reg("tie-embeddings", tie_embeddings);   reg("d-ff", d_ff_pin);                 reg("gated-ffn", gated_ffn);
+        reg("attention-gate", attention_gate);
         reg("moe-quant-experts", moe_quant_experts); reg("num-experts", num_experts);   reg("experts-per-tok", experts_per_tok);
         reg("prec-param", prec_param);           reg("vocab-exact", vocab_exact);       reg("seq", seq_len);
         reg("pos-encoding", pos_encoding);
@@ -2126,6 +2134,7 @@ int main(int argc, char** argv) {
     // Gated DeltaNet Stage 1: every Nth layer (0-indexed, N = stride) stays softmax attention; the rest
     // become GDN layers (layout.hpp's GDN_SCHEDULE, op_gdn/gdn_math.hpp's CPU forward). 0 = off, every
     // layer softmax attention. See docs/GATED_DELTANET.md.
+    cos << "#define SUB0_GDN_OUTPUT_SILU " << gdn_output_silu << "\n";
     cos << "constexpr int  GDN_FULL_ATTN_STRIDE = " << gdn_full_attn_stride << ";\n";
     // Gated DeltaNet's OWN four head axes (WP4b blocker B, docs/WP4_SCOPE.md S2): the linear-attention
     // key/value head counts and per-head widths, no longer aliased onto N_KV_HEADS/N_HEADS/D_HEAD.
@@ -2261,6 +2270,7 @@ int main(int argc, char** argv) {
     // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
     // swiglu_backward_act_kernel in backend_cuda.cu).
     cos << "constexpr bool USE_GATED_FFN = " << (gated_ffn ? "true" : "false") << ";\n";
+    cos << "constexpr bool USE_ATTENTION_GATE = " << (attention_gate ? "true" : "false") << ";\n";
     // Tied embeddings: the LM head reuses tok_emb (transposed) instead of its own matrix+bias --
     // see op_tied_head in backend_cpu.cpp. No dims/checkpoint-shape interaction with USE_GATED_FFN,
     // the two are independent axes.

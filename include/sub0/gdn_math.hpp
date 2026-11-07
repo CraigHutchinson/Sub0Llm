@@ -82,7 +82,13 @@ namespace sub0::gdn {
 // (token, layer) inside forward() -- `x_q` feeds BOTH in_qkv and in_z (the same D_MODEL-wide input row),
 // never re-quantized per projection. `out_gather_buf`/`out_gather_idx` are likewise sized/derived once
 // by the caller, not per token.
+enum class Projection { Qkv, Z, Beta, Alpha, Out };
 struct Native {
+    // Optional float-activation projection backend. Caller supplies engine/grouped output order
+    // and owns all mapped storage and scratch for the duration of forward(). T==1 only.
+    using Project = bool (*)(void*, Projection, const float*, int, float*, int);
+    Project project = nullptr;
+    void* project_context = nullptr;
     // O5 phase 2b-3 phase A: bbqd::Plane, not bbq::Desc+raw span -- see backbone_quant_dot.hpp's own
     // "format-agnostic plane view" comment. Non-owning; the caller's resolved-role table (decode.cpp)
     // outlives every call this pointer is read in.
@@ -135,6 +141,7 @@ struct Dims {
     int head_k_dim;    // Q/K per-head width (this project's D_HEAD)
     int head_v_dim;    // V/Z per-head width (this project's D_HEAD; == head_k_dim in the real model)
     int conv_kernel;   // depthwise causal conv kernel size (real model: 4)
+    bool output_gate_silu = false; // qwen35 uses SiLU; Qwen4-preview uses sigmoid
 
     constexpr int key_dim()   const { return head_k_dim * num_k_heads; }
     constexpr int value_dim() const { return head_v_dim * num_v_heads; }
@@ -247,13 +254,9 @@ enum class Stage : unsigned char { InQuant, InProj, BaProj, Conv, Recurrence, Ga
 // `state`/`conv_hist` in/out, see the file header. `scratch`: >= scratch_floats(d,T) floats, fully
 // consumed here, not retained.
 //
-// The output GATE activation is hardcoded SIGMOID here, not a generic `hidden_act` fallback: the real
-// Qwen4-preview config sets `output_gate_type="sigmoid"` explicitly (manifest's config_small, and
-// `activation=config.output_gate_type or config.hidden_act` in the real __init__ -- a truthy
-// `output_gate_type` always wins), so this is the one real, verified value rather than a speculative
-// knob (AGENTS.md S8: don't add surface area nothing has asked for yet). The causal conv's own
-// activation is separately, correctly SiLU (`config.hidden_act`) -- the two are genuinely different
-// activations in the real model, not the same choice reused twice.
+// Output gating defaults to Qwen4-preview's sigmoid. Dims::output_gate_silu selects qwen35's
+// SiLU gate (z * sigmoid(z)), as defined by Transformers' Qwen3_5RMSNormGated. Causal conv
+// activation remains SiLU independently of this output-gate choice.
 // B24: every one of the nine WEIGHT pointers is templated on `WP` (docs/BACKBONE_PRECISION.md S1,
 // include/sub0/param_store.hpp). `x`, `state`, `conv_hist`, `out` and `scratch` stay `float*` -- they
 // are activations and caller scratch, not parameters. In an F32 build `WP` is `const float*` and this
@@ -283,6 +286,14 @@ inline void forward(const Dims& d, int T,
     const int K = d.conv_kernel;
     const int Hk = d.num_k_heads, Hv = d.num_v_heads, rep = d.rep();
     const int dk = d.head_k_dim, dv = d.head_v_dim;
+    const auto project = [&](Projection role, const float* input, WP weights, int in, int out_width, float* output) {
+        if (native && native->project && T == 1) {
+            if (!native->project(native->project_context, role, input, in, output, out_width)) {
+                std::fprintf(stderr, "fatal: mapped GDN projection rejected geometry or data\n");
+                std::abort();
+            }
+        } else gemv::axpy<Threads>(input, weights, in, out_width, output);
+    };
     constexpr float RMS_EPS = 1e-6f;   // Qwen4ExpTextRMSNormGated's real eps (rms_norm_eps in the manifest)
     constexpr float L2_EPS  = 1e-6f;   // l2norm's real eps
 
@@ -355,12 +366,12 @@ inline void forward(const Dims& d, int T,
             }
         } else {
             probe(Stage::InProj);
-            gemv::axpy<Threads>(xt, w_qkv, hs, conv_dim, qkvr);   // O2: include/sub0/gemv.hpp
-            gemv::axpy<Threads>(xt, w_z, hs, value_dim, zr);
+            project(Projection::Qkv, xt, w_qkv, hs, conv_dim, qkvr);
+            project(Projection::Z, xt, w_z, hs, value_dim, zr);
         }
         probe(Stage::BaProj);
-        gemv::axpy<Threads>(xt, w_b, hs, Hv, br);             // O4: raw b_logit, transformed below
-        gemv::axpy<Threads>(xt, w_a, hs, Hv, gr);             // O4: raw a_logit, transformed below
+        project(Projection::Beta, xt, w_b, hs, Hv, br);
+        project(Projection::Alpha, xt, w_a, hs, Hv, gr);
         for (int hh = 0; hh < Hv; ++hh) {
             br[hh] = detail::sigmoid(br[hh]);
             gr[hh] = -std::exp(a_log[hh]) * detail::softplus(gr[hh] + dt_bias[hh]);
@@ -471,7 +482,8 @@ inline void forward(const Dims& d, int T,
             ms /= dv;
             const float rinv = 1.f / std::sqrt(ms + RMS_EPS);
             for (int j = 0; j < dv; ++j)
-                gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
+                gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]) *
+                    (d.output_gate_silu ? zv[j] : 1.f);
         });
         float* ot = out + static_cast<std::size_t>(t) * hs;
         probe(Stage::OutQuant);   // native path: gather + quantize; the axpy fallback has neither
@@ -506,7 +518,7 @@ inline void forward(const Dims& d, int T,
             }
         } else {
             probe(Stage::OutProj);
-            gemv::axpy<Threads>(gated, w_out, value_dim, hs, ot);
+            project(Projection::Out, gated, w_out, value_dim, hs, ot);
         }
     }
 }
@@ -836,7 +848,8 @@ inline void backward(const Dims& d, int T,
             const float rinv = 1.f / std::sqrt(ms + RMS_EPS);
             rinv_buf[static_cast<std::size_t>(t) * Hv + hh] = rinv;
             for (int j = 0; j < dv; ++j)
-                gated_row[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
+                gated_row[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]) *
+                    (d.output_gate_silu ? zv[j] : 1.f);
         }
     }
 
@@ -871,7 +884,8 @@ inline void backward(const Dims& d, int T,
             const float r3_over_dv = (rinv * rinv * rinv) / static_cast<float>(dv);
             float Ssum = 0.f;
             for (int j = 0; j < dv; ++j) {
-                const float gate = detail::sigmoid(zv[j]);
+                const float sigmoid = detail::sigmoid(zv[j]);
+                const float gate = sigmoid * (d.output_gate_silu ? zv[j] : 1.f);
                 gate_cache[j] = gate;
                 const float normed = cv[j] * rinv;
                 const float dg = d_gated_row[hh * dv + j];
@@ -879,7 +893,10 @@ inline void backward(const Dims& d, int T,
                 d_normed_cache[j] = d_normed;
                 dnorm_w[j] += dg * normed * gate;
                 const float d_gate = dg * norm_w[j] * normed;
-                zv[j] = d_gate * gate * (1.f - gate);          // overwrite z_proj IN PLACE: d(z_logit)
+                const float derivative = d.output_gate_silu
+                    ? sigmoid * (1.f + zv[j] * (1.f - sigmoid))
+                    : sigmoid * (1.f - sigmoid);
+                zv[j] = d_gate * derivative; // overwrite z_proj IN PLACE: d(z_logit)
                 Ssum += d_normed * cv[j];
             }
             for (int j = 0; j < dv; ++j)

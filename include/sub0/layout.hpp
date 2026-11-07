@@ -312,8 +312,13 @@ inline constexpr int GDN_CONV_DIM  = 2 * GDN_KEY_DIM + GDN_VALUE_DIM;
 // This build's GDN dims, per S3a's mapping: hidden_size=D_MODEL (in AND out -- see gdn_math.hpp's own
 // note on hidden_size playing double duty), with GDN's own four head axes above. Valid (never divides
 // by zero, etc.) even when USE_GATED_DELTANET is false -- it just describes a shape nothing builds.
+// Legacy generated headers omit this macro and retain the sigmoid gate.
+#ifndef SUB0_GDN_OUTPUT_SILU
+#define SUB0_GDN_OUTPUT_SILU 0
+#endif
+inline constexpr bool GDN_OUTPUT_SILU = SUB0_GDN_OUTPUT_SILU != 0;
 inline constexpr gdn::Dims GDN_DIMS{D_MODEL, GDN_K_HEADS, GDN_V_HEADS,
-                                    GDN_K_HEAD_DIM, GDN_V_HEAD_DIM, GDN_CONV_KERNEL};
+                                    GDN_K_HEAD_DIM, GDN_V_HEAD_DIM, GDN_CONV_KERNEL, GDN_OUTPUT_SILU};
 static_assert(GDN_DIMS.conv_dim() == GDN_CONV_DIM,
               "GDN_CONV_DIM must equal gdn::Dims::conv_dim() -- two derivations of one width");
 
@@ -895,6 +900,8 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT2 =
     arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK, QSA_INDEXER_BUDGET,
                       QSA_INDEXER_COMPRESS_RATIO, USE_GATED_DELTANET ? GDN_K_HEADS : 0,
                       ROTARY_DIM == D_HEAD ? 0 : ROTARY_DIM);
+// Optional third word: emitted only for a nonlegacy GDN gate. Default model bytes stay unchanged.
+inline constexpr std::uint64_t ARCH_FINGERPRINT3 = USE_GATED_DELTANET && GDN_OUTPUT_SILU ? 1u : 0u;
 inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0, 0, 0, 0, 0);
 
 // MODEL_ARCH_ID -- the FULL architecture identity: every axis that makes two models different things,
@@ -934,6 +941,7 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(USE_GATED_FFN));
     mix(static_cast<std::uint64_t>(USE_TIED_EMBEDDINGS));
     mix(static_cast<std::uint64_t>(USE_QK_NORM));
+    if constexpr (ARCH_FINGERPRINT3 != 0) mix(ARCH_FINGERPRINT3);
     mix(ARCH_FINGERPRINT);      // folds in LoopSplit's schedule and ROPE_THETA
     mix(static_cast<std::uint64_t>(DEPTH_ATTN_STRIDE));   // adds no parameters; changes computation
     mix(static_cast<std::uint64_t>(ROPE_SCALING));
@@ -1053,7 +1061,7 @@ consteval int count_num_params() {
             // unconditionally, so they are part of this mixer's identity, not an optional engine feature.
             n += 10;
         } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
-            n += 4;   // Wq, Wk, Wv, Wo
+            n += 4 + (USE_ATTENTION_GATE ? 1 : 0);   // Wq, optional WqGate, Wk, Wv, Wo
             if constexpr (USE_QK_NORM) n += 2;   // QNorm, KNorm
         } else {
             n += 9;   // GdnInProjQkv/Z/B/A, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj
@@ -1130,7 +1138,7 @@ inline constexpr int NUM_PARAMS = count_num_params();
 // which is why they are separate kinds rather than a reuse. QsaIdxQkProj is the indexer's single fused
 // [D_MODEL, (idx_n+idx_kv)*idx_hd] projection; QsaIdxQNorm/QsaIdxKNorm are its two [1, idx_hd] norms.
 enum class PKind : unsigned char {
-    TokEmb, PosEmb, Ln1, Ln2, Wq, Wk, Wv, Wo, W1, B1, W2, B2, LnF, LmHead, LmBias, Wg, QNorm, KNorm,
+    TokEmb, PosEmb, Ln1, Ln2, Wq, WqGate, Wk, Wv, Wo, W1, B1, W2, B2, LnF, LmHead, LmBias, Wg, QNorm, KNorm,
     NgramEmb, NgramProj,
     GdnInProjQkv, GdnInProjZ, GdnInProjB, GdnInProjA, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj,
     GrHcNorm, GrMixDown, GrMixUp, GrBlockInject,
@@ -1213,6 +1221,7 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
             // --head-dim makes N_HEADS*D_HEAD independent of D_MODEL (WP4b blocker A). Identical to
             // the previous [D_MODEL,D_MODEL] pair at --head-dim 0.
             add(D_MODEL, D_Q,     PKind::Wq,  true,  true);
+            if constexpr (USE_ATTENTION_GATE) add(D_MODEL, D_Q, PKind::WqGate, true, true);
             // Wk/Wv are [in=D_MODEL, out=D_KV] -- narrower than Wq under GQA, identical when N_KV_HEADS
             // == N_HEADS. NOTE the axis order is this project's [rows=in, cols=out], the TRANSPOSE of the
             // PyTorch references this feature is modelled on (see AGENTS.md 5: re-derive conventions, do
@@ -1337,7 +1346,7 @@ inline constexpr std::array<ParamDesc, NUM_PARAMS> PARAM_LAYOUT = make_param_lay
 // GPU hybrid dispatch (device_adam_step, backend_cuda.cu) can never drift out of sync on which
 // kinds route through Muon -- backend_cpu.cpp used to inline this exact kind set locally.
 inline constexpr bool is_muon_kind(PKind k) {
-    return k == PKind::Wq || k == PKind::Wk || k == PKind::Wv || k == PKind::Wo ||
+    return k == PKind::Wq || k == PKind::WqGate || k == PKind::Wk || k == PKind::Wv || k == PKind::Wo ||
            k == PKind::W1 || k == PKind::W2 || k == PKind::Wg ||
            // MoE (Stage 1): the routed and shared experts' own SwiGLU matrices are ordinary hidden GEMM
            // weights, NUM_EXPERTS independent copies of the same role Wg/W1/W2 already play -- Muon-

@@ -46,7 +46,7 @@ TEST_CASE("quant registry: ids and names are unique, geometry is sane", "[quant]
 }
 
 TEST_CASE("quant registry: an unknown type id is unknown everywhere, never guessed", "[quant][registry]") {
-    for (const std::uint32_t id : {9999u, 10u /*Q2_K: real ggml id, not implemented*/, 0xffffffffu}) {
+    for (const std::uint32_t id : {9999u, 0xffffffffu}) {
         CHECK(find_format(id) == nullptr);
         CHECK(block_spec(id).elems == 0);
         CHECK(dequant_fn(id) == nullptr);

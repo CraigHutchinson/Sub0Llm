@@ -1126,6 +1126,16 @@ const float* Model::forward_one(int id, int pos) {
                     for (int aa = 0; aa < d; ++aa) att[off + aa] += p * vj[aa];
                 }
             }
+            if constexpr (USE_ATTENTION_GATE) {
+                // Attention has consumed qn, so reuse it for the gate projection without per-token allocation.
+                linear_row(a, L.Wq_gate, nullptr, qn, C, sub0::D_Q);
+                for (int j = 0; j < sub0::D_Q; ++j) {
+                    const float x = qn[j];
+                    const float s = x >= 0.f ? 1.f / (1.f + std::exp(-x))
+                                             : std::exp(x) / (1.f + std::exp(x));
+                    att[j] *= s;
+                }
+            }
             linear_row(att, L.Wo, nullptr, proj, sub0::D_Q, C);   // Wo is [D_Q, D_MODEL] (blocker A)
             gr_write_row(h, proj);                                           // residual (write step)
         };

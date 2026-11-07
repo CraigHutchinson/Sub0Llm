@@ -231,6 +231,10 @@ target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0llm_frontend)
 # no CLI11 dependency -- it takes one plain --gguf <dir> argument), same "reads only what a design pass
 # needs, never a bulk payload load" reasoning as sub0llm-tokenizer above.
 add_executable(sub0llm-backbone-census tools/sub0llm-backbone-census.cpp)
+add_executable(sub0llm-dense-probe tools/sub0llm-dense-probe.cpp)
+add_executable(sub0llm-export-tokenizer tools/sub0llm-export-tokenizer.cpp)
+target_link_libraries(sub0llm-export-tokenizer PRIVATE sub0llm_frontend)
+target_include_directories(sub0llm-dense-probe PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_include_directories(sub0llm-backbone-census PRIVATE "${CMAKE_SOURCE_DIR}/include")
 
 # WP4c: the offline weight transplant (docs/WP4_SCOPE.md S4). Unusual in exactly one way, and the
@@ -319,6 +323,12 @@ target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 # CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
 add_library(sub0llm_core SHARED src/engine_core.cpp src/blend_schedule.cpp ${SUB0_BACKEND_SOURCES})
+add_executable(sub0llm-model-probe EXCLUDE_FROM_ALL tools/sub0llm-model-probe.cpp)
+add_executable(sub0llm-dense-layer EXCLUDE_FROM_ALL tools/sub0llm-dense-layer.cpp)
+target_include_directories(sub0llm-dense-layer PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+add_executable(sub0llm-dense-token EXCLUDE_FROM_ALL tools/sub0llm-dense-token.cpp)
+target_include_directories(sub0llm-dense-token PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+target_link_libraries(sub0llm-model-probe PRIVATE sub0llm_core)
 target_include_directories(sub0llm_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0llm_frontend used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
