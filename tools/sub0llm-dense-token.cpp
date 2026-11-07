@@ -22,13 +22,14 @@ int main(int argc,char** argv) try {
     app.add_option("--tokenizer-dir",tokenizer_dir,"Tokenizer exported from this GGUF");
     app.add_option("--projection-threads",projection_threads,"Independent output-row workers (OpenMP)")->check(CLI::Range(1,8));
     // TODO(#60): evaluation knob; promote the proven kernel through the generated configuration after gates.
-    app.add_option("--iq1s-kernel",iq1_kernel_name,"IQ1_S projection experiment")->check(CLI::IsMember({"baseline","scalar","native"}));
+    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel experiment")->check(CLI::IsMember({"baseline","scalar","native","native-all"}));
     app.add_option("--timings-file",timings_file,"Native setup/prefill/decode metrics; suppress progress output; no dumps");
     app.add_option("--projection-profile",projection_profile_file,"Diagnostic per-format projection attribution; requires timings");
     app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
     app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
-    const auto iq1_kernel=iq1_kernel_name=="native"?sub0::denseq::Iq1Kernel::Native:
+    const auto iq1_kernel=iq1_kernel_name=="native-all"?sub0::denseq::Iq1Kernel::NativeAll:
+                          iq1_kernel_name=="native"?sub0::denseq::Iq1Kernel::Native:
                           iq1_kernel_name=="scalar"?sub0::denseq::Iq1Kernel::Scalar:sub0::denseq::Iq1Kernel::Baseline;
     const bool measure=!timings_file.empty();
     if(!projection_profile_file.empty() && !measure)throw std::runtime_error("projection profile requires timings");

@@ -70,7 +70,7 @@ def main():
     parser.add_argument("--tokenizer-dir", type=Path, default=root / "out/build/qwen35-native/tokenizer")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=8)
-    parser.add_argument("--iq1s-kernel", choices=("baseline", "scalar", "native"), help="Opt-in kernel experiment; requires the matching rebuilt backend")
+    parser.add_argument("--iq1s-kernel", "--projection-kernel", choices=("baseline", "scalar", "native", "native-all"), help="Opt-in kernel experiment; requires the matching rebuilt backend")
     parser.add_argument("--turn", action="append", help="Scripted turn or /reset or /context; repeatable")
     args = parser.parse_args()
     if not 1 <= args.max_new_tokens <= 128:
