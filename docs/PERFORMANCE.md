@@ -63,8 +63,10 @@ fixed-scale fixtures; the reference exploits the known scale and is not weakened
 warm-cache output-row slices, not DRAM-streamed model projections. They cover Q8_0 only; new quant
 modules need corresponding representative cases. Their ratios are comparisons with that reference,
 not universal abstraction-overhead budgets. A green fixture/gate is **not** 27B correctness, memory
-scaling, prefill/decode throughput, or full-context quality. The nine-position numerical failure in
-#29/#43 and draft PR #47 remains unresolved and must not be excused by kernel speed.
+scaling, prefill/decode throughput, or full-context quality. The earlier nine-position discrepancy was resolved by #54/PR #55: automatic reference flash
+attention cast F32 K/V to F16. PR #47 records the corrected nine-position check and a complete
+16-position reply/EOS check at unchanged tolerances. Future runtime changes still need their own
+independent numerical/quality evidence; these samples do not establish maximum-context correctness.
 
 For model changes, run the independent model/reference checks at unchanged tolerances and the relevant
 regressions before performance interpretation. Quality uses the existing paired-perplexity contract
@@ -166,8 +168,9 @@ token denominators, multi-worker topology/memory-pressure metadata, and verified
 The generic evidence layer has been contributed in [Sub0Math PR #2](https://github.com/CraigHutchinson/Sub0Math/pull/2);
 engine-specific token/context/cache policy stays here. Extend the
 existing shared confirmation/acceptance path when integrating timing metrics, rather than introducing
-a weaker parallel time judge. The original #50 and upstream-adoption #52 add the identity/RSS layer only; #29/#43 numerical failures
-remain independent blockers to model performance claims.
+a weaker parallel time judge. The original #50 and upstream-adoption #52 add the identity/RSS layer only. Reference correction
+#55 and chat validation #47 supply separate finite numerical evidence; new performance claims still
+need the appropriate runtime/quality checks and model-specific measurement methodology.
 
 
 Shared workload outcomes use `sub0perf-workload-outcome-1` with `status`, `next_action` and stable
