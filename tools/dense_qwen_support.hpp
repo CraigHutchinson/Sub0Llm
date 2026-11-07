@@ -4,6 +4,7 @@
 #include "sub0/file_map.hpp"
 #include "sub0/backbone_quant.hpp"
 #include "sub0/layout.hpp"
+#include "qwen_projection_profile.hpp"
 #include <array>
 #include <cstdio>
 #include <stdexcept>
@@ -18,12 +19,13 @@ struct Layer {
     const sub0::gguf::Reader& reader;
     int index=0;
     int workers=1;
+    sub0::phase::ProjectionProfile* profile=nullptr; // borrowed; caller owns it for the full decode
     std::array<std::vector<float>,8> row_scratch;
     std::vector<float> scratch, raw_output, gathered;
     std::array<const sub0::gguf::TensorInfo*, 5> projections{};
     std::array<std::vector<float>,4> captured_projections;
     std::vector<std::uint32_t> qkv_rows, z_rows, head_rows, out_indices;
-    explicit Layer(const sub0::gguf::Reader& r, int layer_index=0, int thread_count=1) : reader(r), index(layer_index), workers(thread_count), raw_output(sub0::GDN_CONV_DIM), gathered(sub0::GDN_VALUE_DIM),
+    explicit Layer(const sub0::gguf::Reader& r, int layer_index=0, int thread_count=1, sub0::phase::ProjectionProfile* projection_profile=nullptr) : reader(r), index(layer_index), workers(thread_count), profile(projection_profile), raw_output(sub0::GDN_CONV_DIM), gathered(sub0::GDN_VALUE_DIM),
         qkv_rows(sub0::GDN_CONV_DIM), z_rows(sub0::GDN_VALUE_DIM), head_rows(sub0::GDN_V_HEADS), out_indices(sub0::GDN_VALUE_DIM) {
         scratch.reserve(256);
         if(workers<1 || workers>8)throw std::runtime_error("projection threads must be 1..8");
@@ -52,6 +54,15 @@ struct Layer {
         return values;
     }
     bool project(const sub0::gguf::TensorInfo* t, const float* x,int in,float* y,int out) {
+        if(!profile)return project_impl(t,x,in,y,out);
+        const auto start=sub0::phase::Clock::now();
+        const bool ok=project_impl(t,x,in,y,out);
+        if(t)profile->record(t->type_raw,reader.tensor_bytes(*t).size(),
+                            in>0 && out>0?2ull*static_cast<std::uint64_t>(in)*static_cast<std::uint64_t>(out):0,
+                            sub0::phase::milliseconds(start),ok);
+        return ok;
+    }
+    bool project_impl(const sub0::gguf::TensorInfo* t, const float* x,int in,float* y,int out) {
         if(!t || t->dims.size()!=2 || t->dims[0]!=static_cast<std::uint64_t>(in) || t->dims[1]!=static_cast<std::uint64_t>(out))return false;
         const auto raw=reader.tensor_bytes(*t);
         if(workers==1)return sub0::denseq::project(t->type_raw,raw,{x,static_cast<std::size_t>(in)},{y,static_cast<std::size_t>(out)},scratch);
