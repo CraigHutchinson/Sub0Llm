@@ -1,5 +1,13 @@
 # Handover — resuming the Qwen4-Next work in a new session or on a new machine
 
+## Dense 27B reference speed — 2026-11-07
+
+[Controlled comparison](performance/QWEN27B_SPEED_COMPARISON.md), issue #56: clean native llama.cpp
+measured 17.027 prompt tokens/s and 4.284 generated tokens/s; native Sub0Llm measured 0.249/0.249
+on eight physical cores with the same downloaded model. Three rotating rounds, all untainted.
+The next priority is profiling and packed quantized kernels under #18, plus batched prefill under #29/#30.
+The production chat binary is unchanged. Raw measurements and build identities accompany the report.
+
 ## Local dense 27B milestone — 2026-11-07
 
 The downloaded Qwen3.8-27B has a working bounded console chat PoC on CrogBuntu1. Start with

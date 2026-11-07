@@ -4,9 +4,10 @@
 #include "sub0/qwen_tokenizer.hpp"
 #include <CLI/CLI.hpp>
 #include <filesystem>
+#include "qwen_phase_metrics.hpp"
 using namespace sub0::dense_probe;
 int main(int argc,char** argv) try {
-    std::string model,prompt="1543",dump_prefix="-",text,response_file;
+    std::string model,prompt="1543",dump_prefix="-",text,response_file,timings_file;
     bool inspect_context=false;
     std::string tokenizer_dir=(std::filesystem::path(argv[0]).parent_path()/"tokenizer").string();
     int generate=0;
@@ -19,9 +20,13 @@ int main(int argc,char** argv) try {
     auto* text_option=app.add_option("--text",text,"Literal prompt text; no chat template or implicit special tokens");
     app.add_option("--tokenizer-dir",tokenizer_dir,"Tokenizer exported from this GGUF");
     app.add_option("--projection-threads",projection_threads,"Independent output-row workers (OpenMP)")->check(CLI::Range(1,8));
+    app.add_option("--timings-file",timings_file,"Native setup/prefill/decode metrics; suppress progress output; no dumps");
     app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
     app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
+    const bool measure=!timings_file.empty();
+    if(measure && (inspect_context || dump_prefix!="-"))throw std::runtime_error("timings require inference without dumps");
+    sub0::phase::Metrics metrics;
     const bool text_mode=text_option->count()!=0;
     if(text_mode&&raw_option->count())throw std::runtime_error("choose text or raw token input");
     static_assert(sub0::GDN_DIMS.output_gate_silu && USE_ATTENTION_GATE && !sub0::USE_MOE);
@@ -36,6 +41,7 @@ int main(int argc,char** argv) try {
     }
     if(!text_mode && (tokens.size()>SEQ_LEN || static_cast<std::size_t>(generate)>SEQ_LEN-tokens.size()))
         throw std::runtime_error("context window exceeded");
+    const auto setup_begin=measure?sub0::phase::Clock::now():sub0::phase::Clock::time_point{};
     sub0::FileMap file;std::string error;if(!file.open(model,error))throw std::runtime_error(error);
     const sub0::gguf::Reader reader({file.data(),file.size()});
     const auto* arch=reader.find("general.architecture");if(!reader.ok()||!arch||arch->s!="qwen35")throw std::runtime_error("requires qwen35 GGUF");
@@ -70,6 +76,14 @@ int main(int argc,char** argv) try {
     const auto spec=sub0::gguf::block_spec(emb->type_raw);auto decode=sub0::gguf::dequant_fn(emb->type_raw);
     if(!decode||D_MODEL%spec.elems)throw std::runtime_error("embedding format");
     const std::size_t row_bytes=D_MODEL/spec.elems*spec.bytes;auto bytes=reader.tensor_bytes(*emb);if(bytes.size()<row_bytes*VOCAB)throw std::runtime_error("embedding truncated");
+    if(measure){
+        for(const auto& tensor:reader.tensors()){
+            if(tensor.name=="token_embd.weight")continue;
+            metrics.weight_bytes_per_eval+=reader.tensor_bytes(tensor).size();
+            if(tensor.dims.size()==2)metrics.projection_flops_per_eval+=2*tensor.element_count();
+        }
+        metrics.weight_bytes_per_eval+=row_bytes;
+    }
     std::vector<float> h,a(D_MODEL),mixer(D_MODEL),gate(D_FF),up(D_FF),down(D_MODEL);
     struct Cache {std::vector<float> state,history,k,v;};
     std::vector<Cache> caches(N_LAYERS);
@@ -78,7 +92,9 @@ int main(int argc,char** argv) try {
         if(sub0::GDN_SCHEDULE.full_attn[l]){c.k.resize(static_cast<std::size_t>(SEQ_LEN)*sub0::D_KV);c.v.resize(c.k.size());}
         else {c.state.resize(sub0::gdn::state_floats(sub0::GDN_DIMS));c.history.resize(sub0::gdn::conv_hist_floats(sub0::GDN_DIMS));}
     }
+    if(measure){metrics.reserve(prompt_size,generate);metrics.setup_ms=sub0::phase::milliseconds(setup_begin);}
     for(position=0;position<tokens.size();++position) {
+    const auto token_begin=measure?sub0::phase::Clock::now():sub0::phase::Clock::time_point{};
     const int token=tokens[position];
     if(!decode(bytes.subspan(static_cast<std::size_t>(token)*row_bytes,row_bytes),D_MODEL,h))throw std::runtime_error("embedding decode");
     const auto& d=sub0::GDN_DIMS;
@@ -120,14 +136,15 @@ int main(int argc,char** argv) try {
         for(int i=0;i<D_FF;++i){float x=gate[i];float s=x>=0?1.f/(1.f+std::exp(-x)):std::exp(x)/(1.f+std::exp(x));up[i]*=x*s;}
         if(!layer.project(layer.find("blk.0.ffn_down.weight"),up.data(),D_FF,down.data(),D_MODEL))throw std::runtime_error("FFN down");
         for(int i=0;i<D_MODEL;++i){h[i]+=down[i];if(!std::isfinite(h[i]))throw std::runtime_error("nonfinite hidden");}
-        dump(".layer"+std::to_string(l),h);std::fprintf(stderr,"layer %d/%d complete\n",l+1,N_LAYERS);
+        dump(".layer"+std::to_string(l),h);if(!measure)std::fprintf(stderr,"layer %d/%d complete\n",l+1,N_LAYERS);
     }
     norm(h,initial.load("output_norm.weight",D_MODEL),a);dump(".norm",a);
     std::vector<float> logits(VOCAB);
     if(!initial.project(reader.find_tensor("output.weight"),a.data(),D_MODEL,logits.data(),VOCAB))throw std::runtime_error("LM head");
     for(float v:logits)if(!std::isfinite(v))throw std::runtime_error("nonfinite logits");
     dump(".logits",logits);const auto best=std::max_element(logits.begin(),logits.end());
-    std::printf("mapped sequence inference: position=%zu input=%d layers=%d logits=%zu top_token=%zu top_logit=%.9g; raw token interface\n",position,token,N_LAYERS,logits.size(),static_cast<std::size_t>(best-logits.begin()),*best);
+    if(measure){(position<prompt_size?metrics.prefill_ms:metrics.decode_ms).push_back(sub0::phase::milliseconds(token_begin));metrics.top_ids.push_back(static_cast<int>(best-logits.begin()));}
+    if(!measure)std::printf("mapped sequence inference: position=%zu input=%d layers=%d logits=%zu top_token=%zu top_logit=%.9g; raw token interface\n",position,token,N_LAYERS,logits.size(),static_cast<std::size_t>(best-logits.begin()),*best);
     if(text_mode && position+1>=prompt_size) {
         const int next=static_cast<int>(best-logits.begin());
         if(next==tokenizer.eos_id()) {stopped_eos=true;std::printf("text stop: EOS\n");break;}
@@ -135,6 +152,7 @@ int main(int argc,char** argv) try {
     }
     if(position+1==tokens.size() && tokens.size()<prompt_size+static_cast<std::size_t>(generate))tokens.push_back(static_cast<int>(best-logits.begin()));
     }
+    if(measure)metrics.write(timings_file,projection_threads,SEQ_LEN,false,true);
     if(text_mode)std::printf("TEXT_RESULT generated=%zu finish=%s\n",generated.size(),stopped_eos?"eos":"length");
     if(!response_file.empty()){
         const std::string decoded=tokenizer.decode(generated);FILE* f=std::fopen(response_file.c_str(),"wb");if(!f)throw std::runtime_error("response file open");
