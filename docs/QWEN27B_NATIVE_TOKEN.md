@@ -48,3 +48,38 @@ Use `compare_hidden.py` for vector checks; the measured full-logit check passes 
 This verifies one input, not vocabulary-wide behavior, multiple positions or a context window. Those
 remain required before chat/backend work (#43), along with independent sequence-state validation,
 full suites and review before merging PR #44. Tracking: #15 and #29.
+
+## Stateful sequence proving ground (2026-11-07)
+
+The tool now supersedes the original position-zero limitation. It keeps each GDN layer's recurrent
+state and convolution history, and each attention layer's float32 K/V cache, for the sequence.
+Full attention computes Q/K normalization (epsilon 1e-6), raw-GGUF split-half partial RoPE,
+causal softmax, sigmoid gating and the output projection at each position.
+
+Pass comma-separated raw token IDs. To run one greedy feedback step after a prompt, provide the
+optional continuation count after a dump prefix (use `-` to disable dumps):
+
+```sh
+out/build/qwen35-native/sub0llm-dense-token MODEL.gguf 1543,88123
+out/build/qwen35-native/sub0llm-dense-token MODEL.gguf 1543 - 1
+```
+
+Prompt plus continuation positions cannot exceed the generated `SEQ_LEN` (128 in the 27B profile).
+The tool rejects overflow and malformed IDs before mapping weights. Context resets on each process
+invocation; there is no truncation/sliding-window policy. Continuation count 1 feeds the first argmax
+back once and computes the following logits. No special-token stopping, tokenizer or chat template
+is provided. This remains a proving ground with per-layer temporary allocations, not an optimized
+long-running chat service. Subsequent-position dumps use `.posN` before the existing suffixes.
+
+Independent float-activation/F32-cache reference results (all 248320 logits per position):
+
+| Input sequence | Position | top token (both) | relative L2 | max absolute |
+|---|---:|---:|---:|---:|
+| 1543,88123 | 1 | 198 | 6.10538e-5 | 0.00117445 |
+| 1543 then greedy 13 | 1 | 220 | 3.76653e-5 | 0.00120127 |
+
+Observed peak RSS is 5834604 KiB (~5.56 GiB). Both relative-logit checks pass tolerance 0.001.
+The reference token harness accepts an optional comma-separated prompt after its dump prefix and
+uses F32 KV caches to match this path. These are two-position checks, not long-context validation;
+context-limit rejection is checked separately. Chat/backend integration (#43), longer sequence and
+reset tests, normal engine-loader integration and broad merge gates remain.
