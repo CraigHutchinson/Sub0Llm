@@ -1,6 +1,6 @@
 # Quantisation formats: one registry now, one module per format next
 
-Status: step 1 implemented (registry + conformance tests); steps 2-4 are the intended path, not yet built.
+Status: step 1 implemented (registry + conformance tests). During the live Qwen3.8-27B work, the FormatModule contract/list and scalar decoders are being introduced incrementally with the actual file blockers. Current modules are Q2_K, Q3_K, IQ1_M, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, and IQ4_XS. GGML type IDs are pinned to upstream: Q3_K=11, IQ2_XS=17, IQ3_XXS=18, IQ2_S=22, IQ3_S=21, IQ4_XS=23, IQ1_M=29. A corrected full-file transplant dry run reconciles all 868 destinations (26,896,246,784 floats), with one synthesized LM-bias tensor, no unmatched source tensors, and zero per-tensor mismatches. Independent numerical parity against ggml and the full test suite remain gates before merge. IQ4_NL remains the planned pilot for migrating an existing Plane.
 Context: docs/QUANTIZED_RESIDENT_DENSE.md (issue #15) needs about eight more formats, and the project
 will keep meeting new ones. The goal is that supporting a new format is ONE self-contained module
 plus ONE line in a list, with tests that cannot be forgotten.
@@ -27,6 +27,14 @@ suite's pre-existing assertions are identical to before (193,082 on `main`).
 ```
 include/sub0/quant/
   format.hpp        TensorType, BlockSpec, the FormatModule concept, the registry (kFormats/kDequant derived from it)
+  q2_k.hpp          Q2_K scalar dequantiser + block geometry
+  iq3_xxs.hpp       IQ3_XXS scalar decoder + its codebook
+  iq2_xs.hpp        IQ2_XS scalar decoder + its codebook
+  iq2_s.hpp         IQ2_S scalar decoder + its codebook
+  iq3_s.hpp         IQ3_S scalar decoder + its codebook
+  iq1_m.hpp         IQ1_M scalar decoder + shared IQ1_S grid
+  iq4_xs.hpp        IQ4_XS scalar decoder + shared IQ4_NL values
+  q3_k.hpp          Q3_K scalar decoder + packed 6-bit scales
   iq1_s.hpp         everything for IQ1_S: geometry, tables it needs, dequantise, Plane (dot), self-description
   iq2_xxs.hpp  iq4_nl.hpp  q4_k.hpp ...
   all.hpp           the ONE list of modules (adding a format = one #include + one entry)
@@ -56,8 +64,8 @@ without it.
    pilot: its geometry, dequantiser, and the existing `Iq4NlPlane`, behind the concept. Gate: all existing
    suites bit-identical (AGENTS 10: enumerate consumers repo-wide, run the full suite with the feature on).
 3. Move the rest of the existing formats the same way, one commit each; delete the old switches/tables.
-4. Add the missing formats from #15 as new modules in byte-share order (IQ1_M, IQ2_XS, IQ2_S, IQ3_XXS,
-   IQ4_XS, IQ3_S, then Q2_K, Q3_K), each with a reference check against the real UD-IQ1_S tensors and, where
+4. DONE initial modules for the missing formats (IQ1_M, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, Q2_K,
+   Q3_K); next add independent numerical parity checks against ggml using the real UD-IQ1_S tensors and, where
    there is a Plane, the generic Plane test. The block geometries needed are already derived from the real file
    (they sum to the file's size); verify each against ggml-common.h before implementing (AGENTS 5).
 

@@ -1456,6 +1456,7 @@ void Model::build_layout() {
             // Wq [D_MODEL, D_Q] and Wo [D_Q, D_MODEL] -- not square once --head-dim makes
             // N_HEADS*D_HEAD independent of D_MODEL (WP4b blocker A). MUST match make_param_layout().
             L.Wq = mk_param(D_MODEL, sub0::D_Q, true);
+            if constexpr (USE_ATTENTION_GATE) L.Wq_gate = mk_param(D_MODEL, sub0::D_Q, true);
             L.Wk = mk_param(D_MODEL, D_KV, true);      // GQA: narrower than Wq when N_KV_HEADS < N_HEADS
             L.Wv = mk_param(D_MODEL, D_KV, true);
             L.Wo = mk_param(sub0::D_Q, D_MODEL, true);
@@ -1593,7 +1594,8 @@ void Model::init_weights() {
             randn(L.qsa_q, 0.02f);  randn(L.qsa_gate, 0.02f); randn(L.qsa_k, 0.02f);
             randn(L.qsa_v, 0.02f);  randn(L.qsa_o, 0.02f);    randn(L.qsa_idx_qk, 0.02f);
         } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
-            randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
+            randn(L.Wq, 0.02f); if constexpr (USE_ATTENTION_GATE) randn(L.Wq_gate, 0.02f);
+            randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
             if constexpr (USE_QK_NORM) { ones(L.q_norm); ones(L.k_norm); }
         } else {
             // Gated DeltaNet init, matching the real model's own scheme (S1a's __init__, quoted in
@@ -1846,6 +1848,16 @@ Node* Model::forward(const int* ids, int T) {
             if (DEPTH_SCHEDULE.own[static_cast<std::size_t>(exec_i)] >= 0) g_depth.push(kn, vn);
         }
         Node* att = op_attn(qn, kn, vn, N_HEADS);
+        if constexpr (USE_ATTENTION_GATE) {
+            Node* gate = op_linear(a, L.Wq_gate, nullptr, q);
+            const std::size_t n = static_cast<std::size_t>(att->rows) * att->cols;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float x = gate->data[i];
+                const float s = x >= 0.f ? 1.f / (1.f + std::exp(-x))
+                                         : std::exp(x) / (1.f + std::exp(x));
+                att->data[i] *= s;
+            }
+        }
         mixer_out = op_linear(att, L.Wo, nullptr, q);
         }
         emit_layer(mixer_out, li, "attn_out");   // [T, D_MODEL] QSA's (or Wo's) own output

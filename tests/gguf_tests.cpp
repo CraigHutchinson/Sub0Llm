@@ -545,6 +545,20 @@ TEST_CASE("gguf: a BF16 tensor round-trips through Reader::tensor_bytes + to_f32
     CHECK(out[3] == 0.5f);
 }
 
+TEST_CASE("gguf: dequantize_q2_k unpacks two-bit planes and validates short buffers", "[gguf]") {
+    std::vector<std::uint8_t> raw(84, 0);
+    put_u16(raw, 80, kF16One); // d
+    put_u16(raw, 82, kF16One); // dmin, but the tested scale byte has a zero min nibble
+    raw[0] = 1;                // first 16-value group has scale 1 and min 0
+    for (int i = 0; i < 16; ++i) raw[16 + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i % 4); // codes 0,1,2,3
+    std::vector<float> out;
+    REQUIRE(dequantize_q2_k(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int i = 0; i < 16; ++i) CHECK(out[static_cast<std::size_t>(i)] == static_cast<float>(i % 4));
+    for (int i = 16; i < 256; ++i) CHECK(out[static_cast<std::size_t>(i)] == 0.0f);
+    CHECK_FALSE(dequantize_q2_k(std::span<const std::uint8_t>(raw.data(), 83), 256, out));
+}
+
 TEST_CASE("gguf: dequantize_q4_k decodes a hand-built super-block exactly", "[gguf]") {
     // d = 1.0, dmin = 0.5. The 12 packed scale bytes are chosen so BOTH branches of the 6-bit
     // scale/min unpack are exercised and both give values readable straight off the bytes:
@@ -725,13 +739,199 @@ TEST_CASE("gguf: dequantize_iq2_xxs expands grid magnitudes with the sign codebo
     CHECK(out[1] == 1.0f);
     CHECK(out[6] == 1.0f);
     CHECK(out[7] == -1.0f);
-    CHECK(out[8] == 1.0f);
+    CHECK(out[8] == 3.0f); // scale nibble covers the whole 32-element group
 
     // The 4-bit scale nibble: db = d * (0.5 + s) * 0.25, so s = 3 gives db = 0.875 and every
     // magnitude-8 element becomes 7.0.
     put_u32(raw, 6, 0x30000000u);
     REQUIRE(dequantize_iq2_xxs(raw, 256, out));
     CHECK(out[0] == Catch::Approx(7.0f));
+}
+
+TEST_CASE("gguf: Q3_K module expands packed 6-bit scales and high masks", "[gguf]") {
+    using sub0::quant::Q3K;
+    CHECK(Q3K::type == TensorType::Q3_K);
+    CHECK(Q3K::block.elems == 256);
+    CHECK(Q3K::block.bytes == 110);
+
+    std::vector<std::uint8_t> raw(110, 0);
+    put_u16(raw, 108, kF16One);
+    std::vector<float> out;
+    REQUIRE(Q3K::dequantize(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int i = 0; i < 256; ++i) { INFO("i " << i); CHECK(out[static_cast<std::size_t>(i)] == 128.0f); }
+
+    // The mask chooses q in [0,3] when set and q-4 otherwise; setting it for q=0 yields zero.
+    raw[0] = 1;
+    raw[32] = 3;
+    REQUIRE(Q3K::dequantize(raw, 256, out));
+    CHECK(out[0] == -96.0f);
+    CHECK(out[1] == 128.0f);
+
+    // Packed high scale bits produce scale value 32, hence a zero multiplier for the first 16 values.
+    raw[0] = 0;
+    raw[104] = 2;
+    REQUIRE(Q3K::dequantize(raw, 256, out));
+    CHECK(out[0] == 0.0f);
+    CHECK(out[16] == 128.0f);
+    CHECK_FALSE(Q3K::dequantize(std::span<const std::uint8_t>(raw.data(), raw.size() - 1), 256, out));
+}
+
+TEST_CASE("gguf: IQ4_XS module combines packed scale bits and split nibbles", "[gguf]") {
+    using sub0::quant::IQ4XS;
+    CHECK(IQ4XS::type == TensorType::IQ4_XS);
+    CHECK(IQ4XS::block.elems == 256);
+    CHECK(IQ4XS::block.bytes == 136);
+    CHECK(KVALUES_IQ4NL[0] == -127);
+    CHECK(KVALUES_IQ4NL[15] == 113);
+
+    std::vector<std::uint8_t> raw(136, 0);
+    put_u16(raw, 0, kF16One);
+    put_u16(raw, 2, 0x000au); // scale high bits = 2 for groups 0 and 1
+    raw[4] = 0x21;             // scale low nibbles 1 and 2, yielding multipliers 1 and 2
+    raw[8] = 0xf0;
+    raw[24] = 0xf0;
+    std::vector<float> out;
+    REQUIRE(IQ4XS::dequantize(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    CHECK(out[0] == -127.0f);
+    CHECK(out[16] == 113.0f);
+    CHECK(out[32] == -254.0f);
+    CHECK(out[48] == 226.0f);
+    CHECK_FALSE(IQ4XS::dequantize(std::span<const std::uint8_t>(raw.data(), raw.size() - 1), 256, out));
+}
+
+TEST_CASE("gguf: IQ1_M module assembles shared delta and ternary grid", "[gguf]") {
+    using sub0::quant::IQ1M;
+    CHECK(IQ1M::type == TensorType::IQ1_M);
+    CHECK(IQ1M::block.elems == 256);
+    CHECK(IQ1M::block.bytes == 56);
+
+    std::vector<std::uint8_t> raw(56, 0);
+    // The high nibbles of scales[4] assemble f16 1.0 in IQ1_M's packed super-scale.
+    raw[52] = 0x00; raw[53] = 0xc0;
+    raw[54] = 0x00; raw[55] = 0x30;
+    std::vector<float> out;
+    REQUIRE(IQ1M::dequantize(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int i = 0; i < 256; ++i) { INFO("i " << i); CHECK(out[static_cast<std::size_t>(i)] == -0.875f); }
+
+    // qh bit 3 changes the first group's delta sign without changing the grid index.
+    raw[32] = 0x08;
+    REQUIRE(IQ1M::dequantize(raw, 256, out));
+    CHECK(out[0] == -1.125f);
+    CHECK(out[8] == -0.875f);
+
+    raw[0] = 1; // grid 1 starts with +1, then seven -1s
+    REQUIRE(IQ1M::dequantize(raw, 256, out));
+    CHECK(out[0] == 0.875f);
+    CHECK(out[1] == -1.125f);
+    CHECK_FALSE(IQ1M::dequantize(std::span<const std::uint8_t>(raw.data(), raw.size() - 1), 256, out));
+}
+
+TEST_CASE("gguf: IQ3_S module expands extended grid indices and paired signs", "[gguf]") {
+    using sub0::quant::IQ3S;
+    CHECK(IQ3S::type == TensorType::IQ3_S);
+    CHECK(IQ3S::block.elems == 256);
+    CHECK(IQ3S::block.bytes == 110);
+    CHECK(sub0::quant::IQ3S_GRID[0] == 0x01010101u);
+
+    std::vector<std::uint8_t> raw(110, 0);
+    put_u16(raw, 0, kF16One);
+    std::vector<float> out;
+    REQUIRE(IQ3S::dequantize(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int i = 0; i < 256; ++i) { INFO("i " << i); CHECK(out[static_cast<std::size_t>(i)] == 1.0f); }
+
+    raw[66] = 1; // qh bit 0 extends the first qs index from 0 to 256
+    raw[74] = 0x81; // first 8-value group's first and last values are negative
+    raw[106] = 0x10; // second 32-value half uses scale d * (1 + 2*1) = 3
+    REQUIRE(IQ3S::dequantize(raw, 256, out));
+    CHECK(out[0] == -static_cast<float>(sub0::quant::IQ3S_GRID[256] & 0xffu));
+    CHECK(out[1] == static_cast<float>((sub0::quant::IQ3S_GRID[256] >> 8) & 0xffu));
+    CHECK(out[4] == 1.0f);
+    CHECK(out[7] == -1.0f);
+    CHECK(out[32] == 3.0f);
+    CHECK_FALSE(IQ3S::dequantize(std::span<const std::uint8_t>(raw.data(), raw.size() - 1), 256, out));
+}
+
+TEST_CASE("gguf: IQ2_S module expands extended grids, signs, and paired scales", "[gguf]") {
+    using sub0::quant::IQ2S;
+    CHECK(IQ2S::type == TensorType::IQ2_S);
+    CHECK(IQ2S::block.elems == 256);
+    CHECK(IQ2S::block.bytes == 82);
+    CHECK(sub0::quant::IQ2S_GRID[0] == 0x0808080808080808ull);
+
+    std::vector<std::uint8_t> raw(82, 0);
+    put_u16(raw, 0, kF16One);
+    std::vector<float> out;
+    REQUIRE(IQ2S::dequantize(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int i = 0; i < 256; ++i) { INFO("i " << i); CHECK(out[static_cast<std::size_t>(i)] == 1.0f); }
+
+    // Signs are stored after the first 32 grid-index bytes; high grid-index bits live in qh.
+    raw[34] = 0x81;
+    raw[66] = 0x03; // for l=0, qh bits 1:0 extend the 8-bit index to grid index 3*256
+    raw[74] = 0x10;
+    REQUIRE(IQ2S::dequantize(raw, 256, out));
+    CHECK(out[0] == Catch::Approx(-0.125f * static_cast<float>((sub0::quant::IQ2S_GRID[768] & 0xffu))));
+    CHECK(out[1] == Catch::Approx(0.125f * static_cast<float>((sub0::quant::IQ2S_GRID[768] >> 8) & 0xffu)));
+    CHECK(out[16] == Catch::Approx(0.375f * static_cast<float>(sub0::quant::IQ2S_GRID[0] & 0xffu)));
+    CHECK_FALSE(IQ2S::dequantize(std::span<const std::uint8_t>(raw.data(), raw.size() - 1), 256, out));
+}
+
+TEST_CASE("gguf: IQ2_XS module expands grids, packed signs, and paired scales", "[gguf]") {
+    using sub0::quant::IQ2XS;
+    CHECK(IQ2XS::type == TensorType::IQ2_XS);
+    CHECK(IQ2XS::block.elems == 256);
+    CHECK(IQ2XS::block.bytes == 74);
+    CHECK(sub0::quant::IQ2XS_GRID[0] == 0x0808080808080808ull);
+
+    std::vector<std::uint8_t> raw(74, 0);
+    put_u16(raw, 0, kF16One);
+    std::vector<float> out;
+    REQUIRE(IQ2XS::dequantize(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int i = 0; i < 256; ++i) { INFO("i " << i); CHECK(out[static_cast<std::size_t>(i)] == 1.0f); }
+
+    // qs[0] stores grid index 0 in bits 0..8 and sign index 1 in bits 9..15.
+    // scales[0]'s high nibble applies to the second 16 values in its 32-value group.
+    put_u16(raw, 2, 0x0200u);
+    raw[66] = 0x10;
+    REQUIRE(IQ2XS::dequantize(raw, 256, out));
+    CHECK(out[0] == -1.0f);
+    CHECK(out[1] == 1.0f);
+    CHECK(out[7] == -1.0f);
+    CHECK(out[8] == 1.0f);
+    CHECK(out[16] == 3.0f);
+    CHECK_FALSE(IQ2XS::dequantize(std::span<const std::uint8_t>(raw.data(), raw.size() - 1), 256, out));
+}
+
+TEST_CASE("gguf: IQ3_XXS module expands paired grids, sign groups, and scale", "[gguf]") {
+    using sub0::quant::IQ3XXS;
+    CHECK(IQ3XXS::type == TensorType::IQ3_XXS);
+    CHECK(IQ3XXS::block.elems == 256);
+    CHECK(IQ3XXS::block.bytes == 98);
+    CHECK(sub0::quant::IQ3XXS_GRID[0] == 0x04040404u);
+
+    std::vector<std::uint8_t> raw(98, 0);
+    put_u16(raw, 0, kF16One);
+    std::vector<float> out;
+    REQUIRE(IQ3XXS::dequantize(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int i = 0; i < 256; ++i) { INFO("i " << i); CHECK(out[static_cast<std::size_t>(i)] == 1.0f); }
+
+    // The first aux word has sign index 1 for its first 8-value group and scale nibble 1.
+    // Magnitude 4 * d(1) * (0.5 + 1) * 0.5 = 3; sign code 1 flips elements 0 and 7.
+    put_u32(raw, 66, 0x10000001u);
+    REQUIRE(IQ3XXS::dequantize(raw, 256, out));
+    CHECK(out[0] == -3.0f);
+    CHECK(out[1] == 3.0f);
+    CHECK(out[6] == 3.0f);
+    CHECK(out[7] == -3.0f);
+    CHECK(out[8] == 1.0f);
+
+    CHECK_FALSE(IQ3XXS::dequantize(std::span<const std::uint8_t>(raw.data(), raw.size() - 1), 256, out));
 }
 
 TEST_CASE("gguf: dequantize_iq1_s decodes the ternary grid with its per-block delta", "[gguf]") {

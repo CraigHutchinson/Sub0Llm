@@ -720,6 +720,7 @@ int main(int argc, char** argv) {
     // etc. to opt out (e.g. importing a GGUF of a different shape).
     int gated_ffn    = 1;       // 1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the
                                  // plain 2-matrix GELU+bias FFN -- matches the GGUF/Llama-family convention
+    int attention_gate = 0;     // 1 = Qwen attention output sigmoid-gated by a second Q projection
     int tie_embeddings = 1;    // 1 = the LM head reuses tok_emb (transposed) instead of its own
                                  // matrix+bias -- a real param-count win at this project's small-model scale
     int qk_norm      = 1;       // 1 = RMSNorm applied per-head to Q/K right after their projection,
@@ -1044,6 +1045,9 @@ int main(int argc, char** argv) {
                    "2-matrix GELU+bias FFN -- matches the GGUF/Llama-family convention, for "
                    "importing open weights of that shape (CPU and GPU)")
        ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--attention-gate", attention_gate,
+                   "1 = Qwen full-attention query projection includes a separate sigmoid output gate")
+       ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--tie-embeddings", tie_embeddings,
                    "1 = the LM head reuses the token embedding matrix (transposed) instead of its own "
                    "matrix+bias -- fewer params, no separate head weight")
@@ -1223,6 +1227,8 @@ int main(int argc, char** argv) {
         reg("qsa-indexer-head-dim", qsa_idx_head_dim); reg("qsa-indexer-budget", qsa_idx_budget);
         reg("qsa-indexer-compress-ratio", qsa_idx_ratio);
         reg("tie-embeddings", tie_embeddings);   reg("d-ff", d_ff_pin);                 reg("gated-ffn", gated_ffn);
+        reg("attention-gate", attention_gate);
+        reg("attention-gate", attention_gate);
         reg("moe-quant-experts", moe_quant_experts); reg("num-experts", num_experts);   reg("experts-per-tok", experts_per_tok);
         reg("prec-param", prec_param);           reg("vocab-exact", vocab_exact);       reg("seq", seq_len);
         reg("pos-encoding", pos_encoding);
@@ -2261,6 +2267,7 @@ int main(int argc, char** argv) {
     // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
     // swiglu_backward_act_kernel in backend_cuda.cu).
     cos << "constexpr bool USE_GATED_FFN = " << (gated_ffn ? "true" : "false") << ";\n";
+    cos << "constexpr bool USE_ATTENTION_GATE = " << (attention_gate ? "true" : "false") << ";\n";
     // Tied embeddings: the LM head reuses tok_emb (transposed) instead of its own matrix+bias --
     // see op_tied_head in backend_cpu.cpp. No dims/checkpoint-shape interaction with USE_GATED_FFN,
     // the two are independent axes.

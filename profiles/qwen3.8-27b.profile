@@ -27,6 +27,7 @@ heads = 24
 kv-heads = 4
 d-ff = 17408
 gated-ffn = 1
+attention-gate = 1
 num-experts = 0
 
 # Weights (metadata only; see scripts/models.py)

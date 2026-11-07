@@ -213,7 +213,7 @@ constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_
 // so a GDN-only build still trains and still allocates everything it always did -- which is also why
 // every existing build in this repo is bit-identical under this change: FORWARD_ONLY is false unless
 // one of the three forward-only mechanisms is on, and no default build turns any of them on.
-constexpr bool FORWARD_ONLY = USE_GATED_RESIDUAL || USE_MOE || USE_QSA;
+constexpr bool FORWARD_ONLY = USE_GATED_RESIDUAL || USE_MOE || USE_QSA || USE_ATTENTION_GATE;
 // Sized 1 (not 0 -- a zero-length std::array has no data()) when the gradient path is dead. Only the
 // Worker's array can be conditionally sized like this; the shared three are heap handles that simply
 // stay null, and every accessor that would hand one out refuses loudly instead (see grad_ptr below).
@@ -626,7 +626,7 @@ struct Layer {
     // and GR's own hc_norm is the pre-block norm) -- the same "unused pointers just stay nullptr" idiom
     // q_norm/k_norm and the gdn_* set already use, so the struct's shape stays config-independent.
     Node *ln1 = nullptr, *ln2 = nullptr;
-    Node *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm;
+    Node *Wq, *Wq_gate = nullptr, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm;
     Node *gdn_in_qkv = nullptr, *gdn_in_z = nullptr, *gdn_in_b = nullptr, *gdn_in_a = nullptr,
          *gdn_conv = nullptr, *gdn_a_log = nullptr, *gdn_dt_bias = nullptr, *gdn_norm = nullptr,
          *gdn_out_proj = nullptr;

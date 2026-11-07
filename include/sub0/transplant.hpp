@@ -117,7 +117,8 @@ namespace sub0::transplant {
 // own layout stopped emitting one under USE_GATED_RESIDUAL there is no destination to fill either.
 // See the Synthetic note below for the full finding.
 enum class Dest {
-    TokEmb, LmHead, LmBias,
+    TokEmb, Ln1, Ln2, LnF, LmHead, LmBias,
+    AttnQ, AttnQGate, AttnK, AttnV, AttnO, AttnQNorm, AttnKNorm,
     GdnInProjQkv, GdnInProjZ, GdnInProjB, GdnInProjA, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj,
     GrAttnNorm, GrAttnDown, GrAttnUp, GrAttnInject,
     GrFfnNorm,  GrFfnDown,  GrFfnUp,  GrFfnInject,
@@ -161,6 +162,11 @@ enum class Fold {
 
 constexpr Fold fold_for(Dest d) {
     switch (d) {
+        case Dest::Ln1:
+        case Dest::Ln2:
+        case Dest::LnF:
+        case Dest::AttnQNorm:
+        case Dest::AttnKNorm:
         // Every Qwen4ExpTextRMSNorm gain in the file EXCEPT GDN's ssm_norm, which the converter's own
         // `not name.endswith("linear_attn.norm.weight")` deliberately excludes.
         case Dest::GrAttnNorm:
@@ -288,8 +294,18 @@ inline void ungroup_v_heads(const float* src, int rows, int cols, VPerm vp, int 
 constexpr Recipe recipe_for(Dest d) {
     switch (d) {
         case Dest::TokEmb:      return {Op::Copy,      "token_embd.weight"};
+        case Dest::Ln1:         return {Op::Copy,      "blk.%d.attn_norm.weight"};
+        case Dest::Ln2:         return {Op::Copy,      "blk.%d.post_attention_norm.weight"};
+        case Dest::LnF:         return {Op::Copy,      "output_norm.weight"};
         case Dest::LmHead:      return {Op::Transpose, "output.weight"};
         case Dest::LmBias:      return {Op::Synthetic, nullptr, nullptr, 0, 0.0f};
+        case Dest::AttnQ:       return {Op::PerHeadHalf, "blk.%d.attn_q.weight", nullptr, 0};
+        case Dest::AttnQGate:   return {Op::PerHeadHalf, "blk.%d.attn_q.weight", nullptr, 1};
+        case Dest::AttnK:       return {Op::Transpose, "blk.%d.attn_k.weight"};
+        case Dest::AttnV:       return {Op::Transpose, "blk.%d.attn_v.weight"};
+        case Dest::AttnO:       return {Op::Transpose, "blk.%d.attn_output.weight"};
+        case Dest::AttnQNorm:   return {Op::Copy, "blk.%d.attn_q_norm.weight"};
+        case Dest::AttnKNorm:   return {Op::Copy, "blk.%d.attn_k_norm.weight"};
 
         // Gated DeltaNet. GGUF calls the fused Q|K|V projection `attn_qkv` and the output gate
         // `attn_gate` -- names that look like ordinary attention but belong to the linear-attention
