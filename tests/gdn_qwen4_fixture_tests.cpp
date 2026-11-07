@@ -18,6 +18,7 @@
 // at the token level -- this test is that prediction's confirmation.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "sub0/gdn_math.hpp"
 
@@ -284,7 +285,9 @@ TEST_CASE("Gated DeltaNet backward matches finite differences at a synthetic mul
           "[gdn][grad][fd]") {
     constexpr int T = 4, hidden_size = 5;
     constexpr int num_k_heads = 2, num_v_heads = 4, head_k_dim = 3, head_v_dim = 2, conv_kernel = 3;
-    const sub0::gdn::Dims dims{hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel};
+    const bool silu_gate = GENERATE(false, true);
+    INFO("SiLU output gate: " << silu_gate);
+    const sub0::gdn::Dims dims{hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel, silu_gate};
     const int key_dim = dims.key_dim(), value_dim = dims.value_dim(), conv_dim = dims.conv_dim();
     REQUIRE(dims.rep() == 2);
 

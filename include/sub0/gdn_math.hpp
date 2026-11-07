@@ -135,6 +135,7 @@ struct Dims {
     int head_k_dim;    // Q/K per-head width (this project's D_HEAD)
     int head_v_dim;    // V/Z per-head width (this project's D_HEAD; == head_k_dim in the real model)
     int conv_kernel;   // depthwise causal conv kernel size (real model: 4)
+    bool output_gate_silu = false; // qwen35 uses SiLU; Qwen4-preview uses sigmoid
 
     constexpr int key_dim()   const { return head_k_dim * num_k_heads; }
     constexpr int value_dim() const { return head_v_dim * num_v_heads; }
@@ -247,13 +248,9 @@ enum class Stage : unsigned char { InQuant, InProj, BaProj, Conv, Recurrence, Ga
 // `state`/`conv_hist` in/out, see the file header. `scratch`: >= scratch_floats(d,T) floats, fully
 // consumed here, not retained.
 //
-// The output GATE activation is hardcoded SIGMOID here, not a generic `hidden_act` fallback: the real
-// Qwen4-preview config sets `output_gate_type="sigmoid"` explicitly (manifest's config_small, and
-// `activation=config.output_gate_type or config.hidden_act` in the real __init__ -- a truthy
-// `output_gate_type` always wins), so this is the one real, verified value rather than a speculative
-// knob (AGENTS.md S8: don't add surface area nothing has asked for yet). The causal conv's own
-// activation is separately, correctly SiLU (`config.hidden_act`) -- the two are genuinely different
-// activations in the real model, not the same choice reused twice.
+// Output gating defaults to Qwen4-preview's sigmoid. Dims::output_gate_silu selects qwen35's
+// SiLU gate (z * sigmoid(z)), as defined by Transformers' Qwen3_5RMSNormGated. Causal conv
+// activation remains SiLU independently of this output-gate choice.
 // B24: every one of the nine WEIGHT pointers is templated on `WP` (docs/BACKBONE_PRECISION.md S1,
 // include/sub0/param_store.hpp). `x`, `state`, `conv_hist`, `out` and `scratch` stay `float*` -- they
 // are activations and caller scratch, not parameters. In an F32 build `WP` is `const float*` and this
@@ -471,7 +468,8 @@ inline void forward(const Dims& d, int T,
             ms /= dv;
             const float rinv = 1.f / std::sqrt(ms + RMS_EPS);
             for (int j = 0; j < dv; ++j)
-                gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
+                gated[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]) *
+                    (d.output_gate_silu ? zv[j] : 1.f);
         });
         float* ot = out + static_cast<std::size_t>(t) * hs;
         probe(Stage::OutQuant);   // native path: gather + quantize; the axpy fallback has neither
@@ -836,7 +834,8 @@ inline void backward(const Dims& d, int T,
             const float rinv = 1.f / std::sqrt(ms + RMS_EPS);
             rinv_buf[static_cast<std::size_t>(t) * Hv + hh] = rinv;
             for (int j = 0; j < dv; ++j)
-                gated_row[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
+                gated_row[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]) *
+                    (d.output_gate_silu ? zv[j] : 1.f);
         }
     }
 
@@ -871,7 +870,8 @@ inline void backward(const Dims& d, int T,
             const float r3_over_dv = (rinv * rinv * rinv) / static_cast<float>(dv);
             float Ssum = 0.f;
             for (int j = 0; j < dv; ++j) {
-                const float gate = detail::sigmoid(zv[j]);
+                const float sigmoid = detail::sigmoid(zv[j]);
+                const float gate = sigmoid * (d.output_gate_silu ? zv[j] : 1.f);
                 gate_cache[j] = gate;
                 const float normed = cv[j] * rinv;
                 const float dg = d_gated_row[hh * dv + j];
@@ -879,7 +879,10 @@ inline void backward(const Dims& d, int T,
                 d_normed_cache[j] = d_normed;
                 dnorm_w[j] += dg * normed * gate;
                 const float d_gate = dg * norm_w[j] * normed;
-                zv[j] = d_gate * gate * (1.f - gate);          // overwrite z_proj IN PLACE: d(z_logit)
+                const float derivative = d.output_gate_silu
+                    ? sigmoid * (1.f + zv[j] * (1.f - sigmoid))
+                    : sigmoid * (1.f - sigmoid);
+                zv[j] = d_gate * derivative; // overwrite z_proj IN PLACE: d(z_logit)
                 Ssum += d_normed * cv[j];
             }
             for (int j = 0; j < dv; ++j)

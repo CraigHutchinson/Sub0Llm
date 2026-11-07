@@ -78,11 +78,14 @@ CPU, `docs/HANDOVER.md`) bounds decode; not yet measured.
 
 - **Verified correctness blocker (#45, 2026-11-07):** the actual downloaded GGUF reports
   `general.architecture=qwen35` and RMS epsilon `1e-6`. The existing GDN primitive targets
-  Qwen4-preview: its output gate is sigmoid and its forward RMS epsilon is `1e-5`.
+  Qwen4-preview: its output gate defaults to sigmoid. Correction to the initial report:
+  forward and backward already use RMS epsilon `1e-6`; there is no GDN epsilon mismatch.
   Transformers' `Qwen3_5RMSNormGated` instead applies SiLU after RMS normalization (epsilon `1e-6`):
   https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py .
-  Resolve the activation/epsilon choices consistently across forward, decode, recomputation and
-  configuration compatibility before interpreting generated tokens as correct model inference.
+  The primitive now accepts `Dims::output_gate_silu`, including backward recomputation and derivative.
+  Seven GDN cases pass (1,962 assertions), including finite-difference checks for both activations.
+  Generated-config selection and compatibility discrimination remain before engine inference can
+  select SiLU safely; existing engine configs still select the sigmoid default.
 
 - Does the dense decode path support Qwen3.5-style GDN + gated FFN at d5120 (the `qwen35` arch)? Run it at the
   smallest scale first.
