@@ -8,6 +8,7 @@
 - Generated configuration SHA256, model/tokenizer identity, token IDs/prompt and context length:
 - Worker count, pinning, power state, contention and background workload:
 - Independent correctness/quality command and result, unchanged thresholds:
+- Workload adapter spec/record, oracle/input hashes, RSS budget/verdict, elapsed unjudged status:
 - Memory: peak RSS, cache/context/scratch budget, pressure setup and per-arm result:
 - sub0perf level, command, samples file, baseline and previous kept-build identity:
 - Coverage: measured/unmeasured groups, NOISY/ENVIRONMENT/deferrals and confirmation/reproduction:

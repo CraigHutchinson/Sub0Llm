@@ -2,9 +2,9 @@ name: Performance workflow
 on:
   push:
     branches: [main]
-    paths: ['tools/perf/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
+    paths: ['tools/perf/**', 'tools/perf_extensions/**', 'perf/workloads/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
   pull_request:
-    paths: ['tools/perf/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
+    paths: ['tools/perf/**', 'tools/perf_extensions/**', 'perf/workloads/**', 'cmake/Sub0*Perf*', 'cmake/Sub0MathTooling.cmake', 'benchmarks/dense_quant_perf.cpp', 'include/sub0/**', 'tests/vendor/nanobench.h', 'scripts/check_sub0perf_vendor.py', 'CMakeLists.txt', 'CMakePresets.json', '.github/workflows/perf-tools.yml']
 permissions:
   contents: read
 jobs:
@@ -18,6 +18,7 @@ jobs:
           python-version: '3.12'
       - run: python scripts/check_sub0perf_vendor.py
       - run: python -m unittest discover -s tools/perf
+      - run: python -m unittest discover -s tools/perf_extensions/tests
       - name: Build and verify real benchmark protocol
         run: |
           cmake -S . -B out/perf-ci -DSUB0_PERF_ONLY=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_STANDARD=26 -DSUB0MATH_PERF_ON_BUILD=OFF -DSUB0MATH_PERF_GIT_HOOKS=OFF
