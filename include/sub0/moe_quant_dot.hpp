@@ -256,42 +256,18 @@ struct Iq1SPlane {
     /// This format's `d` is shared by 8 consecutive 32-wide groups (one 256-element superblock) --
     /// group_cached()/group_v_cached() below exploit that via SuperCache; see its own comment.
     static constexpr bool kHasSuper = true;
-    static constexpr std::uint64_t kSuperElems = 256;
-    static constexpr std::uint64_t kBlockBytes = 50;
+    static constexpr std::uint64_t kSuperElems = quant::IQ1S::block.elems;
+    static constexpr std::uint64_t kBlockBytes = quant::IQ1S::block.bytes;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
     /// The group's bit fields: the ONE place this format's layout is read. group() and group_v() differ
     /// only in how they materialise the result.
-    struct Fields {
-        std::uint16_t       d_bits = 0;
-        std::uint16_t       qh     = 0;
-        const std::uint8_t* qs     = nullptr;   // non-owning; into `plane`
-    };
-    [[nodiscard]] Fields fields(std::uint64_t p) const noexcept {
-        const std::uint8_t* blk = plane + (p / 256) * 50;
-        const int ib = static_cast<int>((p % 256) / 32);
-        Fields f;
-        f.qs = blk + 2 + 4 * ib;
-        std::memcpy(&f.d_bits, blk, sizeof f.d_bits);
-        std::memcpy(&f.qh, blk + 34 + 2 * ib, sizeof f.qh);
-        return f;
-    }
-    /// This sub-group's own 11-bit grid index (8-bit `qs` byte | 3 high bits from `qh`) -- the ONE place
-    /// that bit formula is written; grid() and the gather-based group_v_cached() both read it from here
-    /// so a gather-vs-scalar index can never silently diverge from a scalar-vs-scalar one.
-    [[nodiscard]] static int index(const Fields& f, int l) noexcept {
-        return static_cast<int>(f.qs[l] | (((f.qh >> (3 * l)) & 7) << 8));
-    }
-    /// Eight int8 weights, little-endian.
-    [[nodiscard]] static std::uint64_t grid(const Fields& f, int l) noexcept {
-        return gguf::IQ1S_GRID[static_cast<std::size_t>(index(f, l))];
-    }
-    [[nodiscard]] static float scale(const Fields& f, float d) noexcept {
-        return d * static_cast<float>(2 * ((f.qh >> 12) & 7) + 1);
-    }
-    [[nodiscard]] static float delta(const Fields& f) noexcept {
-        return (f.qh & 0x8000) ? -gguf::IQ1S_DELTA : gguf::IQ1S_DELTA;
-    }
+    using Fields=quant::IQ1S::Fields;
+    [[nodiscard]] Fields fields(std::uint64_t p) const noexcept { return quant::IQ1S::fields(plane,p); }
+    [[nodiscard]] static int index(const Fields& f,int l) noexcept { return quant::IQ1S::index(f,l); }
+    [[nodiscard]] static std::uint64_t grid(const Fields& f,int l) noexcept { return quant::IQ1S::grid(f,l); }
+    [[nodiscard]] static float scale(const Fields& f,float d) noexcept { return quant::IQ1S::scale(f,d); }
+    [[nodiscard]] static float delta(const Fields& f) noexcept { return quant::IQ1S::delta(f); }
     /// Refreshes `c` only when `p`'s own superblock differs from the one `c` already holds.
     void refresh(std::uint64_t p, SuperCache& c) const noexcept {
         const std::uint64_t blk = p / kSuperElems;

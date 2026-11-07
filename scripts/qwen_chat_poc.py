@@ -16,9 +16,11 @@ def render(messages):
 
 
 class Session:
-    def __init__(self, backend, model, tokenizer, maximum, threads):
+    def __init__(self, backend, model, tokenizer, maximum, threads, iq1s_kernel=None):
         self.base = [str(backend), str(model), "--tokenizer-dir", str(tokenizer),
                      "--projection-threads", str(threads), "--continuation-steps", str(maximum - 1)]
+        if iq1s_kernel is not None:
+            self.base += ["--iq1s-kernel", iq1s_kernel]
         self.messages = []
         self.last_context = None
         self.last_result = None
@@ -68,12 +70,13 @@ def main():
     parser.add_argument("--tokenizer-dir", type=Path, default=root / "out/build/qwen35-native/tokenizer")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=8)
+    parser.add_argument("--iq1s-kernel", choices=("baseline", "scalar", "native"), help="Opt-in kernel experiment; requires the matching rebuilt backend")
     parser.add_argument("--turn", action="append", help="Scripted turn or /reset or /context; repeatable")
     args = parser.parse_args()
     if not 1 <= args.max_new_tokens <= 128:
         parser.error("max-new-tokens must be 1..128")
     session = Session(args.backend.resolve(), args.model.resolve(), args.tokenizer_dir.resolve(),
-                      args.max_new_tokens, args.threads)
+                      args.max_new_tokens, args.threads, args.iq1s_kernel)
     scripted = iter(args.turn) if args.turn is not None else None
     while True:
         try:

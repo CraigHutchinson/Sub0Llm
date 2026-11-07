@@ -12,6 +12,7 @@ int main(int argc,char** argv) try {
     std::string tokenizer_dir=(std::filesystem::path(argv[0]).parent_path()/"tokenizer").string();
     int generate=0;
     int projection_threads=1;
+    std::string iq1_kernel_name="baseline";
     CLI::App app{"Mapped Qwen raw-token or text sequence proving ground"};
     app.add_option("model",model,"GGUF model")->required();
     auto* raw_option=app.add_option("tokens",prompt,"Comma-separated raw token IDs (default 1543)");
@@ -20,11 +21,15 @@ int main(int argc,char** argv) try {
     auto* text_option=app.add_option("--text",text,"Literal prompt text; no chat template or implicit special tokens");
     app.add_option("--tokenizer-dir",tokenizer_dir,"Tokenizer exported from this GGUF");
     app.add_option("--projection-threads",projection_threads,"Independent output-row workers (OpenMP)")->check(CLI::Range(1,8));
+    // TODO(#60): evaluation knob; promote the proven kernel through the generated configuration after gates.
+    app.add_option("--iq1s-kernel",iq1_kernel_name,"IQ1_S projection experiment")->check(CLI::IsMember({"baseline","scalar","native"}));
     app.add_option("--timings-file",timings_file,"Native setup/prefill/decode metrics; suppress progress output; no dumps");
     app.add_option("--projection-profile",projection_profile_file,"Diagnostic per-format projection attribution; requires timings");
     app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
     app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
+    const auto iq1_kernel=iq1_kernel_name=="native"?sub0::denseq::Iq1Kernel::Native:
+                          iq1_kernel_name=="scalar"?sub0::denseq::Iq1Kernel::Scalar:sub0::denseq::Iq1Kernel::Baseline;
     const bool measure=!timings_file.empty();
     if(!projection_profile_file.empty() && !measure)throw std::runtime_error("projection profile requires timings");
     if(measure && (inspect_context || dump_prefix!="-"))throw std::runtime_error("timings require inference without dumps");
@@ -75,7 +80,7 @@ int main(int argc,char** argv) try {
     bool stopped_eos=false;
     std::size_t position=0;
     auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(dump_prefix=="-")return;const std::string path=dump_prefix+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
-    Layer initial(reader,0,projection_threads,profiler);const auto* emb=reader.find_tensor("token_embd.weight");
+    Layer initial(reader,0,projection_threads,profiler,iq1_kernel);const auto* emb=reader.find_tensor("token_embd.weight");
     if(!emb||emb->dims.size()!=2||emb->dims[0]!=D_MODEL||emb->dims[1]!=VOCAB)throw std::runtime_error("embedding dimensions");
     const auto spec=sub0::gguf::block_spec(emb->type_raw);auto decode=sub0::gguf::dequant_fn(emb->type_raw);
     if(!decode||D_MODEL%spec.elems)throw std::runtime_error("embedding format");
@@ -104,7 +109,7 @@ int main(int argc,char** argv) try {
     if(!decode(bytes.subspan(static_cast<std::size_t>(token)*row_bytes,row_bytes),D_MODEL,h))throw std::runtime_error("embedding decode");
     const auto& d=sub0::GDN_DIMS;
     for(int l=0;l<N_LAYERS;++l){
-        Layer layer(reader,l,projection_threads,profiler);norm(h,layer.load("blk.0.attn_norm.weight",D_MODEL),a);
+        Layer layer(reader,l,projection_threads,profiler,iq1_kernel);norm(h,layer.load("blk.0.attn_norm.weight",D_MODEL),a);
         if(sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
             std::vector<float> qg(2*sub0::D_Q),q(sub0::D_Q),k(sub0::D_KV),v(sub0::D_KV),att(sub0::D_Q);
             if(!layer.project(layer.find("blk.0.attn_q.weight"),a.data(),D_MODEL,qg.data(),2*sub0::D_Q)||!layer.project(layer.find("blk.0.attn_k.weight"),a.data(),D_MODEL,k.data(),sub0::D_KV)||!layer.project(layer.find("blk.0.attn_v.weight"),a.data(),D_MODEL,v.data(),sub0::D_KV))throw std::runtime_error("full attention projection");

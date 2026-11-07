@@ -59,3 +59,6 @@ measurements or change system policy to manufacture a roofline claim.
 |---|---|---|
 | Baseline #56 / PR #57 | merged | Controlled four-arm comparison and raw samples |
 | Projection attribution #58 | complete | [Two real-model runs](QWEN27B_PROJECTION_PROFILE.md): ~99.2% projections, ~71% IQ1_S; unchanged logits |
+| IQ1_S #60 | measured candidate | [2.95× end-to-end gain](IQ1S_ITERATION.md); unchanged activations, broader promotion qualification remains |
+| Remaining projection reduction [#62](https://github.com/CraigHutchinson/Sub0Llm/issues/62) | queued | Vectorize the remaining float dot path, led by IQ2_XXS/IQ1_M/Q3_K |
+| Context/quality and promotion [#63](https://github.com/CraigHutchinson/Sub0Llm/issues/63) | queued | Full supported window, independent quality gates, generated defaults and artifact promotion |

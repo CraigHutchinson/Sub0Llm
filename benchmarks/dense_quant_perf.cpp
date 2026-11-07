@@ -2,6 +2,7 @@
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include <bench_runner.hpp>
 #include "sub0/dense_quant.hpp"
+#include "iq1s_perf.hpp"
 #include <bit>
 #include <cmath>
 #include <stdexcept>
@@ -69,6 +70,7 @@ int main(int argc, char** argv) try {
     runner.run("Q8_0 32x5120, denseq", [&] {
         qwen_width.project(); ankerl::nanobench::doNotOptimizeAway(qwen_width.output.data());
     });
+    add_iq1s_benchmarks(runner);
     return runner.finish();
 } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());
