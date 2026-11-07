@@ -88,7 +88,15 @@ CPU, `docs/HANDOVER.md`) bounds decode; not yet measured.
   27B profile. Both engine forward paths receive it through `GDN_DIMS`. Nonlegacy model artifacts
   append an eight-byte third architecture word; sigmoid artifacts retain their exact prior layout.
   SiLU checkpoints use v8 with the extra word; legacy checkpoints retain v7. Generated profile and
-  override checks pass. Actual artifact load/rejection tests and whole-engine numerical parity remain.
+  override checks pass. Actual small-engine save/load checks pass: each gate variant loads its own
+  artifact and rejects the other; SiLU rejects a missing or altered third word. At d32/L4/H2/KV1,
+  GDN K1/V2 x 16, ff64, vocab512, seq8, f32 parameters, three-token forward/decode maximum absolute
+  logit differences are 1.19209e-7 (SiLU) and 5.96046e-8 (sigmoid). These are random-weight engine
+  checks, not independent real-model parity. The artifacts are 303168 and 303160 bytes respectively.
+  `sub0llm-model-probe` preserves this harness as an explicit build target: run `save MODEL.bin` to
+  save and check forward/decode, and `load MODEL.bin` in each separately configured binary to check
+  acceptance (exit 0) or refusal (exit 6). Generate the small axes above using the Qwen profile with
+  explicit dimension overrides and `--gdn-output-silu 1|0`. Real-weight model parity remains pending.
 
 - Does the dense decode path support Qwen3.5-style GDN + gated FFN at d5120 (the `qwen35` arch)? Run it at the
   smallest scale first.

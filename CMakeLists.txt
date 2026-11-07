@@ -321,6 +321,8 @@ target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 # CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
 add_library(sub0llm_core SHARED src/engine_core.cpp src/blend_schedule.cpp ${SUB0_BACKEND_SOURCES})
+add_executable(sub0llm-model-probe EXCLUDE_FROM_ALL tools/sub0llm-model-probe.cpp)
+target_link_libraries(sub0llm-model-probe PRIVATE sub0llm_core)
 target_include_directories(sub0llm_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0llm_frontend used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
