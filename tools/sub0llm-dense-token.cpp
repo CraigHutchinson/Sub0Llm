@@ -6,9 +6,11 @@
 #include <filesystem>
 using namespace sub0::dense_probe;
 int main(int argc,char** argv) try {
-    std::string model,prompt="1543",dump_prefix="-",text;
+    std::string model,prompt="1543",dump_prefix="-",text,response_file;
+    bool inspect_context=false;
     std::string tokenizer_dir=(std::filesystem::path(argv[0]).parent_path()/"tokenizer").string();
     int generate=0;
+    int projection_threads=1;
     CLI::App app{"Mapped Qwen raw-token or text sequence proving ground"};
     app.add_option("model",model,"GGUF model")->required();
     auto* raw_option=app.add_option("tokens",prompt,"Comma-separated raw token IDs (default 1543)");
@@ -16,6 +18,9 @@ int main(int argc,char** argv) try {
     app.add_option("steps,--continuation-steps",generate,"Greedy feedback positions after prompt")->check(CLI::Range(0,SEQ_LEN));
     auto* text_option=app.add_option("--text",text,"Literal prompt text; no chat template or implicit special tokens");
     app.add_option("--tokenizer-dir",tokenizer_dir,"Tokenizer exported from this GGUF");
+    app.add_option("--projection-threads",projection_threads,"Independent output-row workers (OpenMP)")->check(CLI::Range(1,8));
+    app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
+    app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
     const bool text_mode=text_option->count()!=0;
     if(text_mode&&raw_option->count())throw std::runtime_error("choose text or raw token input");
@@ -51,12 +56,15 @@ int main(int argc,char** argv) try {
     }
     if(tokens.empty())throw std::runtime_error("empty prompt");
     for(int id:tokens)if(id<0||id>=VOCAB)throw std::runtime_error("token outside model vocabulary");
+    std::printf("CONTEXT prompt=%zu reserve=%d capacity=%d\n",tokens.size(),generate,SEQ_LEN);
     if(tokens.size()>SEQ_LEN || static_cast<std::size_t>(generate)>SEQ_LEN-tokens.size())throw std::runtime_error("context window exceeded");
+    if(inspect_context)return 0;
+    if(!text_mode && !response_file.empty())throw std::runtime_error("response file requires text mode");
     const std::size_t prompt_size=tokens.size();tokens.reserve(prompt_size+generate);
     std::vector<int> generated;
     std::size_t position=0;
     auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(dump_prefix=="-")return;const std::string path=dump_prefix+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
-    Layer initial(reader);const auto* emb=reader.find_tensor("token_embd.weight");
+    Layer initial(reader,0,projection_threads);const auto* emb=reader.find_tensor("token_embd.weight");
     if(!emb||emb->dims.size()!=2||emb->dims[0]!=D_MODEL||emb->dims[1]!=VOCAB)throw std::runtime_error("embedding dimensions");
     const auto spec=sub0::gguf::block_spec(emb->type_raw);auto decode=sub0::gguf::dequant_fn(emb->type_raw);
     if(!decode||D_MODEL%spec.elems)throw std::runtime_error("embedding format");
@@ -74,7 +82,7 @@ int main(int argc,char** argv) try {
     if(!decode(bytes.subspan(static_cast<std::size_t>(token)*row_bytes,row_bytes),D_MODEL,h))throw std::runtime_error("embedding decode");
     const auto& d=sub0::GDN_DIMS;
     for(int l=0;l<N_LAYERS;++l){
-        Layer layer(reader,l);norm(h,layer.load("blk.0.attn_norm.weight",D_MODEL),a);
+        Layer layer(reader,l,projection_threads);norm(h,layer.load("blk.0.attn_norm.weight",D_MODEL),a);
         if(sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
             std::vector<float> qg(2*sub0::D_Q),q(sub0::D_Q),k(sub0::D_KV),v(sub0::D_KV),att(sub0::D_Q);
             if(!layer.project(layer.find("blk.0.attn_q.weight"),a.data(),D_MODEL,qg.data(),2*sub0::D_Q)||!layer.project(layer.find("blk.0.attn_k.weight"),a.data(),D_MODEL,k.data(),sub0::D_KV)||!layer.project(layer.find("blk.0.attn_v.weight"),a.data(),D_MODEL,v.data(),sub0::D_KV))throw std::runtime_error("full attention projection");
@@ -125,5 +133,9 @@ int main(int argc,char** argv) try {
         generated.push_back(next);std::printf("text continuation: %s\n",tokenizer.decode(generated).c_str());std::fflush(stdout);
     }
     if(position+1==tokens.size() && tokens.size()<prompt_size+static_cast<std::size_t>(generate))tokens.push_back(static_cast<int>(best-logits.begin()));
+    }
+    if(!response_file.empty()){
+        const std::string decoded=tokenizer.decode(generated);FILE* f=std::fopen(response_file.c_str(),"wb");if(!f)throw std::runtime_error("response file open");
+        const bool ok=std::fwrite(decoded.data(),1,decoded.size(),f)==decoded.size();const int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("response file write");
     }
 } catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}
