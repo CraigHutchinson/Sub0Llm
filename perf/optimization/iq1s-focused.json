@@ -1,7 +1,7 @@
 {
   "schema": "optimization-item-1",
   "id": "iq1s-dependency",
-  "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+  "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/70",
   "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
   "constraints": [
     "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
