@@ -70,7 +70,7 @@ def source(tree, name):
 
 
 def validate_item(item):
-    if item.get('schema') != 'optimization-item-1' or not re.fullmatch(r'[a-z0-9-]{1,64}', item['id']):
+    if not isinstance(item,dict) or item.get('schema') != 'optimization-item-1' or not re.fullmatch(r'[a-z0-9-]{1,64}', item['id']):
         raise ValueError('invalid item contract/id')
     if not item.get('issue') or not item.get('goal') or not item.get('constraints'):
         raise ValueError('issue, focused goal and invariants required')
@@ -132,8 +132,10 @@ def response_schema(item):
 
 
 def parse_reply(reply, item):
-    if reply.get('schema') != 'optimization-inference-1' or reply.get('finish_reason') != 'stop':
+    if not isinstance(reply,dict) or reply.get('schema') != 'optimization-inference-1' or reply.get('finish_reason') != 'stop':
         raise ValueError('inference failed/truncated; no candidate may be applied')
+    if not isinstance(reply.get('content'),str):
+        raise ValueError('inference content must be JSON text')
     return validate_proposal(json.loads(reply['content']), item)
 
 
@@ -217,6 +219,9 @@ def _run(item_path, output, resume=False, proposals_only=False, base=None):
     item_path = Path(item_path).resolve(); item = validate_item(load(item_path)); output = Path(output).resolve()
     if git(ROOT, 'status', '--porcelain', '--untracked-files=no'):
         raise ValueError('commit tracked changes before starting a reproducible experiment')
+    # Refuse an occupied resource before consuming a search attempt or creating worktrees.
+    with PerfLock(ROOT,'optimization resource readiness',timeout=0):
+        pass
     output.mkdir(parents=True, exist_ok=True); state_path = output / 'state.json'
     provider = [x.replace('{root}', str(ROOT)) for x in item['provider_command']]
     identity = trusted_identity(item)
@@ -297,6 +302,7 @@ def _run(item_path, output, resume=False, proposals_only=False, base=None):
                         record['status']='evaluating';save(state_path,state)
                         command(argv, ROOT, folder/'evaluation.log', max(.1,min(evaluation['timeout'],item['wall_seconds']-(time.time()-state['started']))))
                         verdict = load(result)
+                        if not isinstance(verdict,dict):raise ValueError('evaluation must be an object')
                         # Pin every evaluator-produced file; model text cannot supply verdicts.
                         evidence = {}
                         for name in verdict.get('evidence', []):

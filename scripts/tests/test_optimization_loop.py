@@ -111,6 +111,8 @@ class OptimizationTest(unittest.TestCase):
         reply=dict(schema='optimization-inference-1',content=json.dumps(p),finish_reason='length')
         with self.assertRaises(ValueError):loop.parse_reply(reply,self.item())
         self.assertEqual(loop.parse_reply({**reply,'finish_reason':'stop'},self.item()),p)
+        for malformed in ([],None,dict(schema='optimization-inference-1',finish_reason='stop',content=[])):
+            with self.assertRaises(ValueError):loop.parse_reply(malformed,self.item())
         with self.assertRaises(ValueError):loop.validate_proposal({**proposal(),'command':'rm'},self.item())
 
 if __name__=='__main__':unittest.main()
