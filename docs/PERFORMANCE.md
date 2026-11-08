@@ -9,6 +9,8 @@ snapshot; update source, hashes and documentation together in a reviewed PR rath
 
 For the local dense 27B objective and staged milestones, see [the performance campaign](performance/QWEN27B_CAMPAIGN.md).
 
+The dense 27B default-promotion gate is documented in [full-context qualification](performance/QWEN27B_QUALIFICATION.md).
+
 ## Everyday workflow
 
 ```sh

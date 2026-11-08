@@ -5,14 +5,24 @@
 #include <CLI/CLI.hpp>
 #include <filesystem>
 #include "qwen_phase_metrics.hpp"
+#include "qwen_quality_metrics.hpp"
 using namespace sub0::dense_probe;
+#ifndef SUB0_DENSE_PROJECTION_DEFAULT
+#define SUB0_DENSE_PROJECTION_DEFAULT 0
+#endif
+static_assert(SUB0_DENSE_PROJECTION_DEFAULT>=0 && SUB0_DENSE_PROJECTION_DEFAULT<=3);
+constexpr const char* configured_kernel_name(){
+    constexpr const char* names[]{"baseline","scalar","native","native-all"};
+    return names[SUB0_DENSE_PROJECTION_DEFAULT];
+}
 int main(int argc,char** argv) try {
     std::string model,prompt="1543",dump_prefix="-",text,response_file,timings_file,projection_profile_file;
-    bool inspect_context=false;
+    bool inspect_context=false,logits_only=false;
+    std::string score_file,score_targets;
     std::string tokenizer_dir=(std::filesystem::path(argv[0]).parent_path()/"tokenizer").string();
     int generate=0;
-    int projection_threads=1;
-    std::string iq1_kernel_name="baseline";
+    int projection_threads=SUB0_DENSE_PROJECTION_DEFAULT==3?std::min(8,DEFAULT_THREADS):1;
+    std::string iq1_kernel_name=configured_kernel_name();
     CLI::App app{"Mapped Qwen raw-token or text sequence proving ground"};
     app.add_option("model",model,"GGUF model")->required();
     auto* raw_option=app.add_option("tokens",prompt,"Comma-separated raw token IDs (default 1543)");
@@ -21,17 +31,24 @@ int main(int argc,char** argv) try {
     auto* text_option=app.add_option("--text",text,"Literal prompt text; no chat template or implicit special tokens");
     app.add_option("--tokenizer-dir",tokenizer_dir,"Tokenizer exported from this GGUF");
     app.add_option("--projection-threads",projection_threads,"Independent output-row workers (OpenMP)")->check(CLI::Range(1,8));
-    // TODO(#60): evaluation knob; promote the proven kernel through the generated configuration after gates.
-    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel experiment")->check(CLI::IsMember({"baseline","scalar","native","native-all"}));
+    // Evaluation override; the default comes from the generated configuration (#63).
+    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel; generated default, explicit experiment override")->capture_default_str()->check(CLI::IsMember({"baseline","scalar","native","native-all"}));
     app.add_option("--timings-file",timings_file,"Native setup/prefill/decode metrics; suppress progress output; no dumps");
     app.add_option("--projection-profile",projection_profile_file,"Diagnostic per-format projection attribution; requires timings");
+    app.add_option("--score-file",score_file,"Teacher-forced f64 NLL JSON; requires raw targets");
+    app.add_option("--score-targets",score_targets,"One raw next-token target per input position");
+    app.add_flag("--logits-only",logits_only,"Dump only logits, retaining every requested position");
     app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
     app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
     const auto iq1_kernel=iq1_kernel_name=="native-all"?sub0::denseq::Iq1Kernel::NativeAll:
                           iq1_kernel_name=="native"?sub0::denseq::Iq1Kernel::Native:
                           iq1_kernel_name=="scalar"?sub0::denseq::Iq1Kernel::Scalar:sub0::denseq::Iq1Kernel::Baseline;
-    const bool measure=!timings_file.empty();
+    const bool measure=!timings_file.empty(),scoring=!score_file.empty(),quiet=measure||scoring;
+    if(quiet)std::printf("KERNEL selected=%s threads=%d configured=%s\n",iq1_kernel_name.c_str(),projection_threads,configured_kernel_name());
+    if(scoring!=!score_targets.empty())throw std::runtime_error("score file and targets are required together");
+    if(scoring && (measure || inspect_context || generate || text_option->count()))throw std::runtime_error("scoring requires raw teacher-forced inputs without generation/timing");
+    if(logits_only && dump_prefix=="-")throw std::runtime_error("logits-only requires a dump prefix");
     if(!projection_profile_file.empty() && !measure)throw std::runtime_error("projection profile requires timings");
     if(measure && (inspect_context || dump_prefix!="-"))throw std::runtime_error("timings require inference without dumps");
     sub0::phase::Metrics metrics;
@@ -41,7 +58,16 @@ int main(int argc,char** argv) try {
     if(text_mode&&raw_option->count())throw std::runtime_error("choose text or raw token input");
     static_assert(sub0::GDN_DIMS.output_gate_silu && USE_ATTENTION_GATE && !sub0::USE_MOE);
     sub0::qwen_tok::Tokenizer tokenizer;
-    std::vector<int> tokens;
+    std::vector<int> tokens,targets;
+    if(scoring){
+        std::size_t at=0;
+        while(at<=score_targets.size()){
+            const auto comma=score_targets.find(',',at);const auto stop=comma==std::string::npos?score_targets.size():comma;
+            int id=-1;const auto parsed=std::from_chars(score_targets.data()+at,score_targets.data()+stop,id);
+            if(parsed.ec!=std::errc{} || parsed.ptr!=score_targets.data()+stop || id<0 || id>=VOCAB)throw std::runtime_error("invalid score target");
+            targets.push_back(id);if(comma==std::string::npos)break;at=comma+1;
+        }
+    }
     std::size_t begin=0;
     if(!text_mode) while(begin<=prompt.size()) {
         const auto end=prompt.find(',',begin);const auto stop=end==std::string::npos?prompt.size():end;
@@ -77,10 +103,12 @@ int main(int argc,char** argv) try {
     if(inspect_context)return 0;
     if(!text_mode && !response_file.empty())throw std::runtime_error("response file requires text mode");
     const std::size_t prompt_size=tokens.size();tokens.reserve(prompt_size+generate);
+    if(scoring && targets.size()!=prompt_size)throw std::runtime_error("score target count differs from inputs");
+    sub0::quality::Scores scores;if(scoring)scores.reserve(prompt_size);
     std::vector<int> generated;
     bool stopped_eos=false;
     std::size_t position=0;
-    auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(dump_prefix=="-")return;const std::string path=dump_prefix+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
+    auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(dump_prefix=="-" || (logits_only && suffix!=".logits"))return;const std::string path=dump_prefix+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
     Layer initial(reader,0,projection_threads,profiler,iq1_kernel);const auto* emb=reader.find_tensor("token_embd.weight");
     if(!emb||emb->dims.size()!=2||emb->dims[0]!=D_MODEL||emb->dims[1]!=VOCAB)throw std::runtime_error("embedding dimensions");
     const auto spec=sub0::gguf::block_spec(emb->type_raw);auto decode=sub0::gguf::dequant_fn(emb->type_raw);
@@ -147,7 +175,7 @@ int main(int argc,char** argv) try {
         for(int i=0;i<D_FF;++i){float x=gate[i];float s=x>=0?1.f/(1.f+std::exp(-x)):std::exp(x)/(1.f+std::exp(x));up[i]*=x*s;}
         if(!layer.project(layer.find("blk.0.ffn_down.weight"),up.data(),D_FF,down.data(),D_MODEL))throw std::runtime_error("FFN down");
         for(int i=0;i<D_MODEL;++i){h[i]+=down[i];if(!std::isfinite(h[i]))throw std::runtime_error("nonfinite hidden");}
-        dump(".layer"+std::to_string(l),h);if(!measure)std::fprintf(stderr,"layer %d/%d complete\n",l+1,N_LAYERS);
+        dump(".layer"+std::to_string(l),h);if(!quiet)std::fprintf(stderr,"layer %d/%d complete\n",l+1,N_LAYERS);
     }
     norm(h,initial.load("output_norm.weight",D_MODEL),a);dump(".norm",a);
     std::vector<float> logits(VOCAB);
@@ -155,7 +183,8 @@ int main(int argc,char** argv) try {
     for(float v:logits)if(!std::isfinite(v))throw std::runtime_error("nonfinite logits");
     dump(".logits",logits);const auto best=std::max_element(logits.begin(),logits.end());
     if(measure){(position<prompt_size?metrics.prefill_ms:metrics.decode_ms).push_back(sub0::phase::milliseconds(token_begin));metrics.top_ids.push_back(static_cast<int>(best-logits.begin()));}
-    if(!measure)std::printf("mapped sequence inference: position=%zu input=%d layers=%d logits=%zu top_token=%zu top_logit=%.9g; raw token interface\n",position,token,N_LAYERS,logits.size(),static_cast<std::size_t>(best-logits.begin()),*best);
+    if(!quiet)std::printf("mapped sequence inference: position=%zu input=%d layers=%d logits=%zu top_token=%zu top_logit=%.9g; raw token interface\n",position,token,N_LAYERS,logits.size(),static_cast<std::size_t>(best-logits.begin()),*best);
+    if(scoring){scores.add(logits,targets[position]);if((position+1)%16==0)std::fprintf(stderr,"scored %zu/%zu\n",position+1,prompt_size);}
     if(text_mode && position+1>=prompt_size) {
         const int next=static_cast<int>(best-logits.begin());
         if(next==tokenizer.eos_id()) {stopped_eos=true;std::printf("text stop: EOS\n");break;}
@@ -163,6 +192,7 @@ int main(int argc,char** argv) try {
     }
     if(position+1==tokens.size() && tokens.size()<prompt_size+static_cast<std::size_t>(generate))tokens.push_back(static_cast<int>(best-logits.begin()));
     }
+    if(scoring)scores.write(score_file,tokens,targets);
     if(measure)metrics.write(timings_file,projection_threads,SEQ_LEN,false,true);
     if(profiler)profiler->write(projection_profile_file);
     if(text_mode)std::printf("TEXT_RESULT generated=%zu finish=%s\n",generated.size(),stopped_eos?"eos":"length");

@@ -1,0 +1,40 @@
+[
+  {
+    "domain": "literature",
+    "url": "https://www.gutenberg.org/cache/epub/11/pg11.txt",
+    "book_page": "https://www.gutenberg.org/ebooks/11",
+    "source_sha256": "01b38ea4c710a84bc18d0bd41271a5a1a92b94e97b2812f4dece97d4a694725e",
+    "body_fraction": 0.23,
+    "text_sha256": "51f5b2252eb8c6678c1543a6d97bcc328237f4d6111079ef3be5b602502019a8",
+    "copyright": "Source book page declares public domain in the USA; authors died before 1900."
+  },
+  {
+    "domain": "science",
+    "url": "https://www.gutenberg.org/cache/epub/2009/pg2009.txt",
+    "book_page": "https://www.gutenberg.org/ebooks/2009",
+    "source_sha256": "2b13c8524d813e706ad23336d81a142d48b44f1f96788b41494a0a83e1b82f88",
+    "body_fraction": 0.37,
+    "text_sha256": "ec3569fd2b4e8a911ae9216d60de999d9454f4f33e1fefc0593abf55f1f0293c",
+    "copyright": "Source book page declares public domain in the USA; authors died before 1900."
+  },
+  {
+    "domain": "civics",
+    "url": "https://www.gutenberg.org/cache/epub/1404/pg1404.txt",
+    "book_page": "https://www.gutenberg.org/ebooks/1404",
+    "source_sha256": "0b92fadc9d7afd767eefd27805a20e44417ff26d1fb2f964229f39dcc7b2a65d",
+    "body_fraction": 0.47,
+    "text_sha256": "255202093248e278280fbcf6f045dae88ea96e2d3260a0b3cbd87ed8a0a0d44c",
+    "copyright": "Source book page declares public domain in the USA; authors died before 1900."
+  },
+  {
+    "domain": "software",
+    "repository_files": [
+      "README.md",
+      "include/sub0/quant/iq1_s.hpp",
+      "docs/PERFORMANCE.md"
+    ],
+    "source_commit": "c21f0dae313e79fccb176eb3e9355dc5a8f1966f",
+    "text_sha256": "a202603707c95f4b126ee3283f12bd14803781f097e39e37594951d5a6bdf670",
+    "license": "Repository license"
+  }
+]

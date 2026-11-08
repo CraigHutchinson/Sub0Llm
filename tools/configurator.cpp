@@ -721,6 +721,7 @@ int main(int argc, char** argv) {
     // etc. to opt out (e.g. importing a GGUF of a different shape).
     int gated_ffn    = 1;       // 1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the
                                  // plain 2-matrix GELU+bias FFN -- matches the GGUF/Llama-family convention
+    int dense_projection_kernel = -1; // AUTO remains baseline until #63 qualification passes.
     int attention_gate = 0;     // 1 = Qwen attention output sigmoid-gated by a second Q projection
     int tie_embeddings = 1;    // 1 = the LM head reuses tok_emb (transposed) instead of its own
                                  // matrix+bias -- a real param-count win at this project's small-model scale
@@ -1047,6 +1048,10 @@ int main(int argc, char** argv) {
                    "2-matrix GELU+bias FFN -- matches the GGUF/Llama-family convention, for "
                    "importing open weights of that shape (CPU and GPU)")
        ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--dense-projection-kernel", dense_projection_kernel,
+                   "Mapped dense projection default: auto, baseline, scalar, native or native-all")
+       ->transform(CLI::CheckedTransformer(std::map<std::string,int>{{"auto",-1},{"baseline",0},{"scalar",1},{"native",2},{"native-all",3}},CLI::ignore_case))
+       ->check(CLI::Range(-1,3))->default_str("auto");
     app.add_option("--attention-gate", attention_gate,
                    "1 = Qwen full-attention query projection includes a separate sigmoid output gate")
        ->capture_default_str()->check(CLI::Range(0, 1));
@@ -2271,6 +2276,9 @@ int main(int argc, char** argv) {
     // swiglu_backward_act_kernel in backend_cuda.cu).
     cos << "constexpr bool USE_GATED_FFN = " << (gated_ffn ? "true" : "false") << ";\n";
     cos << "constexpr bool USE_ATTENTION_GATE = " << (attention_gate ? "true" : "false") << ";\n";
+    // Not a model-layout/fingerprint axis. Explicit selection stages qualification artifacts;
+    // AUTO is conservatively baseline until the complete #63 quality contract passes.
+    cos << "#define SUB0_DENSE_PROJECTION_DEFAULT " << (dense_projection_kernel<0?0:dense_projection_kernel) << "\n";
     // Tied embeddings: the LM head reuses tok_emb (transposed) instead of its own matrix+bias --
     // see op_tied_head in backend_cpu.cpp. No dims/checkpoint-shape interaction with USE_GATED_FFN,
     // the two are independent axes.
