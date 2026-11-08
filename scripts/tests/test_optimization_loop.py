@@ -35,6 +35,12 @@ class OptimizationTest(unittest.TestCase):
             (root/'escape').symlink_to('/tmp')
             with self.assertRaises(ValueError):loop.source(root,'escape/x.hpp')
 
+    def test_invalid_command_contract_is_refused(self):
+        item=self.item();item['provider_command']=[42]
+        with self.assertRaises(ValueError):loop.validate_item(item)
+        item=self.item();item['evaluation']=dict(command=['tool'],timeout=-1)
+        with self.assertRaises(ValueError):loop.validate_item(item)
+
     def test_compact_schema_and_edit_limit(self):
         item=self.item();item.update(max_edits=1,max_edit_chars=4)
         schema=loop.response_schema(item)
@@ -96,6 +102,9 @@ class OptimizationTest(unittest.TestCase):
             with patch.object(loop,'ROOT',root):result=loop.run(root/'item.json',root/'out')
             self.assertNotEqual(result['best_commit'],result['base_commit']);self.assertEqual(result['attempts'][0]['status'],'improved_for_review')
             self.assertEqual(result['attempts'][1]['status'],'duplicate');self.assertEqual((root/'x.hpp').read_text(),'x=1;\n')
+            item.update(max_attempts=1);(root/'next.json').write_text(json.dumps(item))
+            with patch.object(loop,'ROOT',root):next_run=loop.run(root/'next.json',root/'next-out',base=result['best_commit'])
+            self.assertEqual(next_run['base_commit'],result['best_commit']);self.assertEqual((root/'x.hpp').read_text(),'x=1;\n')
 
     def test_truncated_inference_never_applies_edits(self):
         p=proposal([dict(path='x.hpp',old='x=1;',new='x=2;')])

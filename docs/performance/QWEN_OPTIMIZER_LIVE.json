@@ -1,0 +1,1687 @@
+{
+  "schema": "optimization-live-evidence-1",
+  "host": "CrogBuntu1",
+  "date_utc": "2026-11-08",
+  "original": {
+    "state": {
+      "schema": "optimization-run-1",
+      "contract": {
+        "item_sha256": "36377f860c6715b8a083139b9299a2c9e9e4e855b4fcf17346c8669ee5bdd6fb",
+        "identities": {
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/scripts/optimization/iterate.py": "4cec1de0d5d43685d71dc47616edefbe7c85c9175beb891088bca8b32ee09df4",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/scripts/optimization/llama_provider.py": "3a76563e9dadece18d3c0b46a03890ef690acd8e76ec8453631bad35edf3d995",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/scripts/optimization/evaluate_kernel.py": "488e48243a93ff4317163a0e0ef04a6eb9ccb841a6a22de01ffe9675f72ea3bf",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/perf/optimization/llama-cpu.json": "45654c182c7e363f93d932a39022774b97c857fd182b49eb1fd69a55b628049b",
+          "/usr/lib/llvm-21/bin/clang": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932"
+        },
+        "proposals_only": false
+      },
+      "item": {
+        "schema": "optimization-item-1",
+        "id": "iq1s-dependency",
+        "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+        "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+        "constraints": [
+          "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+          "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+          "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+        ],
+        "qualification_scope": "kernel-only",
+        "editable_files": [
+          "include/sub0/quant/iq1_s.hpp"
+        ],
+        "context": [
+          {
+            "path": "include/sub0/quant/iq1_s.hpp",
+            "start_marker": "    // Internal row core:",
+            "end_marker": "static_assert(FormatModule<IQ1S>);"
+          }
+        ],
+        "max_context_chars": 7000,
+        "max_attempts": 3,
+        "stagnation_window": 1,
+        "max_recoveries": 3,
+        "wall_seconds": 1800,
+        "inference_timeout": 600,
+        "seed": 42,
+        "hints": [
+          "Try two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction. Use only three small exact edits: declaration, update and final reduction. Retain generic compilation and scalar behavior.",
+          "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
+        ],
+        "provider_command": [
+          "python3",
+          "{root}/scripts/optimization/llama_provider.py",
+          "--config",
+          "perf/optimization/llama-cpu.json"
+        ],
+        "identity_files": [
+          "scripts/optimization/iterate.py",
+          "scripts/optimization/llama_provider.py",
+          "scripts/optimization/evaluate_kernel.py",
+          "perf/optimization/llama-cpu.json",
+          "/usr/bin/clang++"
+        ],
+        "evaluation": {
+          "command": [
+            "python3",
+            "{root}/scripts/optimization/evaluate_kernel.py",
+            "--baseline",
+            "{baseline}",
+            "--candidate",
+            "{candidate}",
+            "--result",
+            "{result}",
+            "--compiler",
+            "/usr/bin/clang++",
+            "--benchmark",
+            "IQ1_S 32x5120, fused native",
+            "--editable",
+            "include/sub0/quant/iq1_s.hpp",
+            "--rounds",
+            "5",
+            "--min-gain",
+            "0.02"
+          ],
+          "timeout": 600
+        }
+      },
+      "base_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+      "best_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+      "status": "stalled",
+      "attempts": [
+        {
+          "attempt": 1,
+          "baseline_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+          "status": "no_proposal",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-001",
+          "hypothesis": "Use two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction.",
+          "detail": "No useful edit found; retain generic compilation and scalar behavior.",
+          "recovery_hint": "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
+        },
+        {
+          "attempt": 2,
+          "baseline_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+          "status": "failed",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-002",
+          "detail": "inference failed/truncated; no candidate may be applied",
+          "recovery_hint": "Inspect serial accumulator dependencies; try independent accumulators and measure register pressure."
+        },
+        {
+          "attempt": 3,
+          "baseline_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+          "status": "failed",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-003",
+          "detail": "inference failed/truncated; no candidate may be applied",
+          "recovery_hint": "Hoist repeated scale/index/broadcast work; check whether the compiler already does so."
+        }
+      ],
+      "seen": [],
+      "no_progress": 0,
+      "recoveries": 3,
+      "started": 1794109740.8743167,
+      "next_hint": 3,
+      "continuation": {
+        "review_branch": null,
+        "best_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+        "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+        "review_required": true,
+        "qualification_scope": "kernel-only",
+        "next_hint": "Hoist repeated scale/index/broadcast work; check whether the compiler already does so.",
+        "novel_proposals": 0,
+        "improved_attempts": 0,
+        "action": "Review preserved diffs/evidence; narrow or reprofile the work item. Never infer global optimality from a stalled run."
+      }
+    },
+    "records": [
+      {
+        "result": {
+          "attempt": 1,
+          "baseline_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+          "status": "no_proposal",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-001",
+          "hypothesis": "Use two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction.",
+          "detail": "No useful edit found; retain generic compilation and scalar behavior.",
+          "recovery_hint": "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
+        },
+        "request": {
+          "schema": "optimization-request-1",
+          "work_item": "iq1s-dependency",
+          "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+          "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+          "constraints": [
+            "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+            "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+            "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+          ],
+          "editable_files": [
+            "include/sub0/quant/iq1_s.hpp"
+          ],
+          "context": [
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "sha256": "5aedae5bedd5278347a670efc43e5830e0ee245bdbb214f2f1434f7cd5c9894f",
+              "start_line": 56,
+              "text": "    // Internal row core: caller validates whole blocks, input width and encoded span first.\n    // Float inputs are retained. SIMD changes accumulation order, never packed weight decoding.\n    template<bool Native>\n    [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {\n        float sum=0;\n#if defined(__AVX2__)\n        __m256 accum=_mm256_setzero_ps();\n#endif\n        for(std::size_t b=0;b<width/block.elems;++b){\n            const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);\n            for(int ib=0;ib<8;++ib){\n                const auto f=fields(row,base+32*ib);const float dl=scale(f,d),offset=delta(f);\n                for(int l=0;l<4;++l){\n                    const auto g=grid(f,l);const auto at=base+32*ib+8*l;\n#if defined(__AVX2__)\n                    if constexpr(Native){\n                        const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\n                        const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\n                        accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                    } else\n#endif\n                    {\n                        for(int j=0;j<8;++j){\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\n                        }\n                    }\n                }\n            }\n        }\n#if defined(__AVX2__)\n        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum);for(float v:lanes)sum+=v;}\n#endif\n        return sum;\n    }\n};\nstatic_assert(FormatModule<IQ1S>);\n"
+            }
+          ],
+          "artifact_dir": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-001",
+          "feedback": [],
+          "hint": "Try two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction. Use only three small exact edits: declaration, update and final reduction. Retain generic compilation and scalar behavior.",
+          "attempt": 1,
+          "seed": 43,
+          "response_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "hypothesis": {
+                "type": "string"
+              },
+              "mechanism": {
+                "type": "string"
+              },
+              "edits": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "type": "string"
+                    },
+                    "new": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "old",
+                    "new"
+                  ]
+                }
+              },
+              "no_change_reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "hypothesis",
+              "mechanism",
+              "edits",
+              "no_change_reason"
+            ]
+          }
+        },
+        "inference": {
+          "schema": "optimization-inference-1",
+          "content": "{\"hypothesis\": \"Use two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction.\", \"mechanism\": \"Kernel-only experiment: split accumulation into two independent accumulators to reduce dot latency at width 5120, one falsifiable small mechanism per attempt.\", \"edits\": [], \"no_change_reason\": \"No useful edit found; retain generic compilation and scalar behavior.\"}",
+          "finish_reason": "stop",
+          "usage": {
+            "completion_tokens": 94,
+            "prompt_tokens": 1096,
+            "total_tokens": 1190,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 1096,
+            "prompt_ms": 17372.566,
+            "prompt_per_token_ms": 15.850881386861312,
+            "prompt_per_second": 63.08797445351482,
+            "predicted_n": 94,
+            "predicted_ms": 21987.392,
+            "predicted_per_token_ms": 236.42356989247313,
+            "predicted_per_second": 4.229696728015765
+          },
+          "engine": {
+            "kind": "llama.cpp",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "identities": {
+              "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+            },
+            "config": {
+              "server": "out/build/llama-optimizer/bin/llama-server",
+              "model": "../../Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+              "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+              "context": 4096,
+              "max_tokens": 768,
+              "batch": 512,
+              "ubatch": 128,
+              "max_rss_mib": 8192,
+              "threads": 8,
+              "threads_batch": 16,
+              "cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ],
+              "decode_cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "prompt_tokens_preflight": 1096,
+            "peak_rss_mib": 7033.69921875,
+            "wall_s": 43.90737087400339,
+            "server_log_sha256": "f7e63680366a92c700347eb7732da9c9aa5e132fd9e3d244cea3dd12a2194510"
+          }
+        },
+        "proposal.json": {
+          "hypothesis": "Use two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction.",
+          "mechanism": "Kernel-only experiment: split accumulation into two independent accumulators to reduce dot latency at width 5120, one falsifiable small mechanism per attempt.",
+          "edits": [],
+          "no_change_reason": "No useful edit found; retain generic compilation and scalar behavior."
+        }
+      },
+      {
+        "result": {
+          "attempt": 2,
+          "baseline_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+          "status": "failed",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-002",
+          "detail": "inference failed/truncated; no candidate may be applied",
+          "recovery_hint": "Inspect serial accumulator dependencies; try independent accumulators and measure register pressure."
+        },
+        "request": {
+          "schema": "optimization-request-1",
+          "work_item": "iq1s-dependency",
+          "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+          "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+          "constraints": [
+            "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+            "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+            "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+          ],
+          "editable_files": [
+            "include/sub0/quant/iq1_s.hpp"
+          ],
+          "context": [
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "sha256": "5aedae5bedd5278347a670efc43e5830e0ee245bdbb214f2f1434f7cd5c9894f",
+              "start_line": 56,
+              "text": "    // Internal row core: caller validates whole blocks, input width and encoded span first.\n    // Float inputs are retained. SIMD changes accumulation order, never packed weight decoding.\n    template<bool Native>\n    [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {\n        float sum=0;\n#if defined(__AVX2__)\n        __m256 accum=_mm256_setzero_ps();\n#endif\n        for(std::size_t b=0;b<width/block.elems;++b){\n            const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);\n            for(int ib=0;ib<8;++ib){\n                const auto f=fields(row,base+32*ib);const float dl=scale(f,d),offset=delta(f);\n                for(int l=0;l<4;++l){\n                    const auto g=grid(f,l);const auto at=base+32*ib+8*l;\n#if defined(__AVX2__)\n                    if constexpr(Native){\n                        const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\n                        const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\n                        accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                    } else\n#endif\n                    {\n                        for(int j=0;j<8;++j){\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\n                        }\n                    }\n                }\n            }\n        }\n#if defined(__AVX2__)\n        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum);for(float v:lanes)sum+=v;}\n#endif\n        return sum;\n    }\n};\nstatic_assert(FormatModule<IQ1S>);\n"
+            }
+          ],
+          "artifact_dir": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-002",
+          "feedback": [
+            {
+              "attempt": 1,
+              "status": "no_proposal",
+              "detail": "No useful edit found; retain generic compilation and scalar behavior.",
+              "hypothesis": "Use two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction."
+            }
+          ],
+          "hint": "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback.",
+          "attempt": 2,
+          "seed": 44,
+          "response_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "hypothesis": {
+                "type": "string"
+              },
+              "mechanism": {
+                "type": "string"
+              },
+              "edits": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "type": "string"
+                    },
+                    "new": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "old",
+                    "new"
+                  ]
+                }
+              },
+              "no_change_reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "hypothesis",
+              "mechanism",
+              "edits",
+              "no_change_reason"
+            ]
+          }
+        },
+        "inference": {
+          "schema": "optimization-inference-1",
+          "content": "{\"hypothesis\": \"Use a single __m256 accumulator that interleaves the two IQ1_S halves per 4-byte grid cell, then combine with a horizontal add to reduce the dot core's scalar broadcast path.\", \"mechanism\": \"The current loop reads grid(f,l) and then __m256_loadu_ps(x+at), which is a scalar broadcast of the packed weight. A distinct mechanism is to load the packed weight as a single __m256 load and combine the two IQ1_S halves with a horizontal add, which changes the accumulation order without changing packed weight decoding.\", \"edits\": [{\"path\": \"include/sub0/quant/iq1_s.hpp\", \"old\": \"                    if constexpr(Native){\\n                        const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\\n                        const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\\n                        accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\\n                    } else\", \"new\": \"                    if constexpr(Native){\\n                        const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\\n                        const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\\n                        accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\\n                    } else\"}, {\"path\": \"include/sub0/quant/iq1_s.hpp\", \"old\": \"                    {\\n                        for(int j=0;j<8;++j){\\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\\n                        }\\n                    }\", \"new\": \"                    {\\n                        for(int j=0;j<8;++j){\\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\\n                        }\\n                    }\"}, {\"path\": \"include/sub0/quant/iq1_s.hpp\", \"old\": \"                    {\\n                        for(int j=0;j<8;++j){\\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\\n                        }\\n                    }\", \"new\": \"                    {\\n                        for(int j=0;j<8;++j){\\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\\n                        }\\n                    }\"}], \"no_change_reason\": \"The scalar fallback path remains unchanged; the",
+          "finish_reason": "length",
+          "usage": {
+            "completion_tokens": 768,
+            "prompt_tokens": 1133,
+            "total_tokens": 1901,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 1133,
+            "prompt_ms": 18219.292,
+            "prompt_per_token_ms": 16.08057546337158,
+            "prompt_per_second": 62.18682921378063,
+            "predicted_n": 768,
+            "predicted_ms": 184534.132,
+            "predicted_per_token_ms": 240.59208865710562,
+            "predicted_per_second": 4.156412646740062
+          },
+          "engine": {
+            "kind": "llama.cpp",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "identities": {
+              "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+            },
+            "config": {
+              "server": "out/build/llama-optimizer/bin/llama-server",
+              "model": "../../Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+              "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+              "context": 4096,
+              "max_tokens": 768,
+              "batch": 512,
+              "ubatch": 128,
+              "max_rss_mib": 8192,
+              "threads": 8,
+              "threads_batch": 16,
+              "cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ],
+              "decode_cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "prompt_tokens_preflight": 1133,
+            "peak_rss_mib": 7041.15625,
+            "wall_s": 207.29626582299534,
+            "server_log_sha256": "407fb4a7c215f4757d86aad802990916ac2909c611f3209e39cc68395e393b34"
+          }
+        }
+      },
+      {
+        "result": {
+          "attempt": 3,
+          "baseline_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+          "status": "failed",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-003",
+          "detail": "inference failed/truncated; no candidate may be applied",
+          "recovery_hint": "Hoist repeated scale/index/broadcast work; check whether the compiler already does so."
+        },
+        "request": {
+          "schema": "optimization-request-1",
+          "work_item": "iq1s-dependency",
+          "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+          "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+          "constraints": [
+            "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+            "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+            "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+          ],
+          "editable_files": [
+            "include/sub0/quant/iq1_s.hpp"
+          ],
+          "context": [
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "sha256": "5aedae5bedd5278347a670efc43e5830e0ee245bdbb214f2f1434f7cd5c9894f",
+              "start_line": 56,
+              "text": "    // Internal row core: caller validates whole blocks, input width and encoded span first.\n    // Float inputs are retained. SIMD changes accumulation order, never packed weight decoding.\n    template<bool Native>\n    [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {\n        float sum=0;\n#if defined(__AVX2__)\n        __m256 accum=_mm256_setzero_ps();\n#endif\n        for(std::size_t b=0;b<width/block.elems;++b){\n            const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);\n            for(int ib=0;ib<8;++ib){\n                const auto f=fields(row,base+32*ib);const float dl=scale(f,d),offset=delta(f);\n                for(int l=0;l<4;++l){\n                    const auto g=grid(f,l);const auto at=base+32*ib+8*l;\n#if defined(__AVX2__)\n                    if constexpr(Native){\n                        const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\n                        const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\n                        accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                    } else\n#endif\n                    {\n                        for(int j=0;j<8;++j){\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\n                        }\n                    }\n                }\n            }\n        }\n#if defined(__AVX2__)\n        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum);for(float v:lanes)sum+=v;}\n#endif\n        return sum;\n    }\n};\nstatic_assert(FormatModule<IQ1S>);\n"
+            }
+          ],
+          "artifact_dir": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-001/attempt-003",
+          "feedback": [
+            {
+              "attempt": 1,
+              "status": "no_proposal",
+              "detail": "No useful edit found; retain generic compilation and scalar behavior.",
+              "hypothesis": "Use two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction."
+            },
+            {
+              "attempt": 2,
+              "status": "failed",
+              "detail": "inference failed/truncated; no candidate may be applied",
+              "hypothesis": ""
+            }
+          ],
+          "hint": "Inspect serial accumulator dependencies; try independent accumulators and measure register pressure.",
+          "attempt": 3,
+          "seed": 45,
+          "response_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "hypothesis": {
+                "type": "string"
+              },
+              "mechanism": {
+                "type": "string"
+              },
+              "edits": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "type": "string"
+                    },
+                    "new": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "old",
+                    "new"
+                  ]
+                }
+              },
+              "no_change_reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "hypothesis",
+              "mechanism",
+              "edits",
+              "no_change_reason"
+            ]
+          }
+        },
+        "inference": {
+          "schema": "optimization-inference-1",
+          "content": "{\"hypothesis\": \"Use two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction.\", \"mechanism\": \"Independent accumulators reduce register pressure and dependency chain length; the scalar fallback and packed weight decoding are unchanged.\", \"edits\": [{\"path\": \"include/sub0/quant/iq1_s.hpp\", \"old\": \"    // Internal row core: caller validates whole blocks, input width and encoded span first.\\n    // Float inputs are retained. SIMD changes accumulation order, never packed weight decoding.\\n    template<bool Native>\\n    [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {\\n        float sum=0;\\n#if defined(__AVX2__)\\n        __m256 accum=_mm256_setzero_ps();\\n#endif\\n        for(std::size_t b=0;b<width/block.elems;++b){\\n            const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);\\n            for(int ib=0;ib<8;++ib){\\n                const auto f=fields(row,base+32*ib);const float dl=scale(f,d),offset=delta(f);\\n                for(int l=0;l<4;++l){\\n                    const auto g=grid(f,l);const auto at=base+32*ib+8*l;\\n#if defined(__AVX2__)\\n                    if constexpr(Native){\\n                        const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\\n                        const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\\n                        accum=_mm256_add_ps(_mm256_loadu_ps(x+at),_mm256_add_ps(_mm256_loadu_ps(x+at),w));\\n                    } else\\n#endif\\n                    {\\n                        for(int j=0;j<8;++j){\\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\\n                        }\\n                    }\\n                }\\n            }\\n        }\\n#if defined(__AVX2__)\\n        if constexpr(Native){aligns(32) float lanes[8];_mm256_store_ps(lanes,accum);for(float v:lanes)sum+=v;}\\n#endif\\n        return sum;\\n    }\\n};\\nstatic_assert(FormatModule<IQ1S>);\", \"new\": \"    // Internal row core: caller validates whole blocks, input width and encoded span first.\\n    // Float inputs are retained. SIMD changes accumulation order, never packed weight decoding.\\n    template<bool Native>\\n    [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {\\n        float sum=0;\\n#if defined(__AVX2__)\\n        __m256 accum=_mm256_setzero_ps();\\n#endif\\n        for(std::size_t b=0;b<width/block.elems;++b){\\n            const",
+          "finish_reason": "length",
+          "usage": {
+            "completion_tokens": 768,
+            "prompt_tokens": 1159,
+            "total_tokens": 1927,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 1159,
+            "prompt_ms": 18508.362,
+            "prompt_per_token_ms": 15.969251078515963,
+            "prompt_per_second": 62.62034425304627,
+            "predicted_n": 768,
+            "predicted_ms": 185974.571,
+            "predicted_per_token_ms": 242.47010560625813,
+            "predicted_per_second": 4.124219756904292
+          },
+          "engine": {
+            "kind": "llama.cpp",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "identities": {
+              "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+            },
+            "config": {
+              "server": "out/build/llama-optimizer/bin/llama-server",
+              "model": "../../Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+              "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+              "context": 4096,
+              "max_tokens": 768,
+              "batch": 512,
+              "ubatch": 128,
+              "max_rss_mib": 8192,
+              "threads": 8,
+              "threads_batch": 16,
+              "cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ],
+              "decode_cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "prompt_tokens_preflight": 1159,
+            "peak_rss_mib": 7033.734375,
+            "wall_s": 209.0273327929899,
+            "server_log_sha256": "7ccde8bc4ae4cc0610050a5b6e5e9fba9247bcb70c5f5a920e85b5c7d5d697f0"
+          }
+        }
+      }
+    ]
+  },
+  "compact_expert_seeded": {
+    "state": {
+      "schema": "optimization-run-1",
+      "contract": {
+        "item_sha256": "29fb0f3cfa6a01c439058570e3a993e1e31505bd21f2d7f8ef9bed555cb90f38",
+        "identities": {
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/scripts/optimization/iterate.py": "dcc5ae9531405b92860160aeaafb06f59184d2f025cdb5cf33de518a875ca7b7",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/scripts/optimization/llama_provider.py": "1933999a0c9954f55d147588e71996158541e34d63d97f7e03599659acea9957",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/scripts/optimization/evaluate_kernel.py": "488e48243a93ff4317163a0e0ef04a6eb9ccb841a6a22de01ffe9675f72ea3bf",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/perf/optimization/llama-cpu.json": "45654c182c7e363f93d932a39022774b97c857fd182b49eb1fd69a55b628049b",
+          "/usr/lib/llvm-21/bin/clang": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932",
+          "/usr/bin/python3.14": "52e0a13e60a981d8c4b6478be2ba5176f69da07948a056bf49cf6f077e30cb41",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/accept.py": "84cba700c380a9f379a99665fafbdafc6cb0825139464a32697d2a11c9e9cb0c",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/baseline.py": "5acda30c784a83c5fbfb13d816a9223d06a54aa2ad0f7e24abbaff6c18944dae",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/cli.py": "18649ecbfcc71e76c8cccc361bcfc90d8787f1111ebd7cd58955fdf11cf3047b",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/common.py": "bfd43d47f34497389c9dabcbf5c7d5d5fb0e95849356d87b8e202c71f6b5ef30",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/confirm.py": "363ae878da8ad8f8f69054c893930ba277fe7bffba2602b60819afcafd64a380",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/deferral.py": "ee76ce979d1a81bd11d4089d5deff9eec0810e570eb1cba8f1d0d7b3d24c8414",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/gate.py": "5c4a263e0b4ddc603d7ca800f2982cbc08f877f6452e4aad44ff115f8e22670e",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/gitstate.py": "f203f5b8a3fefe86d560d25830a848766db992bfc35f36d502237ef46a517f45",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/hooks.py": "ea2b41bbd30fa8ab2e9381d24e107c575f35de4c884fde5576333b1d67bf5bb6",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/judge.py": "1200ef66031f2d290000283249a933ad44be6881bb27e9c30bd6a9a56653e043",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/levels.py": "a00aa499ebc86f19e95c9f0c13ae4c9baefeda94f254bf50562fa63350d909b7",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/load.py": "528c9c3bf542875fd78c48feb846d92274fdfcca7db4b5caf3690e122fe207e9",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/lock.py": "293e3522767b5ed6147ce44679a81e51ca3b2cba3bd642247a09de28b43267ed",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/pins.py": "5211af4c332993cee7f64d257d494afd24e941ff21de26b16f75fcf13453fda6",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/plan.py": "cfba058a0a227d24b10b7fb2501008ea437137457df2cda32aed1c306e3bd151",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/platform_proc.py": "09399413039bebca0732e6a3454ce9e27a4776eb1142f8b22895c94cca620e9a",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/power.py": "6f69e85b38847d42b595ce95fcf91e0e628d74454075fffd433be90b607155d7",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/report.py": "4e7b3a7b28f845bf92c04c705075419bdf6cf48fa27a3f8e0cd45cd233399b4b",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/reproduce.py": "6782c3f0ca9fba6c4e78cdce21e9f00dfeda451957a81b5eb61a268243f45ba0",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/runner.py": "496451d498499abdcb7aab2ea866224dcea1b793572a59c629a0286ddd211cbd",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/selftest.py": "cc742507cb39aa7fc94b50847b40edef9405551cccda67e6a8a9d1ee7fc39222",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/speed.py": "c8dff3879d10d1442eb6b48fac707cb296c42c6a4e647e5fc52dad34c629f42d",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/stats.py": "3b9d3de06a9835ef544154dcd305900475364dea64b6f950fca67e9184bf1318",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/workload.py": "be3e291b05c0f230a50ec96a041b46c249b9cfd1b284261655ef99ceb4350994",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf/sub0perf/__init__.py": "dea5cb138e982094ebc34d19b9d00a2f6a9ff1ed3ed98b70c60a9749908a3caa"
+        },
+        "proposals_only": false
+      },
+      "item": {
+        "schema": "optimization-item-1",
+        "id": "iq1s-dependency",
+        "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+        "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+        "constraints": [
+          "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+          "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+          "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+        ],
+        "qualification_scope": "kernel-only",
+        "editable_files": [
+          "include/sub0/quant/iq1_s.hpp"
+        ],
+        "context": [
+          {
+            "path": "include/sub0/quant/iq1_s.hpp",
+            "start_marker": "    // Internal row core:",
+            "end_marker": "static_assert(FormatModule<IQ1S>);"
+          }
+        ],
+        "max_context_chars": 7000,
+        "max_attempts": 2,
+        "stagnation_window": 1,
+        "max_recoveries": 2,
+        "wall_seconds": 1200,
+        "inference_timeout": 600,
+        "seed": 42,
+        "hints": [
+          "Try two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction. Use only three small exact edits: declaration, update and final reduction. Retain generic compilation and scalar behavior.",
+          "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
+        ],
+        "provider_command": [
+          "/usr/bin/python3",
+          "{root}/scripts/optimization/llama_provider.py",
+          "--config",
+          "perf/optimization/llama-cpu.json"
+        ],
+        "identity_files": [
+          "scripts/optimization/iterate.py",
+          "scripts/optimization/llama_provider.py",
+          "scripts/optimization/evaluate_kernel.py",
+          "perf/optimization/llama-cpu.json",
+          "/usr/bin/clang++",
+          "/usr/bin/python3"
+        ],
+        "evaluation": {
+          "command": [
+            "/usr/bin/python3",
+            "{root}/scripts/optimization/evaluate_kernel.py",
+            "--baseline",
+            "{baseline}",
+            "--candidate",
+            "{candidate}",
+            "--result",
+            "{result}",
+            "--compiler",
+            "/usr/bin/clang++",
+            "--benchmark",
+            "IQ1_S 32x5120, fused native",
+            "--editable",
+            "include/sub0/quant/iq1_s.hpp",
+            "--rounds",
+            "5",
+            "--min-gain",
+            "0.02"
+          ],
+          "timeout": 600
+        },
+        "max_edits": 3,
+        "max_edit_chars": 600,
+        "seed_edits": [
+          {
+            "path": "include/sub0/quant/iq1_s.hpp",
+            "old": "__m256 accum=_mm256_setzero_ps();",
+            "new": "__m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();"
+          },
+          {
+            "path": "include/sub0/quant/iq1_s.hpp",
+            "old": "accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));",
+            "new": "if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));"
+          },
+          {
+            "path": "include/sub0/quant/iq1_s.hpp",
+            "old": "_mm256_store_ps(lanes,accum);",
+            "new": "_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));"
+          }
+        ]
+      },
+      "base_commit": "a03f8dc4c2d2e23d48e5dc7e0c8279caa7842141",
+      "best_commit": "9ab9678bcb5e4fea16833cf73b3463f61fcb74c7",
+      "status": "budget_exhausted",
+      "attempts": [
+        {
+          "attempt": 1,
+          "baseline_commit": "a03f8dc4c2d2e23d48e5dc7e0c8279caa7842141",
+          "status": "improved_for_review",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001",
+          "hypothesis": "Split the single __m256 accum into two independent accumulators (accum0/accum1) selected by l&1, then combined in the final lane reduction.",
+          "evaluation_sha256": "89bf0c133e9f16b04e1fc6f56c9410f66a507e24c109360912d5aa7436840abd",
+          "evaluation": {
+            "schema": "optimization-evaluation-1",
+            "qualification_scope": "kernel-only",
+            "candidate_files": {
+              "include/sub0/quant/iq1_s.hpp": "b760cd1a1a981784474dc9f5e71219c67be1f2638708d707e25163d1e1ecf1de"
+            },
+            "baseline_commit": "a03f8dc4c2d2e23d48e5dc7e0c8279caa7842141",
+            "correctness": "pass",
+            "memory": "pass",
+            "performance": "improved",
+            "evidence": [
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline-build.log",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-build.log",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-generic-build.log",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/kernel-evidence.json"
+            ],
+            "median_candidate_over_baseline": 0.8639980580605192,
+            "robust_cv": 0.00778362471050649,
+            "decision_limit": 0.02335087413151947,
+            "identities": {
+              "baseline": "1a277c4f0371d3f36e3445b2a6711fbd76ef5757a13121c8421d0069ce372f27",
+              "candidate": "d0f9faff40e68f12c3f7bd549956c97daa125c2fdb507cf13af9557a45ef855d",
+              "candidate-generic": "427c592fb1c42aac7289aa516293ae8b1b7f7d8f2751d011fc371b65ad2d7107",
+              "compiler": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932"
+            }
+          },
+          "evidence_sha256": {
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-generic-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/kernel-evidence.json": "f2dbed4edd6cd506d3bf8bbe8dae3dc414bdc5065e889964b5a6e38008c17cb1"
+          },
+          "candidate_commit": "9ab9678bcb5e4fea16833cf73b3463f61fcb74c7"
+        },
+        {
+          "attempt": 2,
+          "baseline_commit": "9ab9678bcb5e4fea16833cf73b3463f61fcb74c7",
+          "status": "failed",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-002",
+          "detail": "out-of-scope or no-op edit",
+          "recovery_hint": "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
+        }
+      ],
+      "seen": [
+        "19520803ed204a700fa369ef828c3b110f744bf9b94e4dd7119377a0b74aba68"
+      ],
+      "no_progress": 0,
+      "recoveries": 1,
+      "started": 1794110385.885996,
+      "next_hint": 1,
+      "evaluated_trees": [
+        "20b2a632c14c09e50fe504a61adf5d20f7bf2c0db69423bc00670081ab24ec38"
+      ],
+      "review_branch": "optimization/iq1s-dependency/58532f4a5d06",
+      "continuation": {
+        "review_branch": "optimization/iq1s-dependency/58532f4a5d06",
+        "best_commit": "9ab9678bcb5e4fea16833cf73b3463f61fcb74c7",
+        "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+        "review_required": true,
+        "qualification_scope": "kernel-only",
+        "next_hint": "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback.",
+        "novel_proposals": 1,
+        "improved_attempts": 1,
+        "action": "Review preserved diffs/evidence; narrow or reprofile the work item. Never infer global optimality from a stalled run."
+      }
+    },
+    "records": [
+      {
+        "result": {
+          "attempt": 1,
+          "baseline_commit": "a03f8dc4c2d2e23d48e5dc7e0c8279caa7842141",
+          "status": "improved_for_review",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001",
+          "hypothesis": "Split the single __m256 accum into two independent accumulators (accum0/accum1) selected by l&1, then combined in the final lane reduction.",
+          "evaluation_sha256": "89bf0c133e9f16b04e1fc6f56c9410f66a507e24c109360912d5aa7436840abd",
+          "evaluation": {
+            "schema": "optimization-evaluation-1",
+            "qualification_scope": "kernel-only",
+            "candidate_files": {
+              "include/sub0/quant/iq1_s.hpp": "b760cd1a1a981784474dc9f5e71219c67be1f2638708d707e25163d1e1ecf1de"
+            },
+            "baseline_commit": "a03f8dc4c2d2e23d48e5dc7e0c8279caa7842141",
+            "correctness": "pass",
+            "memory": "pass",
+            "performance": "improved",
+            "evidence": [
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline-build.log",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-build.log",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-generic-build.log",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/kernel-evidence.json"
+            ],
+            "median_candidate_over_baseline": 0.8639980580605192,
+            "robust_cv": 0.00778362471050649,
+            "decision_limit": 0.02335087413151947,
+            "identities": {
+              "baseline": "1a277c4f0371d3f36e3445b2a6711fbd76ef5757a13121c8421d0069ce372f27",
+              "candidate": "d0f9faff40e68f12c3f7bd549956c97daa125c2fdb507cf13af9557a45ef855d",
+              "candidate-generic": "427c592fb1c42aac7289aa516293ae8b1b7f7d8f2751d011fc371b65ad2d7107",
+              "compiler": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932"
+            }
+          },
+          "evidence_sha256": {
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-generic-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/kernel-evidence.json": "f2dbed4edd6cd506d3bf8bbe8dae3dc414bdc5065e889964b5a6e38008c17cb1"
+          },
+          "candidate_commit": "9ab9678bcb5e4fea16833cf73b3463f61fcb74c7"
+        },
+        "request": {
+          "schema": "optimization-request-1",
+          "work_item": "iq1s-dependency",
+          "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+          "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+          "constraints": [
+            "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+            "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+            "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+          ],
+          "editable_files": [
+            "include/sub0/quant/iq1_s.hpp"
+          ],
+          "context": [
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "sha256": "5aedae5bedd5278347a670efc43e5830e0ee245bdbb214f2f1434f7cd5c9894f",
+              "start_line": 56,
+              "text": "    // Internal row core: caller validates whole blocks, input width and encoded span first.\n    // Float inputs are retained. SIMD changes accumulation order, never packed weight decoding.\n    template<bool Native>\n    [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {\n        float sum=0;\n#if defined(__AVX2__)\n        __m256 accum=_mm256_setzero_ps();\n#endif\n        for(std::size_t b=0;b<width/block.elems;++b){\n            const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);\n            for(int ib=0;ib<8;++ib){\n                const auto f=fields(row,base+32*ib);const float dl=scale(f,d),offset=delta(f);\n                for(int l=0;l<4;++l){\n                    const auto g=grid(f,l);const auto at=base+32*ib+8*l;\n#if defined(__AVX2__)\n                    if constexpr(Native){\n                        const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\n                        const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\n                        accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                    } else\n#endif\n                    {\n                        for(int j=0;j<8;++j){\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\n                        }\n                    }\n                }\n            }\n        }\n#if defined(__AVX2__)\n        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum);for(float v:lanes)sum+=v;}\n#endif\n        return sum;\n    }\n};\nstatic_assert(FormatModule<IQ1S>);\n"
+            }
+          ],
+          "artifact_dir": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001",
+          "feedback": [],
+          "hint": "Try two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction. Use only three small exact edits: declaration, update and final reduction. Retain generic compilation and scalar behavior.",
+          "attempt": 1,
+          "seed": 43,
+          "candidate_hints": [
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "old": "__m256 accum=_mm256_setzero_ps();",
+              "new": "__m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();"
+            },
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "old": "accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));",
+              "new": "if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));"
+            },
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "old": "_mm256_store_ps(lanes,accum);",
+              "new": "_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));"
+            }
+          ],
+          "response_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "hypothesis": {
+                "type": "string",
+                "maxLength": 160
+              },
+              "mechanism": {
+                "type": "string",
+                "maxLength": 160
+              },
+              "edits": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "type": "string",
+                      "maxLength": 600
+                    },
+                    "new": {
+                      "type": "string",
+                      "maxLength": 600
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "old",
+                    "new"
+                  ]
+                },
+                "maxItems": 3
+              },
+              "no_change_reason": {
+                "type": "string",
+                "maxLength": 160
+              }
+            },
+            "required": [
+              "hypothesis",
+              "mechanism",
+              "edits",
+              "no_change_reason"
+            ]
+          }
+        },
+        "inference": {
+          "schema": "optimization-inference-1",
+          "content": "{\"hypothesis\": \"Split the single __m256 accum into two independent accumulators (accum0/accum1) selected by l&1, then combined in the final lane reduction.\", \"mechanism\": \"The existing single-accumulator design serializes all dot products through one register. By routing even-lane products into accum0 and odd-lane products into a \", \"edits\": [{\"path\": \"include/sub0/quant/iq1_s.hpp\", \"old\": \"__m256 accum=_mm256_setzero_ps();\", \"new\": \"__m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();\"}, {\"path\": \"include/sub0/quant/iq1_s.hpp\", \"old\": \"accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\", \"new\": \"if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\\n                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\"}, {\"path\": \"include/sub0/quant/iq1_s.hpp\", \"old\": \"_mm256_store_ps(lanes,accum);\", \"new\": \"_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));\"}], \"no_change_reason\": \"\"}",
+          "finish_reason": "stop",
+          "usage": {
+            "completion_tokens": 346,
+            "prompt_tokens": 1431,
+            "total_tokens": 1777,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 1431,
+            "prompt_ms": 22697.219,
+            "prompt_per_token_ms": 15.861089447938506,
+            "prompt_per_second": 63.04737157446469,
+            "predicted_n": 346,
+            "predicted_ms": 83097.001,
+            "predicted_per_token_ms": 240.86087246376812,
+            "predicted_per_second": 4.151774382326987
+          },
+          "engine": {
+            "kind": "llama.cpp",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "identities": {
+              "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+            },
+            "config": {
+              "server": "out/build/llama-optimizer/bin/llama-server",
+              "model": "../../Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+              "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+              "context": 4096,
+              "max_tokens": 768,
+              "batch": 512,
+              "ubatch": 128,
+              "max_rss_mib": 8192,
+              "threads": 8,
+              "threads_batch": 16,
+              "cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ],
+              "decode_cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "prompt_tokens_preflight": 1431,
+            "peak_rss_mib": 7034.72265625,
+            "wall_s": 110.34676806500647,
+            "server_log_sha256": "8ffa528b1518f480fe37f3c9daa4acf1980c1a82e8b12dfeff88d0c1c079f9cb"
+          }
+        },
+        "proposal.json": {
+          "hypothesis": "Split the single __m256 accum into two independent accumulators (accum0/accum1) selected by l&1, then combined in the final lane reduction.",
+          "mechanism": "The existing single-accumulator design serializes all dot products through one register. By routing even-lane products into accum0 and odd-lane products into a ",
+          "edits": [
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "old": "__m256 accum=_mm256_setzero_ps();",
+              "new": "__m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();"
+            },
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "old": "accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));",
+              "new": "if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));"
+            },
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "old": "_mm256_store_ps(lanes,accum);",
+              "new": "_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));"
+            }
+          ],
+          "no_change_reason": ""
+        },
+        "evaluation.json": {
+          "schema": "optimization-evaluation-1",
+          "qualification_scope": "kernel-only",
+          "candidate_files": {
+            "include/sub0/quant/iq1_s.hpp": "b760cd1a1a981784474dc9f5e71219c67be1f2638708d707e25163d1e1ecf1de"
+          },
+          "baseline_commit": "a03f8dc4c2d2e23d48e5dc7e0c8279caa7842141",
+          "correctness": "pass",
+          "memory": "pass",
+          "performance": "improved",
+          "evidence": [
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline-build.log",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-build.log",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-generic-build.log",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/kernel-evidence.json"
+          ],
+          "median_candidate_over_baseline": 0.8639980580605192,
+          "robust_cv": 0.00778362471050649,
+          "decision_limit": 0.02335087413151947,
+          "identities": {
+            "baseline": "1a277c4f0371d3f36e3445b2a6711fbd76ef5757a13121c8421d0069ce372f27",
+            "candidate": "d0f9faff40e68f12c3f7bd549956c97daa125c2fdb507cf13af9557a45ef855d",
+            "candidate-generic": "427c592fb1c42aac7289aa516293ae8b1b7f7d8f2751d011fc371b65ad2d7107",
+            "compiler": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932"
+          }
+        },
+        "kernel-evidence.json": {
+          "rounds": [
+            {
+              "candidate": {
+                "ns": 10165.8113207547,
+                "calibration_start_ns": 2975.3882017126502,
+                "calibration_end_ns": 2974.89683698297
+              },
+              "baseline": {
+                "ns": 11764.8350515464,
+                "calibration_start_ns": 2975.09063313096,
+                "calibration_end_ns": 2975.11708586297
+              },
+              "ratio": 0.8639980580605192,
+              "round": 0,
+              "quiet": [
+                0.00375234521575985,
+                0.5004080590006197,
+                true
+              ]
+            },
+            {
+              "candidate": {
+                "ns": 10123.7522123894,
+                "calibration_start_ns": 2976.31303520457,
+                "calibration_end_ns": 2975.5357664233597
+              },
+              "baseline": {
+                "ns": 11698.4725274725,
+                "calibration_start_ns": 2974.90849956635,
+                "calibration_end_ns": 2974.91326973114
+              },
+              "ratio": 0.8649825645168788,
+              "round": 1,
+              "quiet": [
+                0.0050031269543464665,
+                0.5003661980008474,
+                true
+              ]
+            },
+            {
+              "baseline": {
+                "ns": 11789.3092783505,
+                "calibration_start_ns": 2977.61313868613,
+                "calibration_end_ns": 2977.6044290056398
+              },
+              "candidate": {
+                "ns": 10124.457943925201,
+                "calibration_start_ns": 2976.34633682207,
+                "calibration_end_ns": 2976.74486675404
+              },
+              "ratio": 0.8591484800618265,
+              "round": 2,
+              "quiet": [
+                0.0037476577139287947,
+                0.5009003110026242,
+                true
+              ]
+            },
+            {
+              "baseline": {
+                "ns": 11818.546391752601,
+                "calibration_start_ns": 2975.6270642201803,
+                "calibration_end_ns": 2976.9104622871
+              },
+              "candidate": {
+                "ns": 10129.2477876106,
+                "calibration_start_ns": 2975.4029209622,
+                "calibration_end_ns": 2976.24768856448
+              },
+              "ratio": 0.8571283226397769,
+              "round": 3,
+              "quiet": [
+                0.009375,
+                0.500422728000558,
+                true
+              ]
+            },
+            {
+              "candidate": {
+                "ns": 10248.4455445545,
+                "calibration_start_ns": 2975.7252075142,
+                "calibration_end_ns": 2976.48876953125
+              },
+              "baseline": {
+                "ns": 11799.478260869599,
+                "calibration_start_ns": 2975.66797728266,
+                "calibration_end_ns": 2975.35068093385
+              },
+              "ratio": 0.8685340331276644,
+              "round": 4,
+              "quiet": [
+                0.004375,
+                0.5003031970118172,
+                true
+              ]
+            }
+          ],
+          "checks": {
+            "baseline": {
+              "elapsed_s": 0.010854952008230612,
+              "peak_rss_mib": 22.8125,
+              "output_sha256": "eb1c93da4654cb1cf892f88ebe3a59beb6bc458c9a00ca0049fe62591b4eb38e"
+            },
+            "candidate": {
+              "elapsed_s": 0.0104916980053531,
+              "peak_rss_mib": 22.8125,
+              "output_sha256": "eb1c93da4654cb1cf892f88ebe3a59beb6bc458c9a00ca0049fe62591b4eb38e"
+            },
+            "candidate-generic": {
+              "elapsed_s": 0.010485546998097561,
+              "peak_rss_mib": 22.8125,
+              "output_sha256": "eb1c93da4654cb1cf892f88ebe3a59beb6bc458c9a00ca0049fe62591b4eb38e"
+            }
+          },
+          "build_commands": [
+            [
+              "/usr/bin/clang++",
+              "-std=c++23",
+              "-O3",
+              "-march=native",
+              "-Wall",
+              "-Wextra",
+              "-Werror",
+              "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/include",
+              "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/tools/perf",
+              "-isystem",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/tests/vendor",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/benchmarks/dense_quant_perf.cpp",
+              "-o",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline-bench"
+            ],
+            [
+              "/usr/bin/clang++",
+              "-std=c++23",
+              "-O3",
+              "-march=native",
+              "-Wall",
+              "-Wextra",
+              "-Werror",
+              "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate/include",
+              "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/tools/perf",
+              "-isystem",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/tests/vendor",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/benchmarks/dense_quant_perf.cpp",
+              "-o",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-bench"
+            ],
+            [
+              "/usr/bin/clang++",
+              "-std=c++23",
+              "-O3",
+              "-Wall",
+              "-Wextra",
+              "-Werror",
+              "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate/include",
+              "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/tools/perf",
+              "-isystem",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/tests/vendor",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/baseline/benchmarks/dense_quant_perf.cpp",
+              "-o",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-001/candidate-generic-bench"
+            ]
+          ],
+          "cpu": 0,
+          "host": "CrogBuntu1",
+          "min_gain": 0.02,
+          "max_rss_mib": 256,
+          "thread_environment": {}
+        },
+        "diff": "diff --git a/include/sub0/quant/iq1_s.hpp b/include/sub0/quant/iq1_s.hpp\nindex 7f337b7..0a2e36f 100644\n--- a/include/sub0/quant/iq1_s.hpp\n+++ b/include/sub0/quant/iq1_s.hpp\n@@ -59,7 +59,7 @@ struct IQ1S {\n     [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {\n         float sum=0;\n #if defined(__AVX2__)\n-        __m256 accum=_mm256_setzero_ps();\n+        __m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();\n #endif\n         for(std::size_t b=0;b<width/block.elems;++b){\n             const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);\n@@ -71,7 +71,8 @@ struct IQ1S {\n                     if constexpr(Native){\n                         const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\n                         const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\n-                        accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n+                        if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n+                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                     } else\n #endif\n                     {\n@@ -84,7 +85,7 @@ struct IQ1S {\n             }\n         }\n #if defined(__AVX2__)\n-        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum);for(float v:lanes)sum+=v;}\n+        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));for(float v:lanes)sum+=v;}\n #endif\n         return sum;\n     }\n"
+      },
+      {
+        "result": {
+          "attempt": 2,
+          "baseline_commit": "9ab9678bcb5e4fea16833cf73b3463f61fcb74c7",
+          "status": "failed",
+          "folder": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-002",
+          "detail": "out-of-scope or no-op edit",
+          "recovery_hint": "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
+        },
+        "request": {
+          "schema": "optimization-request-1",
+          "work_item": "iq1s-dependency",
+          "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+          "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+          "constraints": [
+            "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+            "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+            "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+          ],
+          "editable_files": [
+            "include/sub0/quant/iq1_s.hpp"
+          ],
+          "context": [
+            {
+              "path": "include/sub0/quant/iq1_s.hpp",
+              "sha256": "b760cd1a1a981784474dc9f5e71219c67be1f2638708d707e25163d1e1ecf1de",
+              "start_line": 56,
+              "text": "    // Internal row core: caller validates whole blocks, input width and encoded span first.\n    // Float inputs are retained. SIMD changes accumulation order, never packed weight decoding.\n    template<bool Native>\n    [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {\n        float sum=0;\n#if defined(__AVX2__)\n        __m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();\n#endif\n        for(std::size_t b=0;b<width/block.elems;++b){\n            const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);\n            for(int ib=0;ib<8;++ib){\n                const auto f=fields(row,base+32*ib);const float dl=scale(f,d),offset=delta(f);\n                for(int l=0;l<4;++l){\n                    const auto g=grid(f,l);const auto at=base+32*ib+8*l;\n#if defined(__AVX2__)\n                    if constexpr(Native){\n                        const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));\n                        const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));\n                        if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                    } else\n#endif\n                    {\n                        for(int j=0;j<8;++j){\n                            const auto q=static_cast<std::int8_t>((g>>(8*j))&255);\n                            const float w=dl*(static_cast<float>(q)+offset);sum+=x[at+j]*w;\n                        }\n                    }\n                }\n            }\n        }\n#if defined(__AVX2__)\n        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));for(float v:lanes)sum+=v;}\n#endif\n        return sum;\n    }\n};\nstatic_assert(FormatModule<IQ1S>);\n"
+            }
+          ],
+          "artifact_dir": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/live-iq1s-compact-001/attempt-002",
+          "feedback": [
+            {
+              "attempt": 1,
+              "status": "improved_for_review",
+              "detail": "",
+              "hypothesis": "Split the single __m256 accum into two independent accumulators (accum0/accum1) selected by l&1, then combined in the final lane reduction."
+            }
+          ],
+          "hint": "Try two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction. Use only three small exact edits: declaration, update and final reduction. Retain generic compilation and scalar behavior.",
+          "attempt": 2,
+          "seed": 44,
+          "candidate_hints": [],
+          "response_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "hypothesis": {
+                "type": "string",
+                "maxLength": 160
+              },
+              "mechanism": {
+                "type": "string",
+                "maxLength": 160
+              },
+              "edits": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "type": "string",
+                      "maxLength": 600
+                    },
+                    "new": {
+                      "type": "string",
+                      "maxLength": 600
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "old",
+                    "new"
+                  ]
+                },
+                "maxItems": 3
+              },
+              "no_change_reason": {
+                "type": "string",
+                "maxLength": 160
+              }
+            },
+            "required": [
+              "hypothesis",
+              "mechanism",
+              "edits",
+              "no_change_reason"
+            ]
+          }
+        },
+        "inference": {
+          "schema": "optimization-inference-1",
+          "content": "{\n  \"hypothesis\": \"Split the single __m256 accum into two independent accumulators (accum0/accum1) selected by l&1, then combined in the final lane reduction.\",\n  \"mechanism\": \"Use two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction.\",\n  \"edits\": [\n    {\n      \"path\": \"include/sub0/quant/iq1_s.hpp\",\n      \"old\": \"if(l&1) accum1=_mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\",\n      \"new\": \"if(l&1) accum1=_mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\"\n    },\n    {\n      \"path\": \"include/sub0/quant/iq1_s.hpp\",\n      \"old\": \"if(l&1) accum1=_mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\",\n      \"new\": \"if(l&1) accum1=_mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\"\n    },\n    {\n      \"path\": \"include/sub0/quant/iq1_s.hpp\",\n      \"old\": \"if(l&1) accum1=_mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\",\n      \"new\": \"if(l&1) accum1=_mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\"\n    }\n  ],\n  \"no_change_reason\": \"No useful edit found; the existing code already implements the two-accumulator pattern correctly.\"\n}",
+          "finish_reason": "stop",
+          "usage": {
+            "completion_tokens": 437,
+            "prompt_tokens": 1309,
+            "total_tokens": 1746,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 1309,
+            "prompt_ms": 20888.745,
+            "prompt_per_token_ms": 15.957788388082506,
+            "prompt_per_second": 62.66532527444804,
+            "predicted_n": 437,
+            "predicted_ms": 105922.775,
+            "predicted_per_token_ms": 242.94214449541283,
+            "predicted_per_second": 4.116206358830762
+          },
+          "engine": {
+            "kind": "llama.cpp",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "identities": {
+              "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+              "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+            },
+            "config": {
+              "server": "out/build/llama-optimizer/bin/llama-server",
+              "model": "../../Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+              "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+              "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+              "context": 4096,
+              "max_tokens": 768,
+              "batch": 512,
+              "ubatch": 128,
+              "max_rss_mib": 8192,
+              "threads": 8,
+              "threads_batch": 16,
+              "cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ],
+              "decode_cpus": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7
+              ]
+            },
+            "prompt_tokens_preflight": 1309,
+            "peak_rss_mib": 7033.78125,
+            "wall_s": 131.35306647099787,
+            "server_log_sha256": "3b66c0e03bf3df685c302ca5b65b5c04749be5b0a9524d578e96c8d462902ee4"
+          }
+        }
+      }
+    ]
+  },
+  "unchanged_control": {
+    "result": {
+      "schema": "optimization-evaluation-1",
+      "qualification_scope": "kernel-only",
+      "candidate_files": {
+        "include/sub0/quant/iq1_s.hpp": "5aedae5bedd5278347a670efc43e5830e0ee245bdbb214f2f1434f7cd5c9894f"
+      },
+      "baseline_commit": "96fd7c066ca11f72f66652b9e0eb2ae8039301ec",
+      "correctness": "pass",
+      "memory": "pass",
+      "performance": "unchanged",
+      "evidence": [
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-control/baseline-build.log",
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-control/candidate-build.log",
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-control/candidate-generic-build.log",
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-control/kernel-evidence.json"
+      ],
+      "median_candidate_over_baseline": 1.00263342357489,
+      "robust_cv": 0.009760932168459038,
+      "decision_limit": 0.029282796505377115,
+      "identities": {
+        "baseline": "1a277c4f0371d3f36e3445b2a6711fbd76ef5757a13121c8421d0069ce372f27",
+        "candidate": "1a277c4f0371d3f36e3445b2a6711fbd76ef5757a13121c8421d0069ce372f27",
+        "candidate-generic": "427c592fb1c42aac7289aa516293ae8b1b7f7d8f2751d011fc371b65ad2d7107",
+        "compiler": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932"
+      }
+    },
+    "samples": {
+      "rounds": [
+        {
+          "candidate": {
+            "ns": 11731.6781609195,
+            "calibration_start_ns": 2974.74164133739,
+            "calibration_end_ns": 2974.7540437678404
+          },
+          "baseline": {
+            "ns": 11705.7272727273,
+            "calibration_start_ns": 2975.97783354245,
+            "calibration_end_ns": 2975.236328125
+          },
+          "ratio": 1.00263342357489,
+          "round": 0,
+          "quiet": [
+            0.0031269543464665416,
+            0.5003196220059181,
+            true
+          ]
+        },
+        {
+          "candidate": {
+            "ns": 11866.5773195876,
+            "calibration_start_ns": 2975.23795049935,
+            "calibration_end_ns": 2974.78753659557
+          },
+          "baseline": {
+            "ns": 11669.8265306122,
+            "calibration_start_ns": 2975.1689669594302,
+            "calibration_end_ns": 2975.4236381323003
+          },
+          "ratio": 1.0168362101444524,
+          "round": 1,
+          "quiet": [
+            0.004375,
+            0.5003218670026399,
+            true
+          ]
+        },
+        {
+          "baseline": {
+            "ns": 11675.404494382,
+            "calibration_start_ns": 2975.0508033000397,
+            "calibration_end_ns": 2974.73295701259
+          },
+          "candidate": {
+            "ns": 11611.133333333299,
+            "calibration_start_ns": 2974.77937964176,
+            "calibration_end_ns": 2975.26932989691
+          },
+          "ratio": 0.9945859055601415,
+          "round": 2,
+          "quiet": [
+            0.003125,
+            0.50035257700074,
+            true
+          ]
+        },
+        {
+          "baseline": {
+            "ns": 11652.3369565217,
+            "calibration_start_ns": 2976.0958171206203,
+            "calibration_end_ns": 2976.0078158923097
+          },
+          "candidate": {
+            "ns": 11737.0,
+            "calibration_start_ns": 2977.05613701237,
+            "calibration_end_ns": 2976.1596107056
+          },
+          "ratio": 1.0069408391417176,
+          "round": 3,
+          "quiet": [
+            0.00375234521575985,
+            0.500380289988243,
+            true
+          ]
+        },
+        {
+          "candidate": {
+            "ns": 11645.3483146067,
+            "calibration_start_ns": 2975.9454987834497,
+            "calibration_end_ns": 2976.07820995399
+          },
+          "baseline": {
+            "ns": 11694.247311828,
+            "calibration_start_ns": 2976.58468125595,
+            "calibration_end_ns": 2975.9024738344397
+          },
+          "ratio": 0.9960324274617479,
+          "round": 4,
+          "quiet": [
+            0.003125,
+            0.5006671750015812,
+            true
+          ]
+        }
+      ],
+      "checks": {
+        "baseline": {
+          "elapsed_s": 0.010864708994631656,
+          "peak_rss_mib": 23.0859375,
+          "output_sha256": "eb1c93da4654cb1cf892f88ebe3a59beb6bc458c9a00ca0049fe62591b4eb38e"
+        },
+        "candidate": {
+          "elapsed_s": 0.01066091499524191,
+          "peak_rss_mib": 23.0859375,
+          "output_sha256": "eb1c93da4654cb1cf892f88ebe3a59beb6bc458c9a00ca0049fe62591b4eb38e"
+        },
+        "candidate-generic": {
+          "elapsed_s": 0.010597222004435025,
+          "peak_rss_mib": 23.0859375,
+          "output_sha256": "eb1c93da4654cb1cf892f88ebe3a59beb6bc458c9a00ca0049fe62591b4eb38e"
+        }
+      },
+      "build_commands": [
+        [
+          "/usr/bin/clang++",
+          "-std=c++23",
+          "-O3",
+          "-march=native",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf",
+          "-isystem",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tests/vendor",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/benchmarks/dense_quant_perf.cpp",
+          "-o",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-control/baseline-bench"
+        ],
+        [
+          "/usr/bin/clang++",
+          "-std=c++23",
+          "-O3",
+          "-march=native",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf",
+          "-isystem",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tests/vendor",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/benchmarks/dense_quant_perf.cpp",
+          "-o",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-control/candidate-bench"
+        ],
+        [
+          "/usr/bin/clang++",
+          "-std=c++23",
+          "-O3",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf",
+          "-isystem",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tests/vendor",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/benchmarks/dense_quant_perf.cpp",
+          "-o",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-control/candidate-generic-bench"
+        ]
+      ],
+      "cpu": 0,
+      "host": "CrogBuntu1",
+      "min_gain": 0.02,
+      "max_rss_mib": 256,
+      "thread_environment": {}
+    }
+  },
+  "scope": "Kernel-only harness validation; no automatic production/model performance claim."
+}

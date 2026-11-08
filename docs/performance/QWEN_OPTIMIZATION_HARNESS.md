@@ -48,7 +48,7 @@ to these kernel fixtures. This does not certify model RSS, full logits or corpus
 model-scope evaluator with the existing #63 gates before production promotion.
 
 Empty, duplicate, malformed, truncated, failed and non-improving attempts feed their concrete reason
-into later requests. Both proposal fingerprints and resulting source hashes detect repeats. Work items can bound edit
+into later requests. Successful attempts also advance the hint to avoid repeating a solved mechanism. Both proposal fingerprints and resulting source hashes detect repeats. Work items can bound edit
 count/size and provide expert `seed_edits`; these are candidate hints, never evidence or automatic edits.
 After truncation, retry guidance specifically requests compact single-line replacements. The example
 uses three <=600-character hunks and an expert two-accumulator seed; distinguish seeded ideas from
@@ -57,7 +57,8 @@ the configured stagnation window the runner rotates mechanism hints and continue
 or run budget it records `stalled` or `budget_exhausted`, best commit, counts and a next hint. A stalled
 CLI exits 3. It never declares global optimality. A mechanism is not permanently parked merely because
 this bounded search failed; the project's three-pass policy still applies. An agent can inspect the
-continuation packet, add assembly/profile evidence, narrow the item and start a new recorded run.
+continuation packet, add assembly/profile evidence, narrow the item and start a new recorded run, using `--base BEST_COMMIT` to retain the previous incumbent without changing
+the root checkout.
 
 `--resume` requires the same item/provider/evaluator identities and a nonterminal run. Interrupted
 attempts remain recorded, and resume starts the next attempt. A per-run OS lock excludes duplicate
@@ -138,3 +139,22 @@ The protocol and loop are engine-independent. Shared generic performance primiti
 Sub0Math; model prompts, work-item policy and candidate selection live here. Do not fork the vendored
 rig for this workflow. Review useful generic lifecycle/tuning interfaces upstream after this proving
 run, rather than adding model-specific policy to Sub0Math.
+
+## Live proving run
+
+The first real three-attempt run returned no edit once and exhausted its output limit twice. All
+were rejected, hints rotated, the run exited 3 as `stalled`, and the incumbent stayed unchanged.
+This exposed whole-function output as a practical failure mode, so compact schemas/hunks and targeted
+retry guidance were added, with optional explicitly labelled expert seed edits.
+
+The expert-seeded continuation produced the supplied two-accumulator idea as three valid edits.
+Native and generic compilation, frozen independent numeric fixtures and kernel RSS checks passed.
+Five paired rounds measured candidate/baseline latency ratio 0.863998 (13.60% lower kernel latency;
+0.78% robust CV, 2.34% decision limit). A local review commit was preserved; the next attempt used
+that incumbent and rejected a no-op. This is an expert-seeded kernel result, not independent Qwen
+discovery or a full-model gain. The separate quant increment needs its own issue/PR and model gates.
+
+An unchanged-source control built byte-identical native binaries and was correctly judged unchanged
+(ratio 1.002633, within the noise limit). [Full live/control evidence](QWEN_OPTIMIZER_LIVE.json) records
+requests, replies, outcomes and kernel samples. Controller lifecycle/scope/novelty/gate tests run in
+the ordinary script suite; CI needs no model or server download.

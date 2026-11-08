@@ -84,8 +84,16 @@ def validate_item(item):
     for n in ('max_attempts', 'stagnation_window', 'max_recoveries', 'wall_seconds', 'max_context_chars'):
         if type(item[n]) is not int or item[n] < 1:
             raise ValueError('positive budget required: ' + n)
-    if not isinstance(item['provider_command'], list) or not item['provider_command']:
-        raise ValueError('JSON inference command required')
+    if not isinstance(item['provider_command'], list) or not item['provider_command'] or any(not isinstance(v,str)for v in item['provider_command']):
+        raise ValueError('JSON inference argv required')
+    if not isinstance(item['identity_files'],list)or any(not isinstance(v,str)for v in item['identity_files']):
+        raise ValueError('identity file list required')
+    if any(not isinstance(v,str)for v in item.get('hints',[])):
+        raise ValueError('hints must be strings')
+    if 'evaluation'in item:
+        e=item['evaluation']
+        if not isinstance(e,dict)or not isinstance(e.get('command'),list)or not e['command']or any(not isinstance(v,str)for v in e['command'])or type(e.get('timeout'))not in (int,float)or not 0<e['timeout']<=item['wall_seconds']:
+            raise ValueError('trusted evaluation argv and bounded timeout required')
     return item
 
 
@@ -205,32 +213,38 @@ def judge(value, item, candidate, baseline):
     return value['correctness'] == value['memory'] == 'pass' and value['performance'] == 'improved'
 
 
-def _run(item_path, output, resume=False, proposals_only=False):
+def _run(item_path, output, resume=False, proposals_only=False, base=None):
     item_path = Path(item_path).resolve(); item = validate_item(load(item_path)); output = Path(output).resolve()
     if git(ROOT, 'status', '--porcelain', '--untracked-files=no'):
         raise ValueError('commit tracked changes before starting a reproducible experiment')
     output.mkdir(parents=True, exist_ok=True); state_path = output / 'state.json'
     provider = [x.replace('{root}', str(ROOT)) for x in item['provider_command']]
     identity = trusted_identity(item)
-    contract = dict(item_sha256=sha(item_path), identities=identity, proposals_only=proposals_only)
+    base_commit=git(ROOT,'rev-parse','--verify',base+'^{commit}')if base else load(state_path)['base_commit']if resume else git(ROOT,'rev-parse','HEAD')
+    contract = dict(item_sha256=sha(item_path), identities=identity, proposals_only=proposals_only,base_commit=base_commit)
     if resume:
         state = load(state_path)
         if state['contract'] != contract:
             raise ValueError('resume contract/artifacts changed')
         if state['status'] != 'running':
             raise ValueError('run is terminal; create a new run from its continuation packet')
+        if state['attempts'] and state['attempts'][-1]['status']in ('generating','evaluating'):
+            state['attempts'][-1].update(status='interrupted',detail='prior runner ended during an attempt; partial evidence is untrusted')
+            save(Path(state['attempts'][-1]['folder'])/'result.json',state['attempts'][-1])
+            state['no_progress']+=1
+            save(state_path,state)
     else:
         if state_path.exists():
             raise ValueError('output already exists; use --resume or a new path')
-        state = dict(schema='optimization-run-1', contract=contract, item=item, base_commit=git(ROOT, 'rev-parse', 'HEAD'),
-                     best_commit=git(ROOT, 'rev-parse', 'HEAD'), status='running', attempts=[], seen=[],
+        state = dict(schema='optimization-run-1', contract=contract, item=item, base_commit=base_commit,
+                     best_commit=base_commit, status='running', attempts=[], seen=[],
                      no_progress=0, recoveries=0, started=time.time(), next_hint=0)
         save(state_path, state)
     while len(state['attempts']) < item['max_attempts'] and time.time()-state['started'] < item['wall_seconds']:
         i = len(state['attempts'])+1; folder = output / f'attempt-{i:03d}'; folder.mkdir()
         tree = folder / 'candidate'; baseline = state['best_commit']
         git(ROOT, 'worktree', 'add', '--detach', str(tree), baseline)
-        record = dict(attempt=i, baseline_commit=baseline, status='interrupted', folder=str(folder))
+        record = dict(attempt=i, baseline_commit=baseline, status='generating', folder=str(folder))
         state['attempts'].append(record); save(state_path, state)
         feedback = [dict(attempt=r['attempt'], status=r['status'], detail=r.get('detail', '')[-900:],
                          hypothesis=r.get('hypothesis', '')[:200]) for r in state['attempts'][-5:-1]]
@@ -280,6 +294,7 @@ def _run(item_path, output, resume=False, proposals_only=False):
                         mapping = {'{root}': str(ROOT), '{candidate}': str(tree), '{baseline}': str(baseline_tree),
                                    '{result}': str(result), '{attempt}': str(folder)}
                         argv = [mapping.get(a, a.replace('{root}', str(ROOT))) for a in evaluation['command']]
+                        record['status']='evaluating';save(state_path,state)
                         command(argv, ROOT, folder/'evaluation.log', max(.1,min(evaluation['timeout'],item['wall_seconds']-(time.time()-state['started']))))
                         verdict = load(result)
                         # Pin every evaluator-produced file; model text cannot supply verdicts.
@@ -310,7 +325,7 @@ def _run(item_path, output, resume=False, proposals_only=False):
         except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
             record.update(status='duplicate' if isinstance(error,DuplicateProposal) else 'failed', detail=str(error))
         if record['status'] == 'improved_for_review' or (proposals_only and record['status']=='review_proposal'):
-            state['no_progress'] = 0
+            state['no_progress'] = 0;state['next_hint'] += 1
         else:
             state['no_progress'] += 1
         if state['no_progress'] >= item['stagnation_window']:
@@ -330,21 +345,21 @@ def _run(item_path, output, resume=False, proposals_only=False):
     save(state_path, state); return state
 
 
-def run(item_path, output, resume=False, proposals_only=False):
+def run(item_path, output, resume=False, proposals_only=False,base=None):
     folder=Path(output).resolve();folder.mkdir(parents=True,exist_ok=True)
     with (folder/'.runner.lock').open('a')as lock:
         try:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError as e:
             raise ValueError('another runner owns this output directory')from e
-        return _run(item_path,output,resume,proposals_only)
+        return _run(item_path,output,resume,proposals_only,base)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__); p.add_argument('--item', required=True); p.add_argument('--out', required=True)
-    p.add_argument('--resume', action='store_true'); p.add_argument('--proposals-only', action='store_true'); a = p.parse_args()
+    p.add_argument('--base',help='Starting commit/ref, e.g. the prior continuation best_commit');p.add_argument('--resume', action='store_true'); p.add_argument('--proposals-only', action='store_true'); a = p.parse_args()
     try:
-        s = run(a.item, a.out, a.resume, a.proposals_only); print(json.dumps(dict(status=s['status'], continuation=s['continuation'])))
+        s = run(a.item, a.out, a.resume, a.proposals_only,a.base); print(json.dumps(dict(status=s['status'], continuation=s['continuation'])))
     except (ValueError, OSError, subprocess.SubprocessError) as e:
         print(json.dumps(dict(status='refused', error=str(e))), file=sys.stderr); return 2
     return 3 if s['status']=='stalled' else 0

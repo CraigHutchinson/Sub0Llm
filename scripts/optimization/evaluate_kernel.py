@@ -59,6 +59,8 @@ def evaluate():
         if result['memory']!='pass':raise ValueError('kernel RSS budget exceeded')
         identities={k:digest(v)for k,v in binaries.items()};identities['compiler']=digest(a.compiler)
         initial=power_state()
+        governor_path=Path(f'/sys/devices/system/cpu/cpu{a.cpu}/cpufreq/scaling_governor')
+        governor=governor_path.read_text().strip()if governor_path.exists()else 'unavailable'
         if initial.untrusted or initial.source=='fake' or initial.state!='ac' or initial.saver:raise ValueError('trusted mains power without saver required')
         set_pin_cpu(a.cpu)
         try:
@@ -73,7 +75,7 @@ def evaluate():
                         value=measure(binaries[label],['--exact',a.benchmark],temporary)[a.benchmark]
                         end=measure(binaries[label],['--calibration'],temporary)['__calibration']
                         pair[label]=dict(ns=value,calibration_start_ns=cal,calibration_end_ns=end)
-                if initial.as_dict()!=power_state().as_dict():raise ValueError('power state changed')
+                if initial.as_dict()!=power_state().as_dict()or (governor_path.exists()and governor_path.read_text().strip()!=governor):raise ValueError('power/governor state changed')
                 if any(abs(x['calibration_end_ns']/x['calibration_start_ns']-1)>.05 for x in pair.values()):raise ValueError('clock drift; inconclusive')
                 pair['ratio']=(pair['candidate']['ns']/pair['candidate']['calibration_start_ns'])/(pair['baseline']['ns']/pair['baseline']['calibration_start_ns'])
                 pair['round']=r;pair['quiet']=quiet;records.append(pair)
@@ -87,7 +89,7 @@ def evaluate():
     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError)as e:
         result['error']=str(e)
         result['diagnostics']='\n'.join(Path(p).read_text(errors='replace')[-2000:]for p in result['evidence']if p.endswith('-build.log'))
-    evidence=folder/'kernel-evidence.json';evidence.write_text(json.dumps(dict(rounds=records,checks=checks,build_commands=build_commands,cpu=a.cpu,host=platform.node(),min_gain=a.min_gain,max_rss_mib=a.max_rss_mib,thread_environment={k:v for k,v in env.items()if k.startswith('OMP_')}),indent=2)+'\n')
+    evidence=folder/'kernel-evidence.json';evidence.write_text(json.dumps(dict(rounds=records,checks=checks,build_commands=build_commands,cpu=a.cpu,host=platform.node(),min_gain=a.min_gain,max_rss_mib=a.max_rss_mib,thread_environment={k:v for k,v in env.items()if k.startswith('OMP_')},governor=locals().get('governor','not measured'),power=locals().get('initial').as_dict()if 'initial'in locals()else None),indent=2)+'\n')
     result['evidence'].append(str(evidence));out.write_text(json.dumps(result,indent=2,allow_nan=False)+'\n')
     return 0
 def main():
