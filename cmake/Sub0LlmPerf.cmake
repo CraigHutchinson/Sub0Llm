@@ -23,3 +23,6 @@ set_tests_properties(sub0llm-chat-state PROPERTIES WORKING_DIRECTORY "${PROJECT_
 add_executable(sub0llm-phase-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/phase_fixture.cpp")
 add_test(NAME sub0llm-native-phase-contract COMMAND "${Python3_EXECUTABLE}"
   "${PROJECT_SOURCE_DIR}/tools/reference/tests/check_phase_fixture.py" $<TARGET_FILE:sub0llm-phase-fixture>)
+add_executable(sub0llm-quality-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/quality_fixture.cpp")
+add_test(NAME sub0llm-native-quality-contract COMMAND "${Python3_EXECUTABLE}"
+  "${PROJECT_SOURCE_DIR}/tools/reference/tests/check_quality_fixture.py" $<TARGET_FILE:sub0llm-quality-fixture>)

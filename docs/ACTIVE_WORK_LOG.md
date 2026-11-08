@@ -34,6 +34,9 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
+**2026-11-08 Codex — #63 active.** Full 128-position and corpus quality qualification, reusable score/reference cache and generated defaults. Holds quality tools, mapped-token score adapter and configurator; owns CPU during long quality runs. No performance measurements may overlap. Prior/default artifacts remain preserved.
+
+
 **2026-11-07 Codex — #62 done.** Opt-in vector float reductions across remaining quant formats; holds dense projection header, proving-ground CLI, fixtures and evidence. All numerical/performance runs and actual chat smoke complete; CPU/files released for PR review. Another 1.72× gain; preserved default and prior IQ1_S artifacts remain intact.
 
 
