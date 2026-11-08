@@ -156,5 +156,7 @@ discovery or a full-model gain. The separate quant increment needs its own issue
 
 An unchanged-source control built byte-identical native binaries and was correctly judged unchanged
 (ratio 1.002633, within the noise limit). [Full live/control evidence](QWEN_OPTIMIZER_LIVE.json) records
-requests, replies, outcomes and kernel samples. Controller lifecycle/scope/novelty/gate tests run in
+requests, replies, outcomes and kernel samples. A deliberately incorrect candidate is rejected by
+the independent numeric fixture before any timing; its real diagnostic is retained for subsequent
+model feedback. Controller lifecycle/scope/novelty/gate tests run in
 the ordinary script suite; CI needs no model or server download.

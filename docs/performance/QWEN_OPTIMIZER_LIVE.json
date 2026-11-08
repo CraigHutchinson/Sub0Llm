@@ -1683,5 +1683,79 @@
       "thread_environment": {}
     }
   },
-  "scope": "Kernel-only harness validation; no automatic production/model performance claim."
+  "scope": "Kernel-only harness validation; no automatic production/model performance claim.",
+  "incorrect_candidate_control": {
+    "result": {
+      "schema": "optimization-evaluation-1",
+      "qualification_scope": "kernel-only",
+      "candidate_files": {
+        "include/sub0/quant/iq1_s.hpp": "dc5b5bb8e8bb50b3b640808095152147d9576e4a26a4911a133ae88b1fb1894b"
+      },
+      "baseline_commit": "14a15a637e922ff1f5f95d60a582785f945386ce",
+      "correctness": "fail",
+      "memory": "not_measured",
+      "performance": "inconclusive",
+      "evidence": [
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-failure/baseline-build.log",
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-failure/baseline-correctness.log",
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-failure/candidate-build.log",
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-failure/candidate-correctness.log",
+        "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-failure/kernel-evidence.json"
+      ],
+      "error": "command failed with exit 1: /bin/sh",
+      "diagnostics": "\nQ8_0 32x256, hand-written fixed-scale\nQ8_0 32x256, denseq\nQ8_0 32x5120, hand-written fixed-scale\nQ8_0 32x5120, denseq\nIQ1_S 32x256, baseline\nIQ1_S 32x256, fused scalar\nIQ1_S 32x256, fused native\nIQ1_S 32x5120, baseline\nIQ1_S 32x5120, fused scalar\nIQ1_S 32x5120, fused native\nIQ1_S 32x17408, baseline\nIQ1_S 32x17408, fused scalar\nIQ1_S 32x17408, fused native\nQ8_0 float 4x256, prior\nQ8_0 float 4x256, vector\nQ8_0 float 4x5120, prior\nQ8_0 float 4x5120, vector\nQ4_K float 4x256, prior\nQ4_K float 4x256, vector\nQ4_K float 4x5120, prior\nQ4_K float 4x5120, vector\nQ5_K float 4x256, prior\nQ5_K float 4x256, vector\nQ5_K float 4x5120, prior\nQ5_K float 4x5120, vector\nQ6_K float 4x256, prior\nQ6_K float 4x256, vector\nQ6_K float 4x5120, prior\nQ6_K float 4x5120, vector\nIQ2_XXS float 4x256, prior\nIQ2_XXS float 4x256, vector\nIQ2_XXS float 4x5120, prior\nIQ2_XXS float 4x5120, vector\nIQ4_NL float 4x256, prior\nIQ4_NL float 4x256, vector\nIQ4_NL float 4x5120, prior\nIQ4_NL float 4x5120, vector\nQ2_K float 4x256, prior\nQ2_K float 4x256, vector\nQ2_K float 4x5120, prior\nQ2_K float 4x5120, vector\nIQ3_XXS float 4x256, prior\nIQ3_XXS float 4x256, vector\nIQ3_XXS float 4x5120, prior\nIQ3_XXS float 4x5120, vector\nIQ2_XS float 4x256, prior\nIQ2_XS float 4x256, vector\nIQ2_XS float 4x5120, prior\nIQ2_XS float 4x5120, vector\nIQ2_S float 4x256, prior\nIQ2_S float 4x256, vector\nIQ2_S float 4x5120, prior\nIQ2_S float 4x5120, vector\nIQ3_S float 4x256, prior\nIQ3_S float 4x256, vector\nIQ3_S float 4x5120, prior\nIQ3_S float 4x5120, vector\nIQ1_M float 4x256, prior\nIQ1_M float 4x256, vector\nIQ1_M float 4x5120, prior\nIQ1_M float 4x5120, vector\nIQ1_S float 4x256, prior\nIQ1_S float 4x256, vector\nIQ1_S float 4x5120, prior\nIQ1_S float 4x5120, vector\nIQ4_XS float 4x256, prior\nIQ4_XS float 4x256, vector\nIQ4_XS float 4x5120, prior\nIQ4_XS float 4x5120, vector\nQ3_K float 4x256, prior\nQ3_K float 4x256, vector\nQ3_K float 4x5120, prior\nQ3_K float 4x5120, vector\n\n\nIQ1_S independent double dot fixture mismatch\nQ8_0 32x256, hand-written fixed-scale\nQ8_0 32x256, denseq\nQ8_0 32x5120, hand-written fixed-scale\nQ8_0 32x5120, denseq\n"
+    },
+    "evidence": {
+      "rounds": [],
+      "checks": {
+        "baseline": {
+          "elapsed_s": 0.010930074990028515,
+          "peak_rss_mib": 22.55078125,
+          "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "build_commands": [
+        [
+          "/usr/bin/clang++",
+          "-std=c++23",
+          "-O3",
+          "-march=native",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/include",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf",
+          "-isystem",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tests/vendor",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/benchmarks/dense_quant_perf.cpp",
+          "-o",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-failure/baseline-bench"
+        ],
+        [
+          "/usr/bin/clang++",
+          "-std=c++23",
+          "-O3",
+          "-march=native",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-failure/candidate/include",
+          "-I/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tools/perf",
+          "-isystem",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/tests/vendor",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/benchmarks/dense_quant_perf.cpp",
+          "-o",
+          "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/evaluator-failure/candidate-bench"
+        ]
+      ],
+      "cpu": 0,
+      "host": "CrogBuntu1",
+      "min_gain": 0.02,
+      "max_rss_mib": 256,
+      "thread_environment": {},
+      "governor": "not measured",
+      "power": null
+    },
+    "diff": "diff --git a/include/sub0/quant/iq1_s.hpp b/include/sub0/quant/iq1_s.hpp\nindex 7f337b7..8b05fe6 100644\n--- a/include/sub0/quant/iq1_s.hpp\n+++ b/include/sub0/quant/iq1_s.hpp\n@@ -86,7 +86,7 @@ struct IQ1S {\n #if defined(__AVX2__)\n         if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum);for(float v:lanes)sum+=v;}\n #endif\n-        return sum;\n+        return sum+1.f;\n     }\n };\n static_assert(FormatModule<IQ1S>);\n"
+  }
 }

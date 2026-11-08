@@ -53,7 +53,10 @@ def evaluate():
             log=folder/(label+'-build.log')
             result['evidence'].append(str(log))
             with log.open('wb')as f:subprocess.run(cmd,stdout=f,stderr=subprocess.STDOUT,check=True,timeout=180)
-            checks[label]=execute([str(binary),'--list'],baseline,env,60)
+            check_log=folder/(label+'-correctness.log');result['evidence'].append(str(check_log))
+            # Constant exec-only redirection preserves wait4's measured PID and the real failure text.
+            check_env={**env,'OPTIMIZATION_LOG':str(check_log)}
+            checks[label]=execute(['/bin/sh','-c','exec "$@" > "$OPTIMIZATION_LOG" 2>&1','kernel-check',str(binary),'--list'],baseline,check_env,60)
         result['correctness']='pass'
         result['memory']='pass'if all(x['peak_rss_mib']<=a.max_rss_mib for x in checks.values())else 'fail'
         if result['memory']!='pass':raise ValueError('kernel RSS budget exceeded')
@@ -88,7 +91,7 @@ def evaluate():
         result.update(median_candidate_over_baseline=median,robust_cv=noise,decision_limit=limit,identities=identities)
     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError)as e:
         result['error']=str(e)
-        result['diagnostics']='\n'.join(Path(p).read_text(errors='replace')[-2000:]for p in result['evidence']if p.endswith('-build.log'))
+        result['diagnostics']='\n'.join(Path(p).read_text(errors='replace')[-2000:]for p in result['evidence']if p.endswith('.log'))
     evidence=folder/'kernel-evidence.json';evidence.write_text(json.dumps(dict(rounds=records,checks=checks,build_commands=build_commands,cpu=a.cpu,host=platform.node(),min_gain=a.min_gain,max_rss_mib=a.max_rss_mib,thread_environment={k:v for k,v in env.items()if k.startswith('OMP_')},governor=locals().get('governor','not measured'),power=locals().get('initial').as_dict()if 'initial'in locals()else None),indent=2)+'\n')
     result['evidence'].append(str(evidence));out.write_text(json.dumps(result,indent=2,allow_nan=False)+'\n')
     return 0
