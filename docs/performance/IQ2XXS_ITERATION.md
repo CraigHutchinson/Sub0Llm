@@ -1,8 +1,9 @@
 # IQ2_XXS fused float projection — preparation
 
 Tracking #66 / #18 / #30. Status on CrogBuntu1, 2026-11-08: implemented opt-in, row checks pass;
-complete-model qualification and controlled performance remain pending. No speed claim or default change.
-The existing #63 native-all qualification continues with preserved executables and frozen inputs.
+full-corpus qualification and controlled performance remain pending. No speed claim or default change.
+The existing #63 native-all qualification retains preserved executables, frozen inputs and its verified
+first-window cache; capture stopped at that boundary to publish/test this increment and will resume.
 
 ## Hypothesis and implementation
 
@@ -45,13 +46,25 @@ ownership finding remains. Compiler warnings are errors; executed row/tail paths
 The shared benchmark executable registers six new prior/fused row cases (79 total). Generic and
 AVX2 list-only runs pass every correctness fixture. Its normal fixture checks
 execute before listing or measuring. The extended real-row oracle additionally requires bit equality
-with the prior vector reduction. The 18 Python script tests pass with the new chat override. The freshly rebuilt complete frontend
+with the prior vector reduction. All eight tooling CTest groups pass. The 18 Python script tests pass with the new chat override. The freshly rebuilt complete frontend
 suite passes 220,980 assertions / 327 cases, identical to the pre-migration #60 baseline counts. The freshly rebuilt complete neutral engine suite
 also passes the unchanged 44,292,784 assertions / 147 cases.
 
+## First complete-model window and actual chat
+
+The separate fused candidate passes every one of 128 positions in `literature-0` against the pinned
+float reference (worst relative L2 0.000008736925, unchanged 0.001 limit). All captured logits, NLLs and
+token traces are bit-identical to the preserved native-all candidate for that window. Peak RSS is
+5,706.16 MiB, within 8 GiB. This is one window, not the full 4,096-target quality verdict.
+
+Actual non-thinking chat returns “Hi there!” with EOS, then “Hi” when asked to repeat the first
+message; replayed prompt grows from 13 to 31 tokens. A 242-token overflow is refused without changing
+accepted messages/context/completion state. Reset clears state and reproduces the initial reply and
+13-token context. A one-token cap produces “Hi” with `finish=length`. Both CI ISA variants pass.
+
 ## Remaining acceptance
 
-Run the tooling CI groups and review any subsequent C++ edits. Stage all binaries before
+Review any subsequent C++ edits. Stage all binaries before
 performance measurements. After the existing quality run releases the shared lock, measure three
 interleaved complete-model rounds against native-all and clean native llama.cpp, with memory/load
 and artifact identities. Run full-context and corpus qualification against the #63 cached oracle;
