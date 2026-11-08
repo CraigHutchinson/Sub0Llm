@@ -4,7 +4,7 @@
 #include <limits>
 
 namespace sub0::denseq {
-enum class Iq1Kernel { Baseline, Scalar, Native, NativeAll };
+enum class Iq1Kernel { Baseline, Scalar, Native, NativeAll, FusedIQ2 };
 // Caller owns weights, inputs, outputs and scratch; scratch must be reserved once before decode.
 // x and y must not overlap. This baseline accepts whole quant blocks per row.
 [[nodiscard]] inline bool project(std::uint32_t type, std::span<const std::uint8_t> raw,
@@ -21,14 +21,19 @@ enum class Iq1Kernel { Baseline, Scalar, Native, NativeAll };
     if(type==static_cast<std::uint32_t>(quant::IQ1S::type) && iq1!=Iq1Kernel::Baseline){
         for(std::size_t row=0;row<y.size();++row){
             const auto* packed=raw.data()+row*row_bytes;
-            y[row]=(iq1==Iq1Kernel::Native || iq1==Iq1Kernel::NativeAll)?quant::IQ1S::dot_row<true>(packed,x.data(),x.size()):quant::IQ1S::dot_row<false>(packed,x.data(),x.size());
+            y[row]=(iq1==Iq1Kernel::Native || iq1==Iq1Kernel::NativeAll || iq1==Iq1Kernel::FusedIQ2)?quant::IQ1S::dot_row<true>(packed,x.data(),x.size()):quant::IQ1S::dot_row<false>(packed,x.data(),x.size());
         }
+        return true;
+    }
+    if(type==static_cast<std::uint32_t>(quant::IQ2XXS::type) && iq1==Iq1Kernel::FusedIQ2){
+        for(std::size_t row=0;row<y.size();++row)
+            y[row]=quant::IQ2XXS::dot_row<true>(raw.data()+row*row_bytes,x.data(),x.size());
         return true;
     }
     for (std::size_t row = 0; row < y.size(); ++row) {
         float sum = 0.f;
 #if defined(__AVX2__)
-        const bool vector_dot=iq1==Iq1Kernel::NativeAll && spec.elems%8==0;
+        const bool vector_dot=(iq1==Iq1Kernel::NativeAll || iq1==Iq1Kernel::FusedIQ2) && spec.elems%8==0;
         __m256 accum=_mm256_setzero_ps();
 #endif
         for (std::size_t b = 0; b < blocks; ++b) {

@@ -10,9 +10,9 @@ using namespace sub0::dense_probe;
 #ifndef SUB0_DENSE_PROJECTION_DEFAULT
 #define SUB0_DENSE_PROJECTION_DEFAULT 0
 #endif
-static_assert(SUB0_DENSE_PROJECTION_DEFAULT>=0 && SUB0_DENSE_PROJECTION_DEFAULT<=3);
+static_assert(SUB0_DENSE_PROJECTION_DEFAULT>=0 && SUB0_DENSE_PROJECTION_DEFAULT<=4);
 constexpr const char* configured_kernel_name(){
-    constexpr const char* names[]{"baseline","scalar","native","native-all"};
+    constexpr const char* names[]{"baseline","scalar","native","native-all","fused-iq2"};
     return names[SUB0_DENSE_PROJECTION_DEFAULT];
 }
 int main(int argc,char** argv) try {
@@ -21,7 +21,7 @@ int main(int argc,char** argv) try {
     std::string score_file,score_targets;
     std::string tokenizer_dir=(std::filesystem::path(argv[0]).parent_path()/"tokenizer").string();
     int generate=0;
-    int projection_threads=SUB0_DENSE_PROJECTION_DEFAULT==3?std::min(8,DEFAULT_THREADS):1;
+    int projection_threads=SUB0_DENSE_PROJECTION_DEFAULT>=3?std::min(8,DEFAULT_THREADS):1;
     std::string iq1_kernel_name=configured_kernel_name();
     CLI::App app{"Mapped Qwen raw-token or text sequence proving ground"};
     app.add_option("model",model,"GGUF model")->required();
@@ -32,7 +32,9 @@ int main(int argc,char** argv) try {
     app.add_option("--tokenizer-dir",tokenizer_dir,"Tokenizer exported from this GGUF");
     app.add_option("--projection-threads",projection_threads,"Independent output-row workers (OpenMP)")->check(CLI::Range(1,8));
     // Evaluation override; the default comes from the generated configuration (#63).
-    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel; generated default, explicit experiment override")->capture_default_str()->check(CLI::IsMember({"baseline","scalar","native","native-all"}));
+    // TODO(#29): keep runtime strategy dispatch in this proving ground; instantiate the
+    // qualified generated strategy with if constexpr in the production engine adapter.
+    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel; generated default, explicit experiment override")->capture_default_str()->check(CLI::IsMember({"baseline","scalar","native","native-all","fused-iq2"}));
     app.add_option("--timings-file",timings_file,"Native setup/prefill/decode metrics; suppress progress output; no dumps");
     app.add_option("--projection-profile",projection_profile_file,"Diagnostic per-format projection attribution; requires timings");
     app.add_option("--score-file",score_file,"Teacher-forced f64 NLL JSON; requires raw targets");
@@ -41,7 +43,8 @@ int main(int argc,char** argv) try {
     app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
     app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
-    const auto iq1_kernel=iq1_kernel_name=="native-all"?sub0::denseq::Iq1Kernel::NativeAll:
+    const auto iq1_kernel=iq1_kernel_name=="fused-iq2"?sub0::denseq::Iq1Kernel::FusedIQ2:
+                          iq1_kernel_name=="native-all"?sub0::denseq::Iq1Kernel::NativeAll:
                           iq1_kernel_name=="native"?sub0::denseq::Iq1Kernel::Native:
                           iq1_kernel_name=="scalar"?sub0::denseq::Iq1Kernel::Scalar:sub0::denseq::Iq1Kernel::Baseline;
     const bool measure=!timings_file.empty(),scoring=!score_file.empty(),quiet=measure||scoring;

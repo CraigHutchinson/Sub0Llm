@@ -12,7 +12,7 @@
 struct RowStats {
     std::size_t rows=0;
     double reference_norm=0;
-    std::array<double,3> errors{},maximum{};
+    std::array<double,4> errors{},maximum{};
 };
 int main(int argc,char**argv)try{
     if(argc!=2)return 2;
@@ -29,9 +29,12 @@ int main(int argc,char**argv)try{
         if(!sub0::gguf::dequant_fn(type)(raw,n,decoded)||std::memcmp(weights.data(),decoded.data(),n*sizeof(float)))throw std::runtime_error("decoder mismatch");
         double gold=0;for(std::size_t j=0;j<n;++j){x[j]=static_cast<float>(static_cast<int>(j*17%101)-50)/37.f;gold+=static_cast<double>(weights[j])*x[j];}
         auto& s=stats[{type,reencoded}];++s.rows;s.reference_norm+=gold*gold;
-        for(int k=0;k<3;++k){
-            const auto mode=k==0?sub0::denseq::Iq1Kernel::Baseline:k==1?sub0::denseq::Iq1Kernel::Native:sub0::denseq::Iq1Kernel::NativeAll;
+        float prior_vector=0;
+        for(int k=0;k<4;++k){
+            const auto mode=k==0?sub0::denseq::Iq1Kernel::Baseline:k==1?sub0::denseq::Iq1Kernel::Native:k==2?sub0::denseq::Iq1Kernel::NativeAll:sub0::denseq::Iq1Kernel::FusedIQ2;
             if(!sub0::denseq::project(type,raw,x,y,scratch,mode)||!std::isfinite(y[0]))throw std::runtime_error("invalid row result");
+            if(k==2)prior_vector=y[0];
+            if(k==3 && std::memcmp(&prior_vector,y.data(),sizeof(float)))throw std::runtime_error("fused path differs from prior vector dot");
             const double d=y[0]-gold;s.errors[k]+=d*d;s.maximum[k]=std::max(s.maximum[k],std::abs(d));
         }
     };
@@ -65,9 +68,9 @@ int main(int argc,char**argv)try{
     for(const auto& [key,s]:stats){
         total+=s.rows;if(!key.second)native_rows+=s.rows;
         std::printf("%s{\"type\":%u,\"reencoded\":%s,\"rows\":%zu,\"kernels\":[",first?"":",",key.first,key.second?"true":"false",s.rows);first=false;
-        for(int k=0;k<3;++k){const double l2=std::sqrt(s.errors[k])/std::max(1.,std::sqrt(s.reference_norm));passed&=l2<=2e-5;
-            std::printf("%s{\"kernel\":%d,\"relative_l2\":%.12g,\"max_abs\":%.12g}",k?",":"",k,l2,s.maximum[k]);}
+        for(int k=0;k<4;++k){const double l2=std::sqrt(s.errors[k])/std::max(1.,std::sqrt(s.reference_norm));passed&=l2<=2e-5;
+            std::printf("%s{\"kernel\":%d,\"enum_value\":%d,\"relative_l2\":%.12g,\"max_abs\":%.12g}",k?",":"",k,k==0?0:k==1?2:k==2?3:4,l2,s.maximum[k]);}
         std::printf("]}");
     }
-    std::printf("],\"rows\":%zu,\"native_rows\":%zu,\"passed\":%s}\n",total,native_rows,passed?"true":"false");ggml_quantize_free();return passed?0:1;
+    std::printf("],\"rows\":%zu,\"native_rows\":%zu,\"bit_exact_prior\":true,\"passed\":%s}\n",total,native_rows,passed?"true":"false");ggml_quantize_free();return passed?0:1;
 }catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}

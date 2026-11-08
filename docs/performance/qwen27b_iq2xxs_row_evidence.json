@@ -1,0 +1,498 @@
+{
+  "schema": "iq2xxs-row-qualification-1",
+  "date_utc": "2026-11-08",
+  "host": "CrogBuntu1",
+  "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+  "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+  "source_sha256": {
+    "tools/reference/check_projection_dots.cpp": "26c5084c8dfc89851b7549e34a307c9ff7af669a1f75f94d102ad3dda34e814e",
+    "include/sub0/quant/iq2_xxs.hpp": "04f835ae0658c121ecc3030fc603a8d2c88114626121bb24836542952256a9c1",
+    "include/sub0/quant/all.hpp": "36ac9487c488702a8dc1eec3dbdbb8b4b36f945f16bf68900c68514e8b60ec86",
+    "include/sub0/gguf.hpp": "e77894081586e126119105a3112f0ad61a8b763419638be4c6e4d4b6c2d6f08b",
+    "include/sub0/dense_quant.hpp": "5e33d59a5aa0a3eec9b63bb784b30a9d2feb54a3c1f7702aa4cbf4916497c195",
+    "include/sub0/moe_quant_dot.hpp": "79348e5725cde2e5efa964fe908a30e84502dbf6c2412d02fdb4c112965a2bd9",
+    "benchmarks/iq2xxs_fixture.hpp": "23b6291f8706f45fb346a14b340152003418c01c46227ca4e168e4a747b9d276"
+  },
+  "oracle_executable_sha256": "8d2f484e7e75241acdf9be64eb316faa38b5e1094e076ec03ea0c74ed863b45c",
+  "compiler": "Clang 21.1.8; -std=c++23 -O3 -march=native -Wall -Wextra -Werror",
+  "oracle": {
+    "source_tensor": "output.weight",
+    "formats": [
+      {
+        "type": 8,
+        "reencoded": false,
+        "rows": 288,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.27664211687e-06,
+            "max_abs": 6.2202309814e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.27664211687e-06,
+            "max_abs": 6.2202309814e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 5.18495242497e-07,
+            "max_abs": 1.91923481996e-06
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 5.18495242497e-07,
+            "max_abs": 1.91923481996e-06
+          }
+        ]
+      },
+      {
+        "type": 10,
+        "reencoded": false,
+        "rows": 24,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 9.51375963064e-07,
+            "max_abs": 2.04944061544e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 9.51375963064e-07,
+            "max_abs": 2.04944061544e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 5.05183343682e-07,
+            "max_abs": 1.35136782298e-06
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 5.05183343682e-07,
+            "max_abs": 1.35136782298e-06
+          }
+        ]
+      },
+      {
+        "type": 11,
+        "reencoded": false,
+        "rows": 3,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.31185017189e-06,
+            "max_abs": 1.9971119456e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.31185017189e-06,
+            "max_abs": 1.9971119456e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 3.73705835838e-07,
+            "max_abs": 4.77920230058e-07
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 3.73705835838e-07,
+            "max_abs": 4.77920230058e-07
+          }
+        ]
+      },
+      {
+        "type": 12,
+        "reencoded": true,
+        "rows": 3,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 6.69380627989e-07,
+            "max_abs": 9.81608268336e-07
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 6.69380627989e-07,
+            "max_abs": 9.81608268336e-07
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 1.50920682239e-07,
+            "max_abs": 2.1373018666e-07
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 1.50920682239e-07,
+            "max_abs": 2.1373018666e-07
+          }
+        ]
+      },
+      {
+        "type": 13,
+        "reencoded": true,
+        "rows": 3,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.45571219954e-06,
+            "max_abs": 2.27115173468e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.45571219954e-06,
+            "max_abs": 2.27115173468e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 5.61979061465e-07,
+            "max_abs": 8.28289793642e-07
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 5.61979061465e-07,
+            "max_abs": 8.28289793642e-07
+          }
+        ]
+      },
+      {
+        "type": 14,
+        "reencoded": true,
+        "rows": 3,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 3.40286248757e-07,
+            "max_abs": 4.59751619442e-07
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 3.40286248757e-07,
+            "max_abs": 4.59751619442e-07
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 1.23202247016e-07,
+            "max_abs": 1.63811968878e-07
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 1.23202247016e-07,
+            "max_abs": 1.63811968878e-07
+          }
+        ]
+      },
+      {
+        "type": 16,
+        "reencoded": false,
+        "rows": 177,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.42502438782e-06,
+            "max_abs": 7.44496171734e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.42502438782e-06,
+            "max_abs": 7.44496171734e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 6.15582035547e-07,
+            "max_abs": 3.60650467623e-06
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 6.15582035547e-07,
+            "max_abs": 3.60650467623e-06
+          }
+        ]
+      },
+      {
+        "type": 17,
+        "reencoded": false,
+        "rows": 63,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.46404385438e-06,
+            "max_abs": 4.95627798602e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.46404385438e-06,
+            "max_abs": 4.95627798602e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 4.30408860943e-07,
+            "max_abs": 1.10375460016e-06
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 4.30408860943e-07,
+            "max_abs": 1.10375460016e-06
+          }
+        ]
+      },
+      {
+        "type": 18,
+        "reencoded": false,
+        "rows": 36,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.34113211441e-06,
+            "max_abs": 4.70011071507e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.34113211441e-06,
+            "max_abs": 4.70011071507e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 3.70179305878e-07,
+            "max_abs": 9.37161245718e-07
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 3.70179305878e-07,
+            "max_abs": 9.37161245718e-07
+          }
+        ]
+      },
+      {
+        "type": 19,
+        "reencoded": false,
+        "rows": 792,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.60658298927e-06,
+            "max_abs": 1.2638304876e-05
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 6.02334714003e-07,
+            "max_abs": 2.81501574806e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 6.02334714003e-07,
+            "max_abs": 2.81501574806e-06
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 6.02334714003e-07,
+            "max_abs": 2.81501574806e-06
+          }
+        ]
+      },
+      {
+        "type": 20,
+        "reencoded": true,
+        "rows": 3,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 3.62126200941e-07,
+            "max_abs": 5.23511134887e-07
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 3.62126200941e-07,
+            "max_abs": 5.23511134887e-07
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 6.30503343121e-07,
+            "max_abs": 9.07000339723e-07
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 6.30503343121e-07,
+            "max_abs": 9.07000339723e-07
+          }
+        ]
+      },
+      {
+        "type": 21,
+        "reencoded": false,
+        "rows": 3,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 5.58986516776e-07,
+            "max_abs": 8.5895963986e-07
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 5.58986516776e-07,
+            "max_abs": 8.5895963986e-07
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 5.47547287487e-07,
+            "max_abs": 6.91684548526e-07
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 5.47547287487e-07,
+            "max_abs": 6.91684548526e-07
+          }
+        ]
+      },
+      {
+        "type": 22,
+        "reencoded": false,
+        "rows": 27,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.66954580851e-06,
+            "max_abs": 3.32171125006e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.66954580851e-06,
+            "max_abs": 3.32171125006e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 9.96719166057e-07,
+            "max_abs": 3.01235841757e-06
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 9.96719166057e-07,
+            "max_abs": 3.01235841757e-06
+          }
+        ]
+      },
+      {
+        "type": 23,
+        "reencoded": false,
+        "rows": 6,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.20404000434e-06,
+            "max_abs": 2.87498814777e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.20404000434e-06,
+            "max_abs": 2.87498814777e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 6.11842113641e-07,
+            "max_abs": 1.37498737462e-06
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 6.11842113641e-07,
+            "max_abs": 1.37498737462e-06
+          }
+        ]
+      },
+      {
+        "type": 29,
+        "reencoded": false,
+        "rows": 75,
+        "kernels": [
+          {
+            "kernel": 0,
+            "enum_value": 0,
+            "relative_l2": 1.24071483202e-06,
+            "max_abs": 3.29910080143e-06
+          },
+          {
+            "kernel": 1,
+            "enum_value": 2,
+            "relative_l2": 1.24071483202e-06,
+            "max_abs": 3.29910080143e-06
+          },
+          {
+            "kernel": 2,
+            "enum_value": 3,
+            "relative_l2": 5.18701831022e-07,
+            "max_abs": 1.18946811978e-06
+          },
+          {
+            "kernel": 3,
+            "enum_value": 4,
+            "relative_l2": 5.18701831022e-07,
+            "max_abs": 1.18946811978e-06
+          }
+        ]
+      }
+    ],
+    "rows": 1506,
+    "native_rows": 1494,
+    "bit_exact_prior": true,
+    "passed": true
+  },
+  "scope": "Row/decoder checks only; no complete-model quality or performance qualification of fused-iq2 yet.",
+  "reference_library_sha256": {
+    "libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+    "libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+    "libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a"
+  }
+}

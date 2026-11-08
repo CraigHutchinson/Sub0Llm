@@ -34,6 +34,8 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
+**2026-11-08 Codex — #66 active (implementation preparation).** IQ2_XXS module migration and separate fused-float experiment; owns quant module/registry, dense projection selector and fixtures. The frozen #63 executables remain unchanged and continue to own CPU. No performance measurements or heavy builds until that run releases the shared lock.
+
 **2026-11-08 Codex — #63 active.** Full 128-position and corpus quality qualification, reusable score/reference cache and generated defaults. Holds quality tools, mapped-token score adapter and configurator; owns CPU during long quality runs. No performance measurements may overlap. Prior/default artifacts remain preserved.
 
 

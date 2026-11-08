@@ -28,7 +28,7 @@ class ChatTest(unittest.TestCase):
     @patch.object(chat.subprocess, "run")
     def test_explicit_kernel_reaches_inspection_and_decode_while_default_omits_it(self, run):
         self.assertNotIn("--iq1s-kernel",self.session().base)
-        for kernel in ("native","native-all"):
+        for kernel in ("native","native-all","fused-iq2"):
             run.reset_mock();run.side_effect=self.backend
             session=chat.Session("backend","model","tokenizer",8,1,kernel)
             session.turn("Hi")
