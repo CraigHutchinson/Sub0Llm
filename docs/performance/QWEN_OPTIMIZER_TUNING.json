@@ -1,0 +1,553 @@
+{
+  "schema": "optimization-tuning-1",
+  "objective": "prompt latency plus projected 512 generated tokens",
+  "scope": "Best of measured profiles for this fixed request; not a global optimum or coding-quality comparison.",
+  "scores": {
+    "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-16-16.json": 137.5159691904762,
+    "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-8-16.json": 133.5696175238095,
+    "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-8-8.json": 140.69157423809523
+  },
+  "selected": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-8-16.json",
+  "samples": [
+    {
+      "round": 0,
+      "config": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-8-8.json",
+      "projected_s": 138.93111085714284,
+      "reply": {
+        "schema": "optimization-inference-1",
+        "content": "{\"hint\": \"Use independent SIMD accumulators and hoist repeated broadcasts while preserving packed weight decoding.\"}",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 22,
+          "prompt_tokens": 748,
+          "total_tokens": 770,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 748,
+          "prompt_ms": 17719.792,
+          "prompt_per_token_ms": 23.689561497326206,
+          "prompt_per_second": 42.21268511503972,
+          "predicted_n": 22,
+          "predicted_ms": 4971.558,
+          "predicted_per_token_ms": 236.74085714285715,
+          "predicted_per_second": 4.2240279606513695
+        },
+        "engine": {
+          "kind": "llama.cpp",
+          "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+          "identities": {
+            "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+          },
+          "config": {
+            "server": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/llama-server",
+            "model": "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "context": 4096,
+            "max_tokens": 96,
+            "batch": 512,
+            "ubatch": 128,
+            "max_rss_mib": 8192,
+            "threads": 8,
+            "threads_batch": 8,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "decode_cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "prompt_tokens_preflight": 748,
+          "peak_rss_mib": 7031.48828125,
+          "wall_s": 27.43885339499684,
+          "server_log_sha256": "2437a9c3db185f15b0302de43425a0f78b2c82c63b27df89f56f35a57d01ea10"
+        }
+      }
+    },
+    {
+      "round": 0,
+      "config": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-8-16.json",
+      "projected_s": 133.821411,
+      "reply": {
+        "schema": "optimization-inference-1",
+        "content": "{\"hint\": \"Use independent SIMD accumulators and hoist repeated broadcasts while preserving packed weight decoding.\"}",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 22,
+          "prompt_tokens": 748,
+          "total_tokens": 770,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 748,
+          "prompt_ms": 12339.683,
+          "prompt_per_token_ms": 16.496902406417114,
+          "prompt_per_second": 60.61744049664809,
+          "predicted_n": 22,
+          "predicted_ms": 4982.649,
+          "predicted_per_token_ms": 237.269,
+          "predicted_per_second": 4.21462559373538
+        },
+        "engine": {
+          "kind": "llama.cpp",
+          "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+          "identities": {
+            "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+          },
+          "config": {
+            "server": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/llama-server",
+            "model": "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "context": 4096,
+            "max_tokens": 96,
+            "batch": 512,
+            "ubatch": 128,
+            "max_rss_mib": 8192,
+            "threads": 8,
+            "threads_batch": 16,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ],
+            "decode_cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "prompt_tokens_preflight": 748,
+          "peak_rss_mib": 7033.4921875,
+          "wall_s": 21.863822233004612,
+          "server_log_sha256": "5824f9df4650b7fb1a6f6fcf0a5e4dea0df3956875d828d6006d5874a497994b"
+        }
+      }
+    },
+    {
+      "round": 0,
+      "config": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-16-16.json",
+      "projected_s": 139.4056768095238,
+      "reply": {
+        "schema": "optimization-inference-1",
+        "content": "{\"hint\": \"Use independent SIMD accumulators and hoist repeated broadcasts while preserving packed weight decoding.\"}",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 22,
+          "prompt_tokens": 748,
+          "total_tokens": 770,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 748,
+          "prompt_ms": 12453.497,
+          "prompt_per_token_ms": 16.64906016042781,
+          "prompt_per_second": 60.06345045090548,
+          "predicted_n": 22,
+          "predicted_ms": 5207.023,
+          "predicted_per_token_ms": 247.9534761904762,
+          "predicted_per_second": 4.033014641955682
+        },
+        "engine": {
+          "kind": "llama.cpp",
+          "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+          "identities": {
+            "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+          },
+          "config": {
+            "server": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/llama-server",
+            "model": "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "context": 4096,
+            "max_tokens": 96,
+            "batch": 512,
+            "ubatch": 128,
+            "max_rss_mib": 8192,
+            "threads": 16,
+            "threads_batch": 16,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ],
+            "decode_cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "prompt_tokens_preflight": 748,
+          "peak_rss_mib": 7033.58984375,
+          "wall_s": 22.220408927998506,
+          "server_log_sha256": "5f0dc71d0304d623adad17060204adc7f358a77d7af20d01435f1479839fe044"
+        }
+      }
+    },
+    {
+      "round": 1,
+      "config": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-8-16.json",
+      "projected_s": 133.317824047619,
+      "reply": {
+        "schema": "optimization-inference-1",
+        "content": "{\"hint\": \"Use independent SIMD accumulators and hoist repeated broadcasts while preserving packed weight decoding.\"}",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 22,
+          "prompt_tokens": 748,
+          "total_tokens": 770,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 748,
+          "prompt_ms": 12442.109,
+          "prompt_per_token_ms": 16.633835561497328,
+          "prompt_per_second": 60.11842526054064,
+          "predicted_n": 22,
+          "predicted_ms": 4957.793,
+          "predicted_per_token_ms": 236.08538095238094,
+          "predicted_per_second": 4.2357557082355
+        },
+        "engine": {
+          "kind": "llama.cpp",
+          "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+          "identities": {
+            "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+          },
+          "config": {
+            "server": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/llama-server",
+            "model": "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "context": 4096,
+            "max_tokens": 96,
+            "batch": 512,
+            "ubatch": 128,
+            "max_rss_mib": 8192,
+            "threads": 8,
+            "threads_batch": 16,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ],
+            "decode_cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "prompt_tokens_preflight": 748,
+          "peak_rss_mib": 7032.55859375,
+          "wall_s": 21.93736941400857,
+          "server_log_sha256": "9b719c48ecda48c8659b493ae6ae24cc560ce813a90112cd68fd260f039731ca"
+        }
+      }
+    },
+    {
+      "round": 1,
+      "config": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-16-16.json",
+      "projected_s": 135.62626157142856,
+      "reply": {
+        "schema": "optimization-inference-1",
+        "content": "{\"hint\": \"Use independent SIMD accumulators and hoist repeated broadcasts while preserving packed weight decoding.\"}",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 22,
+          "prompt_tokens": 748,
+          "total_tokens": 770,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 748,
+          "prompt_ms": 12569.841,
+          "prompt_per_token_ms": 16.80460026737968,
+          "prompt_per_second": 59.50751485241539,
+          "predicted_n": 22,
+          "predicted_ms": 5047.236,
+          "predicted_per_token_ms": 240.3445714285714,
+          "predicted_per_second": 4.160693100144317
+        },
+        "engine": {
+          "kind": "llama.cpp",
+          "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+          "identities": {
+            "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+          },
+          "config": {
+            "server": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/llama-server",
+            "model": "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "context": 4096,
+            "max_tokens": 96,
+            "batch": 512,
+            "ubatch": 128,
+            "max_rss_mib": 8192,
+            "threads": 16,
+            "threads_batch": 16,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ],
+            "decode_cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "prompt_tokens_preflight": 748,
+          "peak_rss_mib": 7033.48828125,
+          "wall_s": 22.15519528099685,
+          "server_log_sha256": "69ca7296dc5c7b32fdbb493d9411c5d2ac04eb52a04482c6dcd2c61558e99223"
+        }
+      }
+    },
+    {
+      "round": 1,
+      "config": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/optimization/tune-fixed-8-8.json",
+      "projected_s": 142.45203761904762,
+      "reply": {
+        "schema": "optimization-inference-1",
+        "content": "{\"hint\": \"Use independent SIMD accumulators and hoist repeated broadcasts while preserving packed weight decoding.\"}",
+        "finish_reason": "stop",
+        "usage": {
+          "completion_tokens": 22,
+          "prompt_tokens": 748,
+          "total_tokens": 770,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 748,
+          "prompt_ms": 17993.054,
+          "prompt_per_token_ms": 24.054885026737967,
+          "prompt_per_second": 41.571597573152395,
+          "predicted_n": 22,
+          "predicted_ms": 5104.763,
+          "predicted_per_token_ms": 243.08395238095238,
+          "predicted_per_second": 4.113805087523162
+        },
+        "engine": {
+          "kind": "llama.cpp",
+          "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+          "identities": {
+            "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "server": "1e2281296523692adcd2a56e06b1e0a1388fc08ddef834640956cce50727747f",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-common.so.0.9.0": "d7b9ada3586eac19ba1d2bd1023880264dba70d7a0ec5208449563dd42699429",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama-server-impl.so": "79acb1984d73119f51c8802f42c1e3e86eccda1ca8632c4e18c705e3c32f12e1",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+            "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/libmtmd.so.0.9.0": "0d79464e898e46852cc85a30e8897941d71364cb129daab513d680d977b0b4b3"
+          },
+          "config": {
+            "server": "/run/media/craig-hutchinson/54D4C5011B8AF586/GitHub/Sub0Llm/out/build/llama-optimizer/bin/llama-server",
+            "model": "/run/media/craig-hutchinson/54D4C5011B8AF586/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+            "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+            "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+            "context": 4096,
+            "max_tokens": 96,
+            "batch": 512,
+            "ubatch": 128,
+            "max_rss_mib": 8192,
+            "threads": 8,
+            "threads_batch": 8,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "decode_cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "prompt_tokens_preflight": 748,
+          "peak_rss_mib": 7030.7890625,
+          "wall_s": 27.847766584003693,
+          "server_log_sha256": "539479e271b947d04d5b2e0a4af1652728b6dada66eeb0c269dc39e9a7af7aeb"
+        }
+      }
+    }
+  ],
+  "power": {
+    "state": "ac",
+    "saver": false
+  },
+  "host": "CrogBuntu1",
+  "date_utc": "2026-11-08"
+}

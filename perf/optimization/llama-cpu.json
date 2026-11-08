@@ -1,0 +1,41 @@
+{
+  "server": "out/build/llama-optimizer/bin/llama-server",
+  "model": "../../Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+  "model_sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+  "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+  "context": 4096,
+  "max_tokens": 768,
+  "batch": 512,
+  "ubatch": 128,
+  "max_rss_mib": 8192,
+  "threads": 8,
+  "threads_batch": 16,
+  "cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "decode_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ]
+}
