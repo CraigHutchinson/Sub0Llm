@@ -1,0 +1,69 @@
+{
+  "schema": "optimization-item-1",
+  "id": "iq1s-dependency",
+  "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/68",
+  "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+  "constraints": [
+    "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+    "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+    "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+  ],
+  "qualification_scope": "kernel-only",
+  "editable_files": [
+    "include/sub0/quant/iq1_s.hpp"
+  ],
+  "context": [
+    {
+      "path": "include/sub0/quant/iq1_s.hpp",
+      "start_marker": "    // Internal row core:",
+      "end_marker": "static_assert(FormatModule<IQ1S>);"
+    }
+  ],
+  "max_context_chars": 7000,
+  "max_attempts": 6,
+  "stagnation_window": 2,
+  "max_recoveries": 3,
+  "wall_seconds": 3600,
+  "inference_timeout": 600,
+  "seed": 42,
+  "hints": [
+    "Try two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction. Use only three small exact edits: declaration, update and final reduction. Retain generic compilation and scalar behavior.",
+    "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
+  ],
+  "provider_command": [
+    "python3",
+    "{root}/scripts/optimization/llama_provider.py",
+    "--config",
+    "perf/optimization/llama-cpu.json"
+  ],
+  "identity_files": [
+    "scripts/optimization/iterate.py",
+    "scripts/optimization/llama_provider.py",
+    "scripts/optimization/evaluate_kernel.py",
+    "perf/optimization/llama-cpu.json",
+    "/usr/bin/clang++"
+  ],
+  "evaluation": {
+    "command": [
+      "python3",
+      "{root}/scripts/optimization/evaluate_kernel.py",
+      "--baseline",
+      "{baseline}",
+      "--candidate",
+      "{candidate}",
+      "--result",
+      "{result}",
+      "--compiler",
+      "/usr/bin/clang++",
+      "--benchmark",
+      "IQ1_S 32x5120, fused native",
+      "--editable",
+      "include/sub0/quant/iq1_s.hpp",
+      "--rounds",
+      "5",
+      "--min-gain",
+      "0.02"
+    ],
+    "timeout": 600
+  }
+}

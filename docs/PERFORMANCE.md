@@ -11,6 +11,9 @@ For the local dense 27B objective and staged milestones, see [the performance ca
 
 The dense 27B default-promotion gate is documented in [full-context qualification](performance/QWEN27B_QUALIFICATION.md).
 
+The [Qwen-driven focused optimization harness](performance/QWEN_OPTIMIZATION_HARNESS.md) adds bounded
+model proposals, isolated experiments and explicit stall/hint recovery on top of these same helpers.
+
 ## Everyday workflow
 
 ```sh

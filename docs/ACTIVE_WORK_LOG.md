@@ -34,6 +34,8 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
+**2026-11-08 Codex — #68 active.** Codified Qwen-driven focused optimization harness, isolated candidates, stall recovery and llama.cpp provider/tuning. Owns `scripts/optimization/`, focused work-item specs and tests. Coordinate CPU through the shared lock; preserve #63/#66 artifacts and stop capture only at a verified completed-window boundary before inference/build/tuning.
+
 **2026-11-08 Codex — #63 active.** Full 128-position and corpus quality qualification, reusable score/reference cache and generated defaults. Holds quality tools, mapped-token score adapter and configurator; owns CPU during long quality runs. No performance measurements may overlap. Prior/default artifacts remain preserved.
 
 
