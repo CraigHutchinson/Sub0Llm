@@ -37,7 +37,7 @@ It returns `optimization-evaluation-1`: exact candidate file hashes, baseline co
 qualification scope, correctness and memory verdicts, a performance verdict and evidence paths.
 Only correctness=pass, memory=pass and performance=improved can advance the incumbent. Inconclusive
 measurements never pass. Evaluator-produced files must exist inside the attempt directory and are
-hashed. The evaluator must hold the shared performance lock across builds/checks/measurement.
+hashed. The interpreter and shared sub0perf modules are also pinned by the run contract. The evaluator must hold the shared performance lock across builds/checks/measurement.
 
 The supplied `evaluate_kernel.py` compiles both native staged binaries and a generic candidate against the baseline's frozen
 benchmark/independent double-dot fixtures. It checks fixtures and peak child RSS, then uses pinned
@@ -48,7 +48,11 @@ to these kernel fixtures. This does not certify model RSS, full logits or corpus
 model-scope evaluator with the existing #63 gates before production promotion.
 
 Empty, duplicate, malformed, truncated, failed and non-improving attempts feed their concrete reason
-into later requests. Both proposal fingerprints and resulting source hashes detect repeats. After
+into later requests. Both proposal fingerprints and resulting source hashes detect repeats. Work items can bound edit
+count/size and provide expert `seed_edits`; these are candidate hints, never evidence or automatic edits.
+After truncation, retry guidance specifically requests compact single-line replacements. The example
+uses three <=600-character hunks and an expert two-accumulator seed; distinguish seeded ideas from
+independent model discoveries in reports. After
 the configured stagnation window the runner rotates mechanism hints and continues; after the recovery
 or run budget it records `stalled` or `budget_exhausted`, best commit, counts and a next hint. A stalled
 CLI exits 3. It never declares global optimality. A mechanism is not permanently parked merely because

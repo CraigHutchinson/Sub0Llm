@@ -94,18 +94,33 @@ def validate_proposal(p, item):
         raise ValueError('proposal fields mismatch')
     if any(not isinstance(p[k], str) for k in ('hypothesis', 'mechanism', 'no_change_reason')) or not isinstance(p['edits'], list):
         raise ValueError('proposal types mismatch')
-    if len(p['edits']) > 12:
+    if len(p['edits']) > item.get('max_edits',12):
         raise ValueError('too many edits for a focused attempt')
     for e in p['edits']:
         if not isinstance(e, dict) or set(e) != {'path', 'old', 'new'} or any(not isinstance(v, str) for v in e.values()):
             raise ValueError('edit contract mismatch')
         if e['path'] not in item['editable_files'] or not e['old'] or e['old'] == e['new']:
             raise ValueError('out-of-scope or no-op edit')
-        if len(e['old']) + len(e['new']) > 32000:
+        if max(len(e['old']),len(e['new'])) > item.get('max_edit_chars',16000):
             raise ValueError('edit too large')
     if p['edits'] and (not p['hypothesis'].strip() or not p['mechanism'].strip()):
         raise ValueError('testable hypothesis and mechanism required')
     return p
+
+
+def trusted_identity(item):
+    files=[Path(p)for p in item['identity_files']]+list((ROOT/'tools/perf/sub0perf').glob('*.py'))+[Path(sys.executable)]
+    return {str(p.resolve()):sha(p)for p in files}
+
+
+def response_schema(item):
+    schema=json.loads(json.dumps(PROPOSAL_SCHEMA))
+    for k in ('hypothesis','mechanism','no_change_reason'):
+        schema['properties'][k]['maxLength']=160
+    edits=schema['properties']['edits'];edits['maxItems']=item.get('max_edits',12)
+    for k in ('old','new'):
+        edits['items']['properties'][k]['maxLength']=item.get('max_edit_chars',16000)
+    return schema
 
 
 def parse_reply(reply, item):
@@ -196,7 +211,7 @@ def _run(item_path, output, resume=False, proposals_only=False):
         raise ValueError('commit tracked changes before starting a reproducible experiment')
     output.mkdir(parents=True, exist_ok=True); state_path = output / 'state.json'
     provider = [x.replace('{root}', str(ROOT)) for x in item['provider_command']]
-    identity = {str(Path(p).resolve()): sha(p) for p in item['identity_files']}
+    identity = trusted_identity(item)
     contract = dict(item_sha256=sha(item_path), identities=identity, proposals_only=proposals_only)
     if resume:
         state = load(state_path)
@@ -220,10 +235,13 @@ def _run(item_path, output, resume=False, proposals_only=False):
         feedback = [dict(attempt=r['attempt'], status=r['status'], detail=r.get('detail', '')[-900:],
                          hypothesis=r.get('hypothesis', '')[:200]) for r in state['attempts'][-5:-1]]
         hint = (item.get('hints', [])+HINTS)[state['next_hint'] % len(item.get('hints', [])+HINTS)]
+        if any('truncated' in r.get('detail','')for r in state['attempts'][-3:]):
+            hint+=' Reply compactly: at most three short replacements, preferably single lines. Never copy the full function; split larger changes across attempts.'
+        seeds=[e for e in item.get('seed_edits',[])if e['path']in item['editable_files'] and source(tree,e['path']).read_text().count(e['old'])==1]
         request = dict(schema='optimization-request-1', work_item=item['id'], issue=item['issue'], goal=item['goal'],
                        constraints=item['constraints'], editable_files=item['editable_files'],
                        context=render_context(tree, item), artifact_dir=str(folder), feedback=feedback, hint=hint,
-                       attempt=i, seed=item.get('seed', 42)+i, response_schema=PROPOSAL_SCHEMA)
+                       attempt=i, seed=item.get('seed', 42)+i, candidate_hints=seeds,response_schema=response_schema(item))
         save(folder/'request.json', request)
         try:
             # Inference provider must terminate its model before it returns. Measurements happen later.
@@ -231,7 +249,7 @@ def _run(item_path, output, resume=False, proposals_only=False):
                 command(provider, ROOT, folder/'provider.log', max(.1, min(item.get('inference_timeout', 600), item['wall_seconds']-(time.time()-state['started']))),
                         json.dumps(request).encode())
             reply = load(folder/'provider.log'); save(folder/'inference.json', reply)
-            if identity != {str(Path(p).resolve()):sha(p) for p in item['identity_files']}:
+            if identity != trusted_identity(item):
                 raise ValueError('trusted artifacts changed during inference')
             proposal = parse_reply(reply, item); save(folder/'proposal.json', proposal)
             record['hypothesis'] = proposal['hypothesis']
@@ -276,7 +294,7 @@ def _run(item_path, output, resume=False, proposals_only=False):
                         changed=set(git(tree, 'diff', 'HEAD', '--name-only').splitlines())
                         if not changed <= set(item['editable_files']):
                             raise ValueError('evaluator/candidate changed files outside allowed scope')
-                        if identity != {str(Path(p).resolve()):sha(p) for p in item['identity_files']}:
+                        if identity != trusted_identity(item):
                             raise ValueError('trusted artifacts changed during attempt')
                         accepted = judge(verdict, item, tree, baseline); record['evaluation_sha256']=sha(result); record['evaluation'] = verdict; record['evidence_sha256'] = evidence
                         if accepted:
@@ -291,7 +309,7 @@ def _run(item_path, output, resume=False, proposals_only=False):
                             record.update(status='not_improved', detail=f"correctness={verdict['correctness']} memory={verdict['memory']} performance={verdict['performance']}; {verdict.get('error','')} {verdict.get('diagnostics','')}")
         except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
             record.update(status='duplicate' if isinstance(error,DuplicateProposal) else 'failed', detail=str(error))
-        if record['status'] == 'improved_for_review':
+        if record['status'] == 'improved_for_review' or (proposals_only and record['status']=='review_proposal'):
             state['no_progress'] = 0
         else:
             state['no_progress'] += 1
@@ -303,7 +321,7 @@ def _run(item_path, output, resume=False, proposals_only=False):
         if state['recoveries'] >= item['max_recoveries']:
             state['status'] = 'stalled'; break
     if state['status'] == 'running':
-        state['status'] = 'budget_exhausted'
+        state['status'] = 'proposals_pending_review' if proposals_only and any(r['status']=='review_proposal'for r in state['attempts']) else 'budget_exhausted'
     state['continuation'] = dict(review_branch=state.get('review_branch'),best_commit=state['best_commit'], issue=item['issue'],
         review_required=True, qualification_scope=item['qualification_scope'],
         next_hint=(item.get('hints', [])+HINTS)[state['next_hint'] % len(item.get('hints', [])+HINTS)],

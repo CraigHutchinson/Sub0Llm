@@ -31,7 +31,7 @@
     "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
   ],
   "provider_command": [
-    "python3",
+    "/usr/bin/python3",
     "{root}/scripts/optimization/llama_provider.py",
     "--config",
     "perf/optimization/llama-cpu.json"
@@ -41,11 +41,12 @@
     "scripts/optimization/llama_provider.py",
     "scripts/optimization/evaluate_kernel.py",
     "perf/optimization/llama-cpu.json",
-    "/usr/bin/clang++"
+    "/usr/bin/clang++",
+    "/usr/bin/python3"
   ],
   "evaluation": {
     "command": [
-      "python3",
+      "/usr/bin/python3",
       "{root}/scripts/optimization/evaluate_kernel.py",
       "--baseline",
       "{baseline}",
@@ -65,5 +66,24 @@
       "0.02"
     ],
     "timeout": 600
-  }
+  },
+  "max_edits": 3,
+  "max_edit_chars": 600,
+  "seed_edits": [
+    {
+      "path": "include/sub0/quant/iq1_s.hpp",
+      "old": "__m256 accum=_mm256_setzero_ps();",
+      "new": "__m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();"
+    },
+    {
+      "path": "include/sub0/quant/iq1_s.hpp",
+      "old": "accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));",
+      "new": "if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));"
+    },
+    {
+      "path": "include/sub0/quant/iq1_s.hpp",
+      "old": "_mm256_store_ps(lanes,accum);",
+      "new": "_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));"
+    }
+  ]
 }

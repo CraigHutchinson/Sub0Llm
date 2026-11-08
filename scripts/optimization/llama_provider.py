@@ -72,7 +72,8 @@ def infer(config, request):
             if not response.url.startswith(endpoint+'/'):
                 raise ValueError('provider redirected outside its loopback endpoint')
             return json.load(response)
-    with tempfile.TemporaryFile() as log:
+    log_path=Path(request['artifact_dir'])/'llama-server.log'if request.get('artifact_dir')else None
+    with (log_path.open('w+b')if log_path else tempfile.TemporaryFile()) as log:
         try:
             os.sched_setaffinity(0, set(cpus))
             process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -90,6 +91,8 @@ def infer(config, request):
                       'Return only JSON matching the supplied response schema. Propose small exact text edits '
                       'only in editable_files. Never change tests, tolerances or evaluation commands. '
                       'Use the failure feedback and hint to find a different mechanism when stalled. '
+                      'Use compact single-line replacements, not whole-function rewrites. candidate_hints are '
+                      'expert suggestions to assess, not measured improvements; refine them if appropriate. '
                       'If no useful edit is found, return edits=[] and explain why; do not invent measured gains.')
             model_request={k:v for k,v in request.items()if k!='artifact_dir'}
             messages = [{'role':'system','content':system}, {'role':'user','content':json.dumps(model_request)}]
@@ -118,8 +121,6 @@ def infer(config, request):
                     os.killpg(process.pid, signal.SIGKILL); process.wait()
             os.sched_setaffinity(0, old_affinity)
             log.seek(0)
-            if request.get('artifact_dir'):
-                Path(request['artifact_dir'],'llama-server.log').write_bytes(log.read())
         # This adapter process launches exactly one child: its child high-water mark is the server's.
         peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss/1024
         if peak > config.get('max_rss_mib',8192):

@@ -35,6 +35,13 @@ class OptimizationTest(unittest.TestCase):
             (root/'escape').symlink_to('/tmp')
             with self.assertRaises(ValueError):loop.source(root,'escape/x.hpp')
 
+    def test_compact_schema_and_edit_limit(self):
+        item=self.item();item.update(max_edits=1,max_edit_chars=4)
+        schema=loop.response_schema(item)
+        self.assertEqual(schema['properties']['edits']['maxItems'],1)
+        self.assertEqual(schema['properties']['edits']['items']['properties']['old']['maxLength'],4)
+        with self.assertRaises(ValueError):loop.validate_proposal(proposal([dict(path='x.hpp',old='12345',new='0')]),item)
+
     def test_rationale_does_not_hide_duplicate_patch(self):
         a=proposal([dict(path='x.hpp',old='a',new='b')]);b={**a,'hypothesis':'a different story'}
         self.assertEqual(loop.fingerprint(a),loop.fingerprint(b))
