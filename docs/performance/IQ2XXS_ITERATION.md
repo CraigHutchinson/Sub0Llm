@@ -1,7 +1,7 @@
 # IQ2_XXS fused float projection — preparation
 
-Tracking #66 / #18 / #30. Status on CrogBuntu1, 2026-11-08: implemented opt-in, row checks pass;
-full-corpus qualification and controlled performance remain pending. No speed claim or default change.
+Tracking #66 / #18 / #30. Status on CrogBuntu1, 2026-11-08: opt-in candidate with an 18% complete-model generation gain;
+full-corpus qualification remains pending. AUTO and the live chat default remain preserved.
 The existing #63 native-all qualification retains preserved executables, frozen inputs and its verified
 first-window cache; capture stopped at that boundary to publish/test this increment and will resume.
 
@@ -62,12 +62,49 @@ message; replayed prompt grows from 13 to 31 tokens. A 242-token overflow is ref
 accepted messages/context/completion state. Reset clears state and reproduces the initial reply and
 13-token context. A one-token cap produces “Hi” with `finish=length`. Both CI ISA variants pass.
 
+## Controlled performance
+
+[Raw evidence](qwen27b_iq2xxs_evidence.json) records commands, hashes, every warmup and measured
+sample, calibration, load, power, phase arrays, generated IDs and peak RSS. Same downloaded model,
+eight physical cores CPU 0–7 on one CCD, 13 pretokenized prompt IDs and eight additional greedy
+evaluations (EOS ignored for fixed count). Four staged arms, one excluded warmup each and three
+rotated measured rounds. All 12 measured samples are untainted; measured output IDs agree across
+all arms. These are warm-cache short-workload backend rates, not long-context or chat-server rates.
+
+| Arm | Prompt tokens/s | Generated tokens/s | Max measured RSS MiB |
+|---|---:|---:|---:|
+| Previous published native-all | 1.279814 | 1.274102 | 5703.14 |
+| Migrated decoder, native-all | 1.372124 | 1.370793 | 5703.00 |
+| Fused IQ2_XXS | 1.514203 | 1.502826 | 5703.06 |
+| Clean native llama.cpp | 17.034562 | 4.270162 | 6249.79 |
+
+Medians: 1.183× prompt / 1.180× generation over the published candidate. The decoder/module
+migration contributes 1.076× generation; fusion adds 1.096× over that migrated path. Fused generation
+samples span 1.489366–1.509335 tokens/s (robust CV 0.64%); prior samples span 1.250647–1.279678
+(0.65%). The reference still generates 2.841× faster and processes this prompt 11.250× faster.
+Memory stays inside the unchanged 8 GiB budget. No reference-parity or hardware-limit claim.
+
+Five interleaved single-core native kernel rounds show prior/fused medians (ns per 32-row projection):
+
+| Width | Prior vector | Fused | Ratio |
+|---|---:|---:|---:|
+| 256 | 2374.44 | 844.94 | 2.810× |
+| 5120 | 42355.59 | 14214.00 | 2.980× |
+| 17408 | 143649.55 | 48096.33 | 2.987× |
+
+All five rounds have <=1% measured load and stable calibration. These warm-cache slices isolate
+kernel cost; their ratio is not substituted for the measured complete-model gain.
+
+Separate post-change diagnostic attribution (no foreign-load rejection): IQ1_S is 28.59% of complete
+decode wall time, IQ1_M 18.50%, Q3_K 16.42%, IQ2_XS 13.87%, IQ2_S 8.58% and IQ2_XXS 5.38%.
+Projection calls sum to 95.29%; the remainder stays visible. Use this ranking for the next hypothesis.
+
 ## Remaining acceptance
 
-Review any subsequent C++ edits. Stage all binaries before
-performance measurements. After the existing quality run releases the shared lock, measure three
-interleaved complete-model rounds against native-all and clean native llama.cpp, with memory/load
-and artifact identities. Run full-context and corpus qualification against the #63 cached oracle;
-validate actual chat behavior. Publish complete evidence through a linked PR and merge only when the
-required gates pass. Negative performance results need three passes and remain parked behind their
-selector. Current row checks do not establish full-model quality, throughput or default promotion.
+Draft PR #67 contains the reviewed implementation and evidence; full frozen corpus qualification
+remains mandatory before closing #66/#63 or promoting defaults. Continue the unchanged fixture,
+protocol, scalar baseline and reference cache with the faster candidate manifest. This selects the
+candidate using measured speed without changing any quality threshold or window. Retain all prior
+artifacts/cache records. Review subsequent code edits, complete generated AUTO/ISA selection and
+final promoted-artifact checks, and merge accepted increments through linked PRs. Full context here
+is bounded to 128; general engine integration, batching, reference parity and hardware limits remain.
