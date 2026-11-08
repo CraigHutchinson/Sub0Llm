@@ -59,7 +59,7 @@ struct IQ1S {
     [[nodiscard]] static float dot_row(const std::uint8_t* row,const float* x,std::size_t width) noexcept {
         float sum=0;
 #if defined(__AVX2__)
-        __m256 accum=_mm256_setzero_ps();
+        __m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();
 #endif
         for(std::size_t b=0;b<width/block.elems;++b){
             const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);
@@ -71,7 +71,8 @@ struct IQ1S {
                     if constexpr(Native){
                         const auto q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(g)));
                         const auto w=_mm256_mul_ps(_mm256_set1_ps(dl),_mm256_add_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(offset)));
-                        accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));
+                        if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));
+                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));
                     } else
 #endif
                     {
@@ -84,7 +85,7 @@ struct IQ1S {
             }
         }
 #if defined(__AVX2__)
-        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum);for(float v:lanes)sum+=v;}
+        if constexpr(Native){alignas(32) float lanes[8];_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));for(float v:lanes)sum+=v;}
 #endif
         return sum;
     }
