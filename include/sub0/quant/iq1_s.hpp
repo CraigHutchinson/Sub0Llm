@@ -88,6 +88,65 @@ struct IQ1S {
 #endif
         return sum;
     }
+    // Batched row core: the SAME arithmetic as dot_row for each of `n` input vectors (x + t*x_stride), but each 256-weight block is
+    // decoded once into a small buffer and reused for all `n` tokens (n <= Tile). Tokens are advanced four at a time so four
+    // independent accumulator chains hide the add latency and the decoded weights are loaded once per group. Every token keeps its
+    // own accumulator and adds in exactly dot_row's order (chunk of 8 ascending, block ascending), so out[t] is bit-identical to
+    // dot_row on token t.
+    template<bool Native,std::size_t Tile>
+    static void dot_row_batch(const std::uint8_t* row,const float* x,std::size_t x_stride,std::size_t width,std::size_t n,float* out) noexcept {
+        float sum[Tile];
+        for(std::size_t t=0;t<n;++t)sum[t]=0;
+#if defined(__AVX2__)
+        __m256 accum[Tile];
+        for(std::size_t t=0;t<n;++t)accum[t]=_mm256_setzero_ps();
+#endif
+        alignas(32) float w[256];
+        for(std::size_t b=0;b<width/block.elems;++b){
+            const auto base=b*block.elems;const float d=f16_to_f32(fields(row,base).d_bits);
+            for(int ib=0;ib<8;++ib){
+                const auto f=fields(row,base+32*ib);const float dl=scale(f,d),offset=delta(f);
+                for(int l=0;l<4;++l){
+                    const auto g=grid(f,l);float* wl=w+32*ib+8*l;
+                    for(int j=0;j<8;++j){const auto q=static_cast<std::int8_t>((g>>(8*j))&255);wl[j]=dl*(static_cast<float>(q)+offset);}
+                }
+            }
+#if defined(__AVX2__)
+            if constexpr(Native){
+                std::size_t t=0;
+                for(;t+4<=n;t+=4){
+                    const float* x0=x+t*x_stride+base;const float* x1=x0+x_stride;const float* x2=x1+x_stride;const float* x3=x2+x_stride;
+                    __m256 a0=accum[t],a1=accum[t+1],a2=accum[t+2],a3=accum[t+3];
+                    for(int k=0;k<256;k+=8){
+                        const __m256 wk=_mm256_load_ps(w+k);
+                        a0=_mm256_add_ps(a0,_mm256_mul_ps(_mm256_loadu_ps(x0+k),wk));
+                        a1=_mm256_add_ps(a1,_mm256_mul_ps(_mm256_loadu_ps(x1+k),wk));
+                        a2=_mm256_add_ps(a2,_mm256_mul_ps(_mm256_loadu_ps(x2+k),wk));
+                        a3=_mm256_add_ps(a3,_mm256_mul_ps(_mm256_loadu_ps(x3+k),wk));
+                    }
+                    accum[t]=a0;accum[t+1]=a1;accum[t+2]=a2;accum[t+3]=a3;
+                }
+                for(;t<n;++t){
+                    const float* xt=x+t*x_stride+base;__m256 a=accum[t];
+                    for(int k=0;k<256;k+=8)a=_mm256_add_ps(a,_mm256_mul_ps(_mm256_loadu_ps(xt+k),_mm256_load_ps(w+k)));
+                    accum[t]=a;
+                }
+                continue;
+            }
+#endif
+            for(std::size_t t=0;t<n;++t){
+                const float* xt=x+t*x_stride+base;float acc=sum[t];
+                for(int j=0;j<256;++j)acc+=xt[j]*w[j];
+                sum[t]=acc;
+            }
+        }
+#if defined(__AVX2__)
+        if constexpr(Native){
+            for(std::size_t t=0;t<n;++t){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum[t]);for(float v:lanes)sum[t]+=v;}
+        }
+#endif
+        for(std::size_t t=0;t<n;++t)out[t]=sum[t];
+    }
 };
 static_assert(FormatModule<IQ1S>);
 }
