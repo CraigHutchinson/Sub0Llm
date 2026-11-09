@@ -1,5 +1,9 @@
 # Agent worker framework: a native toolbox for delegated, parallel, resource-aware work
 
+> **Moved (2026-11-09):** this framework is now its own project, working title `Sub0Work`, at `../Sub0Work` (local checkout,
+> no remote yet; name pending). Its `docs/DESIGN.md` is the source of truth. This copy is a snapshot kept in Sub0Llm until the
+> new project has a remote, then it becomes a pointer. Sub0Llm remains one engine and one consumer of the framework.
+
 Status: DESIGN, 2026-11-09. Intended to become its own project (working name `sub0work`, placeholder) with Sub0Llm as one
 inference engine among several. Related: #68 (the existing optimisation harness), #77 (goal), #78 (machine test), the
 Sub0Pipeline and Sub0Pub libraries. Legend: **[V]** verified in the repo or the library READMEs, **[P]** proposed,
