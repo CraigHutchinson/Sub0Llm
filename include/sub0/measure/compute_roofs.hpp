@@ -140,9 +140,12 @@ inline constexpr int kVnniLanes = 16;
 [[nodiscard]] inline std::string computeKernelReason(ComputeKernel k) {
     if (computeKernelCompiled(k)) return {};
     switch (k) {
-        case ComputeKernel::fmaF32: return "not compiled in: needs -mavx2 -mfma or -mavx512f (build for the host with -march=native)";
-        case ComputeKernel::dotI8: return "not compiled in: needs -mavx512f -mavx512vnni (build for the host with -march=native)";
-        case ComputeKernel::dotBf16: return "not compiled in: needs -mavx512f -mavx512bf16 (build for the host with -march=native)";
+        case ComputeKernel::fmaF32:
+            return "not compiled in: needs -mavx2 -mfma or -mavx512f (build with -march=native)";
+        case ComputeKernel::dotI8:
+            return "not compiled in: needs -mavx512f -mavx512vnni (build with -march=native)";
+        case ComputeKernel::dotBf16:
+            return "not compiled in: needs -mavx512f -mavx512bf16 (build with -march=native)";
     }
     return "not compiled in";
 }
@@ -903,7 +906,8 @@ inline std::string ghzText(double v) {
 /// `toJson(facts, memory)` writes.
 [[nodiscard]] inline std::string toRoofsJson(const MachineFacts& facts, const MemoryRoofs* memory,
                                              const ComputeRoofs* compute) {
-    std::string out = "{\"schema\":\"sub0llm-machine-1\",\"facts\":" + detail::roofs::factsObject(facts) + ",\"roofs\":";
+    std::string out = "{\"schema\":\"sub0llm-machine-1\",\"facts\":";
+    out += detail::roofs::factsObject(facts) + ",\"roofs\":";
     {
         detail::JsonObject roofsObj(out);
         if (memory != nullptr) {
