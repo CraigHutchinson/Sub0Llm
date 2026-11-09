@@ -373,3 +373,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(sub0llm_machine_roofs_tests PRIVATE -march=native)
 endif()
 catch_discover_tests(sub0llm_machine_roofs_tests)
+
+# --- compute roofs and ceilings (issue #78, increment 3) ---------------------
+# The compute kernels need the host's ISA (AVX-512 VNNI and BF16 on the target), so this target is built for the
+# host with -march=native. A kernel whose ISA is not compiled in is a SKIP, never a pass.
+add_executable(sub0llm_machine_compute_roofs_tests machine_compute_roofs_tests.cpp)
+target_include_directories(sub0llm_machine_compute_roofs_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+find_package(Threads REQUIRED)
+target_link_libraries(sub0llm_machine_compute_roofs_tests PRIVATE Catch2::Catch2WithMain Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(sub0llm_machine_compute_roofs_tests PRIVATE -march=native)
+endif()
+catch_discover_tests(sub0llm_machine_compute_roofs_tests)
