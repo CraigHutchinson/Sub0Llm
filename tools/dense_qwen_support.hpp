@@ -43,7 +43,60 @@ struct Layer {
         sub0::bbq::gdn_row_permutation(sub0::GDN_VALUE_DIM,0,sub0::GDN_K_HEADS,sub0::GDN_V_HEADS,sub0::GDN_V_HEAD_DIM,z_rows);
         sub0::bbq::gdn_row_permutation(sub0::GDN_V_HEADS,0,sub0::GDN_K_HEADS,sub0::GDN_V_HEADS,1,head_rows);
         sub0::bbq::gdn_out_gather_index(sub0::GDN_K_HEADS,sub0::GDN_V_HEADS,sub0::GDN_V_HEAD_DIM,out_indices);
+        t_ffn_gate=find("blk.0.ffn_gate.weight");
+        t_ffn_up=find("blk.0.ffn_up.weight");
+        t_ffn_down=find("blk.0.ffn_down.weight");
+        attn_norm_weights=load("blk.0.attn_norm.weight",D_MODEL);
+        post_attention_norm_weights=load("blk.0.post_attention_norm.weight",D_MODEL);
+        if(sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(index)]){
+            t_attn_q=find("blk.0.attn_q.weight");
+            t_attn_k=find("blk.0.attn_k.weight");
+            t_attn_v=find("blk.0.attn_v.weight");
+            t_attn_output=find("blk.0.attn_output.weight");
+            attn_q_norm_weights=load("blk.0.attn_q_norm.weight",D_HEAD);
+            attn_k_norm_weights=load("blk.0.attn_k_norm.weight",D_HEAD);
+            qg.resize(2*sub0::D_Q);q.resize(sub0::D_Q);
+            k.resize(sub0::D_KV);v.resize(sub0::D_KV);att.resize(sub0::D_Q);
+            scores.resize(SEQ_LEN);
+        } else {
+            auto cr=load("blk.0.ssm_conv1d.weight",sub0::GDN_CONV_DIM*sub0::GDN_CONV_KERNEL);
+            conv_weights.resize(cr.size());
+            for(int c=0;c<sub0::GDN_CONV_DIM;++c)
+                for(int k_idx=0;k_idx<sub0::GDN_CONV_KERNEL;++k_idx)
+                    conv_weights[c*sub0::GDN_CONV_KERNEL+k_idx]=cr[qkv_rows[c]*sub0::GDN_CONV_KERNEL+k_idx];
+            auto dr=load("blk.0.ssm_dt.bias",sub0::GDN_V_HEADS);
+            auto ar=load("blk.0.ssm_a",sub0::GDN_V_HEADS);
+            dt_weights.resize(sub0::GDN_V_HEADS);alog_weights.resize(sub0::GDN_V_HEADS);
+            for(int i=0;i<sub0::GDN_V_HEADS;++i){
+                dt_weights[i]=dr[head_rows[i]];
+                float raw=ar[head_rows[i]];
+                if(raw>=0)throw std::runtime_error("ssm_a sign");
+                alog_weights[i]=std::log(-raw);
+            }
+            ssm_gain_weights=load("blk.0.ssm_norm.weight",sub0::GDN_V_HEAD_DIM);
+            gdn_scratch.resize(sub0::gdn::scratch_floats(sub0::GDN_DIMS,1));
+        }
     }
+    const sub0::gguf::TensorInfo* t_ffn_gate=nullptr;
+    const sub0::gguf::TensorInfo* t_ffn_up=nullptr;
+    const sub0::gguf::TensorInfo* t_ffn_down=nullptr;
+    const sub0::gguf::TensorInfo* t_attn_q=nullptr;
+    const sub0::gguf::TensorInfo* t_attn_k=nullptr;
+    const sub0::gguf::TensorInfo* t_attn_v=nullptr;
+    const sub0::gguf::TensorInfo* t_attn_output=nullptr;
+
+    std::vector<float> attn_norm_weights;
+    std::vector<float> post_attention_norm_weights;
+    std::vector<float> attn_q_norm_weights;
+    std::vector<float> attn_k_norm_weights;
+    std::vector<float> conv_weights;
+    std::vector<float> dt_weights;
+    std::vector<float> alog_weights;
+    std::vector<float> ssm_gain_weights;
+    std::vector<float> gdn_scratch;
+
+    std::vector<float> qg, q, k, v, att;
+    std::vector<float> scores;
     const sub0::gguf::TensorInfo* find(const char* name) const {
         std::string resolved=name;
         if(resolved.starts_with("blk.0."))resolved="blk."+std::to_string(index)+resolved.substr(5);
