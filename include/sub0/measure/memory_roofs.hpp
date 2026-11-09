@@ -371,6 +371,28 @@ inline double secondsBetween(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double>(b - a).count();
 }
 
+/// Starts one thread per CPU in `cpus`. Each thread pins itself, runs `setup(t)` when pinned, waits at a barrier
+/// that every thread reaches (pinned or not, so the barrier cannot hang), then runs `body(t)` when pinned. Returns
+/// true when every thread was pinned. Shared by the memory and compute roofs.
+template <typename Setup, typename Body>
+inline bool runPinnedThreads(const std::vector<int>& cpus, Setup&& setup, Body&& body) {
+    const int threads = static_cast<int>(cpus.size());
+    std::vector<char> pinned(cpus.size(), 0);
+    std::barrier<> sync(threads);
+    const auto work = [&](int t) {
+        const bool ok = pinCurrentThread(cpus[static_cast<std::size_t>(t)]);
+        pinned[static_cast<std::size_t>(t)] = ok ? 1 : 0;
+        if (ok) setup(t);
+        sync.arrive_and_wait();
+        if (ok) body(t);
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(cpus.size());
+    for (int t = 0; t < threads; ++t) workers.emplace_back(work, t);
+    for (std::thread& w : workers) w.join();
+    return std::all_of(pinned.begin(), pinned.end(), [](char v) { return v != 0; });
+}
+
 /// Start of thread t's slice of n elements. Boundaries are multiples of 16 floats (64 bytes).
 inline std::size_t sliceBegin(std::size_t n, int threads, int t) {
     const std::size_t v = n * static_cast<std::size_t>(t) / static_cast<std::size_t>(threads);
@@ -476,37 +498,27 @@ inline PassResult runPass(RoofKernel k, RoofArrays& arr, std::size_t n, const st
     PassResult res;
     res.seconds.assign(static_cast<std::size_t>(threads), 0.0);
     res.sums.assign(static_cast<std::size_t>(threads), 0.0);
-    std::vector<char> pinned(static_cast<std::size_t>(threads), 0);
     float* a = arr.a();
     float* b = arr.b();
     float* c = arr.c();
-    std::barrier<> sync(threads);
 
+    const auto setup = [&](int t) {
+        if (!fill) return;
+        fillSlice(k, a, b, c, sliceBegin(n, threads, t), sliceBegin(n, threads, t + 1));
+        if (corrupt && t == 0 && k == RoofKernel::read) a[0] = 2.0f;   // the read sum must now disagree
+    };
     const auto body = [&](int t) {
         const std::size_t lo = sliceBegin(n, threads, t);
         const std::size_t hi = sliceBegin(n, threads, t + 1);
-        const bool ok = pinCurrentThread(cpus[static_cast<std::size_t>(t)]);
-        pinned[static_cast<std::size_t>(t)] = ok ? 1 : 0;
-        if (ok && fill) {
-            fillSlice(k, a, b, c, lo, hi);
-            if (corrupt && t == 0 && k == RoofKernel::read) a[0] = 2.0f;   // the read sum must now disagree
-        }
-        sync.arrive_and_wait();   // every thread arrives, pinned or not, so the barrier cannot hang
         const Clock::time_point t0 = Clock::now();
         double sum = 0.0;
-        if (ok)
-            for (int p = 0; p < passes; ++p) sum = runSlice(k, a, b, c, lo, hi);
+        for (int p = 0; p < passes; ++p) sum = runSlice(k, a, b, c, lo, hi);
         const Clock::time_point t1 = Clock::now();
         res.seconds[static_cast<std::size_t>(t)] = secondsBetween(t0, t1);
         res.sums[static_cast<std::size_t>(t)] = sum;
-        if (corrupt && t == 0 && ok && k != RoofKernel::read) a[0] = -1.0f;   // damage the output
+        if (corrupt && t == 0 && k != RoofKernel::read) a[0] = -1.0f;   // damage the output
     };
-
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(threads));
-    for (int t = 0; t < threads; ++t) workers.emplace_back(body, t);
-    for (std::thread& w : workers) w.join();
-    res.pinned = std::all_of(pinned.begin(), pinned.end(), [](char v) { return v != 0; });
+    res.pinned = runPinnedThreads(cpus, setup, body);
     return res;
 }
 
@@ -952,6 +964,16 @@ inline std::string bytesText(std::uint64_t b) {
     return s;
 }
 
+/// The facts object exactly as `toJson(facts)` writes it (braces included), so a combined document agrees with the
+/// facts document byte for byte. `null` when that document has an unexpected shape.
+inline std::string factsObject(const MachineFacts& facts) {
+    const std::string prefix = "{\"schema\":\"sub0llm-machine-1\",\"facts\":";
+    const std::string factsDoc = toJson(facts);
+    if (factsDoc.size() > prefix.size() + 1 && factsDoc.rfind(prefix, 0) == 0 && factsDoc.back() == '}')
+        return factsDoc.substr(prefix.size(), factsDoc.size() - prefix.size() - 1);
+    return "null";
+}
+
 }  // namespace detail::roofs
 
 /// Deterministic JSON of the memory roofs alone: `{"schema":"sub0llm-machine-1","roofs":{"memory":{...}}}`.
@@ -973,10 +995,7 @@ inline std::string bytesText(std::uint64_t b) {
 /// `toJson(facts)` writes, so the two documents agree byte for byte on the facts.
 [[nodiscard]] inline std::string toJson(const MachineFacts& facts, const MemoryRoofs& roofs) {
     const std::string prefix = "{\"schema\":\"sub0llm-machine-1\",\"facts\":";
-    const std::string factsDoc = toJson(facts);
-    std::string body = "null";
-    if (factsDoc.size() > prefix.size() + 1 && factsDoc.rfind(prefix, 0) == 0 && factsDoc.back() == '}')
-        body = factsDoc.substr(prefix.size(), factsDoc.size() - prefix.size() - 1);
+    const std::string body = detail::roofs::factsObject(facts);
     std::string out = prefix + body + ",\"roofs\":";
     {
         detail::JsonObject roofsObj(out);
