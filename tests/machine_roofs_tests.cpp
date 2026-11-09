@@ -246,11 +246,11 @@ TEST_CASE("machine_roofs: the planner shrinks repeats and thins thread counts to
     CHECK(roomy.repeats == 5);
     CHECK(roomy.note.empty());
 
-    const RoofPlan tight = planRoofRun(ps, cfg, oneGiB, 2.0);
-    CHECK(tight.repeats < 5);
-    CHECK(tight.repeats >= 1);
+    // At 40 GB/s one repeat of all 19 points (fill plus pass) is about 7 s, so 4 s needs thinning as well.
+    const RoofPlan tight = planRoofRun(ps, cfg, oneGiB, 4.0);
+    CHECK(tight.repeats == 1);
     CHECK_FALSE(tight.note.empty());
-    CHECK(tight.estimateSeconds <= 2.0 + 1e-9);
+    CHECK(tight.estimateSeconds <= 4.0 + 1e-9);
 
     const RoofPlan starved = planRoofRun(ps, cfg, oneGiB, 0.01);
     CHECK(starved.repeats == 1);

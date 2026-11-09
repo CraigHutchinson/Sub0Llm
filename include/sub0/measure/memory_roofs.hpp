@@ -135,7 +135,7 @@ struct RoofConfig {
     double budgetSeconds = 30.0;          // the whole run, sweeps and latency included
     int repeats = 5;                      // timed repeats per point, before the planner reduces them
     std::vector<int> threadCounts = {1, 2, 4, 8, 12, 16};
-    double assumedGbPerSec = 40.0;        // scheduling estimate used until a point has been measured
+    double assumedGbPerSec = 20.0;        // starting estimate of the fill-plus-pass rate; the planner re-learns it
     bool runSweep = true;                 // working-set read sweep
     bool runLatency = true;               // pointer-chase latency sweep
     std::size_t arrayBytesOverride = 0;   // 0 = max(1 GiB, 8 x total L3); tests set a small size
@@ -168,8 +168,8 @@ enum class RoofKernel { read, write, copy, triad };
     return 0;
 }
 
-/// Arrays a repeat touches in total: the untimed fill plus the timed pass. Used to estimate a repeat's cost.
-[[nodiscard]] inline int arraysTouched(RoofKernel k) {
+/// Arrays the untimed fill writes once per point (the arrays the kernel uses).
+[[nodiscard]] inline int arraysFilled(RoofKernel k) {
     switch (k) {
         case RoofKernel::read: return 1;
         case RoofKernel::write: return 1;
@@ -177,6 +177,12 @@ enum class RoofKernel { read, write, copy, triad };
         case RoofKernel::triad: return 3;
     }
     return 0;
+}
+
+/// Bytes a point streams for `reps` repeats: one fill, then `reps` timed passes. The fill happens once because the
+/// sources do not change between repeats and every timed pass rewrites the output in full.
+[[nodiscard]] inline double pointStreamBytes(RoofKernel k, int reps, double arrayBytes) {
+    return (arraysFilled(k) + reps * arraysMoved(k)) * arrayBytes;
 }
 
 /// Three 64-byte-aligned float arrays. Allocated, NOT initialised: the pinned worker threads first-touch
@@ -281,7 +287,7 @@ struct BandwidthRequest {
     std::size_t elements = 0;            // floats per array: the working set of each array
     int passes = 1;                      // kernel passes inside one timed region
     int repeats = 5;                     // timed repeats, each checked
-    bool fillEachRepeat = true;          // false: fill once before the first repeat (read sweeps)
+    bool fillEachRepeat = true;          // false: fill once, before the first repeat (the first touch)
     bool corruptOutput = false;          // TEST HOOK: damage one element so the check must fail
     std::chrono::steady_clock::time_point stopAt = std::chrono::steady_clock::time_point::max();
 };
@@ -703,8 +709,8 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
         double total = 0.0;
         for (const auto& counts : plan.threadCounts)
             for (const RoofKernel k : {RoofKernel::read, RoofKernel::write, RoofKernel::copy, RoofKernel::triad})
-                total += static_cast<double>(counts.size()) * reps * arraysTouched(k) *
-                         static_cast<double>(arrayBytes) * secPerByte;
+                total += static_cast<double>(counts.size()) * pointStreamBytes(k, reps, static_cast<double>(arrayBytes)) *
+                         secPerByte;
         return total;
     };
     plan.repeats = std::max(1, cfg.repeats);
@@ -805,57 +811,64 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
             out.latency.push_back(measureLatency(bytes, pack->cpus.front(), latencyRepeats, sideEnd));
     }
 
-    // ---- placement kernels: with the time that remains ----
-    const double elapsed = secondsBetween(start, Clock::now());
-    const RoofPlan plan = planRoofRun(placements, config, arrays.bytes(),
-                                      std::max(0.0, config.budgetSeconds - elapsed));
-    out.plannedRepeats = plan.repeats;
-    out.planNote = plan.note;
-
-    struct Spec {
-        std::size_t placement;
-        int threads;
-        RoofKernel kernel;
-    };
-    std::vector<Spec> specs;
-    for (std::size_t p = 0; p < placements.size(); ++p)
-        for (const int c : plan.threadCounts[p])
-            for (const RoofKernel k : {RoofKernel::read, RoofKernel::write, RoofKernel::copy, RoofKernel::triad})
-                specs.push_back(Spec{p, c, k});
-
+    // ---- placement kernels: with the time that remains, re-planned at each placement ----
+    // The rate starts from the config's guess. After every point it is replaced by what was observed (wall time
+    // per byte streamed, fill included), so the plan for the placements still to come uses the real machine.
     double secondsPerByte = 1.0 / (std::max(config.assumedGbPerSec, 1e-3) * 1e9);
-    for (std::size_t idx = 0; idx < specs.size(); ++idx) {
-        const Spec& s = specs[idx];
-        const Placement& pl = placements[s.placement];
-        KernelPoint kp;
-        kp.kernel = std::string(kernelName(s.kernel));
-        kp.placement = pl.name;
-        kp.threads = s.threads;
-        const double bytesPerRun = arraysTouched(s.kernel) * static_cast<double>(arrays.bytes());
-        const double perRun = bytesPerRun * secondsPerByte;
-        const double remaining = std::chrono::duration<double>(deadline - Clock::now()).count();
-        const double remainingPoints = static_cast<double>(specs.size() - idx);
-        if (remaining < perRun) {
-            kp.skipReason = "time budget exhausted";
-            out.kernels.push_back(std::move(kp));
-            continue;
+    for (std::size_t p = 0; p < placements.size(); ++p) {
+        const Placement& pl = placements[p];
+        const double remainingBudget = std::max(0.0, config.budgetSeconds - secondsBetween(start, Clock::now()));
+        const std::vector<Placement> rest(placements.begin() + static_cast<std::ptrdiff_t>(p), placements.end());
+        RoofConfig replan = config;
+        replan.assumedGbPerSec = 1.0 / (secondsPerByte * 1e9);
+        const RoofPlan plan = planRoofRun(rest, replan, arrays.bytes(), remainingBudget);
+        if (p == 0) {
+            out.plannedRepeats = plan.repeats;
+            out.planNote = plan.note;
+        } else if (!plan.note.empty()) {
+            out.planNote += "[" + pl.name + "] " + plan.note;
         }
-        const int reps = std::clamp(static_cast<int>(std::floor(remaining / (remainingPoints * perRun))), 1,
-                                    plan.repeats);
-        BandwidthRequest req;
-        req.kernel = s.kernel;
-        req.cpus = cpusFor(pl, s.threads);
-        req.elements = arrays.elements();
-        req.passes = 1;
-        req.repeats = reps;
-        req.stopAt = deadline;
-        const Clock::time_point t0 = Clock::now();
-        kp.measurement = measureBandwidth(arrays, req);
-        if (kp.measurement.repeats > 0) {
-            const double observed = secondsBetween(t0, Clock::now()) / kp.measurement.repeats;
-            secondsPerByte = observed / bytesPerRun;
+
+        // Points still to come, counted in the plan, for the per-point repeat share.
+        double pointsLeft = 0.0;
+        for (std::size_t q = 0; q < plan.threadCounts.size(); ++q)
+            pointsLeft += 4.0 * static_cast<double>(plan.threadCounts[q].size());
+
+        for (const int threads : plan.threadCounts[0]) {
+            for (const RoofKernel k : {RoofKernel::read, RoofKernel::write, RoofKernel::copy, RoofKernel::triad}) {
+                KernelPoint kp;
+                kp.kernel = std::string(kernelName(k));
+                kp.placement = pl.name;
+                kp.threads = threads;
+                const double arrayBytes = static_cast<double>(arrays.bytes());
+                const double perRep = arraysMoved(k) * arrayBytes * secondsPerByte;
+                const double perRun = pointStreamBytes(k, 1, arrayBytes) * secondsPerByte;
+                const double remaining = std::chrono::duration<double>(deadline - Clock::now()).count();
+                if (remaining < perRun) {
+                    kp.skipReason = "time budget exhausted";
+                    out.kernels.push_back(std::move(kp));
+                    pointsLeft -= 1.0;
+                    continue;
+                }
+                const int reps = std::clamp(static_cast<int>(std::floor(remaining / (pointsLeft * perRep))), 1,
+                                            plan.repeats);
+                BandwidthRequest req;
+                req.kernel = k;
+                req.cpus = cpusFor(pl, threads);
+                req.elements = arrays.elements();
+                req.passes = 1;
+                req.repeats = reps;
+                req.fillEachRepeat = false;   // one fill per point: the first repeat's fill is the first touch
+                req.stopAt = deadline;
+                const Clock::time_point t0 = Clock::now();
+                kp.measurement = measureBandwidth(arrays, req);
+                if (kp.measurement.repeats > 0)
+                    secondsPerByte = secondsBetween(t0, Clock::now()) /
+                                     pointStreamBytes(k, kp.measurement.repeats, arrayBytes);
+                out.kernels.push_back(std::move(kp));
+                pointsLeft -= 1.0;
+            }
         }
-        out.kernels.push_back(std::move(kp));
     }
     out.totalSeconds = secondsBetween(start, Clock::now());
     return out;
