@@ -361,3 +361,15 @@ add_executable(sub0llm_machine_facts_tests machine_facts_tests.cpp)
 target_include_directories(sub0llm_machine_facts_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sub0llm_machine_facts_tests PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(sub0llm_machine_facts_tests)
+
+# --- memory roofs (issue #78, increment 2) ----------------------------------
+# The kernels are measured on real threads, so this links Threads and is built for the host with -march=native
+# (the AVX-512 read path). Each case runs on small buffers and one or two threads.
+add_executable(sub0llm_machine_roofs_tests machine_roofs_tests.cpp)
+target_include_directories(sub0llm_machine_roofs_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+find_package(Threads REQUIRED)
+target_link_libraries(sub0llm_machine_roofs_tests PRIVATE Catch2::Catch2WithMain Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(sub0llm_machine_roofs_tests PRIVATE -march=native)
+endif()
+catch_discover_tests(sub0llm_machine_roofs_tests)
