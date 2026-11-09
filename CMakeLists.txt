@@ -538,6 +538,13 @@ set_target_properties(sub0llm-qwen4-forward PROPERTIES BUILD_RPATH "$ORIGIN" INS
 add_executable(sub0llm-bench-moeqd tools/sub0llm-bench-moeqd.cpp)
 target_include_directories(sub0llm-bench-moeqd PRIVATE "${CMAKE_SOURCE_DIR}/include")
 
+# --- machine hardware facts (issue #78, increment 1) ------------------------
+# Header-only against include/sub0/measure/machine_facts.hpp: standard library only, no engine, no generated
+# config, so it builds in any configuration in seconds. `sub0llm-machine --facts` prints the summary and
+# writes the JSON to out/machine/<host>-<YYYYMMDD>.json.
+add_executable(sub0llm-machine tools/sub0llm-machine.cpp)
+target_include_directories(sub0llm-machine PRIVATE "${CMAKE_SOURCE_DIR}/include")
+
 # --- kernel microbenchmark for the shared GEMV primitive (O2) --------------
 # Header-only against include/sub0/gemv.hpp; links OpenMP because the primitive's threaded path is what it
 # measures. Same role as sub0llm-bench-moeqd: the seconds-long inner loop, not the gate.

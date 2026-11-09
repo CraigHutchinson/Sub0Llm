@@ -353,3 +353,11 @@ if(WIN32)
     endif()
   endforeach()
 endif()
+
+# --- machine hardware facts (issue #78, increment 1) ------------------------
+# Engine-free like sub0llm_qwen4_shape_tests: include/sub0/measure/machine_facts.hpp is standard library
+# only, so this links Catch2 alone and builds in any configuration.
+add_executable(sub0llm_machine_facts_tests machine_facts_tests.cpp)
+target_include_directories(sub0llm_machine_facts_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(sub0llm_machine_facts_tests PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(sub0llm_machine_facts_tests)
