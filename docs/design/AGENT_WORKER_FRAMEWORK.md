@@ -1,10 +1,10 @@
 # Agent worker framework: a native toolbox for delegated, parallel, resource-aware work
 
-> **Moved (2026-11-09):** this framework is now its own project, working title `Sub0Work`, at `../Sub0Work` (local checkout,
+> **Moved (2026-11-09):** this framework is now its own project, working title `Sub0Squad`, at `../Sub0Squad` (local checkout,
 > no remote yet; name pending). Its `docs/DESIGN.md` is the source of truth. This copy is a snapshot kept in Sub0Llm until the
 > new project has a remote, then it becomes a pointer. Sub0Llm remains one engine and one consumer of the framework.
 
-Status: DESIGN, 2026-11-09. Intended to become its own project (working name `sub0work`, placeholder) with Sub0Llm as one
+Status: DESIGN, 2026-11-09. Intended to become its own project (working name `sub0squad`, placeholder) with Sub0Llm as one
 inference engine among several. Related: #68 (the existing optimisation harness), #77 (goal), #78 (machine test), the
 Sub0Pipeline and Sub0Pub libraries. Legend: **[V]** verified in the repo or the library READMEs, **[P]** proposed,
 **[U]** unknown until tested.
@@ -43,10 +43,10 @@ from a dead supervisor rather than trusting a stale "running"; distinguish cance
 ```mermaid
 flowchart LR
     subgraph clients["Clients (CLI, agents, CI)"]
-      CLI[sub0work submit | status | logs | cancel | wait | resume]
+      CLI[sub0squad submit | status | logs | cancel | wait | resume]
       AG[Agents: Claude Code, Codex, ...]
     end
-    subgraph daemon["sub0workd (native, one per host)"]
+    subgraph daemon["sub0squad (native, one per host)"]
       CO[Coordinator: Sub0Pipeline graphs and executors]
       AR[Resource arbiter: leases, queues, quiet windows]
       BUS[Sub0Pub event bus: typed events]
@@ -74,7 +74,7 @@ flowchart LR
     W4 --> E2
 ```
 
-- **One native daemon per host** (`sub0workd`) hosts a Sub0Pipeline coordinator, the resource arbiter, an event bus and the
+- **One native daemon per host** (`sub0squad`) hosts a Sub0Pipeline coordinator, the resource arbiter, an event bus and the
   journal. A thin CLI and any agent talk to it over a local socket (named pipe on Windows); it never listens on a network.
 - **Workers are processes** hosting registered job kinds (`WorkerHost`), reached through Sub0Pipeline's remote sub-graph
   mechanism. A worker per git worktree isolates edits; an evaluator worker owns builds and checks; a measurement worker
@@ -251,7 +251,7 @@ CPU effectively zero, journal append without per-event fsync storms.
 | Milestone | Deliverable | Gate |
 |---|---|---|
 | M0 | this design agreed; name, repo and licence decided; Sub0Pipeline/Sub0Pub versions pinned | owner sign-off |
-| M1 | `sub0workd` + CLI running the **existing Python harness unchanged as an external job kind** (process job): submit, status, logs, cancel (tree teardown verified, no stray server), wait, resume | cancel leaves no child; `lost` detected; resume works on a real `state.json` |
+| M1 | `sub0squad` + CLI running the **existing Python harness unchanged as an external job kind** (process job): submit, status, logs, cancel (tree teardown verified, no stray server), wait, resume | cancel leaves no child; `lost` detected; resume works on a real `state.json` |
 | M2 | arbiter: core sets, memory budget, exclusive measurement lease, scoped release; journal and replay | two jobs cannot overlap the window; crash releases leases |
 | M3 | Sub0Pub event stream, progress snapshots, Chrome-Trace timeline | status without parsing logs |
 | M4 | planner and fan-out/fan-in: first splitter = one sub-task per quant format (#34-#41) with disjoint files | integrator re-runs gates once; no overlapping edits |
