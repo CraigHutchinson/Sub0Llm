@@ -94,7 +94,8 @@ struct MachineFacts {
     Fact<int> smtWays;                                  // most logical CPUs on one physical core
     Fact<std::vector<LogicalCpu>> cpus;                 // one entry per logical CPU, ascending id
     Fact<std::vector<int>> onePerCore;                  // lowest logical CPU of each physical core
-    Fact<std::vector<std::vector<int>>> coreSiblings;   // logical CPUs per physical package (sysfs core_siblings)
+    Fact<std::vector<std::vector<int>>> smtGroups;      // per physical core: its logical CPUs (the SMT siblings)
+    Fact<std::vector<std::vector<int>>> packageCpus;    // per physical package: every logical CPU in it
     Fact<std::vector<std::vector<int>>> l3Groups;       // logical CPUs sharing one L3: the CCD/CCX grouping
     std::vector<CacheLevel> caches;                     // L1d, L1i, L2, L3, in that order
     Fact<std::vector<std::string>> isaFlags;            // entries of kIsaFlags this CPU reports, in list order
@@ -708,6 +709,12 @@ inline void sBytes(std::string& o, const std::uint64_t& b) {
         f.smtWays = known(threads.empty() ? 0 : *std::max_element(threads.begin(), threads.end()));
         f.onePerCore = known(one);
 
+        // Dense physicalCore indices make this a direct bucket fill; cpus are in ascending id order, so each
+        // group comes out ascending too.
+        std::vector<std::vector<int>> smt(coreIndex.size());
+        for (const LogicalCpu& c : cpus) smt[static_cast<std::size_t>(c.physicalCore)].push_back(c.id);
+        f.smtGroups = known(smt);
+
         std::map<int, std::vector<int>> byPackage;
         bool allPackages = true;
         for (const LogicalCpu& c : cpus) {
@@ -717,16 +724,17 @@ inline void sBytes(std::string& o, const std::uint64_t& b) {
         if (allPackages) {
             std::vector<std::vector<int>> groups;
             for (const auto& [pkgId, ids] : byPackage) groups.push_back(ids);
-            f.coreSiblings = known(groups);
+            f.packageCpus = known(groups);
         } else {
-            f.coreSiblings = unknown<std::vector<std::vector<int>>>("physical_package_id not readable for some CPUs");
+            f.packageCpus = unknown<std::vector<std::vector<int>>>("physical_package_id not readable for some CPUs");
         }
     } else {
         f.cpus = unknown<std::vector<LogicalCpu>>(topoWhy);
         f.physicalCores = unknown<int>(topoWhy);
         f.smtWays = unknown<int>(topoWhy);
         f.onePerCore = unknown<std::vector<int>>(topoWhy);
-        f.coreSiblings = unknown<std::vector<std::vector<int>>>(topoWhy);
+        f.smtGroups = unknown<std::vector<std::vector<int>>>(topoWhy);
+        f.packageCpus = unknown<std::vector<std::vector<int>>>(topoWhy);
     }
 
     // ---- caches: per level size, instance count, and the L3 sharing groups ----
@@ -848,7 +856,8 @@ inline void sBytes(std::string& o, const std::uint64_t& b) {
             JsonObject topo(cpu, "topology");
             topo.fact("cpus", f.cpus);
             topo.fact("onePerCore", f.onePerCore);
-            topo.fact("coreSiblings", f.coreSiblings);
+            topo.fact("smtGroups", f.smtGroups);
+            topo.fact("packageCpus", f.packageCpus);
             topo.fact("l3Groups", f.l3Groups);
         }
         facts.key("caches");
@@ -908,7 +917,9 @@ inline void sBytes(std::string& o, const std::uint64_t& b) {
     putFact(o, f.physicalCores, sInt);
     o += " physical cores, SMT ";
     putFact(o, f.smtWays, sInt);
-    o += " way\n";
+    o += " way, ";
+    if (f.packageCpus.value) o += std::to_string(f.packageCpus.value->size()) + " package(s)\n";
+    else o += "packages unknown\n";
 
     label("L3 groups");
     if (!f.l3Groups.value) {

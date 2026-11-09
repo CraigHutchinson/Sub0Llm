@@ -135,9 +135,18 @@ TEST_CASE("machine_facts: a 2-CCD SMT2 machine reports topology, L3 groups, cach
     REQUIRE(m.onePerCore.value.has_value());
     CHECK(*m.onePerCore.value == range(0, 15));
 
-    REQUIRE(m.coreSiblings.value.has_value());
-    REQUIRE(m.coreSiblings.value->size() == 1);
-    CHECK((*m.coreSiblings.value)[0] == range(0, 31));
+    // SMT pairs: one group per physical core, holding that core's two logical CPUs.
+    REQUIRE(m.smtGroups.value.has_value());
+    REQUIRE(m.smtGroups.value->size() == 16);
+    for (int core = 0; core < 16; ++core) {
+        const std::vector<int> pair = {core, core + 16};
+        CHECK((*m.smtGroups.value)[static_cast<std::size_t>(core)] == pair);
+    }
+
+    // Packages: this fabricated machine has one package, so one group holding every CPU.
+    REQUIRE(m.packageCpus.value.has_value());
+    REQUIRE(m.packageCpus.value->size() == 1);
+    CHECK((*m.packageCpus.value)[0] == range(0, 31));
 
     REQUIRE(m.l3Groups.value.has_value());
     REQUIRE(m.l3Groups.value->size() == 2);
@@ -191,6 +200,7 @@ TEST_CASE("machine_facts: a 2-CCD SMT2 machine reports topology, L3 groups, cach
     const std::string summary = toSummary(m);
     CHECK(summary.find("32 logical CPUs, 16 physical cores, SMT 2 way") != std::string::npos);
     CHECK(summary.find("2 (each group shares one L3)") != std::string::npos);
+    CHECK(summary.find("SMT 2 way, 1 package(s)") != std::string::npos);
 }
 
 TEST_CASE("machine_facts: an empty or absent root reads without throwing and reports unknowns",
@@ -203,6 +213,8 @@ TEST_CASE("machine_facts: an empty or absent root reads without throwing and rep
     CHECK_FALSE(empty.cpuModel.reason.empty());
     CHECK_FALSE(empty.physicalCores.value.has_value());
     CHECK_FALSE(empty.l3Groups.value.has_value());
+    CHECK_FALSE(empty.smtGroups.value.has_value());
+    CHECK_FALSE(empty.packageCpus.value.has_value());
     CHECK_FALSE(empty.memTotalBytes.value.has_value());
     CHECK_FALSE(empty.gpus.value.has_value());
     CHECK_FALSE(empty.memoryInstalledBytes.value.has_value());
@@ -228,6 +240,9 @@ TEST_CASE("machine_facts: toJson is schema-tagged, escaped and byte-identical ac
 
     CHECK(a.rfind("{\"schema\":\"sub0llm-machine-1\",\"facts\":{", 0) == 0);
     CHECK(a.find("\"physicalCores\":{\"value\":16,\"reason\":\"\"}") != std::string::npos);
+    CHECK(a.find("\"smtGroups\":{\"value\":[[0,16],[1,17]") != std::string::npos);
+    CHECK(a.find("\"packageCpus\":{\"value\":[[0,1,") != std::string::npos);
+    CHECK(a.find("coreSiblings") == std::string::npos);
     CHECK(a.find("\"memoryInstalledBytes\"") == std::string::npos);   // key is "installedBytes"
     CHECK(a.find("\"installedBytes\":{\"value\":null,\"reason\":\"needs root") != std::string::npos);
     CHECK(a.find("Test \\\"CPU\\\" 9999X2 16-Core") != std::string::npos);   // quotes are escaped
