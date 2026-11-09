@@ -18,3 +18,14 @@ Older documents stay as history and are superseded where these differ: `docs/QUA
 
 Maintenance: docs own design and evidence, tickets own status and discussion (#22). When a package lands, update its
 section here (status line) and the plan's table; do not duplicate status in both places.
+
+## Names used in these documents
+
+| Name | What it is |
+|---|---|
+| `sub0llm-dense-token` | the mapped single-sequence Qwen 27B proving-ground decoder: embedding, 64 layers, final norm and LM head, persistent GDN state and K/V, greedy continuation, tokenizer and chat template (`tools/sub0llm-dense-token.cpp` + `tools/dense_qwen_support.hpp`). This is what "batching in the tool" meant. Often shortened to "dense-token". |
+| `sub0llm-prefill-prover` | the preliminary #74 prover: serial versus batched projection on the largest real tensor of each quant type; no model, no tokenizer (`tools/sub0llm-prefill-prover.cpp`) |
+| chat PoC | `scripts/qwen_chat_poc.py`, the bounded chat proving ground that drives `sub0llm-dense-token` |
+| `sub0llm-dense-layer`, `sub0llm-dense-probe` | layer-0 only decoder check, and a single mapped projection exerciser |
+| `sub0llm` / `sub0llm-gen` / `sub0llm-train` | the general engine and its stage executables (they do not yet load the mapped dense model) |
+| `sub0squad` | the separate agent worker framework project (working title), not part of Sub0Llm |

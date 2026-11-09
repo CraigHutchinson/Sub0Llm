@@ -54,5 +54,5 @@ estimate **3.08x**. The gain grows with the batch because the decode is amortise
 - IQ1_S: a row x token register micro-kernel (for example 4 rows x 4 tokens) so each activation load feeds several rows and the
   activation tile stays in L1; keep per-token order bit-identical. Re-measure alone and in combination (AGENTS section 13).
 - Generic path: the same token blocking; try AVX-512 (`__AVX512F__` is available; the code uses AVX2 only).
-- Integrate in the tool (`--prefill-chunk`): FFN and attention first, then the GDN `project_batch` hook, then the corpus gate before any default.
+- Integrate in `sub0llm-dense-token` (`--prefill-chunk`): FFN and attention first, then the GDN `project_batch` hook, then the corpus gate before any default.
 - Compare with and without PR #67's fused IQ2_XXS and PR #71's IQ1_S kernel once they land.
