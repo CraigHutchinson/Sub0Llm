@@ -15,6 +15,7 @@ Sub0Pipeline and Sub0Pub libraries. Legend: **[V]** verified in the repo or the 
 5. **Share resources** and schedule **collaboratively** (cores, memory, a model server, build caches, the exclusive
    measurement window).
 6. A start of an agentic worker framework that can be **split into a toolbox project** later, with Sub0Llm as an engine.
+   **Several engines and runtimes** are supported side by side: llama.cpp and our native Sub0Llm directly (section 8).
 7. The LLM engine must support **multiple concurrent users**, and the scheduler must **know the engine's concurrency cap**
    (section 5a).
 
@@ -197,16 +198,41 @@ flowchart TB
 - **Observability** reuses Sub0Pipeline's observer and Chrome-Trace capture for run timelines; status and tooling read the
   journal and the event stream.
 
-## 8. Engines and the Sub0Llm relationship [P]
+## 8. Engines and runtimes: llama.cpp and native Sub0Llm, side by side [P]
 
-- Inference is an **engine seam**: the existing JSON contract `optimization-request-1` to `optimization-inference-1`
-  (prompt-budget checks, schema-constrained output, token rates, RSS, teardown guarantee) becomes the engine interface.
-  Providers: llama.cpp server (today), Sub0Llm (when it supports the context and structured output the work items need; the
-  present mapped 128-position chat PoC cannot, and must refuse instead of silently truncating), others later.
-- Engines are **leased shared services** (section 5), so several sub-tasks share one warm server, and a matched set of work
-  items compares engines on latency, proposal quality and cost per accepted candidate (the harness doc's plan).
-- Sub0Llm is also a **consumer**: its own kernel-optimisation, qualification and measurement loops (#63, #68, #78) are
-  job kinds of the framework, so it uses the toolbox instead of growing its own copy.
+The framework supports **several engines and several ways of running each**; no job names an engine, it states what it
+needs and the scheduler picks one that can serve it.
+
+| Runtime kind | How it is reached | Examples | Notes |
+|---|---|---|---|
+| External server | HTTP or stdio to a separately started process | llama.cpp `llama-server` (today) | isolation, easy teardown; the harness's current path |
+| Spawned process | the framework starts and owns a child, speaks a framed protocol | `sub0llm` engine binary | same contract as above without a network server |
+| **In-process library** | linked into a worker host; calls are function calls | **native Sub0Llm directly**, and `libllama` where wanted | no copy or IPC, mapped weights shared through the page cache across workers, cores and memory accounted by the arbiter |
+
+**One engine seam** for all three (`IEngine`): `capabilities()`, `open(session)`, `generate(request, stream)`,
+`cancel`, `close`, plus the capability events of section 5a. The request/response schema is the existing
+`optimization-request-1` / `optimization-inference-1` contract (prompt-budget check before generation, schema-constrained
+output, token rates, usage, peak RSS, teardown guarantee), so adapters for llama.cpp and Sub0Llm are interchangeable and a
+work item can be replayed against both.
+
+**Capabilities decide routing, and refusal is the default.** `EngineCaps` (section 5a) also lists what the engine can do:
+maximum context per sequence, **structured or grammar-constrained output**, supported model formats and quant tiers,
+sampling controls, streaming, batching mode and measured throughput. A request that exceeds an engine's capabilities is
+refused with a reason, never truncated or silently degraded. This matters today: the Sub0Llm chat proving ground is a mapped
+128-position backend and has no schema-constrained output, so it cannot serve the harness work items yet [V: harness doc];
+llama.cpp can. Routing policy is explicit and recorded: pinned engine (a work item may require one), cheapest capable,
+fastest capable, or matched A/B (the same item to both engines under the same seed and budget to compare latency, proposal
+quality and cost per accepted candidate).
+
+**Engines are leased services** (section 5): the arbiter owns their slots, cores and memory; a warm instance is shared by
+many jobs under reference counts and an idle timeout; an in-process Sub0Llm engine is one more lease holder inside the
+worker host that loaded it. Failure handling is uniform: an engine that dies or breaches its RSS limit fails its leases,
+and the job's retry policy decides, so a llama.cpp outage can fall back to Sub0Llm for items it is capable of serving, and
+the reverse.
+
+Sub0Llm is also a **consumer**: its own kernel-optimisation, qualification and measurement loops (#63, #68, #78) run as job
+kinds, so it uses the toolbox instead of growing a copy. Bringing Sub0Llm up as an engine needs the concurrency work in
+section 5a (#90), structured-output support, and context beyond the proving ground's 128 positions.
 
 ## 9. Native, and what that buys [P]
 
@@ -225,7 +251,7 @@ CPU effectively zero, journal append without per-event fsync storms.
 | M2 | arbiter: core sets, memory budget, exclusive measurement lease, scoped release; journal and replay | two jobs cannot overlap the window; crash releases leases |
 | M3 | Sub0Pub event stream, progress snapshots, Chrome-Trace timeline | status without parsing logs |
 | M4 | planner and fan-out/fan-in: first splitter = one sub-task per quant format (#34-#41) with disjoint files | integrator re-runs gates once; no overlapping edits |
-| M5 | engine seam with `EngineCaps` and slot leasing on a shared llama.cpp server (slots > 1); then a Sub0Llm provider with concurrent sequences | scheduler never exceeds the advertised cap; same item, two engines, comparable evidence |
+| M5 | `IEngine` seam with `EngineCaps`, capability-based routing and slot leasing: llama.cpp server (slots > 1) first, then native Sub0Llm as a spawned process and as an in-process library with concurrent sequences | scheduler never exceeds the advertised cap; an over-capability request is refused with a reason; the same item runs on both engines with comparable evidence |
 | M6 | split into the toolbox repo; Sub0Llm consumes it as a dependency | Sub0Llm builds and runs its loops from the toolbox |
 
 Port Python pieces to native only when stable and hot (the evaluator and arbiter first); never maintain both.
