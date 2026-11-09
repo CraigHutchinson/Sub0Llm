@@ -1,0 +1,89 @@
+{
+  "schema": "optimization-item-1",
+  "id": "iq1s-dependency",
+  "issue": "https://github.com/CraigHutchinson/Sub0Llm/issues/70",
+  "goal": "Reduce native IQ1_S float dot latency at width 5120, one falsifiable small mechanism per attempt.",
+  "constraints": [
+    "Keep packed weight decoding and float activations unchanged. No per-call heap allocation.",
+    "Only edit the native dot core; keep scalar fallback, public interface, tests and tolerances unchanged.",
+    "Kernel-only experiment; full-model quality, memory and speed gates plus C++ review are required before model promotion."
+  ],
+  "qualification_scope": "kernel-only",
+  "editable_files": [
+    "include/sub0/quant/iq1_s.hpp"
+  ],
+  "context": [
+    {
+      "path": "include/sub0/quant/iq1_s.hpp",
+      "start_marker": "    // Internal row core:",
+      "end_marker": "static_assert(FormatModule<IQ1S>);"
+    }
+  ],
+  "max_context_chars": 7000,
+  "max_attempts": 6,
+  "stagnation_window": 2,
+  "max_recoveries": 3,
+  "wall_seconds": 3600,
+  "inference_timeout": 600,
+  "seed": 42,
+  "hints": [
+    "Try two independent __m256 accumulators, selected by l&1, then combine both once before the final lane reduction. Use only three small exact edits: declaration, update and final reduction. Retain generic compilation and scalar behavior.",
+    "Avoid merely hoisting broadcasts already hoisted by -O3. Seek a distinct mechanism and use compiler/test feedback."
+  ],
+  "provider_command": [
+    "/usr/bin/python3",
+    "{root}/scripts/optimization/llama_provider.py",
+    "--config",
+    "perf/optimization/llama-cpu.json"
+  ],
+  "identity_files": [
+    "scripts/optimization/iterate.py",
+    "scripts/optimization/llama_provider.py",
+    "scripts/optimization/evaluate_kernel.py",
+    "perf/optimization/llama-cpu.json",
+    "/usr/bin/clang++",
+    "/usr/bin/python3"
+  ],
+  "evaluation": {
+    "command": [
+      "/usr/bin/python3",
+      "{root}/scripts/optimization/evaluate_kernel.py",
+      "--baseline",
+      "{baseline}",
+      "--candidate",
+      "{candidate}",
+      "--result",
+      "{result}",
+      "--compiler",
+      "/usr/bin/clang++",
+      "--benchmark",
+      "IQ1_S 32x5120, fused native",
+      "--editable",
+      "include/sub0/quant/iq1_s.hpp",
+      "--rounds",
+      "5",
+      "--min-gain",
+      "0.02"
+    ],
+    "timeout": 600
+  },
+  "max_edits": 3,
+  "max_edit_chars": 600,
+  "seed_edits": [
+    {
+      "path": "include/sub0/quant/iq1_s.hpp",
+      "old": "__m256 accum=_mm256_setzero_ps();",
+      "new": "__m256 accum0=_mm256_setzero_ps(),accum1=_mm256_setzero_ps();"
+    },
+    {
+      "path": "include/sub0/quant/iq1_s.hpp",
+      "old": "accum=_mm256_add_ps(accum,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));",
+      "new": "if(l&1) accum1=_mm256_add_ps(accum1,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));\n                        else accum0=_mm256_add_ps(accum0,_mm256_mul_ps(_mm256_loadu_ps(x+at),w));"
+    },
+    {
+      "path": "include/sub0/quant/iq1_s.hpp",
+      "old": "_mm256_store_ps(lanes,accum);",
+      "new": "_mm256_store_ps(lanes,_mm256_add_ps(accum0,accum1));"
+    }
+  ]
+}

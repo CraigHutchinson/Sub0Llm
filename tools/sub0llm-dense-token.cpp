@@ -133,6 +133,14 @@ int main(int argc,char** argv) try {
         if(sub0::GDN_SCHEDULE.full_attn[l]){c.k.resize(static_cast<std::size_t>(SEQ_LEN)*sub0::D_KV);c.v.resize(c.k.size());}
         else {c.state.resize(sub0::gdn::state_floats(sub0::GDN_DIMS));c.history.resize(sub0::gdn::conv_hist_floats(sub0::GDN_DIMS));}
     }
+    std::vector<Layer> layers;
+    layers.reserve(N_LAYERS);
+    for(int l=0;l<N_LAYERS;++l)
+        layers.emplace_back(reader,l,projection_threads,profiler,iq1_kernel);
+    const auto output_norm=initial.load("output_norm.weight",D_MODEL);
+    const auto* output_tensor=reader.find_tensor("output.weight");
+    if(!output_tensor)throw std::runtime_error("missing output.weight");
+    std::vector<float> logits(VOCAB);
     if(measure){metrics.reserve(prompt_size,generate);metrics.setup_ms=sub0::phase::milliseconds(setup_begin);}
     for(position=0;position<tokens.size();++position) {
     projection_profile.decoding=position>=prompt_size;
@@ -141,59 +149,62 @@ int main(int argc,char** argv) try {
     if(!decode(bytes.subspan(static_cast<std::size_t>(token)*row_bytes,row_bytes),D_MODEL,h))throw std::runtime_error("embedding decode");
     const auto& d=sub0::GDN_DIMS;
     for(int l=0;l<N_LAYERS;++l){
-        Layer layer(reader,l,projection_threads,profiler,iq1_kernel);norm(h,layer.load("blk.0.attn_norm.weight",D_MODEL),a);
+        auto& layer=layers[l];norm(h,layer.attn_norm_weights,a);
         if(sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
-            std::vector<float> qg(2*sub0::D_Q),q(sub0::D_Q),k(sub0::D_KV),v(sub0::D_KV),att(sub0::D_Q);
-            if(!layer.project(layer.find("blk.0.attn_q.weight"),a.data(),D_MODEL,qg.data(),2*sub0::D_Q)||!layer.project(layer.find("blk.0.attn_k.weight"),a.data(),D_MODEL,k.data(),sub0::D_KV)||!layer.project(layer.find("blk.0.attn_v.weight"),a.data(),D_MODEL,v.data(),sub0::D_KV))throw std::runtime_error("full attention projection");
-            for(int hd=0;hd<N_HEADS;++hd)for(int j=0;j<D_HEAD;++j)q[hd*D_HEAD+j]=qg[hd*2*D_HEAD+j];
+            if(!layer.project(layer.t_attn_q,a.data(),D_MODEL,layer.qg.data(),2*sub0::D_Q)||
+               !layer.project(layer.t_attn_k,a.data(),D_MODEL,layer.k.data(),sub0::D_KV)||
+               !layer.project(layer.t_attn_v,a.data(),D_MODEL,layer.v.data(),sub0::D_KV))
+                throw std::runtime_error("full attention projection");
+            for(int hd=0;hd<N_HEADS;++hd)for(int j=0;j<D_HEAD;++j)layer.q[hd*D_HEAD+j]=layer.qg[hd*2*D_HEAD+j];
             auto normalize_rope=[&](std::vector<float>& values,int heads,const std::vector<float>& gain){
                 for(int hd=0;hd<heads;++hd){float ms=0;for(int j=0;j<D_HEAD;++j)ms+=values[hd*D_HEAD+j]*values[hd*D_HEAD+j];
                     float inv=1.f/std::sqrt(ms/D_HEAD+1e-6f);for(int j=0;j<D_HEAD;++j)values[hd*D_HEAD+j]*=gain[j]*inv;
                     for(int j=0;j<sub0::ROTARY_HALF;++j){float angle=static_cast<float>(position)*std::pow(ROPE_THETA,-2.f*j/ROTARY_DIM);float cs=std::cos(angle),sn=std::sin(angle);int i=hd*D_HEAD+j;float x=values[i],y=values[i+sub0::ROTARY_HALF];values[i]=x*cs-y*sn;values[i+sub0::ROTARY_HALF]=x*sn+y*cs;}
                 }
             };
-            normalize_rope(q,N_HEADS,layer.load("blk.0.attn_q_norm.weight",D_HEAD));normalize_rope(k,N_KV_HEADS,layer.load("blk.0.attn_k_norm.weight",D_HEAD));
-            auto& c=caches[l];std::copy(k.begin(),k.end(),c.k.begin()+position*sub0::D_KV);std::copy(v.begin(),v.end(),c.v.begin()+position*sub0::D_KV);
-            std::vector<float> scores(position+1);
+            normalize_rope(layer.q,N_HEADS,layer.attn_q_norm_weights);normalize_rope(layer.k,N_KV_HEADS,layer.attn_k_norm_weights);
+            auto& c=caches[l];std::copy(layer.k.begin(),layer.k.end(),c.k.begin()+position*sub0::D_KV);std::copy(layer.v.begin(),layer.v.end(),c.v.begin()+position*sub0::D_KV);
             for(int hd=0;hd<N_HEADS;++hd){const int kv=hd/sub0::GQA_GROUP;float mx=-INFINITY;
-                for(std::size_t t=0;t<=position;++t){float dot=0;for(int j=0;j<D_HEAD;++j)dot+=q[hd*D_HEAD+j]*c.k[t*sub0::D_KV+kv*D_HEAD+j];scores[t]=dot/std::sqrt(static_cast<float>(D_HEAD));mx=std::max(mx,scores[t]);}
-                float sum=0;for(float& score:scores){score=std::exp(score-mx);sum+=score;}
-                for(int j=0;j<D_HEAD;++j){float value=0;for(std::size_t t=0;t<=position;++t)value+=scores[t]/sum*c.v[t*sub0::D_KV+kv*D_HEAD+j];float x=qg[hd*2*D_HEAD+D_HEAD+j];float sig=x>=0?1.f/(1.f+std::exp(-x)):std::exp(x)/(1.f+std::exp(x));att[hd*D_HEAD+j]=value*sig;}
+                for(std::size_t t=0;t<=position;++t){float dot=0;for(int j=0;j<D_HEAD;++j)dot+=layer.q[hd*D_HEAD+j]*c.k[t*sub0::D_KV+kv*D_HEAD+j];layer.scores[t]=dot/std::sqrt(static_cast<float>(D_HEAD));mx=std::max(mx,layer.scores[t]);}
+                float sum=0;for(std::size_t t=0;t<=position;++t){layer.scores[t]=std::exp(layer.scores[t]-mx);sum+=layer.scores[t];}
+                for(int j=0;j<D_HEAD;++j){float value=0;for(std::size_t t=0;t<=position;++t)value+=layer.scores[t]/sum*c.v[t*sub0::D_KV+kv*D_HEAD+j];float x=layer.qg[hd*2*D_HEAD+D_HEAD+j];float sig=x>=0?1.f/(1.f+std::exp(-x)):std::exp(x)/(1.f+std::exp(x));layer.att[hd*D_HEAD+j]=value*sig;}
             }
-            if(!layer.project(layer.find("blk.0.attn_output.weight"),att.data(),sub0::D_Q,mixer.data(),D_MODEL))throw std::runtime_error("attention output");
+            if(!layer.project(layer.t_attn_output,layer.att.data(),sub0::D_Q,mixer.data(),D_MODEL))throw std::runtime_error("attention output");
         } else {
-            auto cr=layer.load("blk.0.ssm_conv1d.weight",sub0::GDN_CONV_DIM*sub0::GDN_CONV_KERNEL),conv=cr;
-            for(int c=0;c<sub0::GDN_CONV_DIM;++c)for(int k=0;k<sub0::GDN_CONV_KERNEL;++k)conv[c*sub0::GDN_CONV_KERNEL+k]=cr[layer.qkv_rows[c]*sub0::GDN_CONV_KERNEL+k];
-            auto dr=layer.load("blk.0.ssm_dt.bias",sub0::GDN_V_HEADS),ar=layer.load("blk.0.ssm_a",sub0::GDN_V_HEADS),dt=dr,alog=ar;
-            for(int i=0;i<sub0::GDN_V_HEADS;++i){dt[i]=dr[layer.head_rows[i]];float raw=ar[layer.head_rows[i]];if(raw>=0)throw std::runtime_error("ssm_a sign");alog[i]=std::log(-raw);}
-            const auto gain=layer.load("blk.0.ssm_norm.weight",sub0::GDN_V_HEAD_DIM);
-            std::vector<float> scratch(sub0::gdn::scratch_floats(d,1));
             auto& state=caches[l].state;auto& history=caches[l].history;
             sub0::gdn::Native native{};native.project=&Layer::callback;native.project_context=&layer;const float* np=nullptr;
-            sub0::gdn::forward<false,1,const float*>(d,1,a.data(),np,np,np,np,conv.data(),dt.data(),alog.data(),gain.data(),np,state.data(),history.data(),mixer.data(),scratch.data(),&native);
+            sub0::gdn::forward<false,1,const float*>(d,1,a.data(),np,np,np,np,layer.conv_weights.data(),layer.dt_weights.data(),layer.alog_weights.data(),layer.ssm_gain_weights.data(),np,state.data(),history.data(),mixer.data(),layer.gdn_scratch.data(),&native);
         }
         for(int i=0;i<D_MODEL;++i)h[i]+=mixer[i];
-        norm(h,layer.load("blk.0.post_attention_norm.weight",D_MODEL),a);
-        if(!layer.project(layer.find("blk.0.ffn_gate.weight"),a.data(),D_MODEL,gate.data(),D_FF)||!layer.project(layer.find("blk.0.ffn_up.weight"),a.data(),D_MODEL,up.data(),D_FF))throw std::runtime_error("FFN projections");
+        norm(h,layer.post_attention_norm_weights,a);
+        if(!layer.project(layer.t_ffn_gate,a.data(),D_MODEL,gate.data(),D_FF)||!layer.project(layer.t_ffn_up,a.data(),D_MODEL,up.data(),D_FF))throw std::runtime_error("FFN projections");
         for(int i=0;i<D_FF;++i){float x=gate[i];float s=x>=0?1.f/(1.f+std::exp(-x)):std::exp(x)/(1.f+std::exp(x));up[i]*=x*s;}
-        if(!layer.project(layer.find("blk.0.ffn_down.weight"),up.data(),D_FF,down.data(),D_MODEL))throw std::runtime_error("FFN down");
+        if(!layer.project(layer.t_ffn_down,up.data(),D_FF,down.data(),D_MODEL))throw std::runtime_error("FFN down");
         for(int i=0;i<D_MODEL;++i){h[i]+=down[i];if(!std::isfinite(h[i]))throw std::runtime_error("nonfinite hidden");}
         dump(".layer"+std::to_string(l),h);if(!quiet)std::fprintf(stderr,"layer %d/%d complete\n",l+1,N_LAYERS);
     }
-    norm(h,initial.load("output_norm.weight",D_MODEL),a);dump(".norm",a);
-    std::vector<float> logits(VOCAB);
-    if(!initial.project(reader.find_tensor("output.weight"),a.data(),D_MODEL,logits.data(),VOCAB))throw std::runtime_error("LM head");
-    for(float v:logits)if(!std::isfinite(v))throw std::runtime_error("nonfinite logits");
-    dump(".logits",logits);const auto best=std::max_element(logits.begin(),logits.end());
-    if(measure){(position<prompt_size?metrics.prefill_ms:metrics.decode_ms).push_back(sub0::phase::milliseconds(token_begin));metrics.top_ids.push_back(static_cast<int>(best-logits.begin()));}
-    if(!quiet)std::printf("mapped sequence inference: position=%zu input=%d layers=%d logits=%zu top_token=%zu top_logit=%.9g; raw token interface\n",position,token,N_LAYERS,logits.size(),static_cast<std::size_t>(best-logits.begin()),*best);
-    if(scoring){scores.add(logits,targets[position]);if((position+1)%16==0)std::fprintf(stderr,"scored %zu/%zu\n",position+1,prompt_size);}
-    if(text_mode && position+1>=prompt_size) {
-        const int next=static_cast<int>(best-logits.begin());
-        if(next==tokenizer.eos_id()) {stopped_eos=true;std::printf("text stop: EOS\n");break;}
-        generated.push_back(next);std::printf("text continuation: %s\n",tokenizer.decode(generated).c_str());std::fflush(stdout);
+    const bool need_logits=scoring||logits_only||(dump_prefix!="-")||(position>=prompt_size-1);
+    if(need_logits){
+        norm(h,output_norm,a);dump(".norm",a);
+        if(!initial.project(output_tensor,a.data(),D_MODEL,logits.data(),VOCAB))throw std::runtime_error("LM head");
+        for(float v:logits)if(!std::isfinite(v))throw std::runtime_error("nonfinite logits");
+        dump(".logits",logits);const auto best=std::max_element(logits.begin(),logits.end());
+        if(measure){(position<prompt_size?metrics.prefill_ms:metrics.decode_ms).push_back(sub0::phase::milliseconds(token_begin));metrics.top_ids.push_back(static_cast<int>(best-logits.begin()));}
+        if(!quiet)std::printf("mapped sequence inference: position=%zu input=%d layers=%d logits=%zu top_token=%zu top_logit=%.9g; raw token interface\n",position,token,N_LAYERS,logits.size(),static_cast<std::size_t>(best-logits.begin()),*best);
+        if(scoring){scores.add(logits,targets[position]);if((position+1)%16==0)std::fprintf(stderr,"scored %zu/%zu\n",position+1,prompt_size);}
+        if(text_mode && position+1>=prompt_size) {
+            const int next=static_cast<int>(best-logits.begin());
+            if(next==tokenizer.eos_id()) {stopped_eos=true;std::printf("text stop: EOS\n");break;}
+            generated.push_back(next);std::printf("text continuation: %s\n",tokenizer.decode(generated).c_str());std::fflush(stdout);
+        }
+        if(position+1==tokens.size() && tokens.size()<prompt_size+static_cast<std::size_t>(generate))tokens.push_back(static_cast<int>(best-logits.begin()));
+    } else {
+        if(measure){
+            metrics.prefill_ms.push_back(sub0::phase::milliseconds(token_begin));
+            metrics.top_ids.push_back(0);
+        }
+        if(!quiet)std::printf("mapped sequence prefill: position=%zu input=%d layers=%d (LM head elided)\n",position,token,N_LAYERS);
     }
-    if(position+1==tokens.size() && tokens.size()<prompt_size+static_cast<std::size_t>(generate))tokens.push_back(static_cast<int>(best-logits.begin()));
     }
     if(scoring)scores.write(score_file,tokens,targets);
     if(measure)metrics.write(timings_file,projection_threads,SEQ_LEN,false,true);

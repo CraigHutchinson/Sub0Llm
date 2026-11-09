@@ -13,6 +13,23 @@ cache. Its frozen protocol/fixture/reference/scalar baseline are unchanged; the 
 selected by performance. Preserve the original `qwen-qual` manifest and all artifacts. No default/live
 promotion yet. Next measured projection costs: IQ1_S 28.59%, IQ1_M 18.50%, Q3_K 16.42%.
 
+## Focused Qwen optimization harness — 2026-11-08
+
+[Harness design and commands](performance/QWEN_OPTIMIZATION_HARNESS.md), #68: clean pinned llama.cpp,
+managed 4k-context inference, measured 8 decode / 16 batch core profile, isolated work-item experiments,
+trusted paired performance/correctness/RSS gates, duplicate/no-op/truncation detection and bounded
+hint recovery. `perf/optimization/iq1s-focused.json` is the example. Use `--base BEST_COMMIT` to continue
+from a prior local experiment while preserving the root checkout. Kernel-only acceptance needs separate
+full-model qualification before promotion. Live tests detected a true stall, continued with compact
+expert hints, preserved a 13.6% kernel latency improvement for review, and rejected a subsequent no-op.
+The generated kernel is a separate increment; it is not part of the harness/main production code.
+
+The #63/#66 fused-candidate corpus capture was stopped at the verified literature-1 boundary for this
+user-requested harness work. Its artifacts and cache are preserved; resume the existing
+`out/build/qwen-iq2/run-manifest.json` after publishing, without altering fixture/protocol or gates.
+Draft PR #67 remains pending full corpus/default qualification. Do not overlap capture with inference,
+compilation or performance measurements; inspect the live shared lock and active work log first.
+
 ## Dense 27B all-format candidate — 2026-11-07
 
 [Float reduction iteration](performance/FLOAT_REDUCTION_ITERATION.md), #62: 1.269 prompt /
