@@ -538,11 +538,12 @@ set_target_properties(sub0llm-qwen4-forward PROPERTIES BUILD_RPATH "$ORIGIN" INS
 add_executable(sub0llm-bench-moeqd tools/sub0llm-bench-moeqd.cpp)
 target_include_directories(sub0llm-bench-moeqd PRIVATE "${CMAKE_SOURCE_DIR}/include")
 
-# --- machine hardware facts and memory roofs (issue #78, increments 1-2) ----
-# Header-only against include/sub0/measure/{machine_facts,memory_roofs}.hpp: standard library only, no engine, no
-# generated config. `sub0llm-machine --facts` prints the facts; `--roofs mem` also measures the memory roofs
-# inside a time budget. The roofs need the AVX-512 read path, so this target (and only this target) is built
-# for the host with -march=native, as SUB0_NATIVE does for the engine.
+# --- machine hardware facts, memory and compute roofs (issue #78, increments 1-3) ----
+# Header-only against include/sub0/measure/{machine_facts,memory_roofs,compute_roofs,ceilings}.hpp: standard library
+# only, no engine, no generated config. `sub0llm-machine --facts` prints the facts; `--roofs mem|compute|all` also
+# measures the chosen roof sets inside a time budget. The roofs need the host's ISA (AVX-512 read path, VNNI and BF16
+# kernels), so this target (and only this target) is built for the host with -march=native, as SUB0_NATIVE does for
+# the engine.
 find_package(Threads REQUIRED)
 add_executable(sub0llm-machine tools/sub0llm-machine.cpp)
 target_include_directories(sub0llm-machine PRIVATE "${CMAKE_SOURCE_DIR}/include")
