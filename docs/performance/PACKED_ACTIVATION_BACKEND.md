@@ -92,3 +92,14 @@ Neutral engine remains 44,292,784 assertions/147 cases with unchanged three fing
 remains 220,980/327. Generic and native tooling suites pass 11/11. Both precisions pass generic,
 AVX2 and native checks; ASan/UBSan cover move ownership, allocation and concurrent session cases.
 No numerical tolerance was relaxed. Code reviewed against cpp-review before publication.
+
+## Publication-gate repair and mount relocation
+
+The pre-push gate reproduced a roughly 9% regression in existing Q8_0 float projections after
+extending their shared selector. Precision selection now lives solely in the proving-ground
+adapter; `dense_quant.hpp` is byte-identical to the pre-increment main version. Five calibrated
+[recovery rounds](packed_activation_evidence/float-path-recovery.json) measure Q8_0 32x256 at
+4.28 us and 32x5120 at 91.33 us, within the prior performance envelope. Baselines were not relaxed.
+
+The development volume is now permanently `/mnt/development`. Active hook/build paths are
+regenerated there; older dated evidence retains its original file identities and paths.
