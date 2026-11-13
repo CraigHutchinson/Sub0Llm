@@ -1049,9 +1049,9 @@ int main(int argc, char** argv) {
                    "importing open weights of that shape (CPU and GPU)")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--dense-projection-kernel", dense_projection_kernel,
-                   "Mapped dense projection default: auto, baseline, scalar, native or native-all")
-       ->transform(CLI::CheckedTransformer(std::map<std::string,int>{{"auto",-1},{"baseline",0},{"scalar",1},{"native",2},{"native-all",3}},CLI::ignore_case))
-       ->check(CLI::Range(-1,3))->default_str("auto");
+                   "Mapped dense projection default: auto, baseline, scalar, native, native-all or fused-iq2")
+       ->transform(CLI::CheckedTransformer(std::map<std::string,int>{{"auto",-1},{"baseline",0},{"scalar",1},{"native",2},{"native-all",3},{"fused-iq2",4}},CLI::ignore_case))
+       ->check(CLI::Range(-1,4))->default_str("auto");
     app.add_option("--attention-gate", attention_gate,
                    "1 = Qwen full-attention query projection includes a separate sigmoid output gate")
        ->capture_default_str()->check(CLI::Range(0, 1));

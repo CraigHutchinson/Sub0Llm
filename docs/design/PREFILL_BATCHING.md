@@ -50,7 +50,7 @@ flowchart TB
    serial kernel, so results are bit-identical per token to `denseq::project` [P]. Output layout `Y[token][row]`; the
    existing row-split OpenMP workers each own a row range for all tokens, so there are no write conflicts. Generic
    T1 version first, correct for every format; per-format `dot_rows_batch` for IQ1_S and IQ2_XXS next, in measured-cost order.
-2. **FFN and attention in the tool** (`tools/sub0llm-dense-token.cpp`, `tools/dense_qwen_support.hpp`). Today
+2. **FFN and attention in `sub0llm-dense-token`** (`tools/sub0llm-dense-token.cpp`, `tools/dense_qwen_support.hpp`). Today
    `Layer::project(t, x, in, y, out)` is single-vector; add `project_batch` with the same profile accounting. Attention
    scores/softmax stay per token (small next to the weight stream); K/V append happens for all C tokens before the
    per-token causal read, in position order.
@@ -87,7 +87,7 @@ flowchart TB
 ## 5. Order of work
 
 1. `project_batch` generic + equivalence tests (no tool change).
-2. FFN and attention batching in the tool behind `--prefill-chunk` (GDN layers still serial per token) and measure: this
+2. FFN and attention batching in `sub0llm-dense-token` behind `--prefill-chunk` (GDN layers still serial per token) and measure: this
    isolates how much of the model batches without touching `gdn::forward`.
 3. GDN `project_batch` hook and its consumers audit.
 4. Per-format batch kernels, IQ1_S and IQ2_XXS first.

@@ -1,5 +1,7 @@
 # Measurement platform: `sub0llm machine`, provenance, the kernel registry
 
+> Placement and the wider family (machine, fit, bench, verify, and the machine-wide measurement lock) are in [MEASURE_SELECT_VERIFY.md](MEASURE_SELECT_VERIFY.md); where the two differ, that document wins.
+
 Status: DESIGN. Tracking: #78 (machine test), #79 (inventory and migration), #80 (provenance), #81 (kernel tracking),
 #75 (GPU decision experiment). Legend: **[V]** verified in the repo, **[P]** proposed, **[U]** unknown.
 

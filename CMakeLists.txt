@@ -338,6 +338,9 @@ target_include_directories(sub0llm-dense-layer PRIVATE "${CMAKE_SOURCE_DIR}/incl
 add_executable(sub0llm-dense-token EXCLUDE_FROM_ALL tools/sub0llm-dense-token.cpp)
 target_link_libraries(sub0llm-dense-token PRIVATE sub0llm_frontend CLI11::CLI11 ${SUB0_OPENMP_TARGET})
 target_include_directories(sub0llm-dense-token PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+add_executable(sub0llm-prefill-prover EXCLUDE_FROM_ALL tools/sub0llm-prefill-prover.cpp)
+target_link_libraries(sub0llm-prefill-prover PRIVATE CLI11::CLI11 ${SUB0_OPENMP_TARGET})
+target_include_directories(sub0llm-prefill-prover PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sub0llm-model-probe PRIVATE sub0llm_core)
 target_include_directories(sub0llm_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0llm_frontend used by the
@@ -537,6 +540,20 @@ set_target_properties(sub0llm-qwen4-forward PROPERTIES BUILD_RPATH "$ORIGIN" INS
 # (docs/OPTIMIZATION_PROCESS.md S4); the real-artifact decode stays the final gate.
 add_executable(sub0llm-bench-moeqd tools/sub0llm-bench-moeqd.cpp)
 target_include_directories(sub0llm-bench-moeqd PRIVATE "${CMAKE_SOURCE_DIR}/include")
+
+# --- machine hardware facts, memory and compute roofs (issue #78, increments 1-3) ----
+# Header-only against include/sub0/measure/{machine_facts,memory_roofs,compute_roofs,ceilings}.hpp: standard library
+# only, no engine, no generated config. `sub0llm-machine --facts` prints the facts; `--roofs mem|compute|all` also
+# measures the chosen roof sets inside a time budget. The roofs need the host's ISA (AVX-512 read path, VNNI and BF16
+# kernels), so this target (and only this target) is built for the host with -march=native, as SUB0_NATIVE does for
+# the engine.
+find_package(Threads REQUIRED)
+add_executable(sub0llm-machine tools/sub0llm-machine.cpp)
+target_include_directories(sub0llm-machine PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(sub0llm-machine PRIVATE Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(sub0llm-machine PRIVATE -march=native)
+endif()
 
 # --- kernel microbenchmark for the shared GEMV primitive (O2) --------------
 # Header-only against include/sub0/gemv.hpp; links OpenMP because the primitive's threaded path is what it

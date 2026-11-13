@@ -6,6 +6,15 @@ The frozen [v1 protocol](../../perf/quality/qwen27b-v1/PROTOCOL.md) preserves th
 teacher-forced targets across 32 full 128-position windows. Missing/inconclusive data cannot pass.
 The old MoE fixture is unavailable here and has a different tokenizer; its historical PPL is not reused.
 
+## Current candidate — 2026-11-08
+
+Draft PR #67 / #66 adds a faster fused IQ2_XXS candidate: [18% complete-model generation gain](IQ2XXS_ITERATION.md).
+It passes the first complete 128-position window bit for bit against prior native-all; actual chat state
+checks and full neutral suites pass. Continue qualification with `out/build/qwen-iq2/run-manifest.json`.
+The fixture/protocol, numerical/NLL limits, independent reference and scalar baseline are unchanged;
+reference cache records are reused. The original manifest/artifacts remain preserved. Candidate selection
+uses controlled speed, without adapting the quality contract. Full 4,096-target judgement is still pending.
+
 ## Foundation validation
 
 - Pinned independent llama.cpp and native tokenizers agree on all four complete source texts:

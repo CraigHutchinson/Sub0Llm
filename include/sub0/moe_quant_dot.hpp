@@ -344,38 +344,28 @@ struct Iq2XxsPlane {
     /// This format's `d` is shared by 8 consecutive 32-wide groups (one 256-element superblock) --
     /// group_cached()/group_v_cached() below exploit that via SuperCache; see its own comment.
     static constexpr bool kHasSuper = true;
-    static constexpr std::uint64_t kSuperElems = 256;
-    static constexpr std::uint64_t kBlockBytes = 66;
+    static constexpr std::uint64_t kSuperElems = quant::IQ2XXS::block.elems;
+    static constexpr std::uint64_t kBlockBytes = quant::IQ2XXS::block.bytes;
     const std::uint8_t* plane = nullptr;   // non-owning; the sidecar mapping outlives every resolve
 
     /// The group's bit fields: the ONE place this format's layout is read (see Iq1SPlane::Fields).
-    struct Fields {
-        std::uint16_t d_bits = 0;
-        std::uint32_t aux[2] = {0, 0};   ///< [0]: four grid-index bytes; [1]: scale nibble + 4 x 7-bit signs
-    };
-    [[nodiscard]] Fields fields(std::uint64_t p) const noexcept {
-        const std::uint8_t* blk = plane + (p / 256) * 66;
-        const int ib32 = static_cast<int>((p % 256) / 32);
-        Fields f;
-        std::memcpy(&f.d_bits, blk, sizeof f.d_bits);
-        std::memcpy(f.aux, blk + 2 + 8 * ib32, sizeof f.aux);
-        return f;
-    }
+    using Fields=quant::IQ2XXS::Fields;
+    [[nodiscard]] Fields fields(std::uint64_t p) const noexcept {return quant::IQ2XXS::fields(plane,p);}
     /// Eight unsigned magnitudes, little-endian.
     [[nodiscard]] static std::uint64_t grid(const Fields& f, int l) noexcept {
-        return gguf::IQ2XXS_GRID[(f.aux[0] >> (8 * l)) & 0xFFu];
+        return quant::IQ2XXS::grid(f,l);
     }
     /// This sub-group's own 7-bit sign-table index -- the ONE place that bit formula is written; signs()
     /// and the gather-based group_v_cached() both read it from here (see Iq1SPlane::index()).
     [[nodiscard]] static int sign_index(const Fields& f, int l) noexcept {
-        return static_cast<int>((f.aux[1] >> (7 * l)) & 127u);
+        return quant::IQ2XXS::sign_index(f,l);
     }
     /// Eight +1/-1 bytes, little-endian.
     [[nodiscard]] static std::uint64_t signs(const Fields& f, int l) noexcept {
         return SIGNS64[static_cast<std::size_t>(sign_index(f, l))];
     }
     [[nodiscard]] static float scale(const Fields& f, float d) noexcept {
-        return d * (0.5f + static_cast<float>(f.aux[1] >> 28)) * 0.25f;
+        return quant::IQ2XXS::group_scale(d,f.aux[1]);
     }
     /// Refreshes `c` only when `p`'s own superblock differs from the one `c` already holds.
     void refresh(std::uint64_t p, SuperCache& c) const noexcept {

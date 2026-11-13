@@ -10,7 +10,9 @@ marked, proposals are marked, unknowns name the measurement that settles them). 
 | [QUANT_LIBRARY.md](QUANT_LIBRARY.md) | How is a format or kernel added as a module, tested and selected? | #18, #31-#41, #82, #84 |
 | [PREFILL_BATCHING.md](PREFILL_BATCHING.md) | How does batched prefill work and how is it proven? | #74 |
 | [MEASUREMENT_PLATFORM.md](MEASUREMENT_PLATFORM.md) | How do we know what the machine can do and tie every number to it? | #78-#81, #75 |
+| [MEASURE_SELECT_VERIFY.md](MEASURE_SELECT_VERIFY.md) | Should measurement live inside Sub0Llm, and what covers choosing a model before and checking it after? How do sessions avoid disturbing each other's timings? | #78, #79, #80, #81 and the measure tickets |
 | [WORK_PLAN.md](WORK_PLAN.md) | In what order, with what gates, does it all get done? | all |
+| [AGENT_WORKER_FRAMEWORK.md](AGENT_WORKER_FRAMEWORK.md) | How do delegated, parallel, resource-aware background jobs (and optimisation loops) run as a native toolbox, with Sub0Llm as one engine and a known concurrency cap? | #68, worker framework tickets |
 
 Older documents stay as history and are superseded where these differ: `docs/QUANT_FORMATS.md`,
 `docs/QUANTIZED_RESIDENT_DENSE.md`, `docs/CORPUS_WORKFLOW.md` (corpus work: #6). Measurement records live in
@@ -18,3 +20,14 @@ Older documents stay as history and are superseded where these differ: `docs/QUA
 
 Maintenance: docs own design and evidence, tickets own status and discussion (#22). When a package lands, update its
 section here (status line) and the plan's table; do not duplicate status in both places.
+
+## Names used in these documents
+
+| Name | What it is |
+|---|---|
+| `sub0llm-dense-token` | the mapped single-sequence Qwen 27B proving-ground decoder: embedding, 64 layers, final norm and LM head, persistent GDN state and K/V, greedy continuation, tokenizer and chat template (`tools/sub0llm-dense-token.cpp` + `tools/dense_qwen_support.hpp`). This is what "batching in the tool" meant. Often shortened to "dense-token". |
+| `sub0llm-prefill-prover` | the preliminary #74 prover: serial versus batched projection on the largest real tensor of each quant type; no model, no tokenizer (`tools/sub0llm-prefill-prover.cpp`) |
+| chat PoC | `scripts/qwen_chat_poc.py`, the bounded chat proving ground that drives `sub0llm-dense-token` |
+| `sub0llm-dense-layer`, `sub0llm-dense-probe` | layer-0 only decoder check, and a single mapped projection exerciser |
+| `sub0llm` / `sub0llm-gen` / `sub0llm-train` | the general engine and its stage executables (they do not yet load the mapped dense model) |
+| `sub0squad` | the separate agent worker framework project (working title), not part of Sub0Llm |

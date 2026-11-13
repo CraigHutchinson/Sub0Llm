@@ -72,7 +72,7 @@ flowchart TB
 - Gate: reproducible within a stated CV across three fresh processes; quick run inside its budget; valid without root.
 
 **Phase 2: prefill (#74) with seams, in this order.** See `PREFILL_BATCHING.md` section 5: `project_batch` generic and
-bit-equivalence tests, then FFN+attention batching in the tool behind `--prefill-chunk`, then the GDN batched hook, then
+bit-equivalence tests, then FFN+attention batching in `sub0llm-dense-token` behind `--prefill-chunk`, then the GDN batched hook, then
 IQ1_S/IQ2_XXS batch kernels, then metrics and the 13/128/512 scaling table. Seam 2 of `ARCHITECTURE.md` (the
 `ProjectionBackend`) is cut here (#83, first part).
 - Gate: per-position byte-identical to serial `native-all` on the fixed workload; script tests; default build unchanged.

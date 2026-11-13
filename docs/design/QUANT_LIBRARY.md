@@ -20,7 +20,7 @@ Legend: **[V]** verified in the code today; **[P]** proposed.
   moves IQ2_XXS into a module and adds `fused-iq2`.
 - Dense projection: `denseq::project(type, raw, x, y, scratch, kernel)` (`include/sub0/dense_quant.hpp`) decodes a
   row block-by-block and dots it with ONE float input vector. `Iq1Kernel {Baseline, Scalar, Native, NativeAll}`
-  selects the variant; PR #67 adds a `fused-iq2` string. The tool splits output rows over up to 8 OpenMP workers
+  selects the variant; PR #67 adds a `fused-iq2` string. `sub0llm-dense-token` splits output rows over up to 8 OpenMP workers
   (`Layer::project_impl` in `tools/dense_qwen_support.hpp`).
 - Independent oracles: `tools/reference/check_ggml_decoders.cpp`, `check_projection_dots.cpp`,
   `check_iq1s_dots.cpp` compare against the pinned llama.cpp (cf659f24) on real rows.
@@ -65,7 +65,7 @@ after each landing:
 1. **One kernel selector, not an IQ1-named enum.** Replace `Iq1Kernel` (and the string `fused-iq2`) by a per-format
    named variant set: each module declares its variants (`baseline`, `native`, `fused`, ...) and a default; a
    single table maps (format, variant) to a row kernel. The generated default (`--dense-projection-kernel`) and the
-   runtime override both name variants, and the tool prints the resolved choice per format (it already prints
+   runtime override both name variants, and `sub0llm-dense-token` prints the resolved choice per format (it already prints
    `KERNEL selected=...`). Adding a kernel = a function in the module plus one row; AUTO stays the old value until
    qualification passes (AGENTS section 4).
 2. **One decode core per format.** The dequantiser, the row kernel and the batch kernel must share `Fields`/decode

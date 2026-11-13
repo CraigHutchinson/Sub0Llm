@@ -1,0 +1,335 @@
+{
+  "schema": "iq2-migration-regression-1",
+  "date": "2026-11-13",
+  "host": "CrogBuntu1",
+  "description": "Generic pre-push regression repair, no complete-model speed claim",
+  "final_header_sha256": "9d0cbe63cab24a1b9241f9e265556717fda04553228244f5ab8e76e7fc171e60",
+  "runs": {
+    "blocked": {
+      "machine": "x86_64",
+      "system": "Linux 7.0.0-43-generic",
+      "rounds": [
+        {
+          "round": 0,
+          "load": 0.0075,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4502.60711188205,
+          "calibration_end_ns": 4500.898165137621
+        },
+        {
+          "round": 1,
+          "load": 0.0075,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4503.39860465116,
+          "calibration_end_ns": 4503.35347288297
+        },
+        {
+          "round": 2,
+          "load": 0.0106,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4504.97961838682,
+          "calibration_end_ns": 4501.60930232558
+        },
+        {
+          "round": 3,
+          "load": 0.0081,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4503.086046511629,
+          "calibration_end_ns": 4501.84681255947
+        },
+        {
+          "round": 4,
+          "load": 0.0038,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4501.60332022717,
+          "calibration_end_ns": 4508.37003058104
+        },
+        {
+          "round": 5,
+          "load": 0.0044,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4502.05547445255,
+          "calibration_end_ns": 4503.11441860465
+        },
+        {
+          "round": 6,
+          "load": 0.005,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4502.72247706422,
+          "calibration_end_ns": 4502.34713508992
+        },
+        {
+          "round": 7,
+          "load": 0.005,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4505.81720930233,
+          "calibration_end_ns": 4501.31809338521
+        },
+        {
+          "round": 8,
+          "load": 0.0044,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4502.25737392959,
+          "calibration_end_ns": 4502.22062035824
+        },
+        {
+          "round": 9,
+          "load": 0.0106,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4501.66100917431,
+          "calibration_end_ns": 4502.01906976744
+        }
+      ],
+      "cpu": 31,
+      "epochs": 0,
+      "seed": 1,
+      "samples_ns": {
+        "IQ2_XXS float 4x256, prior": [
+          1229.53168635875,
+          1229.05837837838,
+          1234.61492178099,
+          1225.12606837607,
+          1229.76559139785,
+          1219.36680327869,
+          1231.22432113341,
+          1228.59688995215,
+          1230.3653395784502,
+          1271.8064118372401
+        ],
+        "IQ2_XXS float 4x256, vector": [
+          1226.40320733104,
+          1227.9387755102,
+          1230.59059633028,
+          1225.21002386635,
+          1227.68037974684,
+          1224.0842217484,
+          1224.47688838782,
+          1229.89732620321,
+          1219.67130620985,
+          1222.74941724942
+        ],
+        "IQ2_XXS float 4x5120, prior": [
+          24521.75,
+          24411.8936170213,
+          24324.3333333333,
+          24388.2083333333,
+          24237.119047619,
+          24318.9361702128,
+          24307.8723404255,
+          24131.4791666667,
+          24316.5476190476,
+          24216.6382978723
+        ],
+        "IQ2_XXS float 4x5120, vector": [
+          24275.7619047619,
+          24314.6428571429,
+          24453.446808510602,
+          24311.7021276596,
+          24330.9318181818,
+          24203.181818181798,
+          24117.5813953488,
+          24328.476190476198,
+          24203.711111111097,
+          24302.1020408163
+        ]
+      },
+      "raw_capture_sha256": "cc15fc3a995786f0aff27c06a83d4f0ee545d9a2a0f20efeeb9226340e3e62ca"
+    },
+    "pass1": {
+      "machine": "x86_64",
+      "system": "Linux 7.0.0-43-generic",
+      "rounds": [
+        {
+          "round": 0,
+          "load": 0.005,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4502.2965286491,
+          "calibration_end_ns": 4504.24871134021
+        },
+        {
+          "round": 1,
+          "load": 0.0144,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4502.01216545012,
+          "calibration_end_ns": 4503.23065693431
+        },
+        {
+          "round": 2,
+          "load": 0.0056,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4503.69140625,
+          "calibration_end_ns": 4503.71091065292
+        },
+        {
+          "round": 3,
+          "load": 0.0056,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4501.99002601908,
+          "calibration_end_ns": 4502.1311627907
+        },
+        {
+          "round": 4,
+          "load": 0.0056,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4503.62079510703,
+          "calibration_end_ns": 4502.23348837209
+        }
+      ],
+      "cpu": 31,
+      "epochs": 0,
+      "seed": 1,
+      "samples_ns": {
+        "IQ2_XXS float 4x256, prior": [
+          1225.80705882353,
+          1224.76570820021,
+          1223.76372315036,
+          1223.87229190422,
+          1224.71958762887
+        ],
+        "IQ2_XXS float 4x256, vector": [
+          1226.61961722488,
+          1220.33177022274,
+          1225.74578177728,
+          1218.7261904761901,
+          1225.3950617284
+        ],
+        "IQ2_XXS float 4x5120, prior": [
+          24200.6590909091,
+          24200.1914893617,
+          24204.511627907,
+          24239.0238095238,
+          24227.8095238095
+        ],
+        "IQ2_XXS float 4x5120, vector": [
+          24223.2619047619,
+          24229.3636363636,
+          24203.6363636364,
+          24345.1904761905,
+          24251.428571428598
+        ]
+      },
+      "raw_capture_sha256": "be5cecc958f82dd16a6e576421e3df1e3a42fa0344cdc3fd81057fd9649f7f2c"
+    },
+    "pass2": {
+      "machine": "x86_64",
+      "system": "Linux 7.0.0-43-generic",
+      "rounds": [
+        {
+          "round": 0,
+          "load": 0.005,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4501.512142237641,
+          "calibration_end_ns": 4501.66569343066
+        },
+        {
+          "round": 1,
+          "load": 0.0094,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4502.97193149381,
+          "calibration_end_ns": 4501.8512575889
+        },
+        {
+          "round": 2,
+          "load": 0.005,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4503.59895150721,
+          "calibration_end_ns": 4502.49934867564
+        },
+        {
+          "round": 3,
+          "load": 0.0044,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4502.45361328125,
+          "calibration_end_ns": 4504.559069767441
+        },
+        {
+          "round": 4,
+          "load": 0.0044,
+          "waited_s": 0.5,
+          "quiet": true,
+          "calibration_start_ns": 4503.91426181514,
+          "calibration_end_ns": 4501.22793810121
+        }
+      ],
+      "cpu": 31,
+      "epochs": 0,
+      "seed": 1,
+      "samples_ns": {
+        "IQ2_XXS float 4x256, prior": [
+          1084.7964519141,
+          1087.6521739130399,
+          1091.83908045977,
+          1091.88809766022,
+          1101.05009633911
+        ],
+        "IQ2_XXS float 4x256, vector": [
+          1088.7825261158598,
+          1087.72011385199,
+          1088.2578680203,
+          1084.82583732057,
+          1086.92987804878
+        ],
+        "IQ2_XXS float 4x5120, prior": [
+          21656.553191489398,
+          21634.301886792502,
+          21547.2127659574,
+          21629.0,
+          21538.5208333333
+        ],
+        "IQ2_XXS float 4x5120, vector": [
+          21643.693877551,
+          21576.8367346939,
+          21572.719999999998,
+          21704.6875,
+          21553.480000000003
+        ]
+      },
+      "raw_capture_sha256": "51c34a510e08e7b659118cef0141b957a692b44742308d964f32881c825a47ca"
+    }
+  },
+  "prior_record": {
+    "commit": "df6db9e63f843de3235171d005ba3c4df3ac2ae9",
+    "samples_ns": {
+      "IQ2_XXS float 4x256, prior": [
+        1077.72547169811,
+        1076.90355805243,
+        1080.0504201680699
+      ],
+      "IQ2_XXS float 4x256, vector": [
+        1076.5891393442598,
+        1079.05287569573,
+        1075.6264428121701
+      ],
+      "IQ2_XXS float 4x5120, prior": [
+        21427.0625,
+        21334.7647058824,
+        21345.7843137255
+      ],
+      "IQ2_XXS float 4x5120, vector": [
+        21323.9454545455,
+        21337.0833333333,
+        21425.22
+      ]
+    },
+    "raw_capture_sha256": "4c415d29716f046dec003d8d44c45597398b7755c8fdfcd6620e806c710cb786"
+  }
+}

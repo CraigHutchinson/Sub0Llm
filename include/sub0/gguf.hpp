@@ -83,7 +83,7 @@ using BlockSpec = quant::BlockSpec;
 // the format is a separate, optional layer (a Plane in moe_quant_dot.hpp); see docs/QUANT_FORMATS.md.
 struct FormatInfo { TensorType type; const char* name; BlockSpec block; };
 inline constexpr auto kFormats = [] {
-    std::array<FormatInfo, 9 + quant::kModules.size()> formats = {{
+    std::array<FormatInfo, 8 + quant::kModules.size()> formats = {{
         {TensorType::F32,     "F32",     {1, 4}},
         {TensorType::F16,     "F16",     {1, 2}},
         {TensorType::BF16,    "BF16",    {1, 2}},
@@ -91,12 +91,11 @@ inline constexpr auto kFormats = [] {
         {TensorType::Q4_K,    "Q4_K",    {256, 144}},
         {TensorType::Q5_K,    "Q5_K",    {256, 176}},
         {TensorType::Q6_K,    "Q6_K",    {256, 210}},
-        {TensorType::IQ2_XXS, "IQ2_XXS", {256, 66}},
         {TensorType::IQ4_NL,  "IQ4_NL",  {32, 18}},
     }};
     for (std::size_t i = 0; i < quant::kModules.size(); ++i) {
         const auto& module = quant::kModules[i];
-        formats[9 + i] = {module.type, module.name.data(), module.block};
+        formats[8 + i] = {module.type, module.name.data(), module.block};
     }
     return formats;
 }();
@@ -542,53 +541,9 @@ inline bool dequantize_iq4_nl(std::span<const std::uint8_t> raw, std::uint64_t n
     return true;
 }
 
-inline bool dequantize_iq2_xxs(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
-    const std::uint64_t blocks = begin_blocks(TensorType::IQ2_XXS, raw, n, out);
-    if (blocks == 0) return n == 0;
-    std::uint64_t w = 0;
-    for (std::uint64_t i = 0; i < blocks; ++i) {
-        const std::uint8_t* blk = raw.data() + i * 66;
-        std::uint16_t d_bits;
-        std::memcpy(&d_bits, blk, 2);
-        const float d = f16_to_f32(d_bits);
-        const std::uint8_t* qs = blk + 2;          // 8 groups of 8 bytes == 2 u32 each
-        for (int ib32 = 0; ib32 < 8; ++ib32) {
-            std::uint32_t aux[2];
-            std::memcpy(aux, qs + 8 * ib32, 8);
-            const auto* aux8 = reinterpret_cast<const std::uint8_t*>(aux);
-            // The scale's four high bits live in aux[1]'s top nibble; the remaining 28 bits are four
-            // 7-bit sign-pattern indices, one per 8-element group.
-            const float db = d * (0.5f + static_cast<float>(aux[1] >> 28)) * 0.25f;
-            for (int l = 0; l < 4; ++l) {
-                const std::uint64_t grid = IQ2XXS_GRID[aux8[l]];
-                const std::uint8_t signs = KSIGNS_IQ2XS[(aux[1] >> (7 * l)) & 127];
-                // Perf (B28, see docs/CPU_PERF_BACKLOG.md 2d): the whole-group case (every group but
-                // possibly the very last of the tensor) uses a fixed, unrollable 8-iteration loop with
-                // no tail-bound check, and a branchless sign (KMASK_IQ2XS[j] == 1 << j, see
-                // gguf_quant_tables.hpp, so "bit j of signs" is (signs >> j) & 1 -- no data-dependent
-                // branch on essentially-random sign bits, which is where the real cost lived: the
-                // guarded loop shared with dequantize_iq1_s alone did not explain the 6x gap, since
-                // IQ1_S's inner loop is branch-free arithmetic). Numerically identical: 1.f - 2.f*bit
-                // is exact for bit in {0,1}, same as the prior ternary, and this is verified bit-exact
-                // against the ORIGINAL guarded/branching form (kept below for the genuine tail case).
-                if (w + 8 <= n) {
-                    for (int j = 0; j < 8; ++j) {
-                        const auto mag = static_cast<std::uint8_t>((grid >> (8 * j)) & 0xFFu);
-                        const float sign = 1.f - 2.f * static_cast<float>((signs >> j) & 1u);
-                        out[static_cast<std::size_t>(w + j)] = db * static_cast<float>(mag) * sign;
-                    }
-                    w += 8;
-                } else {
-                    for (int j = 0; j < 8 && w < n; ++j, ++w) {
-                        const auto mag = static_cast<std::uint8_t>((grid >> (8 * j)) & 0xFFu);
-                        out[static_cast<std::size_t>(w)] =
-                            db * static_cast<float>(mag) * ((signs & KMASK_IQ2XS[j]) ? -1.f : 1.f);
-                    }
-                }
-            }
-        }
-    }
-    return true;
+// Compatibility adapter; packed geometry and decode live in the IQ2_XXS module.
+inline bool dequantize_iq2_xxs(std::span<const std::uint8_t> raw,std::uint64_t n,std::vector<float>& out) {
+    return quant::IQ2XXS::dequantize(raw,n,out);
 }
 
 // Compatibility adapter; packed fields, geometry and decoder live in the IQ1_S module.
@@ -609,17 +564,16 @@ inline bool dequantize_q2_k(std::span<const std::uint8_t> raw, std::uint64_t n,
 using DequantFn = bool (*)(std::span<const std::uint8_t>, std::uint64_t, std::vector<float>&);
 struct DequantEntry { TensorType type; DequantFn fn; };
 inline constexpr auto kDequant = [] {
-    std::array<DequantEntry, 6 + quant::kModules.size()> entries = {{
+    std::array<DequantEntry, 5 + quant::kModules.size()> entries = {{
         {TensorType::Q8_0,    &dequantize_q8_0},
         {TensorType::Q4_K,    &dequantize_q4_k},
         {TensorType::Q5_K,    &dequantize_q5_k},
         {TensorType::Q6_K,    &dequantize_q6_k},
-        {TensorType::IQ2_XXS, &dequantize_iq2_xxs},
         {TensorType::IQ4_NL,  &dequantize_iq4_nl},
     }};
     for (std::size_t i = 0; i < quant::kModules.size(); ++i) {
         const auto& module = quant::kModules[i];
-        entries[6 + i] = {module.type, module.dequantize};
+        entries[5 + i] = {module.type, module.dequantize};
     }
     return entries;
 }();
