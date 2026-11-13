@@ -12,7 +12,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -85,6 +87,55 @@ RoofConfig tinyConfig() {
 }
 
 }  // namespace
+
+TEST_CASE("machine_roofs: invalid sizes and budgets are rejected", "[machine_roofs]") {
+    RoofArrays overflow(std::numeric_limits<std::size_t>::max());
+    CHECK_FALSE(overflow.ok());
+    CHECK(overflow.elements() == 0);
+    BandwidthRequest req;
+    req.cpus = {0};
+    req.elements = 16;
+    CHECK_FALSE(measureBandwidth(overflow, req).verified);
+
+    CHECK_FALSE(validRoofBudget(std::numeric_limits<double>::infinity()));
+    CHECK_FALSE(validRoofBudget(std::numeric_limits<double>::quiet_NaN()));
+    CHECK_FALSE(validRoofBudget(0));
+    CHECK_FALSE(validRoofBudget(86401));
+    CHECK(validRoofBudget(86400));
+    RoofConfig cfg;
+    cfg.budgetSeconds = std::numeric_limits<double>::infinity();
+    CHECK_FALSE(measureMemoryRoofs(MachineFacts{}, cfg).supported);
+}
+
+TEST_CASE("machine_roofs: partial thread launch cancels and joins workers", "[machine_roofs]") {
+    int launches = 0;
+    std::atomic<bool> ran{false};
+    const bool ok = detail::roofs::runPinnedThreadsWithLauncher(
+        std::vector<int>{0, 1}, [&](int) { ran = true; }, [&](int) { ran = true; },
+        [&](const auto& work, int t) -> std::thread {
+            if (++launches == 2) throw std::runtime_error("injected launch failure");
+            return std::thread(work, t);
+        });
+    CHECK_FALSE(ok);
+    CHECK(launches == 2);
+    CHECK_FALSE(ran.load());
+}
+
+TEST_CASE("machine_roofs: planner arithmetic handles extreme inputs", "[machine_roofs]") {
+    const auto max = std::numeric_limits<std::size_t>::max();
+    const auto sizes = sweepSizes(max);
+    REQUIRE_FALSE(sizes.empty());
+    CHECK(sizes.back() > max / 4);
+    const int maxRepeats = std::numeric_limits<int>::max();
+    CHECK(pointStreamBytes(RoofKernel::triad, maxRepeats, 1.0) == 3.0 + 3.0 * maxRepeats);
+    CHECK(boundedRoofRepeats(std::numeric_limits<double>::infinity(), 5) == 5);
+    CHECK(boundedRoofRepeats(1e30, 5) == 5);
+    CHECK(boundedRoofRepeats(std::numeric_limits<double>::quiet_NaN(), 5) == 1);
+    RoofConfig cfg;
+    cfg.assumedGbPerSec = std::numeric_limits<double>::infinity();
+    CHECK_FALSE(measureMemoryRoofs(MachineFacts{}, cfg).supported);
+    CHECK_FALSE(planRoofRun({}, cfg, 4096, 1.0).note.empty());
+}
 
 TEST_CASE("machine_roofs: pack fills one CCD first, one thread per core", "[machine_roofs]") {
     ScratchDir dir;

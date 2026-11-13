@@ -1,3 +1,10 @@
+# Pending-work integration — 2026-11-13
+
+[Combined review and qualification boundaries](performance/MAIN_INTEGRATION_2026_11_13.md):
+PRs #67/#71/#91/#93/#99/#102 are integrated at the owner's request. AUTO and preserved
+chat artifacts stay unchanged. The combined IQ1/IQ2 candidate requires a fresh #63/#70
+qualification identity; prior fused-IQ2 scores do not qualify its changed accumulation order.
+
 # Handover — resuming the Qwen4-Next work in a new session or on a new machine
 
 ## Dense 27B IQ2_XXS candidate — 2026-11-08

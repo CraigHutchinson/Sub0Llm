@@ -88,9 +88,9 @@ enum class ComputeKernel { fmaF32, dotI8, dotBf16 };
 
 /// Lanes of 32-bit elements in the fma kernel: 16 with AVX-512F, 8 with AVX2 and FMA, 0 when neither is compiled in.
 [[nodiscard]] constexpr int fmaLanes() {
-#if defined(__AVX512F__)
+#if !defined(_MSC_VER) && defined(__AVX512F__)
     return 16;
-#elif defined(__AVX2__) && defined(__FMA__)
+#elif !defined(_MSC_VER) && defined(__AVX2__) && defined(__FMA__)
     return 8;
 #else
     return 0;
@@ -105,13 +105,13 @@ inline constexpr int kVnniLanes = 16;
     switch (k) {
         case ComputeKernel::fmaF32: return fmaLanes() > 0;
         case ComputeKernel::dotI8:
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if !defined(_MSC_VER) && defined(__AVX512F__) && defined(__AVX512VNNI__)
             return true;
 #else
             return false;
 #endif
         case ComputeKernel::dotBf16:
-#if defined(__AVX512F__) && defined(__AVX512BF16__)
+#if !defined(_MSC_VER) && defined(__AVX512F__) && defined(__AVX512BF16__)
             return true;
 #else
             return false;
@@ -125,7 +125,7 @@ inline constexpr int kVnniLanes = 16;
     if (!computeKernelCompiled(k)) return "none";
     switch (k) {
         case ComputeKernel::fmaF32:
-#if defined(__AVX512F__)
+#if !defined(_MSC_VER) && defined(__AVX512F__)
             return "avx512f";
 #else
             return "avx2+fma";
@@ -229,6 +229,11 @@ struct ComputeConfig {
     double passSeconds = 0.05;                   // target duration of one timed pass (calibrated per point)
 };
 
+/// Keep each calibration pass finite and bounded, including direct API requests.
+[[nodiscard]] inline bool validComputePass(double seconds) noexcept {
+    return std::isfinite(seconds) && seconds > 0.0 && seconds <= 60.0;
+}
+
 /// The plan for the compute run: how many repeats, and which thread counts per placement, fit the budget.
 struct ComputePlan {
     int repeats = 1;
@@ -327,7 +332,7 @@ inline constexpr int kChainAddsPerIteration = 8;
 
 /// The fma kernel: 12 chains of fmadd(acc, 1, 0). Writes lane values to out[k * L + j] and returns the timed seconds.
 inline double fmaLoop(std::uint64_t iters, double* out) {
-#if defined(__AVX512F__)
+#if !defined(_MSC_VER) && defined(__AVX512F__)
     constexpr int L = 16;
     alignas(64) float init[kAccumulators * L];
     for (int i = 0; i < kAccumulators * L; ++i) init[i] = static_cast<float>(i + 1);
@@ -348,7 +353,7 @@ inline double fmaLoop(std::uint64_t iters, double* out) {
         for (int j = 0; j < L; ++j) out[k * L + j] = static_cast<double>(tmp[j]);
     }
     return roofs::secondsBetween(t0, t1);
-#elif defined(__AVX2__) && defined(__FMA__)
+#elif !defined(_MSC_VER) && defined(__AVX2__) && defined(__FMA__)
     constexpr int L = 8;
     alignas(32) float init[kAccumulators * L];
     for (int i = 0; i < kAccumulators * L; ++i) init[i] = static_cast<float>(i + 1);
@@ -378,7 +383,7 @@ inline double fmaLoop(std::uint64_t iters, double* out) {
 
 /// The VNNI kernel: 12 chains of dpbusd(acc, 1 unsigned, 1 signed). Each lane gains 4 per instruction.
 inline double dotI8Loop(std::uint64_t iters, double* out) {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if !defined(_MSC_VER) && defined(__AVX512F__) && defined(__AVX512VNNI__)
     constexpr int L = kVnniLanes;
     __m512i acc[kAccumulators];
     for (int k = 0; k < kAccumulators; ++k) acc[k] = _mm512_setzero_si512();
@@ -407,7 +412,7 @@ inline double dotI8Loop(std::uint64_t iters, double* out) {
 /// The BF16 kernel: 12 chains of dpbf16(acc, ones, ones), where each 32-bit lane holds two bf16 1.0 values. Each lane
 /// gains 2 per instruction.
 inline double dotBf16Loop(std::uint64_t iters, double* out) {
-#if defined(__AVX512F__) && defined(__AVX512BF16__)
+#if !defined(_MSC_VER) && defined(__AVX512F__) && defined(__AVX512BF16__)
     constexpr int L = kVnniLanes;
     __m512i pairs = _mm512_set1_epi32(0x3F803F80);   // bf16 1.0 in both halves of each 32-bit lane
     asm volatile("" : "+v"(pairs));
@@ -491,6 +496,11 @@ inline PinnedPass runKernelPass(ComputeKernel k, const std::vector<int>& cpus, s
 /// The effective-clock chain: 8 dependent adds per iteration, each through an empty asm so the compiler keeps them
 /// one after another. Writes the final value to `finalX`.
 inline double clockLoop(std::uint64_t iters, std::uint64_t& finalX) {
+#if defined(_MSC_VER)
+    (void)iters;
+    finalX = 0;
+    return 0.0;
+#else
     std::uint64_t x = 0;
     asm volatile("" : "+r"(x));
     const Clock::time_point t0 = Clock::now();
@@ -503,6 +513,7 @@ inline double clockLoop(std::uint64_t iters, std::uint64_t& finalX) {
     const Clock::time_point t1 = Clock::now();
     finalX = x;
     return roofs::secondsBetween(t0, t1);
+#endif
 }
 
 /// One pinned clock pass on `cpus`. Each thread's chain must end at exactly 8 x iters.
@@ -581,7 +592,11 @@ inline double pointCostSeconds(int reps, double passSeconds) {
     const int threads = static_cast<int>(req.cpus.size());
     const std::uint64_t cap = iterationCap(req.kernel);
     std::string why;
-    if (!kRoofsSupported) {
+    if (!validComputePass(req.passSeconds) ||
+        (req.iterations == 0 && req.stopAt != Clock::time_point::max() &&
+         (req.stopAt <= start || std::chrono::duration<double>(req.stopAt - start).count() < req.passSeconds))) {
+        why = "invalid pass duration or insufficient remaining budget";
+    } else if (!kRoofsSupported) {
         why = "not supported on this platform";
     } else if (!computeKernelCompiled(req.kernel)) {
         why = std::string(computeKernelReason(req.kernel));
@@ -642,7 +657,11 @@ inline double pointCostSeconds(int reps, double passSeconds) {
     c.threads = static_cast<int>(cpus.size());
     const Clock::time_point start = Clock::now();
     std::string why;
-    if (!kRoofsSupported) {
+    if (!validComputePass(passSeconds) ||
+        (stopAt != Clock::time_point::max() &&
+         (stopAt <= start || std::chrono::duration<double>(stopAt - start).count() < passSeconds))) {
+        why = "invalid pass duration or insufficient remaining budget";
+    } else if (!kRoofsSupported) {
         why = "not supported on this platform";
     } else if (cpus.empty() || repeats < 1) {
         why = "invalid request (threads or repeats out of range)";
@@ -695,6 +714,11 @@ inline double pointCostSeconds(int reps, double passSeconds) {
 [[nodiscard]] inline ComputePlan planComputeRun(const std::vector<Placement>& placements, const ComputeConfig& cfg) {
     using namespace detail::compute;
     ComputePlan plan;
+    if (!validComputePass(cfg.passSeconds) || !std::isfinite(cfg.budgetSeconds) || cfg.budgetSeconds < 0.0 ||
+        cfg.repeats < 1) {
+        plan.note = "invalid pass duration, budget or repeats";
+        return plan;
+    }
     plan.threadCounts.resize(placements.size());
     for (std::size_t i = 0; i < placements.size(); ++i)
         plan.threadCounts[i] = threadCountsFor(placements[i], cfg.threadCounts);
@@ -708,7 +732,7 @@ inline double pointCostSeconds(int reps, double passSeconds) {
     double est = estimate(plan.repeats);
     if (est > cfg.budgetSeconds) {
         const double shrunk = std::floor(plan.repeats * (cfg.budgetSeconds / est));
-        const int reps = std::max(1, static_cast<int>(shrunk));
+        const int reps = boundedRoofRepeats(shrunk, plan.repeats);
         plan.note += "repeats " + std::to_string(plan.repeats) + " -> " + std::to_string(reps) + "; ";
         plan.repeats = reps;
         est = estimate(plan.repeats);
@@ -735,6 +759,14 @@ inline double pointCostSeconds(int reps, double passSeconds) {
     ComputeRoofs out;
     out.budgetSeconds = config.budgetSeconds;
     out.passSeconds = config.passSeconds;
+    if (!validRoofBudget(config.budgetSeconds)) {
+        out.unsupportedReason = "budget must be finite and between 0 and 86400 seconds";
+        return out;
+    }
+    if (!validComputePass(config.passSeconds) || config.passSeconds > config.budgetSeconds || config.repeats < 1) {
+        out.unsupportedReason = "invalid pass duration or repeats";
+        return out;
+    }
     const Clock::time_point start = Clock::now();
     const Clock::time_point deadline =
         start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(config.budgetSeconds));

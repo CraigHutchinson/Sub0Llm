@@ -86,6 +86,8 @@ constexpr int  D_HEAD      = 256;     // head_dim
 constexpr bool USE_TERNARY = false;
 constexpr bool USE_GATED_FFN = true;
 constexpr bool USE_TIED_EMBEDDINGS = false;   // tie_word_embeddings: false
+// This preview uses QSA on every full-attention layer, without the dense-27B query gate.
+constexpr bool USE_ATTENTION_GATE = false;
 constexpr bool USE_QK_NORM = true;
 constexpr int  VOCAB       = 248320;  // vocab_size
 // --- Positional encoding (compile-time) --------------------------------

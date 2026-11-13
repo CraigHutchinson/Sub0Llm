@@ -26,3 +26,7 @@ add_test(NAME sub0llm-native-phase-contract COMMAND "${Python3_EXECUTABLE}"
 add_executable(sub0llm-quality-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/quality_fixture.cpp")
 add_test(NAME sub0llm-native-quality-contract COMMAND "${Python3_EXECUTABLE}"
   "${PROJECT_SOURCE_DIR}/tools/reference/tests/check_quality_fixture.py" $<TARGET_FILE:sub0llm-quality-fixture>)
+
+add_executable(sub0llm-batch-projection-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/batch_projection_fixture.cpp")
+target_include_directories(sub0llm-batch-projection-fixture PRIVATE "${PROJECT_SOURCE_DIR}/include")
+add_test(NAME sub0llm-batch-projection-contract COMMAND sub0llm-batch-projection-fixture)

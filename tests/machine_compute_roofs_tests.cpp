@@ -8,6 +8,7 @@
 
 #include "sub0/measure/ceilings.hpp"
 #include "sub0/measure/compute_roofs.hpp"
+
 #include "sub0/measure/machine_facts.hpp"
 #include "sub0/measure/memory_roofs.hpp"
 
@@ -15,11 +16,37 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
 
 using namespace sub0::measure;
+
+TEST_CASE("machine_compute_roofs: non-finite budget is rejected", "[machine_compute_roofs]") {
+    ComputeConfig cfg;
+    cfg.budgetSeconds = std::numeric_limits<double>::infinity();
+    const auto result = measureComputeRoofs(MachineFacts{}, cfg);
+    CHECK_FALSE(result.supported);
+    CHECK_FALSE(result.unsupportedReason.empty());
+}
+
+TEST_CASE("machine_compute_roofs: invalid pass durations are rejected", "[machine_compute_roofs]") {
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    ComputeConfig cfg;
+    cfg.passSeconds = inf;
+    CHECK_FALSE(measureComputeRoofs(MachineFacts{}, cfg).supported);
+    CHECK_FALSE(planComputeRun({}, cfg).note.empty());
+    ComputeRequest req;
+    req.cpus = {0};
+    req.passSeconds = inf;
+    CHECK_FALSE(measureComputeKernel(req).verified);
+    CHECK_FALSE(measureEffectiveClock({0}, nan, 1, std::chrono::steady_clock::time_point::max()).verified);
+    cfg.passSeconds = 2;
+    cfg.budgetSeconds = 1;
+    CHECK_FALSE(measureComputeRoofs(MachineFacts{}, cfg).supported);
+}
 
 namespace {
 

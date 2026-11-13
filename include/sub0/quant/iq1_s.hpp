@@ -90,17 +90,16 @@ struct IQ1S {
         return sum;
     }
     // Batched row core: the SAME arithmetic as dot_row for each of `n` input vectors (x + t*x_stride), but each 256-weight block is
-    // decoded once into a small buffer and reused for all `n` tokens (n <= Tile). Tokens are advanced four at a time so four
-    // independent accumulator chains hide the add latency and the decoded weights are loaded once per group. Every token keeps its
-    // own accumulator and adds in exactly dot_row's order (chunk of 8 ascending, block ascending), so out[t] is bit-identical to
-    // dot_row on token t.
+    // decoded once into a small buffer and reused for all `n` tokens (n <= Tile). Each token keeps the same two alternating
+    // accumulator chains as dot_row, including its final combination order, for bit-identical serial/batched output.
     template<bool Native,std::size_t Tile>
     static void dot_row_batch(const std::uint8_t* row,const float* x,std::size_t x_stride,std::size_t width,std::size_t n,float* out) noexcept {
+        static_assert(Tile > 0 && Tile <= 64);
         float sum[Tile];
         for(std::size_t t=0;t<n;++t)sum[t]=0;
 #if defined(__AVX2__)
-        __m256 accum[Tile];
-        for(std::size_t t=0;t<n;++t)accum[t]=_mm256_setzero_ps();
+        __m256 accum0[Tile],accum1[Tile];
+        for(std::size_t t=0;t<n;++t)accum0[t]=accum1[t]=_mm256_setzero_ps();
 #endif
         alignas(32) float w[256];
         for(std::size_t b=0;b<width/block.elems;++b){
@@ -114,23 +113,14 @@ struct IQ1S {
             }
 #if defined(__AVX2__)
             if constexpr(Native){
-                std::size_t t=0;
-                for(;t+4<=n;t+=4){
-                    const float* x0=x+t*x_stride+base;const float* x1=x0+x_stride;const float* x2=x1+x_stride;const float* x3=x2+x_stride;
-                    __m256 a0=accum[t],a1=accum[t+1],a2=accum[t+2],a3=accum[t+3];
-                    for(int k=0;k<256;k+=8){
-                        const __m256 wk=_mm256_load_ps(w+k);
-                        a0=_mm256_add_ps(a0,_mm256_mul_ps(_mm256_loadu_ps(x0+k),wk));
-                        a1=_mm256_add_ps(a1,_mm256_mul_ps(_mm256_loadu_ps(x1+k),wk));
-                        a2=_mm256_add_ps(a2,_mm256_mul_ps(_mm256_loadu_ps(x2+k),wk));
-                        a3=_mm256_add_ps(a3,_mm256_mul_ps(_mm256_loadu_ps(x3+k),wk));
+                for(std::size_t t=0;t<n;++t){
+                    const float* xt=x+t*x_stride+base;
+                    __m256 a0=accum0[t],a1=accum1[t];
+                    for(int k=0;k<256;k+=16){
+                        a0=_mm256_add_ps(a0,_mm256_mul_ps(_mm256_loadu_ps(xt+k),_mm256_load_ps(w+k)));
+                        a1=_mm256_add_ps(a1,_mm256_mul_ps(_mm256_loadu_ps(xt+k+8),_mm256_load_ps(w+k+8)));
                     }
-                    accum[t]=a0;accum[t+1]=a1;accum[t+2]=a2;accum[t+3]=a3;
-                }
-                for(;t<n;++t){
-                    const float* xt=x+t*x_stride+base;__m256 a=accum[t];
-                    for(int k=0;k<256;k+=8)a=_mm256_add_ps(a,_mm256_mul_ps(_mm256_loadu_ps(xt+k),_mm256_load_ps(w+k)));
-                    accum[t]=a;
+                    accum0[t]=a0;accum1[t]=a1;
                 }
                 continue;
             }
@@ -143,7 +133,7 @@ struct IQ1S {
         }
 #if defined(__AVX2__)
         if constexpr(Native){
-            for(std::size_t t=0;t<n;++t){alignas(32) float lanes[8];_mm256_store_ps(lanes,accum[t]);for(float v:lanes)sum[t]+=v;}
+            for(std::size_t t=0;t<n;++t){alignas(32) float lanes[8];_mm256_store_ps(lanes,_mm256_add_ps(accum0[t],accum1[t]));for(float v:lanes)sum[t]+=v;}
         }
 #endif
         for(std::size_t t=0;t<n;++t)out[t]=sum[t];

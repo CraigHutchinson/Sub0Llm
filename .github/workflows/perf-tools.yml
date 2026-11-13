@@ -30,6 +30,14 @@ jobs:
           cmake -S . -B out/perf-ci -DSUB0_PERF_ONLY=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_STANDARD=26 -DSUB0MATH_PERF_ON_BUILD=OFF -DSUB0MATH_PERF_GIT_HOOKS=OFF -DSUB0MATH_NATIVE_ARCH=OFF -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
           cmake --build out/perf-ci -j2
           ctest --test-dir out/perf-ci --output-on-failure
+      - name: Machine utility build and CLI contracts
+        run: |
+          clang++ -std=c++2c -O2 -Wall -Wextra -Werror ${{ matrix.cxx_flags }} -Iinclude -pthread tools/sub0llm-machine.cpp -o out/perf-ci/sub0llm-machine
+          out/perf-ci/sub0llm-machine --facts --out out/perf-ci/machine.json
+          python -c 'import json; json.load(open("out/perf-ci/machine.json"))'
+          for budget in inf nan 1e999 86401; do
+            if out/perf-ci/sub0llm-machine --roofs all --budget "$budget"; then exit 1; else test "$?" -eq 2; fi
+          done
       - name: Full calibrated sampling (diagnostic on shared hosted hardware)
         run: python tools/perf/bench_check.py run --exe out/perf-ci/sub0llm-bench-denseq --out out/perf-ci/perf/samples.json --rounds 3 --settle 0
       - uses: actions/upload-artifact@v4

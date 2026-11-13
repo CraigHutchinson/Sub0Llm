@@ -75,10 +75,12 @@ template<std::size_t Tile = 16>
     const std::size_t blocks = in / spec.elems;
     if (blocks > std::numeric_limits<std::size_t>::max() / spec.bytes) return false;
     const std::size_t row_bytes = blocks * spec.bytes;
-    if (rows > raw.size() / row_bytes || y_stride < rows) return false;
+    if (rows > raw.size() / row_bytes || y_stride < rows || !x || !y ||
+        n_tokens > std::numeric_limits<std::size_t>::max() / in ||
+        (y_stride && n_tokens > std::numeric_limits<std::size_t>::max() / y_stride)) return false;
     const bool iq1_native = type == static_cast<std::uint32_t>(quant::IQ1S::type) && iq1 != Iq1Kernel::Baseline;
 #if defined(__AVX2__)
-    const bool vector_dot = !iq1_native && iq1 == Iq1Kernel::NativeAll && spec.elems % 8 == 0;
+    const bool vector_dot = !iq1_native && (iq1 == Iq1Kernel::NativeAll || iq1 == Iq1Kernel::FusedIQ2) && spec.elems % 8 == 0;
 #endif
     for (std::size_t first = 0; first < n_tokens; first += Tile) {
         const std::size_t n = std::min(Tile, n_tokens - first);
@@ -87,8 +89,12 @@ template<std::size_t Tile = 16>
             const std::uint8_t* packed = raw.data() + row * row_bytes;
             float result[Tile];
             if (iq1_native) {
-                if (iq1 == Iq1Kernel::Native || iq1 == Iq1Kernel::NativeAll) quant::IQ1S::dot_row_batch<true, Tile>(packed, xt, in, in, n, result);
+                if (iq1 == Iq1Kernel::Native || iq1 == Iq1Kernel::NativeAll || iq1 == Iq1Kernel::FusedIQ2) quant::IQ1S::dot_row_batch<true, Tile>(packed, xt, in, in, n, result);
                 else quant::IQ1S::dot_row_batch<false, Tile>(packed, xt, in, in, n, result);
+            } else if (type == static_cast<std::uint32_t>(quant::IQ2XXS::type) && iq1 == Iq1Kernel::FusedIQ2) {
+                // Reuse the qualified core until an IQ2 batch core preserves its exact arithmetic.
+                for (std::size_t t = 0; t < n; ++t)
+                    result[t] = quant::IQ2XXS::dot_row<true>(packed, xt + t * in, in);
             } else {
                 float sum[Tile];
                 for (std::size_t t = 0; t < n; ++t) sum[t] = 0.f;

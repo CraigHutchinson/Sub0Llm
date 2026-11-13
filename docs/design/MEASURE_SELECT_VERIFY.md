@@ -73,7 +73,7 @@ On this one dev machine that is exactly the case that corrupts timings.
 
 Design [P]:
 1. **A machine-wide lock** in addition to the per-repository one, with the same file protocol (exclusive create, JSON `{pid, time, what, repo}`,
-   same stale rules) at a per-user location that exists for every repository (candidates: `$XDG_RUNTIME_DIR/sub0perf/machine.lock` with a `~/.cache`
+   owner-liveness and process-start identity checks; age alone must never evict a confirmed live owner) at a per-user location that exists for every repository (candidates: `$XDG_RUNTIME_DIR/sub0perf/machine.lock` with a `~/.cache`
    fallback; **[U]** pick one and handle cleanup at logout). Acquisition order is fixed, machine lock first then repository lock, so two sessions
    cannot deadlock.
 2. **A native C++ `PerfLock`** speaking the same protocol, so `sub0llm-machine`, `sub0llm-bench`, `sub0llm verify` and the Sub0Squad arbiter's measurement

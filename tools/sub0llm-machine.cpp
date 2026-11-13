@@ -101,8 +101,8 @@ int main(int argc, char** argv) {
         } else if (a == "--budget" && i + 1 < argc) {
             char* end = nullptr;
             budgetSeconds = std::strtod(argv[++i], &end);
-            if (end == argv[i] || *end != '\0' || !(budgetSeconds > 0.0)) {
-                std::fprintf(stderr, "sub0llm-machine: --budget needs a positive number of seconds\n");
+            if (end == argv[i] || *end != '\0' || !sub0::measure::validRoofBudget(budgetSeconds)) {
+                std::fprintf(stderr, "sub0llm-machine: --budget needs a finite number in (0, 86400] seconds\n");
                 return 2;
             }
         } else if (a == "--out" && i + 1 < argc) outPath = argv[++i];

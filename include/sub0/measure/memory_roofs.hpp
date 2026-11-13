@@ -35,20 +35,27 @@
 #include "sub0/measure/machine_facts.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <barrier>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #if defined(__linux__)
 #include <sched.h>
 #endif
@@ -57,6 +64,22 @@
 #endif
 
 namespace sub0::measure {
+
+/// A bounded duration keeps clock conversion and deadline arithmetic representable.
+[[nodiscard]] inline bool validRoofBudget(double seconds) noexcept {
+    return std::isfinite(seconds) && seconds > 0.0 && seconds <= 86400.0;
+}
+
+[[nodiscard]] inline bool validRoofRate(double gbPerSec) noexcept {
+    return std::isfinite(gbPerSec) && gbPerSec > 0.0 && gbPerSec <= 1e9;
+}
+
+/// Clamp in floating point before converting to avoid out-of-range conversions.
+[[nodiscard]] inline int boundedRoofRepeats(double estimate, int maximum) noexcept {
+    if (!(estimate >= 1.0) || maximum <= 1) return 1;
+    if (estimate >= static_cast<double>(maximum)) return maximum;
+    return static_cast<int>(estimate);
+}
 
 /// Whether this build can pin threads and time memory roofs. False off Linux: the functions still compile.
 #if defined(__linux__)
@@ -182,7 +205,7 @@ enum class RoofKernel { read, write, copy, triad };
 /// Bytes a point streams for `reps` repeats: one fill, then `reps` timed passes. The fill happens once because the
 /// sources do not change between repeats and every timed pass rewrites the output in full.
 [[nodiscard]] inline double pointStreamBytes(RoofKernel k, int reps, double arrayBytes) {
-    return (arraysFilled(k) + reps * arraysMoved(k)) * arrayBytes;
+    return (static_cast<double>(arraysFilled(k)) + static_cast<double>(reps) * arraysMoved(k)) * arrayBytes;
 }
 
 /// Three 64-byte-aligned float arrays. Allocated, NOT initialised: the pinned worker threads first-touch
@@ -191,6 +214,7 @@ class RoofArrays {
 public:
     /// Allocates three arrays of at least `bytesPerArray` (rounded up to 4 KiB). `ok()` is false on failure.
     explicit RoofArrays(std::size_t bytesPerArray) {
+        if (bytesPerArray > std::numeric_limits<std::size_t>::max() - 4095) return;
         const std::size_t rounded = std::max<std::size_t>(4096, (bytesPerArray + 4095) / 4096 * 4096);
         elements_ = rounded / sizeof(float);
         a_ = allocate(rounded);
@@ -209,10 +233,22 @@ public:
 
 private:
     struct FreeFn {
-        void operator()(float* p) const noexcept { std::free(p); }
+        void operator()(float* p) const noexcept {
+#if defined(_WIN32)
+            _aligned_free(p);
+#else
+            std::free(p);
+#endif
+        }
     };
     using Buffer = std::unique_ptr<float, FreeFn>;
-    static Buffer allocate(std::size_t bytes) { return Buffer(static_cast<float*>(std::aligned_alloc(64, bytes))); }
+    static Buffer allocate(std::size_t bytes) {
+#if defined(_WIN32)
+        return Buffer(static_cast<float*>(_aligned_malloc(bytes, 64)));
+#else
+        return Buffer(static_cast<float*>(std::aligned_alloc(64, bytes)));
+#endif
+    }
 
     std::size_t elements_ = 0;
     Buffer a_, b_, c_;
@@ -295,7 +331,11 @@ struct BandwidthRequest {
 /// Working-set sizes 16 KiB, 64 KiB, ... up to `maxBytes`, in factors of 4.
 [[nodiscard]] inline std::vector<std::size_t> sweepSizes(std::size_t maxBytes) {
     std::vector<std::size_t> out;
-    for (std::size_t s = 16u << 10; s <= maxBytes; s *= 4) out.push_back(s);
+    for (std::size_t s = 16u << 10; s <= maxBytes;) {
+        out.push_back(s);
+        if (s > maxBytes / 4) break;
+        s *= 4;
+    }
     return out;
 }
 
@@ -374,23 +414,49 @@ inline double secondsBetween(Clock::time_point a, Clock::time_point b) {
 /// Starts one thread per CPU in `cpus`. Each thread pins itself, runs `setup(t)` when pinned, waits at a barrier
 /// that every thread reaches (pinned or not, so the barrier cannot hang), then runs `body(t)` when pinned. Returns
 /// true when every thread was pinned. Shared by the memory and compute roofs.
-template <typename Setup, typename Body>
-inline bool runPinnedThreads(const std::vector<int>& cpus, Setup&& setup, Body&& body) {
+template <typename Setup, typename Body, typename Launch>
+inline bool runPinnedThreadsWithLauncher(const std::vector<int>& cpus, Setup&& setup, Body&& body, Launch&& launch) {
+    if (cpus.empty() || cpus.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
     const int threads = static_cast<int>(cpus.size());
     std::vector<char> pinned(cpus.size(), 0);
     std::barrier<> sync(threads);
+    std::mutex gateMutex;
+    std::condition_variable gate;
+    bool started = false;
+    bool cancelled = false;
+    std::atomic<bool> failed{false};
     const auto work = [&](int t) {
+        {
+            std::unique_lock lock(gateMutex);
+            gate.wait(lock, [&] { return started; });
+            if (cancelled) return;
+        }
         const bool ok = pinCurrentThread(cpus[static_cast<std::size_t>(t)]);
         pinned[static_cast<std::size_t>(t)] = ok ? 1 : 0;
-        if (ok) setup(t);
+        try { if (ok) setup(t); } catch (...) { failed = true; }
         sync.arrive_and_wait();
-        if (ok) body(t);
+        try { if (ok && !failed) body(t); } catch (...) { failed = true; }
     };
     std::vector<std::thread> workers;
     workers.reserve(cpus.size());
-    for (int t = 0; t < threads; ++t) workers.emplace_back(work, t);
+    try {
+        for (int t = 0; t < threads; ++t) workers.push_back(launch(work, t));
+    } catch (...) {
+        { std::lock_guard lock(gateMutex); cancelled = true; started = true; }
+        gate.notify_all();
+        for (std::thread& w : workers) w.join();
+        return false;
+    }
+    { std::lock_guard lock(gateMutex); started = true; }
+    gate.notify_all();
     for (std::thread& w : workers) w.join();
-    return std::all_of(pinned.begin(), pinned.end(), [](char v) { return v != 0; });
+    return !failed && std::all_of(pinned.begin(), pinned.end(), [](char v) { return v != 0; });
+}
+
+template <typename Setup, typename Body>
+inline bool runPinnedThreads(const std::vector<int>& cpus, Setup&& setup, Body&& body) {
+    return runPinnedThreadsWithLauncher(cpus, setup, body,
+                                       [](const auto& work, int t) { return std::thread(work, t); });
 }
 
 /// Start of thread t's slice of n elements. Boundaries are multiples of 16 floats (64 bytes).
@@ -583,7 +649,7 @@ inline void setStats(Measurement& m, const std::vector<double>& values) {
     const int threads = static_cast<int>(req.cpus.size());
     if (!kRoofsSupported) {
         m.verifyFailure = "not supported on this platform";
-    } else if (threads < 1 || req.passes < 1 || req.repeats < 1 || req.elements == 0 ||
+    } else if (!arr.ok() || threads < 1 || req.passes < 1 || req.repeats < 1 || req.elements == 0 ||
                req.elements > arr.elements() || req.elements % 16 != 0) {
         m.verifyFailure = "invalid request (threads, passes, repeats or elements out of range)";
     } else {
@@ -713,6 +779,10 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
                                           std::size_t arrayBytes, double kernelBudgetSeconds) {
     using namespace detail::roofs;
     RoofPlan plan;
+    if (!validRoofRate(cfg.assumedGbPerSec) || !std::isfinite(kernelBudgetSeconds) || kernelBudgetSeconds < 0.0) {
+        plan.note = "invalid rate or budget";
+        return plan;
+    }
     plan.threadCounts.resize(placements.size());
     for (std::size_t i = 0; i < placements.size(); ++i)
         plan.threadCounts[i] = threadCountsFor(placements[i], cfg.threadCounts);
@@ -728,7 +798,7 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
     plan.repeats = std::max(1, cfg.repeats);
     double est = estimate(plan.repeats);
     if (est > kernelBudgetSeconds) {
-        const int reps = std::max(1, static_cast<int>(std::floor(plan.repeats * kernelBudgetSeconds / est)));
+        const int reps = boundedRoofRepeats(plan.repeats * (kernelBudgetSeconds / est), plan.repeats);
         plan.note += "repeats " + std::to_string(plan.repeats) + " -> " + std::to_string(reps) + "; ";
         plan.repeats = reps;
         est = estimate(plan.repeats);
@@ -755,6 +825,14 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
     using namespace detail::roofs;
     MemoryRoofs out;
     out.budgetSeconds = config.budgetSeconds;
+    if (!validRoofBudget(config.budgetSeconds)) {
+        out.unsupportedReason = "budget must be finite and between 0 and 86400 seconds";
+        return out;
+    }
+    if (!validRoofRate(config.assumedGbPerSec) || config.repeats < 1) {
+        out.unsupportedReason = "invalid rate or repeats";
+        return out;
+    }
     const Clock::time_point start = Clock::now();
     const auto deadline = start + std::chrono::duration_cast<Clock::duration>(
                                       std::chrono::duration<double>(config.budgetSeconds));
@@ -779,9 +857,15 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
         return out;
     }
 
-    if (facts.caches.size() == 4 && facts.caches[3].sizeBytes.value && facts.caches[3].instances.value)
-        out.l3TotalBytes = static_cast<std::size_t>(*facts.caches[3].sizeBytes.value) *
-                           static_cast<std::size_t>(*facts.caches[3].instances.value);
+    if (facts.caches.size() == 4 && facts.caches[3].sizeBytes.value && facts.caches[3].instances.value) {
+        const auto size = static_cast<std::size_t>(*facts.caches[3].sizeBytes.value);
+        const auto count = static_cast<std::size_t>(*facts.caches[3].instances.value);
+        if (count != 0 && size > std::numeric_limits<std::size_t>::max() / count / 8) {
+            out.unsupportedReason = "reported cache size is too large";
+            return out;
+        }
+        out.l3TotalBytes = size * count;
+    }
     const std::size_t wanted = config.arrayBytesOverride != 0
                                    ? config.arrayBytesOverride
                                    : std::max<std::size_t>(std::size_t{1} << 30, 8 * out.l3TotalBytes);
@@ -832,7 +916,8 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
         const double remainingBudget = std::max(0.0, config.budgetSeconds - secondsBetween(start, Clock::now()));
         const std::vector<Placement> rest(placements.begin() + static_cast<std::ptrdiff_t>(p), placements.end());
         RoofConfig replan = config;
-        replan.assumedGbPerSec = 1.0 / (secondsPerByte * 1e9);
+        const double observedRate = 1.0 / (secondsPerByte * 1e9);
+        if (validRoofRate(observedRate)) replan.assumedGbPerSec = observedRate;
         const RoofPlan plan = planRoofRun(rest, replan, arrays.bytes(), remainingBudget);
         if (p == 0) {
             out.plannedRepeats = plan.repeats;
@@ -862,8 +947,7 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
                     pointsLeft -= 1.0;
                     continue;
                 }
-                const int reps = std::clamp(static_cast<int>(std::floor(remaining / (pointsLeft * perRep))), 1,
-                                            plan.repeats);
+                const int reps = boundedRoofRepeats(remaining / (pointsLeft * perRep), plan.repeats);
                 BandwidthRequest req;
                 req.kernel = k;
                 req.cpus = cpusFor(pl, threads);
@@ -874,9 +958,11 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
                 req.stopAt = deadline;
                 const Clock::time_point t0 = Clock::now();
                 kp.measurement = measureBandwidth(arrays, req);
-                if (kp.measurement.repeats > 0)
-                    secondsPerByte = secondsBetween(t0, Clock::now()) /
-                                     pointStreamBytes(k, kp.measurement.repeats, arrayBytes);
+                if (kp.measurement.repeats > 0) {
+                    const double observed = secondsBetween(t0, Clock::now()) /
+                                            pointStreamBytes(k, kp.measurement.repeats, arrayBytes);
+                    if (observed > 0.0 && std::isfinite(observed)) secondsPerByte = observed;
+                }
                 out.kernels.push_back(std::move(kp));
                 pointsLeft -= 1.0;
             }

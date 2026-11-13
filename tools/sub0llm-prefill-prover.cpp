@@ -50,16 +50,16 @@ double median(std::vector<double> v) {
 // One row range per worker, exactly as Layer::project_impl splits an output.
 template <class Body>
 bool for_workers(int workers, std::size_t rows, Body body) {
-    std::vector<char> ok(static_cast<std::size_t>(workers), 1);
+    bool ok = true;
 #ifdef _OPENMP
-#pragma omp parallel for num_threads(workers) schedule(static)
+#pragma omp parallel for num_threads(workers) schedule(static) reduction(&&:ok)
 #endif
     for (int w = 0; w < workers; ++w) {
         const std::size_t begin = rows * static_cast<std::size_t>(w) / static_cast<std::size_t>(workers);
         const std::size_t end = rows * (static_cast<std::size_t>(w) + 1) / static_cast<std::size_t>(workers);
-        ok[static_cast<std::size_t>(w)] = body(w, begin, end) ? 1 : 0;
+        ok = body(w, begin, end) && ok;
     }
-    return std::all_of(ok.begin(), ok.end(), [](char c) { return c != 0; });
+    return ok;
 }
 
 bool run_serial(const Case& c, const std::vector<float>& x, std::vector<float>& y, std::size_t tokens, int workers,
@@ -111,6 +111,7 @@ int main(int argc, char** argv) try {
     app.add_option("--filter", filter, "Only tensors whose name contains this text");
     app.add_option("--skip", skip, "Tensors whose name contains this text are excluded from the model-level estimate (default: the LM head, which prefill evaluates for the last token only)")->capture_default_str();
     CLI11_PARSE(app, argc, argv);
+    if (tokens == 0) throw std::runtime_error("tokens must be positive");
     const Iq1Kernel kernel = kernel_name == "native-all" ? Iq1Kernel::NativeAll : kernel_name == "native" ? Iq1Kernel::Native
                            : kernel_name == "scalar" ? Iq1Kernel::Scalar : Iq1Kernel::Baseline;
 
@@ -134,6 +135,8 @@ int main(int argc, char** argv) try {
         if (!slot.tensor || mib > slot.mib) slot = Case{&t, raw, static_cast<std::size_t>(t.dims[0]), static_cast<std::size_t>(t.dims[1]), mib};
     }
 
+    if (chosen.empty()) throw std::runtime_error("no supported tensors matched");
+
     std::printf("model %s\nbatch of %zu tokens, %d row workers, kernel %s, %d rounds (median), synthetic activations\n",
                 model.c_str(), tokens, threads, kernel_name.c_str(), rounds);
     std::printf("%-8s %-30s %9s %10s | %-24s %-24s %-24s | %s\n", "format", "tensor", "in x out", "MiB", "tile 8 ms (speedup)",
@@ -145,12 +148,15 @@ int main(int argc, char** argv) try {
     double all_mib = 0, serial_time_per_mib_weighted = 0, best_time_per_mib_weighted = 0;
     bool all_identical = true;
     for (const auto& [type, c] : chosen) {
+        if (!c.in || !c.out || tokens > std::numeric_limits<std::size_t>::max() / c.in ||
+            tokens > std::numeric_limits<std::size_t>::max() / c.out)
+            throw std::runtime_error("invalid or overflowing tensor batch shape");
         std::vector<float> x(tokens * c.in);
         for (auto& v : x) { seed = seed * 1664525u + 1013904223u; v = static_cast<float>(static_cast<std::int32_t>(seed >> 8) % 2001 - 1000) / 1000.f; }
         std::vector<float> y_serial(tokens * c.out), y_test(tokens * c.out);
         const std::string fmt = sub0::gguf::find_format(type)->name;
 
-        if (!run_serial(c, x, y_serial, tokens, threads, scratch, kernel)) { std::printf("%-8s serial path rejected the tensor\n", fmt.c_str()); continue; }
+        if (!run_serial(c, x, y_serial, tokens, threads, scratch, kernel)) { throw std::runtime_error("serial path rejected the tensor"); }
         std::vector<Variant> variants{{"8", {}, 0}, {"16", {}, 0}, {"32", {}, 0}};
         std::vector<double> serial_times;
         auto check = [&](Variant& v) {
@@ -158,17 +164,17 @@ int main(int argc, char** argv) try {
                 if (std::memcmp(&y_serial[i], &y_test[i], sizeof(float)) != 0) ++v.mismatches;
         };
         // Warm-up, then interleaved rounds so drift touches all variants alike.
-        (void)run_batch<8>(c, x, y_test, tokens, threads, scratch, kernel);
+        if (!run_batch<8>(c, x, y_test, tokens, threads, scratch, kernel)) throw std::runtime_error("batch warmup rejected");
         for (int r = 0; r < rounds; ++r) {
             auto t0 = Clock::now();
-            (void)run_serial(c, x, y_serial, tokens, threads, scratch, kernel);
+            if (!run_serial(c, x, y_serial, tokens, threads, scratch, kernel)) throw std::runtime_error("serial projection rejected");
             serial_times.push_back(ms_since(t0));
             t0 = Clock::now(); const bool ok8 = run_batch<8>(c, x, y_test, tokens, threads, scratch, kernel);
-            variants[0].times.push_back(ms_since(t0)); if (ok8 && r == 0) check(variants[0]);
+            variants[0].times.push_back(ms_since(t0)); if (!ok8) throw std::runtime_error("batch projection rejected"); if (r == 0) check(variants[0]);
             t0 = Clock::now(); const bool ok16 = run_batch<16>(c, x, y_test, tokens, threads, scratch, kernel);
-            variants[1].times.push_back(ms_since(t0)); if (ok16 && r == 0) check(variants[1]);
+            variants[1].times.push_back(ms_since(t0)); if (!ok16) throw std::runtime_error("batch projection rejected"); if (r == 0) check(variants[1]);
             t0 = Clock::now(); const bool ok32 = run_batch<32>(c, x, y_test, tokens, threads, scratch, kernel);
-            variants[2].times.push_back(ms_since(t0)); if (ok32 && r == 0) check(variants[2]);
+            variants[2].times.push_back(ms_since(t0)); if (!ok32) throw std::runtime_error("batch projection rejected"); if (r == 0) check(variants[2]);
         }
         const double serial_ms = median(serial_times);
         std::string cols;
