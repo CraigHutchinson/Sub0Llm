@@ -59,6 +59,9 @@ def validate(spec):
         raise ValueError('prompt_ids must be a nonempty array of token IDs')
     if len(ids) + spec['tokens_per_request'] >= spec['context_per_slot']:
         raise ValueError('prompt and output must fit inside the per-slot context without truncation')
+    eos = spec.get('eos_token_ids')
+    if not isinstance(eos, list) or not eos or any(type(t) is not int or t < 0 for t in eos) or len(set(eos)) != len(eos):
+        raise ValueError('declare distinct model EOS token IDs for answer-prefix parity')
     levels = spec.get('concurrency')
     if not isinstance(levels, list) or not levels or any(type(v) is not int or v not in (1, 2, 4, 8) or v > spec['server_cap'] for v in levels) or len(set(levels)) != len(levels):
         raise ValueError('concurrency must contain distinct values from 1,2,4,8 within server_cap')
@@ -189,6 +192,13 @@ def inspect_server(spec, host, port):
     return sorted(seen), props
 
 
+def answer_prefix(tokens, eos):
+    for i, token in enumerate(tokens):
+        if token in eos:
+            return tokens[:i + 1]
+    return tokens
+
+
 def one_request(spec, host, port, slot, session, gate, released):
     payload = dict(prompt=spec['prompt_ids'], n_predict=spec['tokens_per_request'], stream=True,
                    cache_prompt=False, ignore_eos=True, return_tokens=True, return_progress=True, temperature=0,
@@ -247,7 +257,9 @@ def one_request(spec, host, port, slot, session, gate, released):
             raise ValueError('missing or invalid server timings')
         content = ''.join(pieces)
         return dict(slot=slot, session=session, wall_s=end-start, ttft_s=first, ended_after_release_s=end-released[0],
-                    tokens=len(ids), content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+                    tokens=len(ids), token_ids=ids,
+                    answer_prefix_sha256=hashlib.sha256(json.dumps(answer_prefix(ids, spec['eos_token_ids']), separators=(',', ':')).encode()).hexdigest(),
+                    content_sha256=hashlib.sha256(content.encode()).hexdigest(),
                     token_sha256=hashlib.sha256(json.dumps(ids, separators=(',', ':')).encode()).hexdigest(),
                     prompt_progress=prompt_progress, final_tokens_cached=final.get('tokens_cached'), timings=timings)
     finally:
@@ -356,6 +368,10 @@ def run(spec, out):
         final_power = power_state()
         if server_identity(spec) != identity or final_power.untrusted or final_power.source == 'fake' or final_power.as_dict() != power.as_dict():
             raise ValueError('server identity or power changed during the run')
+        prefixes = {r['answer_prefix_sha256'] for s in evidence['samples'] if not s['tainted'] for r in s['requests']}
+        if len(prefixes) != 1:
+            raise ValueError('greedy answer prefixes differ across sessions; partial evidence preserved')
+        evidence['answer_prefix_consistent'] = True
         evidence['summary'] = {str(n): {'aggregate_tokens_s_median': statistics.median(s['aggregate_tokens_s'] for s in evidence['samples'] if s['concurrency'] == n and not s['warmup'] and not s['tainted']),
                                          'ttft_p50_s': statistics.median(v['ttft_s'] for s in evidence['samples'] if s['concurrency'] == n and not s['warmup'] and not s['tainted'] for v in s['requests']),
                                          'ttft_p95_s': percentile([v['ttft_s'] for s in evidence['samples'] if s['concurrency'] == n and not s['warmup'] and not s['tainted'] for v in s['requests']], .95),

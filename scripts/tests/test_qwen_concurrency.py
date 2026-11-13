@@ -21,7 +21,7 @@ def manifest(port):
     return dict(engine_kind='llama-server', url=f'http://127.0.0.1:{port}', engine_id='engine', engine_sha256='a'*64,
                 model_id='model', model_sha256='b'*64, server_build='build', server_model_path='/model.gguf',
                 calibrator='/calibrator', server_pid=os.getpid(), cpus=[0], context_per_slot=128, server_cap=2, prompt_ids=[1, 2, 3],
-                tokens_per_request=2, seed=17, concurrency=[1, 2], rounds=3, timeout_seconds=2)
+                tokens_per_request=2, eos_token_ids=[43], seed=17, concurrency=[1, 2], rounds=3, timeout_seconds=2)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -155,6 +155,12 @@ class ConcurrencyTests(unittest.TestCase):
                 bad = dict(self.spec, **change)
                 with self.assertRaises(ValueError):
                     mod.validate(bad)
+
+    def test_answer_prefix_ignores_only_post_eos_tokens(self):
+        self.assertEqual(mod.answer_prefix([42, 43, 0], [43]), [42, 43])
+        self.assertEqual(mod.answer_prefix([42, 43, 99], [43]), [42, 43])
+        self.assertNotEqual(mod.answer_prefix([41, 43, 99], [43]), [42, 43])
+        self.assertEqual(mod.answer_prefix([0, 42], [43]), [0, 42])
 
     def test_percentiles(self):
         self.assertEqual(mod.percentile([5, 2, 4, 1, 3], .95), 5)

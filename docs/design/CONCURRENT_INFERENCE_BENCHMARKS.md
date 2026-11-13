@@ -15,7 +15,7 @@ Create a JSON manifest (fill in actual values):
   "server_pid": 12345, "cpus": [0, 1, 2, 3],
   "context_per_slot": 4096, "server_cap": 4,
   "prompt_ids": [1, 2, 3], "tokens_per_request": 128,
-  "seed": 42, "concurrency": [1, 2, 4], "rounds": 3,
+  "seed": 42, "eos_token_ids": [248046], "concurrency": [1, 2, 4], "rounds": 3,
   "timeout_seconds": 600, "calibrator": "/path/to/sub0perf-calibrator"
 }
 ```
@@ -45,3 +45,9 @@ and after each round, and hashes the runner and calibrator before and after the 
 The [first measured reference profile](../performance/QWEN_CONCURRENCY_BASELINE.md) covers 1/2/4 sessions.
 The next native kernel increment is [#105](https://github.com/CraigHutchinson/Sub0Llm/issues/105):
 a compiled 2-output-row x 2-session IQ1_S Q16 tile, as recommended by Astra's expert review.
+
+The manifest declares the model's EOS token IDs for greedy answer-prefix consistency. Raw generated
+IDs and both full-stream and answer-prefix hashes are retained. If identical greedy requests diverge
+before their declared EOS, the run preserves partial evidence and refuses a final comparison.
+Sampling/EOS handling must match across future engine arms; this fixed-budget server profile uses
+`ignore_eos=true` and is not a natural-stop chat-latency benchmark.

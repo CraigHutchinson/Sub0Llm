@@ -18,22 +18,24 @@ after capture. UI/chat-template metadata is omitted from the published copy with
 
 | Active sessions | Aggregate generated tokens/s, median | Three measured rates | TTFT p50 / p95, s | Request latency p50 / p95, s |
 |---|---:|---|---|---|
-| 1 | 2.482 | 2.498, 2.475, 2.482 | 1.543 / 1.555 | 3.223 / 3.232 |
-| 2 | 3.105 | 3.152, 3.105, 2.541 | 2.227 / 3.539 | 5.153 / 6.298 |
-| 4 | 3.193 | 3.210, 2.763, 3.193 | 4.440 / 5.983 | 10.022 / 11.580 |
+| 1 | 2.469 | 2.489, 2.469, 2.468 | 1.538 / 1.539 | 3.241 / 3.242 |
+| 2 | 3.134 | 3.142, 3.134, 3.131 | 2.178 / 2.182 | 5.105 / 5.110 |
+| 4 | 3.396 | 3.396, 3.772, 3.248 | 3.100 / 4.433 | 9.423 / 9.851 |
 
 **Denominator:** total generated tokens divided by complete round wall time, including prompt
 processing, queueing and request overhead. This is not decode-only tokens/s and must not be compared
 directly with the historical 4.27 decode-only result. TTFT means first nonempty streamed content.
+All eight generated token IDs agree across the entire capture. The runner also checks answer-prefix
+parity through the declared EOS token if one is emitted; no EOS occurs within this reference budget.
 Three rounds describe this short profile; the spread at occupancy 2/4 is substantial and does not
 establish a hardware ceiling or a broad confidence interval.
 
-Peak server RSS observed across the process lifetime: **7.890 GiB**. RSS and PSS snapshots are
+Peak server RSS observed across the process lifetime: **7.597 GiB**. RSS and PSS snapshots are
 recorded per sample; the peak is not reset between occupancies, and all four slots remain configured.
 The context, batch/ubatch choices, slot capacity and sampling are part of the result, not universal
 recommendations. Further tuning needs its own matched, interleaved profile.
 
-The measured aggregate gain at four sessions is about 1.29x, while p95 request latency rises sharply.
+The measured aggregate gain at four sessions is about 1.38x, while p95 request latency rises sharply.
 Concurrency must therefore be evaluated with latency and memory, not only request count. The next
 Sub0Llm mechanism targets reuse of each packed weight/decode across session rows, with one compiled
 batched path supporting occupancy one, per-session state, runtime admission and an active mask.

@@ -34,7 +34,7 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
-**2026-11-13 Codex — #90 benchmark increment complete, publishing.** Provenance-checked concurrent llama.cpp harness, compiled-capacity design and live 1/2/4-session baseline; nine unit tests and 12 untainted live samples. Owned reference server stopped. Next expert-advised kernel tile is #105. Permanent mount /mnt/development; active perf hooks/build and 12 linked-worktree paths repaired.
+**2026-11-13 Codex — #90 benchmark increment complete, publishing.** Provenance-checked concurrent llama.cpp harness, compiled-capacity design and live 1/2/4-session baseline; ten unit tests and 12 untainted, output-consistent live samples. Owned reference server stopped. Next expert-advised kernel tile is #105. Permanent mount /mnt/development; active perf hooks/build and 12 linked-worktree paths repaired.
 
 **2026-11-13 Codex — #84 backend increment merged, PR #104.** Packed IQ1_S/IQ2_XXS integer-activation kernels, independent oracles, concurrency isolation and unchanged defaults. Q8_K fails the fixed logit gate; Q16 passes the initial 16 positions. Full qualification remains #63/#84. CPU and files released.
 
