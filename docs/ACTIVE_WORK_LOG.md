@@ -34,7 +34,9 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
-**2026-11-13 Codex — #84 active.** Packed IQ1_S/IQ2_XXS × quantized-activation dense backend, activation scratch prepared at startup and shared across rows. Holds new quant activation/kernel headers, kernel fixtures/benchmarks and proving-ground dispatch; CPU reserved for bounded correctness/performance checks, no corpus capture running. Existing float defaults/artifacts preserved.
+**2026-11-13 Codex — #90 benchmark increment complete, publishing.** Provenance-checked concurrent llama.cpp harness, compiled-capacity design and live 1/2/4-session baseline; nine unit tests and 12 untainted live samples. Owned reference server stopped. Next expert-advised kernel tile is #105. Permanent mount /mnt/development; active perf hooks/build and 12 linked-worktree paths repaired.
+
+**2026-11-13 Codex — #84 backend increment merged, PR #104.** Packed IQ1_S/IQ2_XXS integer-activation kernels, independent oracles, concurrency isolation and unchanged defaults. Q8_K fails the fixed logit gate; Q16 passes the initial 16 positions. Full qualification remains #63/#84. CPU and files released.
 
 **2026-11-13 Codex — integration complete, publication pending.** Reviewing and integrating PRs #67/#71/#91/#93/#99/#102 at the owner's request. Holds quant headers, CMake and integration tests; delegated review/fixes own measure headers and machine tests. Combined build, 523-test suite, unchanged neutral counts, tooling and sanitizer checks pass. CPU/files released for publication; no new timing claims. Historical #63 capture is paused; no capture process is running.
 
