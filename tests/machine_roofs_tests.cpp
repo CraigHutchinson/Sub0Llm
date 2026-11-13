@@ -104,7 +104,9 @@ TEST_CASE("machine_roofs: invalid sizes and budgets are rejected", "[machine_roo
     CHECK(validRoofBudget(86400));
     RoofConfig cfg;
     cfg.budgetSeconds = std::numeric_limits<double>::infinity();
-    CHECK_FALSE(measureMemoryRoofs(MachineFacts{}, cfg).supported);
+    const auto invalid = measureMemoryRoofs(MachineFacts{}, cfg);
+    CHECK_FALSE(invalid.supported);
+    CHECK(std::isfinite(invalid.budgetSeconds));
 }
 
 TEST_CASE("machine_roofs: partial thread launch cancels and joins workers", "[machine_roofs]") {

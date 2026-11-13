@@ -17,7 +17,7 @@ kernel or close an unfinished qualification issue.
 - Checked row span, null pointers and index multiplication before batch pointer arithmetic.
   Removed repeated worker-status heap allocation from the prefill prover.
 - Reviewed the machine headers against cpp-review. Fixed allocation-size wraparound, failed-buffer
-  access, partial thread-launch teardown, numeric-budget validation and Windows allocation/asm
+  access, partial thread-launch teardown, numeric-budget validation (including finite rejected-result records) and Windows allocation/asm
   portability. Regression cases exercise failure paths rather than relying on successful timing.
 - The unfiltered build exposed a pre-existing missing `USE_ATTENTION_GATE` constant in the
   checked-in Qwen4 real-axis config. It is explicitly false for that preview's QSA architecture;
@@ -53,7 +53,7 @@ On CrogBuntu1, 2026-11-13:
 - Frontend: **220,980 assertions / 327 cases**, unchanged from the pre-integration binary.
 - Shared performance/tooling CTest: **9/9** groups pass. Batch projection fixture passes generic,
   AVX2 and ASan/UBSan; no numerical tolerances were relaxed.
-- Machine suites under AVX2 ASan/UBSan: **5,516 assertions**, 33 passed cases and four expected
+- Machine suites under AVX2 ASan/UBSan: **5,519 assertions**, 33 passed cases and four expected
   ISA-specific skips. Native variants pass in the unfiltered suite.
 - Dense-token and prefill-prover explicit targets build. The actual downloaded GGUF is accepted by
   the prover parser; empty selection and zero-token calls correctly fail rather than report parity.

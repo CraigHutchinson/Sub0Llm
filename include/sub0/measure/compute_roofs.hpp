@@ -757,8 +757,6 @@ inline double pointCostSeconds(int reps, double passSeconds) {
 [[nodiscard]] inline ComputeRoofs measureComputeRoofs(const MachineFacts& facts, const ComputeConfig& config = {}) {
     using namespace detail::compute;
     ComputeRoofs out;
-    out.budgetSeconds = config.budgetSeconds;
-    out.passSeconds = config.passSeconds;
     if (!validRoofBudget(config.budgetSeconds)) {
         out.unsupportedReason = "budget must be finite and between 0 and 86400 seconds";
         return out;
@@ -767,6 +765,8 @@ inline double pointCostSeconds(int reps, double passSeconds) {
         out.unsupportedReason = "invalid pass duration or repeats";
         return out;
     }
+    out.budgetSeconds = config.budgetSeconds;
+    out.passSeconds = config.passSeconds;
     const Clock::time_point start = Clock::now();
     const Clock::time_point deadline =
         start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(config.budgetSeconds));

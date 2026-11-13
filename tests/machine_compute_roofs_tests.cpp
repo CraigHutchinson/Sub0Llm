@@ -27,6 +27,8 @@ TEST_CASE("machine_compute_roofs: non-finite budget is rejected", "[machine_comp
     ComputeConfig cfg;
     cfg.budgetSeconds = std::numeric_limits<double>::infinity();
     const auto result = measureComputeRoofs(MachineFacts{}, cfg);
+    CHECK(std::isfinite(result.budgetSeconds));
+    CHECK(std::isfinite(result.passSeconds));
     CHECK_FALSE(result.supported);
     CHECK_FALSE(result.unsupportedReason.empty());
 }

@@ -824,7 +824,6 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
 [[nodiscard]] inline MemoryRoofs measureMemoryRoofs(const MachineFacts& facts, const RoofConfig& config = {}) {
     using namespace detail::roofs;
     MemoryRoofs out;
-    out.budgetSeconds = config.budgetSeconds;
     if (!validRoofBudget(config.budgetSeconds)) {
         out.unsupportedReason = "budget must be finite and between 0 and 86400 seconds";
         return out;
@@ -833,6 +832,7 @@ inline std::vector<int> thinCounts(const std::vector<int>& c) {
         out.unsupportedReason = "invalid rate or repeats";
         return out;
     }
+    out.budgetSeconds = config.budgetSeconds;
     const Clock::time_point start = Clock::now();
     const auto deadline = start + std::chrono::duration_cast<Clock::duration>(
                                       std::chrono::duration<double>(config.budgetSeconds));
