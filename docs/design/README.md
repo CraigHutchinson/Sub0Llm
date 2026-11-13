@@ -11,6 +11,7 @@ marked, proposals are marked, unknowns name the measurement that settles them). 
 | [PREFILL_BATCHING.md](PREFILL_BATCHING.md) | How does batched prefill work and how is it proven? | #74 |
 | [MEASUREMENT_PLATFORM.md](MEASUREMENT_PLATFORM.md) | How do we know what the machine can do and tie every number to it? | #78-#81, #75 |
 | [WORK_PLAN.md](WORK_PLAN.md) | In what order, with what gates, does it all get done? | all |
+| [AGENT_WORKER_FRAMEWORK.md](AGENT_WORKER_FRAMEWORK.md) | How do delegated, parallel, resource-aware background jobs (and optimisation loops) run as a native toolbox, with Sub0Llm as one engine and a known concurrency cap? | #68, worker framework tickets |
 
 Older documents stay as history and are superseded where these differ: `docs/QUANT_FORMATS.md`,
 `docs/QUANTIZED_RESIDENT_DENSE.md`, `docs/CORPUS_WORKFLOW.md` (corpus work: #6). Measurement records live in
