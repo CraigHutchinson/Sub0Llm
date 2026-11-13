@@ -338,6 +338,9 @@ target_include_directories(sub0llm-dense-layer PRIVATE "${CMAKE_SOURCE_DIR}/incl
 add_executable(sub0llm-dense-token EXCLUDE_FROM_ALL tools/sub0llm-dense-token.cpp)
 target_link_libraries(sub0llm-dense-token PRIVATE sub0llm_frontend CLI11::CLI11 ${SUB0_OPENMP_TARGET})
 target_include_directories(sub0llm-dense-token PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+add_executable(sub0llm-prefill-prover EXCLUDE_FROM_ALL tools/sub0llm-prefill-prover.cpp)
+target_link_libraries(sub0llm-prefill-prover PRIVATE CLI11::CLI11 ${SUB0_OPENMP_TARGET})
+target_include_directories(sub0llm-prefill-prover PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sub0llm-model-probe PRIVATE sub0llm_core)
 target_include_directories(sub0llm_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0llm_frontend used by the
