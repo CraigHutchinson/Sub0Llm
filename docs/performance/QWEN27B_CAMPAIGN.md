@@ -63,3 +63,10 @@ measurements or change system policy to manufacture a roofline claim.
 | Remaining projection reduction [#62](https://github.com/CraigHutchinson/Sub0Llm/issues/62) | measured candidate | [Another 1.72× gain](FLOAT_REDUCTION_ITERATION.md), 1.264 generated tokens/s; quality/promotion remains #63 |
 | IQ2_XXS [#66](https://github.com/CraigHutchinson/Sub0Llm/issues/66) | measured candidate, draft PR #67 | [Another 18% generation gain](IQ2XXS_ITERATION.md), 1.503 tokens/s; corpus/default qualification pending |
 | Context/quality and promotion [#63](https://github.com/CraigHutchinson/Sub0Llm/issues/63) | active | Full supported window, independent quality gates, generated defaults and artifact promotion |
+| Packed integer activations #84 / PR #104 | merged explicit candidate | [Q16 passes the 16-position gate](PACKED_ACTIVATION_BACKEND.md); Q8 fails; no default promotion |
+| Concurrency reference #90 / PR #106 | merged | [Matched llama.cpp concurrency baseline](QWEN_CONCURRENCY_BASELINE.md), bounded pooled Sub0 engine still pending |
+| IQ1 Q16 row/session tile #105 | reviewed candidate | [2.16× two-session prepared kernel gain](Q16_SESSION_TILE.md); single-session model ~1.58 gen tok/s vs clean llama.cpp ~4.13; full corpus pending |
+
+Next execution package: [#107](https://github.com/CraigHutchinson/Sub0Llm/issues/107), bounded
+two-session whole-model proving ground with shared projection coordination and isolated KV/GDN/RNG.
+The tile result establishes a kernel opportunity; it does not establish concurrent-model parity.

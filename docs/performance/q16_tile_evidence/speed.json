@@ -1,0 +1,1737 @@
+{
+  "schema": "qwen-speed-comparison-1",
+  "source_commit": "0e7c1a688deb07b5b5e75795c7fea3143941156f",
+  "manifest": {
+    "cpus": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "prompt_ids": [
+      248045,
+      846,
+      198,
+      12675,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      271,
+      248069,
+      271
+    ],
+    "decode_evaluations": 8,
+    "calibrator": "/mnt/development/GitHub/Sub0Llm/out/build/perf/sub0llm-bench-denseq",
+    "arms": [
+      {
+        "name": "Sub0 Q16 serial",
+        "command": [
+          "/mnt/development/GitHub/Sub0Llm/out/build/q16-session-tile-native/sub0llm-dense-token",
+          "/mnt/development/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+          "{tokens}",
+          "--projection-threads",
+          "8",
+          "--continuation-steps",
+          "8",
+          "--timings-file",
+          "{metrics}",
+          "--projection-kernel",
+          "packed-q16"
+        ]
+      },
+      {
+        "name": "Sub0 Q16 tile",
+        "command": [
+          "/mnt/development/GitHub/Sub0Llm/out/build/q16-session-tile-native/sub0llm-dense-token",
+          "/mnt/development/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+          "{tokens}",
+          "--projection-threads",
+          "8",
+          "--continuation-steps",
+          "8",
+          "--timings-file",
+          "{metrics}",
+          "--projection-kernel",
+          "packed-q16-tile"
+        ]
+      },
+      {
+        "name": "llama native defaults",
+        "command": [
+          "/mnt/development/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock-bench",
+          "/mnt/development/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+          "{metrics}",
+          "{tokens}",
+          "8",
+          "8",
+          "default"
+        ]
+      }
+    ],
+    "identity_files": {
+      "model": "/mnt/development/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+      "reference_harness": "/mnt/development/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock-bench",
+      "calibrator": "/mnt/development/GitHub/Sub0Llm/out/build/perf/sub0llm-bench-denseq",
+      "reference_libggml-base.so.0.29.0": "/mnt/development/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock/lib/libggml-base.so.0.29.0",
+      "reference_libggml-cpu.so.0.29.0": "/mnt/development/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock/lib/libggml-cpu.so.0.29.0",
+      "reference_libggml.so.0.29.0": "/mnt/development/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock/lib/libggml.so.0.29.0",
+      "reference_libllama.so.0.9.0": "/mnt/development/GitHub/Sub0Llm/out/build/qwen-perf/llama-stock/lib/libllama.so.0.9.0",
+      "candidate": "/mnt/development/GitHub/Sub0Llm/out/build/q16-session-tile-native/sub0llm-dense-token",
+      "sub0_config.hpp": "/mnt/development/GitHub/Sub0Llm/out/build/pr76_verify/generated/sub0_config.hpp",
+      "sub0_corpus.hpp": "/mnt/development/GitHub/Sub0Llm/out/build/pr76_verify/generated/sub0_corpus.hpp",
+      "sub0_system.hpp": "/mnt/development/GitHub/Sub0Llm/out/build/pr76_verify/generated/sub0_system.hpp",
+      "tools/sub0llm-dense-token.cpp": "/mnt/development/GitHub/Sub0Llm/tools/sub0llm-dense-token.cpp",
+      "tools/dense_qwen_support.hpp": "/mnt/development/GitHub/Sub0Llm/tools/dense_qwen_support.hpp",
+      "include/sub0/dense_quant_q16_tile.hpp": "/mnt/development/GitHub/Sub0Llm/include/sub0/dense_quant_q16_tile.hpp",
+      "scripts/compare_qwen_speed.py": "/mnt/development/GitHub/Sub0Llm/scripts/compare_qwen_speed.py",
+      "tools/reference/bench_llama_phases.cpp": "/mnt/development/GitHub/Sub0Llm/tools/reference/bench_llama_phases.cpp"
+    },
+    "reference_revision": "cf659f240b232e15700b1721bbb43c1d973c52e9",
+    "method": "13-token non-thinking Hi prompt; 8 additional greedy evals; EOS ignored for fixed count; CPU-only, eight physical cores on one CCD; pretokenized backend phases; explicit packed Q16 old/new kernel arms, no default promotion",
+    "correctness_records": {
+      "q16": "/mnt/development/GitHub/Sub0Llm/out/perf/q16-tile-model/gate.json"
+    }
+  },
+  "identities": {
+    "model": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+    "reference_harness": "7e9afc993abfa86d91ac86a449543065d33974e369afc2c26601dc4cb0eb78bc",
+    "calibrator": "eb349deb77f8538a1d4d0c469651215534e029415f88f6d2e44ddeb113e8c323",
+    "reference_libggml-base.so.0.29.0": "2a653637d62a89d926e75e7cf54bbfcdbfee2ea4343f529b7d498b6e3463cb09",
+    "reference_libggml-cpu.so.0.29.0": "189bac4afe7888dc2f18e7de2e5367c996cb6ede44c1972af3b1c87fc31e7628",
+    "reference_libggml.so.0.29.0": "1ef9b424c298984154012e980972f7d6738855d4cfcfa2b64d1b5ef1408bc17a",
+    "reference_libllama.so.0.9.0": "03f3f26cab527342e20d7c60aac74a8c3cc0f5e6b75974f7c1481421776d4265",
+    "candidate": "0b6490552a412a80b4a355134d3ff8e9be5e4d48443b31852b261c4818164c9a",
+    "sub0_config.hpp": "1c17c68b415ed71077d2b8ca87f497993bb2583f28c2aaa2f0472b6f2dfd2401",
+    "sub0_corpus.hpp": "508bf6c66e2b3277cfdb3f6e9f4174cb6d27cd12fdedf31b72eccad349240436",
+    "sub0_system.hpp": "285db8b3002fbf8943ab6a5ee80d6db70e6ae3db8d8eece66d8fa7a29e71e130",
+    "tools/sub0llm-dense-token.cpp": "6e2fb5c1ee720fdb4dd349295676723f2b0be2f2f86311feb4073358e989ef61",
+    "tools/dense_qwen_support.hpp": "3e6772bcd0e471c3391c03b2133ee33e53feced38eb45e55f662813d49e12814",
+    "include/sub0/dense_quant_q16_tile.hpp": "0a8a6d36cfc65660e45cb7542141b4378d2641297d7e27c6ebb9304ea7b75dca",
+    "scripts/compare_qwen_speed.py": "3f7e25584a359b314d4d97a590a815d0c8a6f7cc7e4d3c3da3d07dd5244be6ec",
+    "tools/reference/bench_llama_phases.cpp": "93d24d864a9496480570ee162ebe24f3d25eb626be37ccfd8e7516490ca41d65",
+    "correctness_q16": "0cdc7ada65e60fc06b9032dd188bf778ace943739929423a41d95a31d11c638d",
+    "manifest": "1b9d7dc9eef79ead8f0bf9618aab5856d8c3ef4a6ce709bc22f50b4f2d8cdca7"
+  },
+  "host": "CrogBuntu1",
+  "system": "Linux-7.0.0-43-generic-x86_64-with-glibc2.43",
+  "power": {
+    "state": "ac",
+    "saver": false
+  },
+  "cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "thread_environment": {
+    "OMP_NUM_THREADS": "8",
+    "OMP_PROC_BIND": "false",
+    "OMP_DYNAMIC": "false",
+    "OMP_THREAD_LIMIT": "8",
+    "OMP_MAX_ACTIVE_LEVELS": "1"
+  },
+  "governors": {
+    "0": "performance",
+    "1": "performance",
+    "2": "performance",
+    "3": "performance",
+    "4": "performance",
+    "5": "performance",
+    "6": "performance",
+    "7": "performance"
+  },
+  "cache": "warm working weights; no eviction/pressure",
+  "samples": [
+    {
+      "arm": "Sub0 Q16 serial",
+      "round": -1,
+      "warmup": true,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 128,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 5764050576,
+        "projection_flops_per_eval": 51247841280,
+        "setup_ms": 75.8027,
+        "batched_prefill": false,
+        "f32_attention": true,
+        "prefill_ms": [
+          539.250164,
+          518.237698,
+          523.400861,
+          516.501999,
+          520.104752,
+          517.899695,
+          517.937858,
+          519.890617,
+          520.292295,
+          520.624217,
+          528.817473,
+          527.422724,
+          631.553056
+        ],
+        "decode_ms": [
+          631.464154,
+          635.994932,
+          629.682677,
+          632.656893,
+          633.494654,
+          633.980053,
+          631.918343,
+          631.582293
+        ],
+        "top_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 1.8835301979367445,
+        "decode_tok_s": 1.5807858642928505,
+        "prefill_s": 6.901933409000001,
+        "decode_s": 5.060773999,
+        "setup_s": 0.0758027,
+        "setup_plus_prefill_s": 6.977736109,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 12.181053375999909,
+        "peak_rss_mib": 5736.40234375
+      },
+      "quiet": {
+        "samples": [
+          0.005001562988433885,
+          0.004066312167657179,
+          0.0034396497811131957,
+          0.005315822388993121,
+          0.005628517823639775,
+          0.011569731081926203,
+          0.004375,
+          0.0046918986549890525,
+          0.004688965301656768,
+          0.004066312167657179
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.004262530813475807,
+      "background_selected": 0.0004104247896574819,
+      "tainted": false,
+      "calibration_ns": [
+        4497.93628404669,
+        4499.20598438855
+      ],
+      "stdout_sha256": "f347fdec4599f5dc73507f8fd6d43ec4b8a97eb7f83fe9b412e1d7a4f5669bef",
+      "child_cpu_s": 96.77999999999999,
+      "mean_busy_cores": 7.945125681058399
+    },
+    {
+      "arm": "Sub0 Q16 tile",
+      "round": -1,
+      "warmup": true,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 128,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 5764050576,
+        "projection_flops_per_eval": 51247841280,
+        "setup_ms": 77.491639,
+        "batched_prefill": false,
+        "f32_attention": true,
+        "prefill_ms": [
+          532.622467,
+          523.294946,
+          516.864001,
+          530.87732,
+          521.524901,
+          515.879726,
+          519.020133,
+          509.930552,
+          511.459922,
+          575.465682,
+          554.008886,
+          545.753349,
+          631.446731
+        ],
+        "decode_ms": [
+          637.399801,
+          629.162951,
+          632.362302,
+          632.010913,
+          630.470351,
+          631.383679,
+          628.00493,
+          626.72357
+        ],
+        "top_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 1.8602924342844285,
+        "decode_tok_s": 1.5849372329699856,
+        "prefill_s": 6.988148616,
+        "decode_s": 5.047518497,
+        "setup_s": 0.077491639,
+        "setup_plus_prefill_s": 7.065640255,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 12.251986301000215,
+        "peak_rss_mib": 5736.25
+      },
+      "quiet": {
+        "samples": [
+          0.006877149109096593,
+          0.004377736085053158,
+          0.00375234521575985,
+          0.0040650406504065045,
+          0.004377736085053158,
+          0.005944931163954944,
+          0.005626758361988122,
+          0.004067584480600751,
+          0.00688360450563204,
+          0.004379105411323116
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.007837430752342294,
+      "background_selected": 0.0004080383556054269,
+      "tainted": false,
+      "calibration_ns": [
+        4498.7451171875,
+        4499.581913499341
+      ],
+      "stdout_sha256": "2a4e460bf27a670c7bc1848740a710696b48a5d20d11bd24b37bcfe4f902a97c",
+      "child_cpu_s": 97.35000000000001,
+      "mean_busy_cores": 7.9456504119705595
+    },
+    {
+      "arm": "llama native defaults",
+      "round": -1,
+      "warmup": true,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 256,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 0,
+        "projection_flops_per_eval": 0,
+        "setup_ms": 506.691182,
+        "batched_prefill": true,
+        "f32_attention": false,
+        "prefill_ms": [
+          782.882382
+        ],
+        "decode_ms": [
+          236.50217,
+          236.437194,
+          236.529703,
+          236.933173,
+          237.197706,
+          241.972326,
+          250.125745,
+          245.345434
+        ],
+        "top_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 16.605304064691545,
+        "decode_tok_s": 4.164403463042753,
+        "prefill_s": 0.782882382,
+        "decode_s": 1.921043451,
+        "setup_s": 0.5066911820000001,
+        "setup_plus_prefill_s": 1.2895735640000001,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 3.388898301000154,
+        "peak_rss_mib": 6249.5390625
+      },
+      "quiet": {
+        "samples": [
+          0.006255864873318737,
+          0.005310840362386754,
+          0.003751172241325414,
+          0.003440725680325305,
+          0.00375234521575985,
+          0.004690431519699813,
+          0.00688145136065061,
+          0.0031289111389236545,
+          0.0034385745545482964,
+          0.005004691898654989
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.010248361185485978,
+      "background_selected": 0.003318584070795957,
+      "tainted": false,
+      "calibration_ns": [
+        4498.15674418605,
+        4499.55708908407
+      ],
+      "stdout_sha256": "84a0008e6f21a39d6adf8f01fa9ac9c2956d856bb28f624e2c299b6cf8c9a6d0",
+      "child_cpu_s": 23.370000000000015,
+      "mean_busy_cores": 6.896046421075223
+    },
+    {
+      "arm": "Sub0 Q16 serial",
+      "round": 0,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 128,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 5764050576,
+        "projection_flops_per_eval": 51247841280,
+        "setup_ms": 77.326489,
+        "batched_prefill": false,
+        "f32_attention": true,
+        "prefill_ms": [
+          556.339607,
+          519.850771,
+          519.595006,
+          519.971264,
+          518.757054,
+          517.760816,
+          521.223768,
+          528.809258,
+          524.646131,
+          521.390911,
+          522.210828,
+          524.665629,
+          637.467853
+        ],
+        "decode_ms": [
+          637.866705,
+          635.234321,
+          638.478148,
+          633.393308,
+          631.870581,
+          639.032451,
+          633.722044,
+          639.169376
+        ],
+        "top_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 1.8751742931232207,
+        "decode_tok_s": 1.5720900767824395,
+        "prefill_s": 6.932688895999999,
+        "decode_s": 5.088766934000001,
+        "setup_s": 0.077326489,
+        "setup_plus_prefill_s": 7.010015385,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 12.237121313000898,
+        "peak_rss_mib": 5736.5390625
+      },
+      "quiet": {
+        "samples": [
+          0.004377736085053158,
+          0.004377736085053158,
+          0.0046918986549890525,
+          0.0053141606752110035,
+          0.00375234521575985,
+          0.005001562988433885,
+          0.004066312167657179,
+          0.01001564945226917,
+          0.005630278385986863,
+          0.005001562988433885
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.004574729094254707,
+      "background_selected": 0.0006126825283363812,
+      "tainted": false,
+      "calibration_ns": [
+        4497.122568093379,
+        4502.02426260704
+      ],
+      "stdout_sha256": "f347fdec4599f5dc73507f8fd6d43ec4b8a97eb7f83fe9b412e1d7a4f5669bef",
+      "child_cpu_s": 97.25000000000001,
+      "mean_busy_cores": 7.94713049846782
+    },
+    {
+      "arm": "Sub0 Q16 tile",
+      "round": 0,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 128,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 5764050576,
+        "projection_flops_per_eval": 51247841280,
+        "setup_ms": 76.455002,
+        "batched_prefill": false,
+        "f32_attention": true,
+        "prefill_ms": [
+          540.61726,
+          512.475507,
+          510.49788,
+          518.118929,
+          511.459762,
+          517.498819,
+          510.900689,
+          510.423335,
+          511.978285,
+          514.483714,
+          515.871049,
+          517.798629,
+          629.68921
+        ],
+        "decode_ms": [
+          636.005112,
+          625.332397,
+          623.023419,
+          630.062402,
+          631.639784,
+          633.652098,
+          631.200544,
+          625.259206
+        ],
+        "top_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 1.9056517483571713,
+        "decode_tok_s": 1.588507162750157,
+        "prefill_s": 6.821813068,
+        "decode_s": 5.0361749620000005,
+        "setup_s": 0.076455002,
+        "setup_plus_prefill_s": 6.89826807,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 12.068363117001354,
+        "peak_rss_mib": 5736.71875
+      },
+      "quiet": {
+        "samples": [
+          0.007502344482650828,
+          0.005001562988433885,
+          0.004688965301656768,
+          0.005939356048765239,
+          0.004690431519699813,
+          0.004066312167657179,
+          0.0059412132582864294,
+          0.003753518923991242,
+          0.004067584480600751,
+          0.004063769928102532
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.004456420354440922,
+      "background_selected": 0.00010359473738752915,
+      "tainted": false,
+      "calibration_ns": [
+        4498.41302325581,
+        4498.12836079792
+      ],
+      "stdout_sha256": "2a4e460bf27a670c7bc1848740a710696b48a5d20d11bd24b37bcfe4f902a97c",
+      "child_cpu_s": 95.94999999999999,
+      "mean_busy_cores": 7.950539693724499
+    },
+    {
+      "arm": "llama native defaults",
+      "round": 0,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 256,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 0,
+        "projection_flops_per_eval": 0,
+        "setup_ms": 518.13002,
+        "batched_prefill": true,
+        "f32_attention": false,
+        "prefill_ms": [
+          790.136672
+        ],
+        "decode_ms": [
+          236.117635,
+          237.261329,
+          238.881224,
+          236.54885,
+          237.08083,
+          236.681627,
+          240.077219,
+          237.857222
+        ],
+        "top_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 16.452849817860372,
+        "decode_tok_s": 4.209405426450612,
+        "prefill_s": 0.7901366719999999,
+        "decode_s": 1.900505936,
+        "setup_s": 0.51813002,
+        "setup_plus_prefill_s": 1.308266692,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 3.379418946000442,
+        "peak_rss_mib": 6249.57421875
+      },
+      "quiet": {
+        "samples": [
+          0.007814942169427946,
+          0.005628517823639775,
+          0.004380475594493116,
+          0.004690431519699813,
+          0.004688965301656768,
+          0.0053141606752110035,
+          0.004690431519699813,
+          0.004379105411323116,
+          0.003440725680325305,
+          0.00437636761487965
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.009164121077478478,
+      "background_selected": 0.0014803849000740192,
+      "tainted": false,
+      "calibration_ns": [
+        4498.00650477017,
+        4500.12462006079
+      ],
+      "stdout_sha256": "84a0008e6f21a39d6adf8f01fa9ac9c2956d856bb28f624e2c299b6cf8c9a6d0",
+      "child_cpu_s": 23.29,
+      "mean_busy_cores": 6.891717295827978
+    },
+    {
+      "arm": "Sub0 Q16 tile",
+      "round": 1,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 128,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 5764050576,
+        "projection_flops_per_eval": 51247841280,
+        "setup_ms": 77.061676,
+        "batched_prefill": false,
+        "f32_attention": true,
+        "prefill_ms": [
+          538.024432,
+          513.770033,
+          521.958139,
+          516.263178,
+          516.437655,
+          517.028329,
+          524.257479,
+          516.018264,
+          517.139323,
+          518.488815,
+          524.347553,
+          520.184285,
+          633.777652
+        ],
+        "decode_ms": [
+          632.218564,
+          632.344489,
+          629.021177,
+          632.885224,
+          640.097702,
+          632.595624,
+          631.512448,
+          632.038656
+        ],
+        "top_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 1.8901681073451164,
+        "decode_tok_s": 1.5801801530366713,
+        "prefill_s": 6.877695137,
+        "decode_s": 5.062713884,
+        "setup_s": 0.07706167600000001,
+        "setup_plus_prefill_s": 6.954756813,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 12.157091552000566,
+        "peak_rss_mib": 5737.0546875
+      },
+      "quiet": {
+        "samples": [
+          0.02188183807439825,
+          0.004688965301656768,
+          0.004377736085053158,
+          0.008448060075093867,
+          0.005315822388993121,
+          0.0046875,
+          0.004690431519699813,
+          0.005315822388993121,
+          0.0050031269543464665,
+          0.005
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.004705942860081775,
+      "background_selected": 0.0003084198622391282,
+      "tainted": false,
+      "calibration_ns": [
+        4497.91445940078,
+        4497.99416058394
+      ],
+      "stdout_sha256": "2a4e460bf27a670c7bc1848740a710696b48a5d20d11bd24b37bcfe4f902a97c",
+      "child_cpu_s": 96.62,
+      "mean_busy_cores": 7.9476246096131655
+    },
+    {
+      "arm": "llama native defaults",
+      "round": 1,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 256,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 0,
+        "projection_flops_per_eval": 0,
+        "setup_ms": 509.001414,
+        "batched_prefill": true,
+        "f32_attention": false,
+        "prefill_ms": [
+          786.428906
+        ],
+        "decode_ms": [
+          249.402245,
+          245.729426,
+          247.032098,
+          243.79882,
+          240.228421,
+          237.52518,
+          237.676883,
+          238.598417
+        ],
+        "top_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 16.53041985209023,
+        "decode_tok_s": 4.123729429349198,
+        "prefill_s": 0.786428906,
+        "decode_s": 1.93999149,
+        "setup_s": 0.509001414,
+        "setup_plus_prefill_s": 1.29543032,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 3.4114987199991447,
+        "peak_rss_mib": 6249.46484375
+      },
+      "quiet": {
+        "samples": [
+          0.006566604127579738,
+          0.0050062578222778474,
+          0.004063769928102532,
+          0.0046875,
+          0.008130081300813009,
+          0.0053141606752110035,
+          0.009082367679298466,
+          0.005315822388993121,
+          0.004377736085053158,
+          0.005632040050062578
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.009906439185470264,
+      "background_selected": 0.0018328445747788917,
+      "tainted": false,
+      "calibration_ns": [
+        4498.292955326459,
+        4498.91098567086
+      ],
+      "stdout_sha256": "84a0008e6f21a39d6adf8f01fa9ac9c2956d856bb28f624e2c299b6cf8c9a6d0",
+      "child_cpu_s": 23.54000000000003,
+      "mean_busy_cores": 6.900193120988752
+    },
+    {
+      "arm": "Sub0 Q16 serial",
+      "round": 1,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 128,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 5764050576,
+        "projection_flops_per_eval": 51247841280,
+        "setup_ms": 76.966502,
+        "batched_prefill": false,
+        "f32_attention": true,
+        "prefill_ms": [
+          548.613996,
+          515.700799,
+          516.776962,
+          520.335549,
+          520.142676,
+          518.860073,
+          527.461389,
+          533.038964,
+          524.757577,
+          520.208723,
+          521.564717,
+          522.115163,
+          633.480738
+        ],
+        "decode_ms": [
+          636.648368,
+          641.111244,
+          635.576062,
+          634.760323,
+          634.390908,
+          636.107971,
+          670.506693,
+          638.747971
+        ],
+        "top_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 1.8777830931975155,
+        "decode_tok_s": 1.5601081774329908,
+        "prefill_s": 6.923057326,
+        "decode_s": 5.127849540000001,
+        "setup_s": 0.076966502,
+        "setup_plus_prefill_s": 7.000023828000001,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 12.267257896999581,
+        "peak_rss_mib": 5736.71875
+      },
+      "quiet": {
+        "samples": [
+          0.004067584480600751,
+          0.004377736085053158,
+          0.00344180225281602,
+          0.003753518923991242,
+          0.00344180225281602,
+          0.004066312167657179,
+          0.004694835680751174,
+          0.004377736085053158,
+          0.003440725680325305,
+          0.0040650406504065045
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.0057620723063585835,
+      "background_selected": 0.0,
+      "tainted": false,
+      "calibration_ns": [
+        4497.7550458715605,
+        4500.27352572145
+      ],
+      "stdout_sha256": "f347fdec4599f5dc73507f8fd6d43ec4b8a97eb7f83fe9b412e1d7a4f5669bef",
+      "child_cpu_s": 97.50000000000004,
+      "mean_busy_cores": 7.947986487171459
+    },
+    {
+      "arm": "llama native defaults",
+      "round": 2,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 256,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 0,
+        "projection_flops_per_eval": 0,
+        "setup_ms": 512.635136,
+        "batched_prefill": true,
+        "f32_attention": false,
+        "prefill_ms": [
+          784.946136
+        ],
+        "decode_ms": [
+          238.769447,
+          236.773275,
+          240.584971,
+          247.685362,
+          244.911273,
+          245.732743,
+          243.918753,
+          238.14046
+        ],
+        "top_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 16.561645957322096,
+        "decode_tok_s": 4.131129733376412,
+        "prefill_s": 0.7849461360000001,
+        "decode_s": 1.936516284,
+        "setup_s": 0.512635136,
+        "setup_plus_prefill_s": 1.297581272,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 3.4012968160004675,
+        "peak_rss_mib": 6249.6796875
+      },
+      "quiet": {
+        "samples": [
+          0.008135168961201502,
+          0.004377736085053158,
+          0.005001562988433885,
+          0.005630278385986863,
+          0.00437636761487965,
+          0.0040650406504065045,
+          0.004693366708385482,
+          0.009696590553644042,
+          0.009073842302878598,
+          0.00718974679587371
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.009841795437822723,
+      "background_selected": 0.003307607497246836,
+      "tainted": false,
+      "calibration_ns": [
+        4497.41990798829,
+        4499.21102909249
+      ],
+      "stdout_sha256": "84a0008e6f21a39d6adf8f01fa9ac9c2956d856bb28f624e2c299b6cf8c9a6d0",
+      "child_cpu_s": 23.499999999999915,
+      "mean_busy_cores": 6.909129450111679
+    },
+    {
+      "arm": "Sub0 Q16 serial",
+      "round": 2,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 128,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 5764050576,
+        "projection_flops_per_eval": 51247841280,
+        "setup_ms": 78.265646,
+        "batched_prefill": false,
+        "f32_attention": true,
+        "prefill_ms": [
+          554.689733,
+          526.971251,
+          522.855626,
+          523.463502,
+          539.021581,
+          525.650956,
+          525.453734,
+          532.38111,
+          529.898045,
+          530.324581,
+          539.820869,
+          528.590815,
+          639.771321
+        ],
+        "decode_ms": [
+          642.889837,
+          641.260303,
+          699.838619,
+          647.339248,
+          640.200602,
+          640.493158,
+          641.05207,
+          640.6904
+        ],
+        "top_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 1.8521438879797936,
+        "decode_tok_s": 1.5403086537907476,
+        "prefill_s": 7.018893124,
+        "decode_s": 5.193764237,
+        "setup_s": 0.07826564600000001,
+        "setup_plus_prefill_s": 7.09715877,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 12.430816598998717,
+        "peak_rss_mib": 5737.11328125
+      },
+      "quiet": {
+        "samples": [
+          0.006257822277847309,
+          0.0059430716296528,
+          0.00375234521575985,
+          0.0053125,
+          0.006875,
+          0.004690431519699813,
+          0.0053141606752110035,
+          0.004694835680751174,
+          0.004066312167657179,
+          0.0053125
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.006919109321927424,
+      "background_selected": 0.0005026641198356748,
+      "tainted": false,
+      "calibration_ns": [
+        4497.77860465116,
+        4498.02335766423
+      ],
+      "stdout_sha256": "f347fdec4599f5dc73507f8fd6d43ec4b8a97eb7f83fe9b412e1d7a4f5669bef",
+      "child_cpu_s": 98.78999999999995,
+      "mean_busy_cores": 7.947185063285169
+    },
+    {
+      "arm": "Sub0 Q16 tile",
+      "round": 2,
+      "warmup": false,
+      "native": {
+        "schema": "qwen-phase-1",
+        "workers": 8,
+        "context_capacity": 128,
+        "prompt_tokens": 13,
+        "decode_evaluations": 8,
+        "weight_bytes_per_eval": 5764050576,
+        "projection_flops_per_eval": 51247841280,
+        "setup_ms": 77.651057,
+        "batched_prefill": false,
+        "f32_attention": true,
+        "prefill_ms": [
+          537.159007,
+          513.292859,
+          512.732945,
+          530.648497,
+          520.991448,
+          522.381118,
+          525.171147,
+          516.029265,
+          521.642969,
+          518.94631,
+          519.781727,
+          521.681213,
+          642.175063
+        ],
+        "decode_ms": [
+          637.804535,
+          632.092741,
+          634.515791,
+          636.283962,
+          633.306339,
+          634.06581,
+          638.847012,
+          637.904037
+        ],
+        "top_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ]
+      },
+      "rates": {
+        "prefill_tok_s": 1.883339144680496,
+        "decode_tok_s": 1.5733102927652431,
+        "prefill_s": 6.902633568000001,
+        "decode_s": 5.084820227,
+        "setup_s": 0.077651057,
+        "setup_plus_prefill_s": 6.980284625,
+        "generated_ids": [
+          12675,
+          1017,
+          0,
+          248046,
+          198,
+          248045,
+          248046,
+          198,
+          248045
+        ],
+        "process_wall_s": 12.209469238001475,
+        "peak_rss_mib": 5736.7890625
+      },
+      "quiet": {
+        "samples": [
+          0.011264080100125156,
+          0.004688965301656768,
+          0.004063769928102532,
+          0.003753518923991242,
+          0.005626758361988122,
+          0.005004691898654989,
+          0.004690431519699813,
+          0.0040650406504065045,
+          0.005623242736644799,
+          0.00655840099937539
+        ],
+        "seconds": 10
+      },
+      "background_global": 0.004765076599887325,
+      "background_selected": 0.00010241704219600768,
+      "tainted": false,
+      "calibration_ns": [
+        4497.375669099761,
+        4499.51073883161
+      ],
+      "stdout_sha256": "2a4e460bf27a670c7bc1848740a710696b48a5d20d11bd24b37bcfe4f902a97c",
+      "child_cpu_s": 96.99999999999999,
+      "mean_busy_cores": 7.9446532940262005
+    }
+  ],
+  "timing_verdict": "descriptive comparison only",
+  "correctness": {
+    "q16": {
+      "passed": true,
+      "positions": [
+        {
+          "position": 0,
+          "values": 248320,
+          "max_abs": 0.002571582794189453,
+          "relative_l2": 0.00019374251767034764,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 1,
+          "values": 248320,
+          "max_abs": 0.0023331642150878906,
+          "relative_l2": 0.00011926791859335874,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 2,
+          "values": 248320,
+          "max_abs": 0.0019383430480957031,
+          "relative_l2": 7.141183236006527e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 3,
+          "values": 248320,
+          "max_abs": 0.0022238492965698242,
+          "relative_l2": 6.165584909500621e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 4,
+          "values": 248320,
+          "max_abs": 0.0013928413391113281,
+          "relative_l2": 4.95376410160878e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 5,
+          "values": 248320,
+          "max_abs": 0.001971721649169922,
+          "relative_l2": 0.0001797036356408573,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 6,
+          "values": 248320,
+          "max_abs": 0.0024785995483398438,
+          "relative_l2": 4.388344499548298e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 7,
+          "values": 248320,
+          "max_abs": 0.0010471343994140625,
+          "relative_l2": 4.3724271299187336e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 8,
+          "values": 248320,
+          "max_abs": 0.0011532306671142578,
+          "relative_l2": 5.0545261383237914e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 9,
+          "values": 248320,
+          "max_abs": 0.0012056827545166016,
+          "relative_l2": 6.24865353986435e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 10,
+          "values": 248320,
+          "max_abs": 0.0015801191329956055,
+          "relative_l2": 7.461509703737768e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 11,
+          "values": 248320,
+          "max_abs": 0.0017959177494049072,
+          "relative_l2": 9.875435362037347e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 12,
+          "values": 248320,
+          "max_abs": 0.0012583732604980469,
+          "relative_l2": 9.434061812659186e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 13,
+          "values": 248320,
+          "max_abs": 0.0012891292572021484,
+          "relative_l2": 8.238157380313924e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 14,
+          "values": 248320,
+          "max_abs": 0.0015961527824401855,
+          "relative_l2": 6.960330380236777e-05,
+          "tolerance": 0.001,
+          "passed": true
+        },
+        {
+          "position": 15,
+          "values": 248320,
+          "max_abs": 0.001382291316986084,
+          "relative_l2": 0.0001079717863133778,
+          "tolerance": 0.001,
+          "passed": true
+        }
+      ],
+      "worst_relative_l2": 0.00019374251767034764
+    }
+  },
+  "summary": {
+    "Sub0 Q16 serial": {
+      "prefill_tok_s": {
+        "samples": [
+          1.8751742931232207,
+          1.8777830931975155,
+          1.8521438879797936
+        ],
+        "median": 1.8751742931232207,
+        "min": 1.8521438879797936,
+        "max": 1.8777830931975155,
+        "robust_cv": 0.0020626386594215377
+      },
+      "decode_tok_s": {
+        "samples": [
+          1.5720900767824395,
+          1.5601081774329908,
+          1.5403086537907476
+        ],
+        "median": 1.5601081774329908,
+        "min": 1.5403086537907476,
+        "max": 1.5720900767824395,
+        "robust_cv": 0.011386623205015324
+      },
+      "setup_s": {
+        "samples": [
+          0.077326489,
+          0.076966502,
+          0.07826564600000001
+        ],
+        "median": 0.077326489,
+        "min": 0.076966502,
+        "max": 0.07826564600000001,
+        "robust_cv": 0.006902120257910434
+      },
+      "setup_plus_prefill_s": {
+        "samples": [
+          7.010015385,
+          7.000023828000001,
+          7.09715877
+        ],
+        "median": 7.010015385,
+        "min": 7.000023828000001,
+        "max": 7.09715877,
+        "robust_cv": 0.002113188287702879
+      },
+      "process_wall_s": {
+        "samples": [
+          12.237121313000898,
+          12.267257896999581,
+          12.430816598998717
+        ],
+        "median": 12.267257896999581,
+        "min": 12.237121313000898,
+        "max": 12.430816598998717,
+        "robust_cv": 0.0036422564693431264
+      },
+      "peak_rss_mib": {
+        "samples": [
+          5736.5390625,
+          5736.71875,
+          5737.11328125
+        ],
+        "median": 5736.71875,
+        "min": 5736.5390625,
+        "max": 5737.11328125,
+        "robust_cv": 4.643851286939942e-05
+      }
+    },
+    "Sub0 Q16 tile": {
+      "prefill_tok_s": {
+        "samples": [
+          1.9056517483571713,
+          1.8901681073451164,
+          1.883339144680496
+        ],
+        "median": 1.8901681073451164,
+        "min": 1.883339144680496,
+        "max": 1.9056517483571713,
+        "robust_cv": 0.0053564653890955626
+      },
+      "decode_tok_s": {
+        "samples": [
+          1.588507162750157,
+          1.5801801530366713,
+          1.5733102927652431
+        ],
+        "median": 1.5801801530366713,
+        "min": 1.5733102927652431,
+        "max": 1.588507162750157,
+        "robust_cv": 0.006445628885317954
+      },
+      "setup_s": {
+        "samples": [
+          0.076455002,
+          0.07706167600000001,
+          0.077651057
+        ],
+        "median": 0.07706167600000001,
+        "min": 0.076455002,
+        "max": 0.077651057,
+        "robust_cv": 0.011339180718052112
+      },
+      "setup_plus_prefill_s": {
+        "samples": [
+          6.89826807,
+          6.954756813,
+          6.980284625
+        ],
+        "median": 6.954756813,
+        "min": 6.89826807,
+        "max": 6.980284625,
+        "robust_cv": 0.005441963693173921
+      },
+      "process_wall_s": {
+        "samples": [
+          12.068363117001354,
+          12.157091552000566,
+          12.209469238001475
+        ],
+        "median": 12.157091552000566,
+        "min": 12.068363117001354,
+        "max": 12.209469238001475,
+        "robust_cv": 0.0063876427131264995
+      },
+      "peak_rss_mib": {
+        "samples": [
+          5736.71875,
+          5737.0546875,
+          5736.7890625
+        ],
+        "median": 5736.7890625,
+        "min": 5736.71875,
+        "max": 5737.0546875,
+        "robust_cv": 1.817136927369813e-05
+      }
+    },
+    "llama native defaults": {
+      "prefill_tok_s": {
+        "samples": [
+          16.452849817860372,
+          16.53041985209023,
+          16.561645957322096
+        ],
+        "median": 16.53041985209023,
+        "min": 16.452849817860372,
+        "max": 16.561645957322096,
+        "robust_cv": 0.002800644147638553
+      },
+      "decode_tok_s": {
+        "samples": [
+          4.209405426450612,
+          4.123729429349198,
+          4.131129733376412
+        ],
+        "median": 4.131129733376412,
+        "min": 4.123729429349198,
+        "max": 4.209405426450612,
+        "robust_cv": 0.0026558572252292265
+      },
+      "setup_s": {
+        "samples": [
+          0.51813002,
+          0.509001414,
+          0.512635136
+        ],
+        "median": 0.512635136,
+        "min": 0.509001414,
+        "max": 0.51813002,
+        "robust_cv": 0.010509143558197322
+      },
+      "setup_plus_prefill_s": {
+        "samples": [
+          1.308266692,
+          1.29543032,
+          1.297581272
+        ],
+        "median": 1.297581272,
+        "min": 1.29543032,
+        "max": 1.308266692,
+        "robust_cv": 0.0024576506335397064
+      },
+      "process_wall_s": {
+        "samples": [
+          3.379418946000442,
+          3.4114987199991447,
+          3.4012968160004675
+        ],
+        "median": 3.4012968160004675,
+        "min": 3.379418946000442,
+        "max": 3.4114987199991447,
+        "robust_cv": 0.004446934121504986
+      },
+      "peak_rss_mib": {
+        "samples": [
+          6249.57421875,
+          6249.46484375,
+          6249.6796875
+        ],
+        "median": 6249.57421875,
+        "min": 6249.46484375,
+        "max": 6249.6796875,
+        "robust_cv": 2.5020579526980276e-05
+      }
+    }
+  }
+}

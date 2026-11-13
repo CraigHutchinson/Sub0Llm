@@ -3,6 +3,7 @@
 #include "sub0/dense_quant.hpp"
 #include "sub0/dense_quant_q8k.hpp"
 #include "sub0/dense_quant_q16.hpp"
+#include "sub0/dense_quant_q16_tile.hpp"
 #include "sub0/file_map.hpp"
 #include "sub0/backbone_quant.hpp"
 #include "sub0/layout.hpp"
@@ -17,7 +18,7 @@
 
 namespace sub0::dense_probe {
 using sub0::gdn::Projection;
-enum class PackedActivation { Float, Q8K, Q16 };
+enum class PackedActivation { Float, Q8K, Q16, Q16Tile };
 struct Layer {
     const sub0::gguf::Reader& reader;
     int index=0;
@@ -36,7 +37,7 @@ struct Layer {
         qkv_rows(sub0::GDN_CONV_DIM), z_rows(sub0::GDN_VALUE_DIM), head_rows(sub0::GDN_V_HEADS), out_indices(sub0::GDN_VALUE_DIM) {
         if(mode==PackedActivation::Q8K)
             quantized_input=sub0::quant::Q8KActivations(std::max({D_MODEL,D_FF,sub0::GDN_VALUE_DIM,sub0::D_Q}));
-        if(mode==PackedActivation::Q16)
+        if(mode==PackedActivation::Q16 || mode==PackedActivation::Q16Tile)
             quantized_input16=sub0::quant::Q16Activations(std::max({D_MODEL,D_FF,sub0::GDN_VALUE_DIM,sub0::D_Q}));
         scratch.reserve(256);
         if(workers<1 || workers>8)throw std::runtime_error("projection threads must be 1..8");
@@ -129,8 +130,8 @@ struct Layer {
     bool project_impl(const sub0::gguf::TensorInfo* t, const float* x,int in,float* y,int out) {
         if(!t || t->dims.size()!=2 || t->dims[0]!=static_cast<std::uint64_t>(in) || t->dims[1]!=static_cast<std::uint64_t>(out))return false;
         const auto raw=reader.tensor_bytes(*t);
-        if((activation_mode==PackedActivation::Q8K || activation_mode==PackedActivation::Q16) && sub0::denseq::q8k_supported(t->type_raw)){
-            const bool use16=activation_mode==PackedActivation::Q16;
+        if(activation_mode!=PackedActivation::Float && sub0::denseq::q8k_supported(t->type_raw)){
+            const bool use16=activation_mode!=PackedActivation::Q8K;
             if(!(use16?quantized_input16.quantize({x,static_cast<std::size_t>(in)}):quantized_input.quantize({x,static_cast<std::size_t>(in)})))return false;
             const auto bytes=static_cast<std::size_t>(in)/256*sub0::gguf::block_spec(t->type_raw).bytes;
             std::array<bool,8> ok{};
@@ -141,6 +142,14 @@ struct Layer {
                 const auto begin=static_cast<std::size_t>(out)*part/workers;
                 const auto end=static_cast<std::size_t>(out)*(part+1)/workers;
                 if(end*bytes>raw.size()){ok[part]=false;continue;}
+                if(begin==end){ok[part]=true;continue;}
+                if(activation_mode==PackedActivation::Q16Tile && t->type_raw==19){
+                    const std::array<const sub0::quant::Q16Activations*,1> active{&quantized_input16};
+                    // Explicit experiment only: native 512-bit word dot wins on the measured Zen4 host.
+                    constexpr int bits=sub0::denseq::iq1_q16_tile_available<512>?512:256;
+                    ok[part]=sub0::denseq::project_iq1_q16_tile<bits>(raw.subspan(begin*bytes,(end-begin)*bytes),active,{y+begin,end-begin},end-begin,end-begin);
+                    continue;
+                }
                 ok[part]=use16?sub0::denseq::project_q16(t->type_raw,raw.subspan(begin*bytes,(end-begin)*bytes),quantized_input16,{y+begin,end-begin}):
                     sub0::denseq::project_q8k(t->type_raw,raw.subspan(begin*bytes,(end-begin)*bytes),quantized_input,{y+begin,end-begin});
             }
