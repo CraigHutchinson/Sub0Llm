@@ -41,3 +41,13 @@ add_executable(sub0llm-q16-projection-fixture "${PROJECT_SOURCE_DIR}/tools/refer
 target_include_directories(sub0llm-q16-projection-fixture PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(sub0llm-q16-projection-fixture PRIVATE Threads::Threads)
 add_test(NAME sub0llm-q16-projection-contract COMMAND sub0llm-q16-projection-fixture)
+
+# Separate experiment suite keeps established default-kernel baseline names stable.
+sub0math_add_benchmark(sub0llm-bench-q16-tile "${PROJECT_SOURCE_DIR}/benchmarks/q16_tile_perf.cpp")
+target_include_directories(sub0llm-bench-q16-tile PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_compile_options(sub0llm-bench-q16-tile PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Werror>)
+add_executable(sub0llm-q16-tile-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/q16_tile_fixture.cpp")
+target_include_directories(sub0llm-q16-tile-fixture PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_compile_options(sub0llm-q16-tile-fixture PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Werror>)
+target_link_libraries(sub0llm-q16-tile-fixture PRIVATE Threads::Threads)
+add_test(NAME sub0llm-q16-tile-contract COMMAND sub0llm-q16-tile-fixture)
