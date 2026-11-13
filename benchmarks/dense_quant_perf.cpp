@@ -5,6 +5,7 @@
 #include "iq1s_perf.hpp"
 #include "iq2xxs_perf.hpp"
 #include "float_reduce_perf.hpp"
+#include "q8k_perf.hpp"
 #include <bit>
 #include <cmath>
 #include <stdexcept>
@@ -75,6 +76,7 @@ int main(int argc, char** argv) try {
     add_iq1s_benchmarks(runner);
     sub0bench::add_iq2xxs_benchmarks(runner);
     sub0bench::add_float_reduce_benchmarks(runner);
+    sub0bench::add_q8k_benchmarks(runner);
     return runner.finish();
 } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());

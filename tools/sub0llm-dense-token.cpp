@@ -34,7 +34,7 @@ int main(int argc,char** argv) try {
     // Evaluation override; the default comes from the generated configuration (#63).
     // TODO(#29): keep runtime strategy dispatch in this proving ground; instantiate the
     // qualified generated strategy with if constexpr in the production engine adapter.
-    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel; generated default, explicit experiment override")->capture_default_str()->check(CLI::IsMember({"baseline","scalar","native","native-all","fused-iq2"}));
+    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel; generated default, explicit experiment override")->capture_default_str()->check(CLI::IsMember({"baseline","scalar","native","native-all","fused-iq2","packed-q8k","packed-q16"}));
     app.add_option("--timings-file",timings_file,"Native setup/prefill/decode metrics; suppress progress output; no dumps");
     app.add_option("--projection-profile",projection_profile_file,"Diagnostic per-format projection attribution; requires timings");
     app.add_option("--score-file",score_file,"Teacher-forced f64 NLL JSON; requires raw targets");
@@ -43,7 +43,9 @@ int main(int argc,char** argv) try {
     app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
     app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
-    const auto iq1_kernel=iq1_kernel_name=="fused-iq2"?sub0::denseq::Iq1Kernel::FusedIQ2:
+    const auto activation_mode=iq1_kernel_name=="packed-q16"?PackedActivation::Q16:
+                               iq1_kernel_name=="packed-q8k"?PackedActivation::Q8K:PackedActivation::Float;
+    const auto iq1_kernel=activation_mode!=PackedActivation::Float || iq1_kernel_name=="fused-iq2"?sub0::denseq::Iq1Kernel::FusedIQ2:
                           iq1_kernel_name=="native-all"?sub0::denseq::Iq1Kernel::NativeAll:
                           iq1_kernel_name=="native"?sub0::denseq::Iq1Kernel::Native:
                           iq1_kernel_name=="scalar"?sub0::denseq::Iq1Kernel::Scalar:sub0::denseq::Iq1Kernel::Baseline;
@@ -112,7 +114,7 @@ int main(int argc,char** argv) try {
     bool stopped_eos=false;
     std::size_t position=0;
     auto dump=[&](const std::string& suffix,const std::vector<float>& values){if(dump_prefix=="-" || (logits_only && suffix!=".logits"))return;const std::string path=dump_prefix+(position?".pos"+std::to_string(position):"")+suffix;FILE* f=std::fopen(path.c_str(),"wb");if(!f)throw std::runtime_error("dump open");bool ok=std::fwrite(values.data(),sizeof(float),values.size(),f)==values.size();int closed=std::fclose(f);if(!ok||closed)throw std::runtime_error("dump write");};
-    Layer initial(reader,0,projection_threads,profiler,iq1_kernel);const auto* emb=reader.find_tensor("token_embd.weight");
+    Layer initial(reader,0,projection_threads,profiler,iq1_kernel,activation_mode);const auto* emb=reader.find_tensor("token_embd.weight");
     if(!emb||emb->dims.size()!=2||emb->dims[0]!=D_MODEL||emb->dims[1]!=VOCAB)throw std::runtime_error("embedding dimensions");
     const auto spec=sub0::gguf::block_spec(emb->type_raw);auto decode=sub0::gguf::dequant_fn(emb->type_raw);
     if(!decode||D_MODEL%spec.elems)throw std::runtime_error("embedding format");
@@ -136,7 +138,7 @@ int main(int argc,char** argv) try {
     std::vector<Layer> layers;
     layers.reserve(N_LAYERS);
     for(int l=0;l<N_LAYERS;++l)
-        layers.emplace_back(reader,l,projection_threads,profiler,iq1_kernel);
+        layers.emplace_back(reader,l,projection_threads,profiler,iq1_kernel,activation_mode);
     const auto output_norm=initial.load("output_norm.weight",D_MODEL);
     const auto* output_tensor=reader.find_tensor("output.weight");
     if(!output_tensor)throw std::runtime_error("missing output.weight");
