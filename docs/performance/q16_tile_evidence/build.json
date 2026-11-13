@@ -1,0 +1,53 @@
+{
+  "source_commit": "0e7c1a688deb07b5b5e75795c7fea3143941156f",
+  "compiler": "Ubuntu clang version 21.1.8 (6ubuntu1)",
+  "kernel_flags": "-O3 -g -std=gnu++26 -fconstexpr-steps=1000000000 -march=native -Wall -Wextra -Werror",
+  "model_peak_rss_kib": 5874192,
+  "model_command": [
+    "/usr/bin/time",
+    "-v",
+    "taskset",
+    "-c",
+    "0-7",
+    "out/build/q16-session-tile-native/sub0llm-dense-token",
+    "/mnt/development/Models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf",
+    "64,8145,0,16743,11,1381,17306,1541,28445,557,748,1691,57080,421,1292,10298",
+    "out/perf/q16-tile-model/candidate",
+    "0",
+    "--logits-only",
+    "--projection-kernel",
+    "packed-q16-tile",
+    "--projection-threads",
+    "8"
+  ],
+  "assembly_review": "objdump -d -C native benchmark: no YMM/ZMM stack accesses in emitted two-row tile specializations; four-session expansion deferred",
+  "sha256": {
+    "include/sub0/dense_quant_q16_tile.hpp": "0a8a6d36cfc65660e45cb7542141b4378d2641297d7e27c6ebb9304ea7b75dca",
+    "benchmarks/q16_tile_fixture.hpp": "7cb4240e765ee8704688c1f941451d86656eaf235fcbd8c9aac37b9b684e8468",
+    "benchmarks/q16_tile_perf.cpp": "17d325b0dd6746e0d961f2de8f3ee8f49f1ffa2d55fda0e7ca5a9f532b821ff7",
+    "tools/reference/tests/q16_tile_fixture.cpp": "0174af37f73b98093d996d0ee66b8210d04e097b609f0f33fc3431d097c2c9fd",
+    "out/build/q16-session-tile-native/sub0llm-bench-q16-tile": "90494f639fe046b706857ecfbba10d477eeb10ed8988a11b81a01ec01ae55121",
+    "out/build/q16-session-tile-native/sub0llm-dense-token": "0b6490552a412a80b4a355134d3ff8e9be5e4d48443b31852b261c4818164c9a",
+    "out/build/pr76_verify/generated/sub0_config.hpp": "1c17c68b415ed71077d2b8ca87f497993bb2583f28c2aaa2f0472b6f2dfd2401",
+    "out/build/pr76_verify/generated/sub0_system.hpp": "285db8b3002fbf8943ab6a5ee80d6db70e6ae3db8d8eece66d8fa7a29e71e130",
+    "out/build/pr76_verify/generated/sub0_corpus.hpp": "508bf6c66e2b3277cfdb3f6e9f4174cb6d27cd12fdedf31b72eccad349240436"
+  },
+  "logits_sha256": {
+    "candidate.logits": "eb9f477a10816c857543cdf0b46e30a8f569390b7a8b49d537876a1028a86c1e",
+    "candidate.pos1.logits": "6a894ca156992cf810079812229367264b17116653bcabd28ba21167fc9eab02",
+    "candidate.pos10.logits": "fa07fd6215a0cc90656a1994a55cbbb399c082b29265899873b9589b0be877ef",
+    "candidate.pos11.logits": "5da60cb1b26ac29a1cfb86455bdee88f3564cb0d15b2e8db1a594f728165ec77",
+    "candidate.pos12.logits": "9e0a2f1d1624cf12c153400e7ae6a32c59f115081ff9947fa9b3d0c52ef63abc",
+    "candidate.pos13.logits": "d28bbd91bcac68547010a77bdf6e5761dfdf51e494a801ee66b589307aaeb16a",
+    "candidate.pos14.logits": "9e3379f3d60b1160ac8b32df2f738ce08056f255e1b9cb4f29d86433a6fe54a7",
+    "candidate.pos15.logits": "c384a7d5a83e7c5134b283d691029c23b9f00738ec3b10be8890b7f7845f8f14",
+    "candidate.pos2.logits": "ea4073cad8650adcab2a9ec2e65d5b394166bc0e2c8b6014da616e4401a1340c",
+    "candidate.pos3.logits": "338989e343733389f5bff1a6e89c88647ab9ec653bdc7d3ba04a2630c22f8872",
+    "candidate.pos4.logits": "75c02941d1a2d5430c5e56085f6d95f25dccc13070f3bd60d26928184aa958ce",
+    "candidate.pos5.logits": "f58c95a2b9a1abab2072006424c4bfcd75a864d7efdc6de347d4b9636e863bc6",
+    "candidate.pos6.logits": "b1e855c1a79568c567a11256d03a834b4088c5ffa3db8c3b645f510bb6d41f8c",
+    "candidate.pos7.logits": "c87183ae1c2c53182adaf173d61e2bb5ebc15c27f0ac00f3d3a43317b826d2ea",
+    "candidate.pos8.logits": "84be33e4a3a957db7ed4c31880a6ab2b97c1db2207b8f663f7a08ecffd833cd9",
+    "candidate.pos9.logits": "1f1eeb552067cd47d1d44da80d0e25895f3faafd18ee9805a9d4e5da5e6a8495"
+  }
+}
