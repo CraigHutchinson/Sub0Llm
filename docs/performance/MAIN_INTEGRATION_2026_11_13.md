@@ -62,4 +62,10 @@ On CrogBuntu1, 2026-11-13:
   context validate against the existing harness contract.
 
 Windows compilation remains unverified on this Linux machine; the portability branches are reviewed.
-No new throughput measurements were taken during the correctness builds.
+No throughput measurement overlapped the correctness builds. The subsequent pre-push gate
+reproduced a generic IQ2_XXS decoder regression (about 14%). A first byte-index/cursor pass
+was insufficient; restoring the proven pre-module whole-group loop inside the format module
+recovered the prior performance (about 1% from its recorded values in five calibrated rounds).
+[Raw focused samples](iq2_migration_regression_2026_11_13.json) retain both passes and the rejected
+candidate. All 177 sampled real IQ2 rows and partial tails are bit-identical to main's prior decoder.
+This is a generic decoder repair, not a combined-model throughput qualification.

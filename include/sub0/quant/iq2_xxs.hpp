@@ -37,29 +37,50 @@ struct IQ2XXS {
     [[nodiscard]] static std::uint64_t grid(const Fields& f,int l) noexcept {
         return gguf::IQ2XXS_GRID[(f.aux[0]>>(8*l))&255];
     }
-    [[nodiscard]] static bool dequantize(std::span<const std::uint8_t> raw,std::uint64_t n,std::vector<float>& out) {
+    [[nodiscard]] static bool dequantize(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
         const auto blocks=n/block.elems+(n%block.elems!=0);
         if(blocks>raw.size()/block.bytes || n>out.max_size())return false;
-        out.resize(static_cast<std::size_t>(n));
-        for(std::uint64_t b=0;b<blocks;++b){
-            const auto* row=raw.data()+b*block.bytes;const float d=scale(row);
-            for(int ib=0;ib<8;++ib){
-                const auto f=fields(row,32*ib);const auto packed=f.aux[1];
-                const float db=group_scale(d,packed);
-                for(int l=0;l<4;++l){
-                    const auto code=grid(f,l);
-                    const auto signs=gguf::KSIGNS_IQ2XS[sign_index(f,l)];
-                    const auto base=b*block.elems+32*ib+8*l;
-                    if(base+8<=n){
-                        for(int j=0;j<8;++j){
-                            const float mag=static_cast<float>((code>>(8*j))&255);
-                            const float sign=1.f-2.f*static_cast<float>((signs>>j)&1);
-                            out[static_cast<std::size_t>(base+j)]=db*mag*sign;
+        out.assign(static_cast<std::size_t>(n),0.f);
+        if (blocks == 0) return n == 0;
+        std::uint64_t w = 0;
+        for (std::uint64_t i = 0; i < blocks; ++i) {
+            const std::uint8_t* blk = raw.data() + i * block.bytes;
+            std::uint16_t d_bits;
+            std::memcpy(&d_bits, blk, 2);
+            const float d = f16_to_f32(d_bits);
+            const std::uint8_t* qs = blk + 2;          // 8 groups of 8 bytes == 2 u32 each
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                std::uint32_t aux[2];
+                aux[0] = word(qs + 8 * ib32);
+                aux[1] = word(qs + 8 * ib32 + 4);
+                const auto* aux8 = qs + 8 * ib32;
+                // The scale's four high bits live in aux[1]'s top nibble; the remaining 28 bits are four
+                // 7-bit sign-pattern indices, one per 8-element group.
+                const float db = d * (0.5f + static_cast<float>(aux[1] >> 28)) * 0.25f;
+                for (int l = 0; l < 4; ++l) {
+                    const std::uint64_t grid = gguf::IQ2XXS_GRID[aux8[l]];
+                    const std::uint8_t signs = gguf::KSIGNS_IQ2XS[(aux[1] >> (7 * l)) & 127];
+                    // Perf (B28, see docs/CPU_PERF_BACKLOG.md 2d): the whole-group case (every group but
+                    // possibly the very last of the tensor) uses a fixed, unrollable 8-iteration loop with
+                    // no tail-bound check, and a branchless sign (gguf::KMASK_IQ2XS[j] == 1 << j, see
+                    // gguf_quant_tables.hpp, so "bit j of signs" is (signs >> j) & 1 -- no data-dependent
+                    // branch on essentially-random sign bits, which is where the real cost lived: the
+                    // guarded loop shared with dequantize_iq1_s alone did not explain the 6x gap, since
+                    // IQ1_S's inner loop is branch-free arithmetic). Numerically identical: 1.f - 2.f*bit
+                    // is exact for bit in {0,1}, same as the prior ternary, and this is verified bit-exact
+                    // against the ORIGINAL guarded/branching form (kept below for the genuine tail case).
+                    if (w + 8 <= n) {
+                        for (int j = 0; j < 8; ++j) {
+                            const auto mag = static_cast<std::uint8_t>((grid >> (8 * j)) & 0xFFu);
+                            const float sign = 1.f - 2.f * static_cast<float>((signs >> j) & 1u);
+                            out[static_cast<std::size_t>(w + j)] = db * static_cast<float>(mag) * sign;
                         }
-                    }else{
-                        for(int j=0;j<8 && base+j<n;++j){
-                            const float mag=static_cast<float>((code>>(8*j))&255);
-                            out[static_cast<std::size_t>(base+j)]=db*mag*((signs>>j)&1?-1.f:1.f);
+                        w += 8;
+                    } else {
+                        for (int j = 0; j < 8 && w < n; ++j, ++w) {
+                            const auto mag = static_cast<std::uint8_t>((grid >> (8 * j)) & 0xFFu);
+                            out[static_cast<std::size_t>(w)] =
+                                db * static_cast<float>(mag) * ((signs & gguf::KMASK_IQ2XS[j]) ? -1.f : 1.f);
                         }
                     }
                 }
