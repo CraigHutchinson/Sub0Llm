@@ -1,5 +1,18 @@
 # Handover — resuming the Qwen4-Next work in a new session or on a new machine
 
+## Dense 27B IQ2_XXS candidate — 2026-11-08
+
+[IQ2_XXS iteration](performance/IQ2XXS_ITERATION.md), #66 / draft PR #67: 1.514 prompt /
+1.503 generated tokens/s, another 18% generation gain at unchanged ~5.57 GiB RSS. Clean native
+llama.cpp measures 17.035 / 4.270 in the same interleaved run; generation gap is 2.84×. Complete
+engine/frontend counts remain unchanged; eight tooling groups and both CI variants pass. One full
+128-position candidate window is bit-identical to prior native-all and passes the independent oracle;
+actual replay/reset/overflow/EOS/length chat checks pass. Full 4,096-target qualification remains #63.
+Resume `scripts/qwen_quality.py capture out/build/qwen-iq2/run-manifest.json` with the verified shared
+cache. Its frozen protocol/fixture/reference/scalar baseline are unchanged; the faster candidate is
+selected by performance. Preserve the original `qwen-qual` manifest and all artifacts. No default/live
+promotion yet. Next measured projection costs: IQ1_S 28.59%, IQ1_M 18.50%, Q3_K 16.42%.
+
 ## Focused Qwen optimization harness — 2026-11-08
 
 [Harness design and commands](performance/QWEN_OPTIMIZATION_HARNESS.md), #68: clean pinned llama.cpp,

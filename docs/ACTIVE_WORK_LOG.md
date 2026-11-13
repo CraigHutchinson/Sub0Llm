@@ -38,6 +38,8 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 **2026-11-08 Codex — #68 implementation complete, PR #69 in review.** Codified Qwen-driven optimization harness with measured llama.cpp profile, isolated candidates and stall recovery. Live trials/control checks and 27 script tests/eight tooling groups pass; generated kernel is tracked separately in #70. CPU and files released for publication. #63/#66 capture stopped at the verified literature-1 boundary; resume the unchanged `out/build/qwen-iq2/run-manifest.json` after pushes.
 
+**2026-11-08 Codex — #66 active (staged qualification/comparison).** IQ2_XXS module migration and separate fused-float experiment in draft PR #67; owns quant module/registry, dense projection selector and fixtures. Full engine/frontend and eight tooling groups pass; 128-position output is bit-identical to the prior candidate and actual chat state checks pass. Controlled native comparison complete: another 18% generation gain, 1.503 tokens/s. CPU released for publication; #63 resumes with this faster candidate and its unchanged fixture/protocol/reference/scalar cache after the push.
+
 **2026-11-08 Codex — #63 active.** Full 128-position and corpus quality qualification, reusable score/reference cache and generated defaults. Holds quality tools, mapped-token score adapter and configurator; owns CPU during long quality runs. No performance measurements may overlap. Prior/default artifacts remain preserved.
 
 
