@@ -1,6 +1,8 @@
 // Shared mapped single-token Qwen proving-ground support.
 #pragma once
 #include "sub0/dense_quant.hpp"
+#include "sub0/dense_quant_q8k.hpp"
+#include "sub0/dense_quant_q16.hpp"
 #include "sub0/file_map.hpp"
 #include "sub0/backbone_quant.hpp"
 #include "sub0/layout.hpp"
@@ -23,11 +25,17 @@ struct Layer {
     sub0::denseq::Iq1Kernel iq1_kernel=sub0::denseq::Iq1Kernel::Baseline;
     std::array<std::vector<float>,8> row_scratch;
     std::vector<float> scratch, raw_output, gathered;
+    sub0::quant::Q8KActivations quantized_input;
+    sub0::quant::Q16Activations quantized_input16;
     std::array<const sub0::gguf::TensorInfo*, 5> projections{};
     std::array<std::vector<float>,4> captured_projections;
     std::vector<std::uint32_t> qkv_rows, z_rows, head_rows, out_indices;
     explicit Layer(const sub0::gguf::Reader& r, int layer_index=0, int thread_count=1, sub0::phase::ProjectionProfile* projection_profile=nullptr, sub0::denseq::Iq1Kernel kernel=sub0::denseq::Iq1Kernel::Baseline) : reader(r), index(layer_index), workers(thread_count), profile(projection_profile), iq1_kernel(kernel), raw_output(sub0::GDN_CONV_DIM), gathered(sub0::GDN_VALUE_DIM),
         qkv_rows(sub0::GDN_CONV_DIM), z_rows(sub0::GDN_VALUE_DIM), head_rows(sub0::GDN_V_HEADS), out_indices(sub0::GDN_VALUE_DIM) {
+        if(kernel==sub0::denseq::Iq1Kernel::PackedQ8K)
+            quantized_input=sub0::quant::Q8KActivations(std::max({D_MODEL,D_FF,sub0::GDN_VALUE_DIM,sub0::D_Q}));
+        if(kernel==sub0::denseq::Iq1Kernel::PackedQ16)
+            quantized_input16=sub0::quant::Q16Activations(std::max({D_MODEL,D_FF,sub0::GDN_VALUE_DIM,sub0::D_Q}));
         scratch.reserve(256);
         if(workers<1 || workers>8)throw std::runtime_error("projection threads must be 1..8");
 #ifndef _OPENMP
@@ -119,7 +127,25 @@ struct Layer {
     bool project_impl(const sub0::gguf::TensorInfo* t, const float* x,int in,float* y,int out) {
         if(!t || t->dims.size()!=2 || t->dims[0]!=static_cast<std::uint64_t>(in) || t->dims[1]!=static_cast<std::uint64_t>(out))return false;
         const auto raw=reader.tensor_bytes(*t);
-        if(workers==1)return sub0::denseq::project(t->type_raw,raw,{x,static_cast<std::size_t>(in)},{y,static_cast<std::size_t>(out)},scratch,iq1_kernel);
+        if((iq1_kernel==sub0::denseq::Iq1Kernel::PackedQ8K || iq1_kernel==sub0::denseq::Iq1Kernel::PackedQ16) && sub0::denseq::q8k_supported(t->type_raw)){
+            const bool use16=iq1_kernel==sub0::denseq::Iq1Kernel::PackedQ16;
+            if(!(use16?quantized_input16.quantize({x,static_cast<std::size_t>(in)}):quantized_input.quantize({x,static_cast<std::size_t>(in)})))return false;
+            const auto bytes=static_cast<std::size_t>(in)/256*sub0::gguf::block_spec(t->type_raw).bytes;
+            std::array<bool,8> ok{};
+#ifdef _OPENMP
+            #pragma omp parallel for num_threads(workers) schedule(static)
+#endif
+            for(int part=0;part<workers;++part){
+                const auto begin=static_cast<std::size_t>(out)*part/workers;
+                const auto end=static_cast<std::size_t>(out)*(part+1)/workers;
+                if(end*bytes>raw.size()){ok[part]=false;continue;}
+                ok[part]=use16?sub0::denseq::project_q16(t->type_raw,raw.subspan(begin*bytes,(end-begin)*bytes),quantized_input16,{y+begin,end-begin}):
+                    sub0::denseq::project_q8k(t->type_raw,raw.subspan(begin*bytes,(end-begin)*bytes),quantized_input,{y+begin,end-begin});
+            }
+            return std::all_of(ok.begin(),ok.begin()+workers,[](bool value){return value;});
+        }
+        const auto fallback=(iq1_kernel==sub0::denseq::Iq1Kernel::PackedQ8K || iq1_kernel==sub0::denseq::Iq1Kernel::PackedQ16)?sub0::denseq::Iq1Kernel::FusedIQ2:iq1_kernel;
+        if(workers==1)return sub0::denseq::project(t->type_raw,raw,{x,static_cast<std::size_t>(in)},{y,static_cast<std::size_t>(out)},scratch,fallback);
         const auto spec=sub0::gguf::block_spec(t->type_raw);
         if(in<=0 || out<=0 || !spec.elems || static_cast<std::uint64_t>(in)%spec.elems)return false;
         const std::size_t row_bytes=static_cast<std::size_t>(in)/spec.elems*spec.bytes;
@@ -131,7 +157,7 @@ struct Layer {
         for(int part=0;part<workers;++part){
             const int begin=static_cast<int>(static_cast<std::int64_t>(out)*part/workers);
             const int end=static_cast<int>(static_cast<std::int64_t>(out)*(part+1)/workers);
-            success[part]=sub0::denseq::project(t->type_raw,raw.subspan(static_cast<std::size_t>(begin)*row_bytes,static_cast<std::size_t>(end-begin)*row_bytes),{x,static_cast<std::size_t>(in)},{y+begin,static_cast<std::size_t>(end-begin)},row_scratch[part],iq1_kernel);
+            success[part]=sub0::denseq::project(t->type_raw,raw.subspan(static_cast<std::size_t>(begin)*row_bytes,static_cast<std::size_t>(end-begin)*row_bytes),{x,static_cast<std::size_t>(in)},{y+begin,static_cast<std::size_t>(end-begin)},row_scratch[part],fallback);
         }
         return std::all_of(success.begin(),success.begin()+workers,[](bool ok){return ok;});
     }

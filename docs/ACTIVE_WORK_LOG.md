@@ -34,6 +34,8 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
+**2026-11-13 Codex — #84 active.** Packed IQ1_S/IQ2_XXS × quantized-activation dense backend, activation scratch prepared at startup and shared across rows. Holds new quant activation/kernel headers, kernel fixtures/benchmarks and proving-ground dispatch; CPU reserved for bounded correctness/performance checks, no corpus capture running. Existing float defaults/artifacts preserved.
+
 **2026-11-13 Codex — integration complete, publication pending.** Reviewing and integrating PRs #67/#71/#91/#93/#99/#102 at the owner's request. Holds quant headers, CMake and integration tests; delegated review/fixes own measure headers and machine tests. Combined build, 523-test suite, unchanged neutral counts, tooling and sanitizer checks pass. CPU/files released for publication; no new timing claims. Historical #63 capture is paused; no capture process is running.
 
 **2026-11-09 Gemini — #72 / #73 done (merged PR #76).** Prompt processing optimization: eliding intermediate prefill LM head projections (#72) and hoisting layer structures/pre-caching dequantized norm and conv weights to eliminate per-token heap churn (#73). Holds `tools/dense_qwen_support.hpp` and `tools/sub0llm-dense-token.cpp`. Testing correctness against 16-position reference gate and Python phase suite.

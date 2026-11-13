@@ -5,12 +5,13 @@
 #include <limits>
 
 namespace sub0::denseq {
-enum class Iq1Kernel { Baseline, Scalar, Native, NativeAll, FusedIQ2 };
+enum class Iq1Kernel { Baseline, Scalar, Native, NativeAll, FusedIQ2, PackedQ8K, PackedQ16 };
 // Caller owns weights, inputs, outputs and scratch; scratch must be reserved once before decode.
 // x and y must not overlap. This baseline accepts whole quant blocks per row.
 [[nodiscard]] inline bool project(std::uint32_t type, std::span<const std::uint8_t> raw,
                                   std::span<const float> x, std::span<float> y,
                                   std::vector<float>& scratch,Iq1Kernel iq1=Iq1Kernel::Baseline) {
+    if(iq1==Iq1Kernel::PackedQ8K || iq1==Iq1Kernel::PackedQ16)return false; // requires a prepared activation row via project_q8k
     const auto spec = gguf::block_spec(type);
     const auto decode = gguf::dequant_fn(type);
     if (!decode || spec.elems == 0 || x.empty() || x.size() % spec.elems != 0 ||
@@ -69,6 +70,7 @@ template<std::size_t Tile = 16>
                                         std::size_t n_tokens, float* y, std::size_t rows, std::size_t y_stride,
                                         std::vector<float>& scratch, Iq1Kernel iq1 = Iq1Kernel::Baseline) {
     static_assert(Tile > 0 && Tile <= 64);
+    if(iq1==Iq1Kernel::PackedQ8K || iq1==Iq1Kernel::PackedQ16)return false; // requires a prepared activation row via project_q8k
     const auto spec = gguf::block_spec(type);
     const auto decode = gguf::dequant_fn(type);
     if (!decode || spec.elems == 0 || in == 0 || in % spec.elems != 0 || n_tokens == 0 || scratch.capacity() < spec.elems) return false;

@@ -30,3 +30,14 @@ add_test(NAME sub0llm-native-quality-contract COMMAND "${Python3_EXECUTABLE}"
 add_executable(sub0llm-batch-projection-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/batch_projection_fixture.cpp")
 target_include_directories(sub0llm-batch-projection-fixture PRIVATE "${PROJECT_SOURCE_DIR}/include")
 add_test(NAME sub0llm-batch-projection-contract COMMAND sub0llm-batch-projection-fixture)
+
+add_executable(sub0llm-q8k-projection-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/q8k_projection_fixture.cpp")
+target_include_directories(sub0llm-q8k-projection-fixture PRIVATE "${PROJECT_SOURCE_DIR}/include")
+add_test(NAME sub0llm-q8k-projection-contract COMMAND sub0llm-q8k-projection-fixture)
+find_package(Threads REQUIRED)
+target_link_libraries(sub0llm-q8k-projection-fixture PRIVATE Threads::Threads)
+
+add_executable(sub0llm-q16-projection-fixture "${PROJECT_SOURCE_DIR}/tools/reference/tests/q16_projection_fixture.cpp")
+target_include_directories(sub0llm-q16-projection-fixture PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(sub0llm-q16-projection-fixture PRIVATE Threads::Threads)
+add_test(NAME sub0llm-q16-projection-contract COMMAND sub0llm-q16-projection-fixture)

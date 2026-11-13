@@ -1,3 +1,10 @@
+# Packed integer-activation backend — 2026-11-13
+
+[#84 implementation and numerical limits](performance/PACKED_ACTIVATION_BACKEND.md): packed IQ1_S/IQ2_XXS
+with prepared Q8_K/Q16 activations. Q8_K fails the unchanged model gate; Q16 passes the initial
+16 positions. Defaults remain preserved pending #63. Session-local scratch and concurrent row tests
+prepare the shared-weight batching work in #90.
+
 # Pending-work integration — 2026-11-13
 
 [Combined review and qualification boundaries](performance/MAIN_INTEGRATION_2026_11_13.md):

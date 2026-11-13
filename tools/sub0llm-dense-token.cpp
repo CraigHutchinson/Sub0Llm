@@ -34,7 +34,7 @@ int main(int argc,char** argv) try {
     // Evaluation override; the default comes from the generated configuration (#63).
     // TODO(#29): keep runtime strategy dispatch in this proving ground; instantiate the
     // qualified generated strategy with if constexpr in the production engine adapter.
-    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel; generated default, explicit experiment override")->capture_default_str()->check(CLI::IsMember({"baseline","scalar","native","native-all","fused-iq2"}));
+    app.add_option("--iq1s-kernel,--projection-kernel",iq1_kernel_name,"Projection kernel; generated default, explicit experiment override")->capture_default_str()->check(CLI::IsMember({"baseline","scalar","native","native-all","fused-iq2","packed-q8k","packed-q16"}));
     app.add_option("--timings-file",timings_file,"Native setup/prefill/decode metrics; suppress progress output; no dumps");
     app.add_option("--projection-profile",projection_profile_file,"Diagnostic per-format projection attribution; requires timings");
     app.add_option("--score-file",score_file,"Teacher-forced f64 NLL JSON; requires raw targets");
@@ -43,7 +43,9 @@ int main(int argc,char** argv) try {
     app.add_flag("--inspect-context",inspect_context,"Validate prompt and report token budget without inference");
     app.add_option("--response-file",response_file,"Write decoded text continuation after successful inference");
     try {app.parse(argc,argv);}catch(const CLI::ParseError& e){return app.exit(e);}
-    const auto iq1_kernel=iq1_kernel_name=="fused-iq2"?sub0::denseq::Iq1Kernel::FusedIQ2:
+    const auto iq1_kernel=iq1_kernel_name=="packed-q16"?sub0::denseq::Iq1Kernel::PackedQ16:
+                          iq1_kernel_name=="packed-q8k"?sub0::denseq::Iq1Kernel::PackedQ8K:
+                          iq1_kernel_name=="fused-iq2"?sub0::denseq::Iq1Kernel::FusedIQ2:
                           iq1_kernel_name=="native-all"?sub0::denseq::Iq1Kernel::NativeAll:
                           iq1_kernel_name=="native"?sub0::denseq::Iq1Kernel::Native:
                           iq1_kernel_name=="scalar"?sub0::denseq::Iq1Kernel::Scalar:sub0::denseq::Iq1Kernel::Baseline;
